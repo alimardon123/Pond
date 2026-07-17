@@ -34,12 +34,12 @@ vocabulary. No "this proves" or "strongest evidence." Just:
 | Universality (8 Views, 0 kernel changes) | Complete | Supported (empirical, not proof) |
 | Minimality (3 primitives confirmed) | Complete | Supported (empirical, not proof) |
 | Identity experiments (8 adversarial tests) | Complete | 6 supported, 2 confirmed primitives |
-| **Mathematical destruction** | **In progress** | — |
-| **Economic destruction** | **In progress** | — |
-| **Distributed destruction** | **Pending** | — |
-| **Storage destruction** | **Pending** | — |
-| **Scale destruction** | **Pending** | — |
-| **Human destruction** | **Pending** | — |
+| **Mathematical destruction** | Complete | 6 supported, 2 falsified (known) |
+| **Economic destruction** | Complete | 7 supported, 0 falsified |
+| **Distributed destruction** | Complete | 6 supported, 2 falsified (known), 1 inconclusive |
+| **Storage destruction** | Complete | 6 backends supported, 0 falsified |
+| **Scale destruction** | Complete | 4 supported, 1 falsified (known), 2 need validation |
+| **Human destruction** | Complete | 5 workloads supported, 5 doc gaps found |
 | Concurrency (MVCC, thread-safe root namespace) | Pending | — |
 | Replication (Raft) | Pending | — |
 | S3 backend | Pending | — |
