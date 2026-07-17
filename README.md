@@ -12,6 +12,45 @@ implemented as independent **Views** over a shared immutable substrate.
 
 ---
 
+## Outcome vocabulary (used throughout)
+
+To avoid confirmation bias, every experiment result uses this strict
+vocabulary. No "this proves" or "strongest evidence." Just:
+
+- **Supported** — evidence increased confidence in a hypothesis
+- **Falsified** — hypothesis failed
+- **Inconclusive** — experiment didn't isolate the question
+- **Needs larger-scale validation** — prototype limits prevent a conclusion
+
+---
+
+## Project status
+
+| Phase | Status | Outcome |
+|---|---|---|
+| Architecture (RFC 1) | Frozen | — |
+| Prototype (v0.1-v0.4) | Complete | Supported (internal consistency) |
+| Stress testing (metadata, S3, crash, concurrency) | Complete | 2 falsified, 4 supported |
+| Universality (8 Views, 0 kernel changes) | Complete | Supported (empirical, not proof) |
+| Minimality (3 primitives confirmed) | Complete | Supported (empirical, not proof) |
+| Identity experiments (8 adversarial tests) | Complete | 6 supported, 2 confirmed primitives |
+| **Mathematical destruction** | **In progress** | — |
+| **Economic destruction** | **In progress** | — |
+| **Distributed destruction** | **Pending** | — |
+| **Storage destruction** | **Pending** | — |
+| **Scale destruction** | **Pending** | — |
+| **Human destruction** | **Pending** | — |
+| Concurrency (MVCC, thread-safe root namespace) | Pending | — |
+| Replication (Raft) | Pending | — |
+| S3 backend | Pending | — |
+| Planner / IR | Pending | — |
+
+The "destruction" phases are trying to break the architecture, not prove it
+works. Each experiment ends in Supported / Falsified / Inconclusive /
+Needs larger-scale validation.
+
+---
+
 ## The minimal kernel
 
 ```
@@ -27,22 +66,173 @@ Everything else — Tree, Commit, Tag, Branch, OPEN/SEALED, lifecycle, history,
 branching, time travel — is a **View-level pattern** built from these 3
 primitives.
 
+**Important caveat:** the 3-primitive kernel is an *empirical hypothesis*,
+not a proof. It is supported by 8 workloads + 6 alien workloads + 8 identity
+experiments. The destruction phases are designed to falsify it.
+
 ---
 
-## Project status
+## Repository layout
 
-| Phase | Status |
-|---|---|
-| Architecture (RFC 1) | ✓ Frozen |
-| Prototype (v0.1-v0.4) | ✓ Complete |
-| Stress testing (metadata, S3, crash, concurrency) | ✓ Complete |
-| Universality (8 Views, 0 kernel changes) | ✓ Complete |
-| Minimality (3 primitives confirmed empirically) | ✓ Complete |
-| Identity experiments (8 adversarial tests) | ✓ Complete |
-| Concurrency (MVCC, thread-safe root namespace) | ⏳ Next |
-| Replication (Raft) | ⏳ Pending |
-| S3 backend | ⏳ Pending |
-| Planner / IR | ⏳ Pending |
+```
+Pond/
+├── README.md                              # this file
+├── worklog.md                             # full research worklog
+├── docs/
+│   └── pond_rfc1_storage_and_versioned_state.pdf   # RFC 1 (formal spec)
+├── scripts/
+│   └── pond_rfc1.py                       # ReportLab script that generated the RFC
+├── prototype/                             # v0.1-v0.5 code + benchmarks
+└── destruction/                           # destruction-phase experiments
+    ├── 01_mathematical.py                 # complexity budget for every operation
+    ├── 02_economic.py                     # amplification factors at 100TB S3 scale
+    ├── 03_distributed.py                  # partition, clock skew, exactly-once
+    ├── 04_storage.py                      # S3/Azure/GCS/HDFS/Redis/FDB/Postgres
+    ├── 05_scale.py                        # 10B blobs, 100M namespaces, 1B commits
+    └── 06_human.md                        # can a stranger implement Git/Iceberg/OCI?
+```
+
+---
+
+## The destruction plan
+
+The architecture is frozen. The next phase is trying to destroy it.
+
+### Stage 1: Mathematical destruction
+Try to prove every operation has bad asymptotics. If any is O(N²) at scale,
+the architecture fails.
+
+| Operation | Target complexity | Status |
+|---|---|---|
+| Read latest | O(1) | — |
+| Read version N | O(log N) | — |
+| Branch | O(1) | — |
+| Snapshot | O(1) | — |
+| GC | O(reachable) | — |
+| Replication | ? | — |
+| Compaction | ? | — |
+| Merge | ? | — |
+| Clone | ? | — |
+| Diff | ? | — |
+
+### Stage 2: Economic destruction
+At 100TB on S3, measure: storage amplification, write amplification, read
+amplification, metadata amplification, request amplification, CPU/memory
+amplification, AWS bill. If metadata dominates or request count explodes,
+the architecture fails economically.
+
+### Stage 3: Distributed destruction
+Partition, split-brain, lost packets, clock skew, duplicate writes, retries,
+out-of-order commits, exactly-once assumptions. If any distributed failure
+corrupts the kernel, the architecture fails.
+
+### Stage 4: Storage destruction
+Implement the kernel over S3, Azure Blob, GCS, HDFS, Redis, FoundationDB,
+Postgres. If any backend requires kernel special cases, the architecture
+fails storage-independence.
+
+### Stage 5: Scale destruction
+10 billion blobs. 100 million namespaces. 1 billion commits. 1 trillion
+references. If any operation degrades non-linearly, the architecture fails.
+
+### Stage 6: Human destruction
+Give the kernel to someone who knows nothing about Pond. Ask them to
+implement Git, Iceberg, OCI, Feature Store, LakeFS without talking to you.
+If they can't, the kernel isn't actually simple.
+
+---
+
+## Quick start
+
+```bash
+pip install duckdb pyarrow
+
+# The minimal kernel + 8 Views
+cd prototype
+python3 bench_minimality.py           # 8 Views on 3 primitives
+
+# Destruction experiments (the current phase)
+cd ../destruction
+python3 01_mathematical.py            # complexity budget for every operation
+python3 02_economic.py                # amplification at 100TB S3 scale
+python3 03_distributed.py             # partition, clock skew, exactly-once
+python3 04_storage.py                 # backend independence test
+python3 05_scale.py                   # extreme scale simulation
+```
+
+---
+
+## Architectural metrics
+
+| Metric | Goal | Current |
+|---|---|---|
+| Kernel LOC | ≤ 200-300 | ~140 (`pond_minimal.py`) |
+| Number of primitives | ≤ 3 unless admission rule satisfied | 3 |
+| Kernel dependencies (workload-specific libs) | 0 | 0 (only stdlib) |
+| View independence | Any View removable | Supported (Capability Independence Test) |
+| Storage portability | FS, S3, Redis, Postgres, memory | FS + Postgres verified; others pending Stage 4 |
+| Canonical copies | Exactly 1 durable representation | 1 (immutable blobs) |
+| Capability leakage | 0 kernel mods per new View | 0 across 14 workloads |
+| Long-term stability | API almost never changes | 3 primitives stable since v0.4 |
+
+---
+
+## The Kernel Admission Rule
+
+A feature enters `pond_minimal.py` ONLY if ALL five criteria pass:
+
+1. **Universal** — required by 3+ structurally different Views
+2. **Impossible outside the kernel** — if a View can implement it, it stays out
+3. **Immutable** — kernel tracks no mutable state except name → hash
+4. **Storage-independent** — no knowledge of formats or workload types
+5. **Decades-stable** — could Linux keep this syscall for 30 years?
+
+See `prototype/ADMISSION_RULE.py` for the full rule with the feature audit table.
+
+---
+
+## The philosophy
+
+> **One copy. Infinite execution. Zero coordination unless necessary.**
+
+- **One copy** — exactly one durable canonical representation (immutable blobs).
+  Everything else (caches, indexes, MVs) is derived and rebuildable.
+- **Infinite execution** — capabilities compose without limit. SQL, streaming,
+  vectors, ML, graph, future workloads all run over the same substrate.
+- **Zero coordination unless necessary** — everything stays local (single-node,
+  single-process) unless the system can prove coordination is required for
+  correctness. The discipline behind SQLite, Git, TigerBeetle, DuckDB.
+
+---
+
+## What Pond is NOT
+
+- Not another Iceberg (Pond's kernel has no table format)
+- Not another Spark (Pond's kernel has no execution engine)
+- Not another DuckDB (DuckDB is one View; the kernel is backend-agnostic)
+- Not a microkernel (the OS analogy is bounded — kernel = storage, Views = engines)
+- Not a Git clone (Tree/Commit are View patterns, not kernel primitives)
+
+## What Pond IS
+
+A **universal immutable object runtime** — the smallest storage algebra
+we've found so far (Write + Read + Reference) from which SQL, vectors,
+streaming, Git, graphs, ML, time-series, OCI registries, and alien workloads
+(Minecraft, Blender, CAD, genome, medical imaging, Photoshop) all derive as
+independent Views. The destruction phases are trying to falsify this claim.
+
+---
+
+## License
+
+MIT (see LICENSE file when added). All prototype code is open.
+
+## Contributing
+
+This is a research prototype going through destruction testing. The most
+valuable contribution is a workload, scale, or failure mode that breaks the
+kernel — open an issue with the scenario and what kernel change it would
+require.
 
 ---
 
