@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Test artifacts (created by running the benchmarks)
+/tmp/pond_*
+prototype/__pycache__/
+
+# Local credentials (NEVER commit)
+.env
+*.pat
+github_pat*
+credentials*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
