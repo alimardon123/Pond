@@ -217,3 +217,117 @@ the kernel. Views and infrastructure provide them as needed.
   (Identity Destruction II, Exp 1)
 
 These questions are not settled. The laws are a hypothesis, not a proof.
+
+---
+
+## Composition Laws (added v0.7 — algebraic properties)
+
+The 5 storage laws (above) specify what objects and names ARE. They
+don't specify what happens when objects and names COMPOSE. The
+composition laws fill that gap.
+
+### Composition Law 1: Reference chains
+If name `N1` resolves to hash `H1`, and the bytes at `H1` contain a
+reference to hash `H2`, then reading `H1` gives bytes that mention `H2`,
+but the kernel does NOT automatically resolve `H2`. Reference chains
+are View-level walks, not kernel-level traversals.
+
+**Implication:** the kernel provides one level of indirection
+(name → hash → bytes). Deeper indirection is a View concern. This is
+intentional — it keeps the kernel minimal.
+
+**Corollary:** "Reachability" is a View-defined concept. The kernel
+does not track transitive reachability. GC (a View concern) defines
+reachability for its own purposes.
+
+### Composition Law 2: Reference moves
+When `Reference(N, H_new)` overwrites a previous binding `H_old`:
+- The bytes at `H_old` are NOT modified (Law 4).
+- The bytes at `H_new` are NOT modified (Law 4).
+- Subsequent `Read(N)` returns bytes at `H_new`.
+- `H_old` may become orphaned (no name points to it directly).
+
+**Implication:** the kernel does not track reference history. Views
+that need history (Git, ML) build it via the Commit pattern (parent
+pointers in blobs).
+
+### Composition Law 3: GC reachability
+The kernel does NOT guarantee GC. Orphaned objects (hashes not
+reachable from any name) accumulate. GC is a View concern.
+
+**Definition (for Views implementing GC):** an object `H` is reachable
+if some name resolves (transitively, via View-defined reference chains)
+to `H`. Views implementing GC walk their own reference chains from all
+names to determine reachability.
+
+**Implication:** different Views can have different GC policies (Git
+keeps all commits reachable from any branch; OCI keeps all manifests
+tagged in the last 30 days). The kernel does not impose a policy.
+
+### Composition Law 4: Backend substitution
+If two kernels `K1` and `K2` use different backends (e.g., `K1` on
+filesystem, `K2` on S3) but have the same sequence of (Write, Reference)
+operations applied in the same order, then they produce the same state
+(same hashes, same name → hash mappings).
+
+**Implication:** a Pond instance can be migrated from one backend to
+another by replaying the operation log. The kernel is backend-independent
+(Law 5) at the composition level, not just the operation level.
+
+**Caveat:** this assumes the operation log is available. The kernel
+does not currently expose an operation log; Views that need migration
+must track their own operations.
+
+### Composition Law 5: Snapshot composition
+A snapshot is a point-in-time view of the namespace. If at time `T1`
+the namespace maps `N → H1`, and at time `T2` it maps `N → H2`, then:
+- Reading at `T1` returns bytes at `H1`.
+- Reading at `T2` returns bytes at `H2`.
+- The bytes at `H1` and `H2` are both immutable (Law 1).
+- `H1` and `H2` may be the same (if no Reference update happened between T1 and T2).
+
+**Implication:** snapshots are free (just record the hash). Time travel
+is possible (read at a past hash) but the kernel doesn't track history
+— Views build history via the Commit pattern.
+
+### Composition Law 6: Branching composition
+A branch is a name that points to a commit hash. Creating a branch is
+`Reference(branch_name, commit_hash)`. The branch shares all objects
+reachable from `commit_hash` with its parent (copy-on-write semantics
+for free, because objects are immutable).
+
+**Implication:** branches are O(1) to create (just a Reference). Merging
+branches is a View concern (the kernel doesn't define merge semantics).
+
+### Composition Law 7: Cross-View isolation
+If two Views use disjoint name prefixes (e.g., `sql:*` and `git:*`),
+they cannot interfere with each other's namespace. The kernel does not
+enforce prefix conventions — Views agree on them.
+
+**Implication:** Views can coexist safely if they follow naming
+conventions. The kernel does not provide isolation guarantees; Views
+must coordinate their naming.
+
+---
+
+## What the composition laws do NOT guarantee (honest gaps)
+
+1. **Cross-View consistency.** Two Views can write to the same name
+   and overwrite each other. The kernel uses last-writer-wins; Views
+   must coordinate via naming conventions or a coordination layer.
+
+2. **Transactional multi-name updates.** The kernel's Reference updates
+   one name at a time. Views that need atomic multi-name updates (e.g.,
+   "update table A and table B together") must implement their own
+   transaction protocol.
+
+3. **Causal consistency across Views.** If View A writes blob X and
+   View B reads it, View B has no way to know whether X was written
+   before or after some other operation. Causal consistency requires
+   View-level coordination.
+
+4. **Distributed snapshot.** The kernel's snapshot is single-node.
+   Distributed snapshots (across nodes) require a coordination protocol
+   (e.g., Chandy-Lamport) that the kernel does not provide.
+
+These gaps are View/infrastructure concerns, not kernel gaps.

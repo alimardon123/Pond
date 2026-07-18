@@ -24,30 +24,48 @@ vocabulary. No "this proves" or "strongest evidence." Just:
 
 ---
 
-## Project status
+## Project status — what changed the architecture vs. what confirmed it
 
-| Phase | Status | Outcome |
+One devastating experiment is worth more than fifty confirmations. This
+table tracks only experiments that *changed the architecture* or *surfaced
+a real finding*. Confirmation experiments are not listed.
+
+| Experiment | Result | Changed architecture? |
 |---|---|---|
-| Architecture (RFC 1) | Frozen | — |
-| Prototype (v0.1-v0.4) | Complete | Supported (internal consistency) |
-| Stress testing (metadata, S3, crash, concurrency) | Complete | 2 falsified, 4 supported |
-| Universality (8 Views, 0 kernel changes) | Complete | Supported (empirical, not proof) |
-| Minimality (3 primitives confirmed) | Complete | Supported (empirical, not proof) |
-| Identity experiments (8 adversarial tests) | Complete | 6 supported, 2 confirmed primitives |
-| **Mathematical destruction** | Complete | 6 supported, 2 falsified (known) |
-| **Economic destruction** | Complete | 7 supported, 0 falsified |
-| **Distributed destruction** | Complete | 6 supported, 2 falsified (known), 1 inconclusive |
-| **Storage destruction** | Complete | 6 backends supported, 0 falsified |
-| **Scale destruction** | Complete | 4 supported, 1 falsified (known), 2 need validation |
-| **Human destruction** | Complete | 5 workloads supported, 5 doc gaps found |
-| Concurrency (MVCC, thread-safe root namespace) | Pending | — |
-| Replication (Raft) | Pending | — |
-| S3 backend | Pending | — |
-| Planner / IR | Pending | — |
+| Metadata locality (flat tree at 5K seals) | O(N²) metadata growth | Yes — hierarchical trees (Git model) |
+| Universality (Parquet hardcoded in seal) | Format leak in kernel | Yes — split kernel from Views |
+| Minimality (Tree/Commit in kernel) | Tree/Commit are patterns, not primitives | Yes — removed Tree/Commit from kernel |
+| Identity (immutability removal) | Breaks Git/OCI/ML/crash recovery | Confirmed immutability is primitive |
+| Identity (Reference removal) | IPFS without IPNS = not a database | Confirmed Reference is primitive (but see open question below) |
+| Identity (laws vs APIs) | APIs evolve; laws endure | Yes — specified as 5 laws, not 3 operations |
+| Identity (multi-hash) | SHA-256 hardcoding is fragile | Yes — multi-hash candidate for v0.8 (passes Admission Rule) |
+| Time travel (no skip pointers) | O(N) walk at 1B commits | Known issue (Finding 5a) — View-level fix, not kernel |
+| GC (none implemented) | Orphans accumulate | Known issue (Finding 6) — View-level fix, not kernel |
+| Concurrency (SQLite thread-binding) | Concurrent writers corrupt | Known issue (Finding 7) — needs thread-safe root namespace |
+| Adversarial View Design | Friction found: 5 kernel points (clustered on indexes) | **Yes** — shared index library recommended (not kernel change) |
+| Composition laws | 7 algebraic properties added to formal spec | Yes — formal spec now has storage + composition laws |
+| Independent implementation challenge | Pending | — |
 
-The "destruction" phases are trying to break the architecture, not prove it
-works. Each experiment ends in Supported / Falsified / Inconclusive /
-Needs larger-scale validation.
+**What this table does NOT show:** the ~50 confirmation experiments that
+ran but did not change the architecture. They were useful for building
+confidence but not for discovering architectural issues. The next phase
+(Adversarial View Design) is designed to surface friction, not confirmation.
+
+---
+
+## The four layers (honest confidence assessment)
+
+| Layer | Status | Confidence |
+|---|---|---|
+| Philosophy | Excellent | High |
+| Kernel design | Very promising | Medium |
+| Prototype | Useful | Medium |
+| Production architecture | Still mostly unknown | Low |
+
+The prototype proves the philosophy. The kernel design is promising but
+attacked by Adversarial View Design (next phase). Production architecture
+(no replication, no real S3, no concurrency, no distributed execution) is
+still mostly unknown — do not extrapolate prototype results to production.
 
 ---
 
