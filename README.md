@@ -162,6 +162,86 @@ python3 05_scale.py                   # extreme scale simulation
 
 ---
 
+## Retractions (honest correction of overclaims)
+
+Earlier versions of this README made claims stronger than the evidence
+supports. Retracting:
+
+1. **"Content-addressing makes the kernel inherently resilient to retries,
+   duplicates, clock skew, split-brain."** — Overclaimed. Content-addressing
+   handles idempotent writes and dedup. It does NOT handle: lost updates,
+   concurrent reference races, namespace coordination, transactional
+   visibility, causal consistency, lease expiration, conflict resolution.
+   Those require additional mechanisms (Raft, MVCC, CRDTs) the kernel
+   does not yet have.
+
+2. **"Metadata is 0.002% of data at 100TB."** — Benchmark result, not
+   architectural statement. Depends on workload (blob size, table count,
+   commit frequency). For 1KB ML checkpoints, the ratio is much higher.
+   For 1B tables, the root namespace dominates. Correct for the specific
+   workload tested; not a universal property.
+
+3. **"Mathematical destruction proved asymptotic complexity."** — It
+   benchmarked one implementation (Python + SQLite). It did NOT prove
+   the architecture's complexity bounds. A different implementation
+   could behave differently. Analytical claims (O(1), O(log N)) are
+   hypotheses, not theorems.
+
+4. **"The kernel needs no modifications."** — Premature. The destruction
+   phase evaluated the kernel against workloads I designed. Workloads
+   I didn't design (CRDTs, multi-writer namespaces, causal consistency)
+   might require kernel changes. The kernel is *probably* sufficient
+   for the workloads tested; it is *not proven* sufficient for all
+   possible workloads.
+
+5. **"Storage independence is supported."** — True for the 6 backends
+   tested (FS, memory, SQLite, Redis, S3, FDB-analytical). Not tested
+   on real S3, real FDB, HDFS, Azure Blob, GCS. The architecture
+   *should* work on all of them (kernel uses only PutObject + GetObject
+   semantics), but empirical validation is pending.
+
+---
+
+## What the destruction phase DID NOT question (Identity Destruction II)
+
+The destruction phase tested the kernel against designed workloads. It did
+NOT question the kernel's foundational assumptions:
+
+- **Is Reference primitive?** It's the only mutating operation. Why is the
+  centralized operation in the kernel? Could namespace be a View concern?
+- **Is the namespace model right?** `name -> hash` is one model. Could it
+  be `(name, epoch)`, paths, tenant+name, capability tokens, graph edges,
+  content queries?
+- **Is the kernel an API or laws?** APIs evolve; invariants endure. Should
+  the architecture be specified as laws (immutability, addressability,
+  name-mutability) rather than operations (Write/Read/Reference)?
+- **Can names disappear?** Reference overwrites, but can a name be deleted?
+  What happens to reachability?
+- **Can references be CRDTs?** For multi-writer/multi-region scenarios.
+- **Can two namespaces overlap?** Compose? Conflict?
+
+These are the Identity Destruction II questions. See `destruction/II_identity/`.
+
+---
+
+## Comparison set (revised)
+
+Pond is NOT competing with Iceberg, Delta, or table formats. The real
+comparison set — systems with similar ambitions:
+
+- **Git** — immutable object graph + mutable refs
+- **Irmin** — content-addressable store + mutable references (OCaml)
+- **IPFS/IPNS** — content addressing + naming
+- **LakeFS** — versioned data namespaces on object storage
+- **FoundationDB** — minimal substrate with layered architecture
+- **Dolt** — versioned structured data using prolly trees
+
+Pond's differentiation (if it holds): a smaller substrate than any of these,
+specified as laws rather than APIs, with Views as the primary extension
+mechanism rather than baked-in semantics.
+
+---
+
 ## Architectural metrics
 
 | Metric | Goal | Current |
