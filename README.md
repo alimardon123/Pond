@@ -44,7 +44,8 @@ a real finding*. Confirmation experiments are not listed.
 | Concurrency (SQLite thread-binding) | Concurrent writers corrupt | Known issue (Finding 7) — needs thread-safe root namespace |
 | Adversarial View Design | Friction found: 5 kernel points (clustered on indexes) | **Yes** — shared index library recommended (not kernel change) |
 | Composition laws | 7 algebraic properties added to formal spec | Yes — formal spec now has storage + composition laws |
-| Independent implementation challenge | Pending | — |
+| Independent implementation challenge | Fresh agent built working GitView from laws alone; 10 ambiguities found | **Yes** — laws sufficient for kernel, NOT for View interoperability |
+| Multi-tenant hostile View | Capability tokens + partitioned namespace solve isolation at View level | No kernel change needed |
 
 **What this table does NOT show:** the ~50 confirmation experiments that
 ran but did not change the architecture. They were useful for building
