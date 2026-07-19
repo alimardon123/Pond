@@ -89,72 +89,54 @@ class ProllyTree:
     @staticmethod
     def build(kernel: PondMinimal, entries: dict[str, str]) -> str:
         """Build a Prolly tree from a sorted dict of key→hash entries.
-        Returns the root hash."""
+        Returns the root hash. Uses fixed-size chunks for simplicity."""
         if not entries:
-            # Empty tree
             return kernel.write(json.dumps({"type": "leaf", "entries": []}, sort_keys=True).encode())
 
-        # Sort entries by key
         sorted_items = sorted(entries.items())
 
-        # Build leaf chunks
-        leaf_chunks = []  # list of [(key, hash), ...]
-        current_chunk = []
-        for i, (key, h) in enumerate(sorted_items):
-            current_chunk.append([key, h])
-            # Check boundary: every TARGET_CHUNK_ENTRIES, or rolling hash
-            if len(current_chunk) >= TARGET_CHUNK_ENTRIES or \
-               (len(current_chunk) > 0 and ProllyTree._rolling_hash_boundary(i, key)):
-                leaf_chunks.append(current_chunk)
-                current_chunk = []
+        # If all entries fit in one chunk, make a single leaf
+        if len(sorted_items) <= TARGET_CHUNK_ENTRIES:
+            leaf_entries = [[k, h] for k, h in sorted_items]
+            data = json.dumps({"type": "leaf", "entries": leaf_entries}, sort_keys=True).encode()
+            return kernel.write(data)
 
-        if current_chunk:
-            leaf_chunks.append(current_chunk)
+        # Split into leaf chunks of TARGET_CHUNK_ENTRIES each
+        leaf_chunks = []
+        for i in range(0, len(sorted_items), TARGET_CHUNK_ENTRIES):
+            chunk = [[k, h] for k, h in sorted_items[i:i + TARGET_CHUNK_ENTRIES]]
+            leaf_chunks.append(chunk)
 
-        # Write leaf chunks and build internal nodes
+        # Build tree levels bottom-up
         level = leaf_chunks
         while len(level) > 1:
-            # Write each chunk at this level
-            chunk_hashes = []
+            # Write each chunk and record (max_key, hash)
+            chunk_entries = []
             for chunk in level:
-                if isinstance(chunk[0], list) and len(chunk[0]) == 2 and isinstance(chunk[0][0], str):
-                    # Leaf chunk
-                    data = json.dumps({"type": "leaf", "entries": chunk}, sort_keys=True).encode()
-                else:
-                    # Internal chunk (already has (max_key, child_hash) pairs)
-                    data = json.dumps({"type": "internal", "children": chunk}, sort_keys=True).encode()
+                data = json.dumps({"type": "leaf", "entries": chunk}, sort_keys=True).encode()
                 h = kernel.write(data)
-                # Get max key in this chunk
-                if chunk:
-                    max_key = chunk[-1][0] if isinstance(chunk[0], list) and len(chunk[0]) == 2 else chunk[-1][0]
-                else:
-                    max_key = ""
-                chunk_hashes.append([max_key, h])
+                max_key = chunk[-1][0]
+                chunk_entries.append([max_key, h])
 
-            # Build next level: group chunk_hashes into internal nodes
+            # Group into internal nodes
+            if len(chunk_entries) <= TARGET_CHUNK_ENTRIES:
+                # Single internal node
+                data = json.dumps({"type": "internal", "children": chunk_entries}, sort_keys=True).encode()
+                return kernel.write(data)
+
+            # Split into internal chunks
             next_level = []
-            current_group = []
-            for i, (max_key, h) in enumerate(chunk_hashes):
-                current_group.append([max_key, h])
-                if len(current_group) >= TARGET_CHUNK_ENTRIES:
-                    next_level.append(current_group)
-                    current_group = []
-            if current_group:
-                next_level.append(current_group)
+            for i in range(0, len(chunk_entries), TARGET_CHUNK_ENTRIES):
+                group = chunk_entries[i:i + TARGET_CHUNK_ENTRIES]
+                next_level.append(group)
             level = next_level
 
         # Write the root
         root = level[0]
-        if isinstance(root[0], list) and len(root[0]) == 2 and isinstance(root[0][0], str):
-            # Could be leaf entries or internal children — check type
-            if len(root) == 1 and isinstance(root[0][1], str) and len(root[0][1]) == 64:
-                # Single internal child → make it the root
-                data = json.dumps({"type": "internal", "children": root}, sort_keys=True).encode()
-            else:
-                data = json.dumps({"type": "leaf", "entries": root}, sort_keys=True).encode()
-        else:
+        if isinstance(root[0], list) and len(root[0]) == 2 and isinstance(root[0][1], str) and len(root[0][1]) == 64:
             data = json.dumps({"type": "internal", "children": root}, sort_keys=True).encode()
-
+        else:
+            data = json.dumps({"type": "leaf", "entries": root}, sort_keys=True).encode()
         return kernel.write(data)
 
     @staticmethod

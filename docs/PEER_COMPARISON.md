@@ -321,6 +321,50 @@ manager, or a 500MB runtime to build a serious data system.
 
 ---
 
+## LanceDB
+
+**What it is:** An open-source vector database built on Lance format
+(columnar, versioned, embedded). LanceDB runs embedded (like DuckDB) or
+serverless on S3. The Lance format is a columnar format with versioning
+and random access, designed for ML/AI workloads.
+
+**What Pond shares:**
+- Embedded (library, not a server) philosophy
+- Object-storage-native (LanceDB on S3; Pond on S3)
+- Versioning (Lance has versioned datasets; Pond has commit DAG)
+- Content-addressed data (Lance fragments are content-addressed)
+- No JVM (LanceDB is Rust; Pond is language-agnostic)
+
+**What Pond differs on:**
+- LanceDB is vector-search-specific (ANN, embeddings, filters). Pond is
+  workload-agnostic (any View, including VectorView).
+- Lance format is columnar (like Parquet but with random access and
+  versioning). Pond stores raw bytes; Views choose format.
+- LanceDB has built-in ANN indexes (IVF, HNSW). Pond's VectorView does
+  linear scan; indexes are View-level.
+- LanceDB is Rust-native with Arrow columnar. Pond is language-agnostic
+  and format-agnostic.
+
+**What Pond is rediscovering:** The "embedded, serverless, S3-native"
+philosophy for data infrastructure. LanceDB proved this for vector
+search; Pond generalizes it to all workloads.
+
+**Where Pond could learn from LanceDB:**
+- Lance format's random access. Lance supports O(1) random row access
+  within a columnar file. Pond's Views currently read entire blobs. A
+  View-level columnar format (like Lance) would enable efficient
+  partial reads.
+- Lance's fragment-based versioning. Lance versions datasets as a
+  sequence of fragments (data files) + a manifest (metadata). This is
+  similar to Pond's delta + snapshot approach, but Lance's fragments
+  are columnar (better for analytical scans).
+- LanceDB's ANN index as a first-class feature. Pond's VectorView
+  could adopt Lance's index format as a View-level library.
+- LanceDB's embedded serverless model. LanceDB on S3 with no server
+  is exactly what Pond's S3 backend achieves.
+
+---
+
 After comparing to 8 peers, Pond's potential contributions are:
 
 1. **Stricter kernel/View separation than any peer.** Git, Irmin,
