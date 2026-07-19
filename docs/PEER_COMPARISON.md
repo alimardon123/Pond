@@ -229,9 +229,99 @@ host non-SQL versioned workloads (Git, OCI, ML).
 
 ---
 
-## Honest summary: what is Pond's actual contribution?
+## WarpStream
 
-After comparing to 6 peers, Pond's potential contributions are:
+**What it is:** A Kafka-compatible streaming platform that runs directly
+on S3 (or any object storage) without local disks. No brokers, no local
+state, no ZooKeeper. Producers write directly to S3; consumers read
+directly from S3. Ordering is maintained via a protocol layer, not
+local storage.
+
+**What Pond shares:**
+- Direct-to-object-storage (no local disk required)
+- Protocol layer separate from storage layer (Pond's View/kernel split)
+- Content-addressed data (WarpStream uses offset-based, but the principle
+  of "storage is dumb, protocol is smart" is shared)
+- No JVM, lightweight binary
+
+**What Pond differs on:**
+- WarpStream is streaming-specific (Kafka protocol). Pond is
+  workload-agnostic (any View).
+- WarpStream uses offset-based addressing (partition + offset). Pond
+  uses content-addressing (hash).
+- WarpStream has a coordination service (for ordering). Pond has no
+  coordination (last-writer-wins; Views add coordination if needed).
+- WarpStream is a commercial product. Pond is a research prototype.
+
+**What Pond is rediscovering:** The "storage is dumb, protocol is smart"
+principle. WarpStream proved this for streaming; Pond generalizes it to
+all workloads. The key insight: object storage can serve as the ONLY
+storage layer if the protocol layer handles ordering, batching, and
+consistency.
+
+**Where Pond could learn from WarpStream:**
+- Batching strategy. WarpStream batches writes to amortize S3 PUT cost.
+  Pond's Views should batch similarly (the OPEN object pattern from
+  earlier prototypes, or a View-level buffer).
+- Offset-based addressing for streaming. Pond's StreamView uses
+  commit-hash-based addressing, which is correct but requires walking
+  the commit chain. WarpStream's offset-based addressing is O(1) for
+  random access. A Pond StreamView could use offset-based addressing
+  as a View-level optimization.
+- No-local-state design. WarpStream's "no local disk" is a strong
+  operational property. Pond's S3 backend (engineering/03_s3_backend.py)
+  achieves the same, but the root namespace still uses SQLite. An
+  FDB/etcd root store would make Pond truly stateless.
+
+---
+
+## Redpanda
+
+**What it is:** A Kafka-compatible streaming platform written in C++
+on Seastar (thread-per-core, shared-nothing). No JVM, no ZooKeeper,
+no garbage collection pauses. Drop-in Kafka replacement at the wire
+protocol level.
+
+**What Pond shares:**
+- No JVM (Pond is Python now, but the design is language-agnostic;
+  the kernel is ~140 lines, reimplementable in any language)
+- Single binary philosophy (PocketBase-inspired)
+- Lightweight (no Spark, no Flink, no JVM ecosystem)
+- Thread-per-core potential (Pond's kernel is single-threaded now,
+  but the design doesn't prevent a Seastar-style implementation)
+
+**What Pond differs on:**
+- Redpanda is streaming-specific (Kafka protocol). Pond is
+  workload-agnostic (any View).
+- Redpanda uses Raft for replication. Pond has no replication yet
+  (explicitly deferred).
+- Redpanda uses Seastar (thread-per-core, shared-nothing). Pond is
+  single-threaded (but the kernel doesn't mandate a threading model).
+- Redpanda uses page-cache-centric I/O (like Kafka). Pond uses
+  content-addressed blobs (immutable, cacheable forever).
+
+**What Pond is rediscovering:** The "no-JVM, lightweight, single-binary"
+philosophy. Redpanda proved this for streaming; Pond generalizes it to
+all data workloads. The key insight: you don't need a JVM, a cluster
+manager, or a 500MB runtime to build a serious data system.
+
+**Where Pond could learn from Redpanda:**
+- Mechanical sympathy as a design principle. Redpanda's Seastar
+  framework (thread-per-core, no cross-thread locks, no shared memory,
+  DMA-based I/O) is the gold standard for mechanical sympathy. Pond's
+  Law 6 (mechanical sympathy) aspires to this, but the prototype
+  doesn't deliver. A Rust/C++ Pond kernel on Seastar or io_uring
+  would.
+- Profile-Guided Optimization. Redpanda uses PGO for 47% lower p999.
+  Pond's production implementation should too.
+- Kafka wire protocol compatibility. Redpanda's success comes partly
+  from being a drop-in Kafka replacement. Pond's StreamView could
+  expose a Kafka-compatible wire protocol as a View-level feature,
+  enabling migration from Kafka/Redpanda to Pond without code changes.
+
+---
+
+After comparing to 8 peers, Pond's potential contributions are:
 
 1. **Stricter kernel/View separation than any peer.** Git, Irmin,
    LakeFS, Dolt all have some workload assumptions in the core.
@@ -254,18 +344,37 @@ After comparing to 6 peers, Pond's potential contributions are:
    all of these (via Views) on one substrate. Whether this is a
    feature or a "jack of all trades, master of none" remains to be seen.
 
+5. **WarpStream-inspired: direct-to-object-storage without local state.**
+   WarpStream proved that Kafka-like streaming can run directly on S3
+   without local disks. Pond's kernel has the same property: it works
+   directly on object storage with no local state requirement. The
+   key insight from WarpStream: the protocol layer (ordering, batching)
+   is separate from the storage layer (S3 PUT/GET). Pond's
+   View/kernel separation mirrors this.
+
+6. **Redpanda-inspired: no-JVM, single-binary, thread-per-core.**
+   Redpanda proved that Kafka-compatible systems don't need the JVM.
+   Pond applies the same principle to lakehouses: no Spark, no Flink,
+   no JVM. Just a tiny kernel (3 primitives, ~140 lines) with Views
+   as thin adapters. Redpanda's Seastar thread-per-core model also
+   shows that mechanical sympathy (cache lines, NUMA, io_uring) can
+   be baked into the execution layer without complicating the storage
+   layer — exactly the separation Pond advocates.
+
 **What Pond is NOT contributing:**
 - Content-addressing (Git, IPFS had it)
 - Minimal substrate (FDB had it)
 - Versioning (Git, LakeFS, Dolt had it)
 - Layered architecture (FDB had it)
 - Views/layers (FDB, Irmin had it)
+- Direct-to-S3 (WarpStream had it)
+- No-JVM (Redpanda had it)
 
 Pond's contribution is the *combination*: minimal + content-addressed +
-workload-agnostic + laws-specified. Whether this combination is valuable
-depends on whether workloads actually benefit from sharing a substrate,
-or whether they're better served by purpose-built systems (Git for
-source code, LakeFS for object storage, Dolt for SQL, FDB for KV).
+workload-agnostic + laws-specified + direct-to-object-storage + no-JVM.
+Whether this combination is valuable depends on whether workloads
+actually benefit from sharing a substrate, or whether they're better
+served by purpose-built systems.
 
 That question is not yet answered. The destruction phase and Identity
 Destruction II are testing it.
