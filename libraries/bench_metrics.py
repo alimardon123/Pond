@@ -100,19 +100,18 @@ def bench_scale(n_entries):
             if f.endswith('.json'):
                 actual_meta_bytes += size
             elif f.endswith('.bin'):
-                # Check if it's a data blob or a tree node
-                with open(fpath, 'rb') as fh:
-                    first_bytes = fh.read(20)
-                    try:
-                        content = fh.read()
-                        full = first_bytes + content
-                        parsed = json.loads(full)
-                        if isinstance(parsed, dict) and 'type' in parsed:
+                # With binary encoding, tree nodes and commits are .bin files
+                # Try to detect: tree nodes start with type byte (1=leaf, 2=internal, 3=commit)
+                # Data blobs are raw bytes that don't start with these type bytes
+                try:
+                    with open(fpath, 'rb') as fh:
+                        first_byte = fh.read(1)
+                        if first_byte and first_byte[0] in (1, 2, 3):
                             actual_meta_bytes += size  # tree node or commit
                         else:
-                            actual_data_bytes += size  # data blob (JSON value)
-                    except:
-                        actual_data_bytes += size  # raw bytes
+                            actual_data_bytes += size  # data blob
+                except:
+                    actual_data_bytes += size
 
     meta_ratio = actual_meta_bytes / actual_data_bytes if actual_data_bytes > 0 else 0
 

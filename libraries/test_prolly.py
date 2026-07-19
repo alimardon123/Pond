@@ -70,25 +70,19 @@ def test():
     print(f"  feature key after merge: {base2.lookup('key-feat')}")
 
     print("\n=== INDEX ===")
-    # Build an index on "value" field (simulated)
-    # For this test, index by the first char of the value
-    def extract_first_char(blob_hash):
-        data = kernel.read_blob(blob_hash).decode()
-        return data[0] if data else "?"
-
-    # Actually, let's build an index manually
+    # Build an index: maps first_char → blob_hash (not key)
     state = base2.read_all()
     index_entries = {}
     for pk, bh in state.items():
         val = kernel.read_blob(bh).decode()
-        index_entries[f"_index/first_char/{val[0]}"] = pk
+        index_entries[f"_index/first_char/{val[0]}"] = bh  # blob hash, not key
 
     tree_root = ProllyTree.build(kernel, index_entries)
     kernel.reference("test__index__first_char", tree_root)
 
     # Lookup by index
-    idx_result = ProllyTree.lookup(kernel, tree_root, "_index/first_char/u")  # "updated-value-50"
-    print(f"  Index lookup 'u': {idx_result}")
+    idx_result = ProllyTree.lookup(kernel, tree_root, "_index/first_char/u")
+    print(f"  Index lookup 'u': {idx_result[:16] if idx_result else None}")
 
     print("\n=== ALL TESTS PASSED ===")
     kernel.close()

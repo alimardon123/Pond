@@ -46,6 +46,7 @@ from typing import Optional, Any, Iterator
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
 from pond_minimal import PondMinimal, hash_bytes
+from binary_encoding import BinaryProllyTree
 
 
 # ---------------------------------------------------------------------------
@@ -89,65 +90,54 @@ class ProllyTree:
     @staticmethod
     def build(kernel: PondMinimal, entries: dict[str, str]) -> str:
         """Build a Prolly tree from a sorted dict of key→hash entries.
-        Returns the root hash. Uses fixed-size chunks for simplicity."""
+        Returns the root hash. Uses BINARY encoding."""
         if not entries:
-            return kernel.write(json.dumps({"type": "leaf", "entries": []}, sort_keys=True).encode())
+            return kernel.write(BinaryProllyTree.encode_leaf([]))
 
         sorted_items = sorted(entries.items())
 
-        # If all entries fit in one chunk, make a single leaf
         if len(sorted_items) <= TARGET_CHUNK_ENTRIES:
-            leaf_entries = [[k, h] for k, h in sorted_items]
-            data = json.dumps({"type": "leaf", "entries": leaf_entries}, sort_keys=True).encode()
-            return kernel.write(data)
+            leaf_entries = [(k, h) for k, h in sorted_items]
+            return kernel.write(BinaryProllyTree.encode_leaf(leaf_entries))
 
-        # Split into leaf chunks of TARGET_CHUNK_ENTRIES each
         leaf_chunks = []
         for i in range(0, len(sorted_items), TARGET_CHUNK_ENTRIES):
-            chunk = [[k, h] for k, h in sorted_items[i:i + TARGET_CHUNK_ENTRIES]]
+            chunk = [(k, h) for k, h in sorted_items[i:i + TARGET_CHUNK_ENTRIES]]
             leaf_chunks.append(chunk)
 
-        # Build tree levels bottom-up
         level = leaf_chunks
         while len(level) > 1:
-            # Write each chunk and record (max_key, hash)
             chunk_entries = []
             for chunk in level:
-                data = json.dumps({"type": "leaf", "entries": chunk}, sort_keys=True).encode()
+                data = BinaryProllyTree.encode_leaf(chunk)
                 h = kernel.write(data)
                 max_key = chunk[-1][0]
-                chunk_entries.append([max_key, h])
+                chunk_entries.append((max_key, h))
 
-            # Group into internal nodes
             if len(chunk_entries) <= TARGET_CHUNK_ENTRIES:
-                # Single internal node
-                data = json.dumps({"type": "internal", "children": chunk_entries}, sort_keys=True).encode()
-                return kernel.write(data)
+                return kernel.write(BinaryProllyTree.encode_internal(chunk_entries))
 
-            # Split into internal chunks
             next_level = []
             for i in range(0, len(chunk_entries), TARGET_CHUNK_ENTRIES):
                 group = chunk_entries[i:i + TARGET_CHUNK_ENTRIES]
                 next_level.append(group)
             level = next_level
 
-        # Write the root
         root = level[0]
-        if isinstance(root[0], list) and len(root[0]) == 2 and isinstance(root[0][1], str) and len(root[0][1]) == 64:
-            data = json.dumps({"type": "internal", "children": root}, sort_keys=True).encode()
+        if isinstance(root[0], tuple):
+            return kernel.write(BinaryProllyTree.encode_internal(root))
         else:
-            data = json.dumps({"type": "leaf", "entries": root}, sort_keys=True).encode()
-        return kernel.write(data)
+            return kernel.write(BinaryProllyTree.encode_leaf(root))
 
     @staticmethod
     def lookup(kernel: PondMinimal, root_hash: str, key: str) -> Optional[str]:
-        """Look up a key in the Prolly tree. O(log N) S3 GETs."""
+        """Look up a key in the Prolly tree. O(log N) S3 GETs. Uses BINARY decoding."""
         current_hash = root_hash
         while current_hash:
-            data = json.loads(kernel.read_blob(current_hash))
-            if data["type"] == "leaf":
-                # Binary search in leaf entries
-                entries = data["entries"]
+            data = kernel.read_blob(current_hash)
+            node = BinaryProllyTree.decode_node(data)
+            if node["type"] == "leaf":
+                entries = node["entries"]
                 lo, hi = 0, len(entries) - 1
                 while lo <= hi:
                     mid = (lo + hi) // 2
@@ -157,10 +147,9 @@ class ProllyTree:
                         lo = mid + 1
                     else:
                         hi = mid - 1
-                return None  # not found
-            elif data["type"] == "internal":
-                # Binary search in children to find the right child
-                children = data["children"]
+                return None
+            elif node["type"] == "internal":
+                children = node["children"]
                 lo, hi = 0, len(children) - 1
                 found = False
                 while lo <= hi:
@@ -174,7 +163,6 @@ class ProllyTree:
                     else:
                         lo = mid + 1
                 if not found:
-                    # Key is larger than all children's max keys → not in tree
                     return None
             else:
                 return None
@@ -182,20 +170,21 @@ class ProllyTree:
 
     @staticmethod
     def read_all(kernel: PondMinimal, root_hash: str) -> dict[str, str]:
-        """Read all entries from the tree. O(N/chunk_size) GETs."""
+        """Read all entries from the tree. Uses BINARY decoding."""
         result = {}
         ProllyTree._read_all_recursive(kernel, root_hash, result)
         return result
 
     @staticmethod
     def _read_all_recursive(kernel: PondMinimal, node_hash: str, result: dict):
-        """Recursively read all entries."""
-        data = json.loads(kernel.read_blob(node_hash))
-        if data["type"] == "leaf":
-            for key, h in data["entries"]:
+        """Recursively read all entries. Uses BINARY decoding."""
+        data = kernel.read_blob(node_hash)
+        node = BinaryProllyTree.decode_node(data)
+        if node["type"] == "leaf":
+            for key, h in node["entries"]:
                 result[key] = h
-        elif data["type"] == "internal":
-            for max_key, child_hash in data["children"]:
+        elif node["type"] == "internal":
+            for max_key, child_hash in node["children"]:
                 ProllyTree._read_all_recursive(kernel, child_hash, result)
 
     @staticmethod
@@ -287,39 +276,24 @@ class ProllyViewBase:
         if delta_count >= COMPACTION_THRESHOLD or parent_hash is None:
             # COMPACT: build a full Prolly tree snapshot
             full_state = self._compute_full_state(parent_hash)
-            # Apply staged changes
             for k, h in self._staged_add.items():
                 full_state[k] = h
             for k in self._staged_del:
                 full_state.pop(k, None)
-            # Build Prolly tree
             tree_root = ProllyTree.build(self.kernel, full_state)
 
-            commit_obj = {
-                "type": "commit",
-                "parent": parent_hash,
-                "snapshot": tree_root,     # full Prolly tree root
-                "delta": None,              # no delta (compacted)
-                "timestamp": time.time(),
-                "message": message or f"compaction commit #{index}",
-                "index": index,
-            }
+            commit_data = BinaryProllyTree.encode_commit(
+                parent_hash, tree_root, {}, [], tree_root,
+                message or f"compaction commit #{index}", time.time(), index)
+            commit_hash = self.kernel.write(commit_data)
         else:
             # DELTA: write just the changed entries
-            commit_obj = {
-                "type": "commit",
-                "parent": parent_hash,
-                "snapshot": None,           # no snapshot (delta only)
-                "delta": {
-                    "+": dict(self._staged_add),
-                    "-": list(self._staged_del),
-                },
-                "timestamp": time.time(),
-                "message": message or f"delta commit #{index}",
-                "index": index,
-            }
+            commit_data = BinaryProllyTree.encode_commit(
+                parent_hash, None,
+                dict(self._staged_add), list(self._staged_del),
+                None, message or f"delta commit #{index}", time.time(), index)
+            commit_hash = self.kernel.write(commit_data)
 
-        commit_hash = self.kernel.write(json.dumps(commit_obj, sort_keys=True).encode())
         self.kernel.reference(self.name, commit_hash)
         if self._active_branch:
             self.kernel.reference(self._active_branch, commit_hash)
@@ -350,7 +324,7 @@ class ProllyViewBase:
         current = head
         steps = 0
         while current:
-            commit = json.loads(self.kernel.read_blob(current))
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
             steps += 1
 
             # Check delta
@@ -388,7 +362,7 @@ class ProllyViewBase:
         deltas = []
         current = head
         while current:
-            commit = json.loads(self.kernel.read_blob(current))
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
             if commit.get("snapshot"):
                 # Found the snapshot — read the Prolly tree
                 state = ProllyTree.read_all(self.kernel, commit["snapshot"])
@@ -423,7 +397,7 @@ class ProllyViewBase:
         history = []
         current = head
         while current and len(history) < limit:
-            commit = json.loads(self.kernel.read_blob(current))
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
             history.append({
                 "commit": current[:12],
                 "message": commit.get("message", ""),
@@ -468,7 +442,7 @@ class ProllyViewBase:
     def undo(self, steps: int = 1) -> str:
         head = self.kernel.resolve(self.name)
         for _ in range(steps):
-            commit = json.loads(self.kernel.read_blob(head))
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(head))
             if not commit.get("parent"):
                 break
             head = commit["parent"]
@@ -500,17 +474,10 @@ class ProllyViewBase:
         tree_root = ProllyTree.build(self.kernel, merged)
 
         parent_hash = self.kernel.resolve(self.name)
-        commit_obj = {
-            "type": "commit",
-            "parent": parent_hash,
-            "parents": [parent_hash, branch_head],
-            "snapshot": tree_root,
-            "delta": None,
-            "timestamp": time.time(),
-            "message": message or f"merge '{branch_name}'",
-            "index": self._commit_index,
-        }
-        commit_hash = self.kernel.write(json.dumps(commit_obj, sort_keys=True).encode())
+        commit_data = BinaryProllyTree.encode_commit(
+            parent_hash, tree_root, {}, [], tree_root,
+            message or f"merge '{branch_name}'", time.time(), self._commit_index)
+        commit_hash = self.kernel.write(commit_data)
         self.kernel.reference(self.name, commit_hash)
         self._commit_index += 1
         return commit_hash
@@ -573,7 +540,7 @@ class ProllyViewBase:
         if not h:
             return 0
         try:
-            commit = json.loads(self.kernel.read_blob(h))
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(h))
             return commit.get("index", 0) + 1
         except Exception:
             return 0
@@ -583,7 +550,7 @@ class ProllyViewBase:
         count = 0
         current = from_hash
         while current:
-            commit = json.loads(self.kernel.read_blob(current))
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
             if commit.get("snapshot"):
                 return count
             count += 1
@@ -602,7 +569,7 @@ class ProllyViewBase:
         deltas = []
         current = commit_hash
         while current:
-            commit = json.loads(self.kernel.read_blob(current))
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
             if commit.get("snapshot"):
                 state = ProllyTree.read_all(self.kernel, commit["snapshot"])
                 break
@@ -630,7 +597,7 @@ class ProllyViewBase:
         while current:
             if current.startswith(prefix):
                 return current
-            commit = json.loads(self.kernel.read_blob(current))
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
             current = commit.get("parent")
         raise ValueError(f"Commit '{prefix}' not found")
 
