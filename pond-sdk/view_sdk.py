@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pond_minimal import PondMinimal
 from prolly_view import ProllyViewBase, ProllyTree
 from binary_encoding import BinaryProllyTree
+from maintenance import (drop_name, is_dropped, resolve_active,
+                         TOMBSTONE_HASH)
 
 
 # ===========================================================================
@@ -132,39 +134,65 @@ class View:
         """
         Drop an index. METADATA ONLY — does NOT touch data blobs.
 
-        How it works:
-        1. Resolve the index tree root
-        2. If it exists, overwrite the Reference to point to an empty tree
-           (or just leave it orphaned — GC will clean it up)
+        Per RFC-0008 (Deletion as Data), this uses the tombstone pattern:
+          1. drop_name(kernel, ref_name) rebinds the index's Reference to
+             TOMBSTONE_HASH. The index is now logically deleted.
+          2. Subsequent lookup_by_index calls return None (resolve_active
+             sees the tombstone and treats it as unbound).
+          3. The previously-pointed-to index tree blob becomes unreachable;
+             PondGC will sweep it on the next collection.
+          4. compact_tombstones(kernel) (Layer 0.5 maintenance) can later
+             remove the name's row from the roots table.
 
-        Data blobs are NEVER modified. The index tree becomes orphaned.
+        Data blobs are NEVER modified. The index Reference becomes a
+        tombstone; the index tree blob becomes orphaned.
+
+        Returns True if the index existed and was dropped, False if the
+        index was not registered (or was already a tombstone).
         """
         ref_name = f"{self.name}__index__{index_name}"
         current = self.kernel.resolve(ref_name)
-        if not current:
+        if not current or current == TOMBSTONE_HASH:
             return False
-        # Point to an empty tree (effectively drops the index)
-        empty_root = ProllyTree.build(self.kernel, {})
-        self.kernel.reference(ref_name, empty_root)
+        drop_name(self.kernel, ref_name)
         return True
 
     def refresh_index(self, index_name: str, key_extractor: Callable[[Any], str]) -> str:
         """
         Refresh an index (rebuild from current data). METADATA ONLY.
 
-        This is the same as create_index but overwrites the existing index.
-        Useful after data changes — the old index may be stale.
+        This is the same as create_index but overwrites the existing index
+        (including a previously-tombstoned index — refresh_index revives
+        a dropped index).
         """
         return self.create_index(index_name, key_extractor)
 
     def list_indexes(self) -> list[str]:
-        """List all indexes for this View."""
+        """List all ACTIVE (non-tombstoned) indexes for this View.
+
+        Per RFC-0008, tombstoned indexes are excluded. Use
+        list_all_indexes() to include tombstoned indexes.
+        """
         prefix = f"{self.name}__index__"
-        return [n[len(prefix):] for n in self.kernel.list_names() if n.startswith(prefix)]
+        return [n[len(prefix):] for n in self.kernel.list_names()
+                if n.startswith(prefix) and not is_dropped(self.kernel, n)]
+
+    def list_all_indexes(self) -> list[str]:
+        """List ALL indexes, including tombstoned ones. Mainly for
+        maintenance/diagnostic tools."""
+        prefix = f"{self.name}__index__"
+        return [n[len(prefix):] for n in self.kernel.list_names()
+                if n.startswith(prefix)]
 
     def lookup_by_index(self, index_name: str, index_key: str) -> Optional[Any]:
-        """Look up data via a secondary index. O(log N)."""
-        tree_root = self.kernel.resolve(f"{self.name}__index__{index_name}")
+        """Look up data via a secondary index. O(log N).
+
+        Per RFC-0008, returns None if the index has been dropped
+        (tombstoned). This makes drop_index immediately effective for
+        readers — no need to wait for compaction.
+        """
+        ref_name = f"{self.name}__index__{index_name}"
+        tree_root = resolve_active(self.kernel, ref_name)
         if not tree_root:
             return None
         full_key = f"_index/{index_name}/{index_key}"

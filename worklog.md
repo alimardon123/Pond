@@ -264,3 +264,61 @@ Task: Respond to architecture review (Phase A+C: formalize Views, deletion as da
 ## Stage Summary
 
 Three new RFCs drafted (0007 View Algebra, 0008 Deletion as Data, 0009 Architecture Metrics), one RFC updated (0005 → Materialization), one new top-level doc created (DESIGN_GOALS.md), two docs updated (PACKAGES.md, rfcs/README.md). The deletion question is settled: no fourth primitive, tombstones at Layer 1, compact_tombstones at Layer 0.5, existing PondGC unchanged. The View formalization question is settled: V = (Σ, A, E, D, M) with 6 laws, all existing Views satisfy the algebra, Views compose via ⊕ and ∘, Semantic adapters are Views. The architecture metrics question is settled: 12 metrics split into hard constraints (5) and trend metrics (7), with measurement cadence defined. The repo now has a canonical entry-point document (DESIGN_GOALS.md) that any future agent — including the user's local AI agents — can read first to understand context. Phase A (freeze) is in effect; Phase B (SDK polish) is the next work, with the vector_report.md findings as the backlog. Phase C (formalize Views) is drafted in RFC-0007 but needs the view_laws.py property-test harness to move to Accepted. Phase D (compatibility: Arrow/DuckDB/Polars/DataFusion/Lance adapters) and Phase E (one flagship) are not started. No kernel changes; no View code changes; no new packages. Architecture discipline preserved.
+
+---
+Task ID: 11
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_report.md (A–J), build view_laws.py property-test harness (RFC-0007)
+
+## Work Log
+
+1. Read validation/vector_report.md findings A–J in full. Read current SDK code: pond-sdk/view_sdk.py (542 LOC), pond-sdk/prolly_view.py (612 LOC), pond-sdk/auto_index.py (513 LOC), pond-sdk/binary_encoding.py (binary commit format). Inspected existing PondGC at engineering/02_gc.py.
+2. Created pond-sdk/maintenance.py (RFC-0008 tombstone helpers):
+   - TOMBSTONE_HASH constant (SHA-256 of b"__pond_tombstone__")
+   - drop_name(kernel, name): logically delete a name (rebind to TOMBSTONE_HASH)
+   - is_dropped(kernel, name): True iff name is tombstoned
+   - resolve_active(kernel, name): resolve returning None for unbound OR tombstoned
+   - compact_tombstones(kernel): Layer 0.5 maintenance, removes tombstoned name rows
+   - 3 tests: round-trip, drop isolation, tombstone+PondGC composition — ALL PASS
+3. Updated pond-sdk/view_sdk.py:
+   - Imported tombstone helpers from maintenance.py
+   - Rewrote drop_index to use drop_name (tombstone pattern, per RFC-0008) instead of "empty tree" workaround
+   - Updated lookup_by_index to use resolve_active (returns None for tombstoned indexes immediately)
+   - Added list_all_indexes() for diagnostic tools (includes tombstoned)
+   - list_indexes() now excludes tombstoned indexes
+4. Updated pond-sdk/auto_index.py:
+   - Imported tombstone helpers
+   - Rewrote unregister_index to use drop_name (tombstone pattern)
+   - Added is_index_registered() helper (True iff registered AND not tombstoned)
+   - Updated find_by() to return None immediately for tombstoned indexes
+5. Ran existing tests: pond-sdk/view_sdk.py index test PASSES (drop_index returns None immediately). pond-sdk/auto_index.py full test suite PASSES (lazy/eager/incremental, 98.5x speedup preserved). Pre-existing OssieSemanticView NameError is unchanged (not introduced by this session).
+6. Created SDK_SPEC.md (top-level, ~430 lines): authoritative SDK contract settling all 10 ambiguities:
+   - A (§1.1): PondMinimal(base_dir) IS the kernel, not a factory
+   - B (§4.2): extractor receives decoded data only, returns str
+   - C (§3.2): get() is O(log N + K), no index needed for primary key
+   - D (§6.1): merge is union with merged-branch-wins on conflict (NOT 3-way)
+   - E (§4.4): indexes are Prolly trees in kernel object store, named {view}__index__{name}
+   - F (§4.5): drop_index/unregister_index use tombstones (RFC-0008)
+   - G (§6.3): diff(a,b) takes commit hash prefixes (NOT branch names, NOT tags)
+   - H (§6.2): history() returns list of dicts with exactly {commit, message, timestamp, index, type}
+   - I (§2.3): put_raw stages existing blob_hash, no encode, no kernel.write
+   - J (§7): full binary commit format documented (1B type + 32B parent + 32B snapshot + deltas + msg + ts + index)
+7. Created pond-sdk/view_laws.py (property-test harness for RFC-0007's 6 laws):
+   - ViewContract dataclass: adapter mapping a View's API to the harness
+   - ViewLaws class with check_all() running all 6 law checks
+   - Law 1: round-trip (decode(encode(d)) == d)
+   - Law 2: purity (encode and kernel.write deterministic)
+   - Law 3: encoding preservation (put→commit→get preserves data)
+   - Law 4: materialization determinism (build twice, compare)
+   - Law 5: composition (structural — data persists in kernel)
+   - Law 6: kernel independence (blobs opaque, content-addressing verified)
+   - LawReport and LawResult dataclasses for structured output
+8. Ran view_laws.py against default View class: ALL 6 LAWS PASS.
+9. Ran view_laws.py against IndexedView class (with eager index as materialization): ALL 6 LAWS PASS.
+10. Updated DESIGN_GOALS.md: added SDK_SPEC.md to top-level docs list, updated pond-sdk entry to mention maintenance.py and view_laws.py.
+11. Updated PACKAGES.md: added SDK_SPEC.md to top-level file list, added maintenance.py and view_laws.py to pond-sdk structure.
+12. Appended this worklog entry.
+
+## Stage Summary
+
+Phase B (SDK polish) complete: all 10 validation ambiguities (A–J) are settled in SDK_SPEC.md with concrete contracts. Tombstones (RFC-0008) are implemented in pond-sdk/maintenance.py and wired into drop_index/unregister_index. The view_laws.py harness verifies RFC-0007's 6 algebra laws; both default View and IndexedView pass all 6. Existing tests still pass (index ops work correctly with tombstones; auto-index lazy/eager/incremental all work; tombstones compose cleanly with existing PondGC — tombstoned blobs get swept on next collection). No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). No new packages — maintenance.py and view_laws.py live inside pond-sdk, preserving the removability discipline. Phase B success criterion (a second external implementation scoring 9/10 DX) is now ready to be measured: re-run validation/vector_challenge_prompt.md with a fresh agent using SDK_SPEC.md as the spec. Phase C (formalize Views) is also unblocked: RFC-0007 can move from Draft to Accepted once view_laws.py runs as CI on every commit.

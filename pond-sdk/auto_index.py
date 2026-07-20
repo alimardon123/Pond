@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pond_minimal import PondMinimal
 from prolly_view import ProllyViewBase, ProllyTree
 from binary_encoding import BinaryProllyTree
+from maintenance import drop_name, is_dropped, resolve_active, TOMBSTONE_HASH
 
 
 class AutoIndex:
@@ -99,13 +100,30 @@ class IndexedView:
         self._auto_indexes[name] = AutoIndex(name, extractor, mode, staleness_budget)
 
     def unregister_index(self, name: str) -> None:
-        """Remove an auto-index."""
+        """Remove an auto-index.
+
+        Per RFC-0008 (Deletion as Data), this uses the tombstone pattern:
+        the index's Reference is rebound to TOMBSTONE_HASH. The index is
+        immediately logically deleted; subsequent find_by() calls return
+        None (the index is treated as unbound). Use compact_tombstones()
+        for physical row removal.
+        """
         self._auto_indexes.pop(name, None)
         ref_name = f"{self.name}__index__{name}"
         current = self.kernel.resolve(ref_name)
-        if current:
-            empty_root = ProllyTree.build(self.kernel, {})
-            self.kernel.reference(ref_name, empty_root)
+        if current and current != TOMBSTONE_HASH:
+            drop_name(self.kernel, ref_name)
+
+    def is_index_registered(self, name: str) -> bool:
+        """True iff the index is registered AND not tombstoned."""
+        if name not in self._auto_indexes:
+            return False
+        ref_name = f"{self.name}__index__{name}"
+        # An index that was registered in this session but tombstoned
+        # via drop_index (not unregister_index) is not active.
+        if self.kernel.resolve(ref_name) == TOMBSTONE_HASH:
+            return False
+        return True
 
     def list_auto_indexes(self) -> list[str]:
         return list(self._auto_indexes.keys())
@@ -169,10 +187,22 @@ class IndexedView:
                 for k, h in state.items() if not k.startswith("_")}
 
     def find_by(self, index_name: str, index_key: str) -> Optional[Any]:
-        """Look up data via an auto-index. Rebuilds or incrementally updates if stale."""
+        """Look up data via an auto-index. Rebuilds or incrementally updates if stale.
+
+        Per RFC-0008, returns None if the index has been tombstoned
+        (dropped via unregister_index or drop_index). This makes
+        unregister_index immediately effective for readers.
+        """
         idx = self._auto_indexes.get(index_name)
         if not idx:
             raise ValueError(f"Index '{index_name}' not registered")
+
+        # Check tombstone: an index can be dropped via drop_index (View
+        # class) or unregister_index (this class). Both bind the ref to
+        # TOMBSTONE_HASH.
+        ref_name = f"{self.name}__index__{index_name}"
+        if self.kernel.resolve(ref_name) == TOMBSTONE_HASH:
+            return None
 
         # Check staleness for LAZY mode
         if idx.mode == "lazy":

@@ -1,0 +1,610 @@
+# Pond SDK Specification
+
+> **Status:** Authoritative contract for the Pond SDK. Every method
+> signature, return shape, and behavior in this document is
+> checkable; violations are bugs.
+>
+> **Audience:** View authors (both human and AI agents) building
+> Views on top of `pond-sdk`. If you read only one SDK document,
+> read this one.
+>
+> **Source of truth:** This document supersedes informal descriptions
+> in `docs/VIEW_AUTHORS_GUIDE.md`. Where the two disagree, this
+> document is correct.
+
+---
+
+## 0. The 10 ambiguities this document settles
+
+The external validation report
+(`validation/vector_report.md`) identified 10 ambiguities (A–J) that
+caused friction when a fresh agent tried to build a `VectorView`
+from the SDK spec. This document settles each one. Cross-reference
+table:
+
+| ID | Ambiguity | Settled in section |
+|---|---|---|
+| A | How is a kernel obtained? | §1.1 |
+| B | Index extractor call signature | §4.2 |
+| C | `get()` complexity | §3.2 |
+| D | Merge semantics | §6.1 |
+| E | Index persistence and naming | §4.4 |
+| F | `drop_index` / `unregister_index` | §4.5 (per RFC-0008) |
+| G | `diff(a, b)` parameter types | §6.3 |
+| H | `history()` return shape | §6.2 |
+| I | `put_raw` semantics | §2.3 |
+| J | Commit object format | §7 |
+
+---
+
+## 1. Obtaining a kernel (Ambiguity A)
+
+### 1.1. Constructor contract
+
+```python
+from pond_minimal import PondMinimal
+
+kernel = PondMinimal(base_dir: str)
+```
+
+`PondMinimal(base_dir)` constructs and returns a kernel instance. It
+is NOT a factory; it IS the kernel. The `base_dir` is the filesystem
+path where the kernel stores its object store and root namespace
+SQLite database. The kernel creates `base_dir/.pond/` if it does not
+exist.
+
+### 1.2. What the kernel provides
+
+The kernel exposes exactly 3 core primitives plus 3 supporting
+operations:
+
+| Method | Signature | Purpose |
+|---|---|---|
+| `write(data: bytes) -> str` | core | Create an immutable content-addressed blob. Returns its 64-char hex SHA-256 hash. |
+| `read(hash_or_name: str) -> bytes` | core | Read a blob by hash, or resolve a name then read. |
+| `reference(name: str, hash: str) -> None` | core | Set a mutable name→hash mapping. The ONLY mutable operation. |
+| `resolve(name: str) -> str \| None` | supporting | Resolve a name to its current hash. Returns `None` if unbound. |
+| `list_names() -> list[str]` | supporting | List all names in the root namespace. |
+| `read_blob(hash: str) -> bytes` | supporting | Read a blob by hash directly (no name resolution). Performance shortcut. |
+
+The 3 supporting operations are pure derivations of the 3 core
+primitives (e.g., `resolve` is `SELECT hash FROM roots WHERE name=?`
+on the kernel's internal SQLite). They do not extend the kernel's
+algebra. See `RFC-0003` for the formal kernel specification.
+
+### 1.3. Lifetime
+
+The kernel holds an open SQLite connection. Call `kernel.close()` to
+release it. The kernel is NOT thread-safe by default; see
+`engineering/01_concurrency.py` for the thread-safe wrapper.
+
+---
+
+## 2. Writing data (Ambiguity I: `put_raw`)
+
+### 2.1. `put(key, data) -> str`
+
+```python
+view.put(key: str, data: Any) -> str
+```
+
+Stages a key→blob mapping for the next commit. The data is encoded
+via `view.encode(data)` (default: JSON), written to the kernel as a
+blob, and the resulting hash is staged under `key`. Returns the
+blob hash.
+
+This is the standard write path. The data passes through `encode`;
+the View does NOT see the raw bytes.
+
+### 2.2. `delete(key) -> None`
+
+```python
+view.delete(key: str) -> None
+```
+
+Stages a deletion for `key`. The deletion is applied at the next
+commit. Calling `delete` on a non-existent key is a no-op (not an
+error).
+
+### 2.3. `put_raw(key, blob_hash) -> None` (Ambiguity I)
+
+```python
+view.put_raw(key: str, blob_hash: str) -> None
+```
+
+Stages a key→blob_hash mapping **without** encoding or writing new
+data. The `blob_hash` must refer to an existing blob in the kernel
+(the View does NOT verify this; the kernel will fail at commit time
+if the hash is unknown).
+
+Use cases:
+- Cross-View data sharing: copy a blob hash from one View to another
+  without re-encoding the data (zero-copy).
+- Re-indexing: build a new index that points to existing data blobs
+  without rewriting them.
+
+`put_raw` does NOT call `encode`. It does NOT call `kernel.write`.
+It only stages the existing hash. The next `commit()` will include
+this mapping in the delta.
+
+If you pass a `blob_hash` that does not exist in the kernel, the
+commit will succeed (the kernel does not validate staged entries),
+but subsequent `get(key)` will fail with `ValueError: Blob not
+found on disk`. Validate hashes before calling `put_raw`.
+
+### 2.4. `commit(message) -> str`
+
+```python
+view.commit(message: str = "") -> str
+```
+
+Commits staged changes. Returns the commit hash (a 64-char hex
+string). After commit, the staging area is cleared.
+
+If `message` is empty, a default message is generated
+(`f"{self.name} commit"`).
+
+Raises `ValueError("Nothing to commit")` if no changes are staged.
+
+---
+
+## 3. Reading data (Ambiguity C: `get()` complexity)
+
+### 3.1. `get(key) -> Optional[Any]`
+
+```python
+view.get(key: str) -> Optional[Any]
+```
+
+Reads a single key. Returns the decoded data, or `None` if the key
+does not exist.
+
+The data passes through `view.decode(bytes)` (default: JSON parse).
+
+### 3.2. Complexity (Ambiguity C)
+
+`get()` is **O(log N + K)** where:
+- N = number of entries in the View
+- K = number of delta commits since the last snapshot (K ≤ 4 by
+  default, the `COMPACTION_THRESHOLD`)
+
+The lookup walks the commit DAG from HEAD:
+1. For each delta commit (≤ K), check if the key is in the delta
+   (`+` or `-`). O(K).
+2. When a snapshot commit is reached, binary-search the Prolly tree.
+   O(log N).
+
+If a secondary index is registered, `find_by(index_name, key)` is
+also O(log N) but with a smaller constant (the index tree is
+smaller than the data tree). For point lookups by primary key,
+`get()` is sufficient — you do NOT need an index. For lookups by a
+non-primary attribute, register an index and use `find_by()`.
+
+**You should NOT register an index for the primary key.** `get()`
+already provides O(log N) primary-key lookup. An index on the
+primary key is redundant.
+
+### 3.3. `get_all() -> dict[str, Any]`
+
+```python
+view.get_all() -> dict[str, Any]
+```
+
+Reads the entire current state as a `{key: decoded_data}` dict.
+Keys starting with `_` (internal — schema, index, semantic
+metadata) are excluded.
+
+O(N/chunk_size + K) kernel reads. Use only for small Views or
+one-time bulk reads; for large Views, prefer `keys()` + `get()`.
+
+### 3.4. `keys() -> list[str]`, `count() -> int`, `exists(key) -> bool`
+
+Standard read helpers. `keys()` returns non-internal keys. `count()`
+returns the number of non-internal entries. `exists(key)` returns
+True iff the key is in the current state.
+
+---
+
+## 4. Indexes (Ambiguities B, E, F)
+
+### 4.1. Two index APIs
+
+The SDK provides two index APIs:
+
+| Class | Use case |
+|---|---|
+| `View` (in `view_sdk.py`) | Manual index management: `create_index`, `drop_index`, `lookup_by_index`. Indexes are built eagerly when created, never auto-updated. Use when you control index lifecycle explicitly. |
+| `IndexedView` (in `auto_index.py`) | Automatic index management: `register_index`, `unregister_index`, `find_by`. Indexes are built lazily on first read, updated eagerly or lazily per the `mode` parameter. Use for most applications. |
+
+Both classes store indexes the same way (see §4.4). They differ
+only in update policy.
+
+### 4.2. Index extractor signature (Ambiguity B)
+
+```python
+extractor: Callable[[Any], str]
+```
+
+The extractor receives the **decoded data** (the same value returned
+by `view.get(key)`). It does NOT receive the key. It does NOT
+receive the raw bytes. It returns a single string — the index key.
+
+Example:
+```python
+def by_region(data: dict) -> str:
+    return data.get("region", "")
+
+view.register_index("by_region", by_region)
+```
+
+If you need to index by the primary key, you must store the primary
+key inside the data (e.g., as a field `"id": key`). The extractor
+cannot access the primary key directly. This is a deliberate design
+choice: it keeps the extractor pure (function of data only, not of
+position).
+
+If your data does not contain its own primary key and you need to
+index by it, add the primary key to the data before `put()`:
+```python
+view.put("user:1", {"id": "user:1", "name": "Alice"})
+view.register_index("by_id", lambda d: d["id"])
+```
+
+### 4.3. Index modes (`IndexedView` only)
+
+When registering an auto-index, choose a mode:
+
+| Mode | Write cost | Read cost | Use case |
+|---|---|---|---|
+| `"eager"` | O(N) per commit (rebuild on every commit) | O(log N), always fresh | OLAP, read-heavy workloads |
+| `"lazy"` (default) | O(1) per commit (no index update) | O(log N) if fresh, O(N + log N) if stale (rebuild then lookup) | OLTP, streaming, mixed workloads |
+| `"background"` | O(1) per commit | O(log N), periodically fresh | NOT IMPLEMENTED — placeholder |
+
+For `lazy` mode, set `staleness_budget` (default 5). The index is
+rebuilt when `commits_since_last_build > staleness_budget`. Lower
+budget = fresher indexes but more rebuilds; higher budget = fewer
+rebuilds but more stale reads.
+
+### 4.4. Index persistence and naming (Ambiguity E)
+
+Indexes are stored as **Prolly trees in the kernel's object store**.
+Each index is a tree mapping `f"_index/{index_name}/{index_key}"`
+to the data blob's hash. The tree's root hash is stored in the
+kernel's root namespace under the name
+`f"{view_name}__index__{index_name}"`.
+
+Concretely:
+- The index tree is a kernel blob (created via `kernel.write`).
+- The index's root pointer is a kernel Reference (created via
+  `kernel.reference`).
+- Indexes are NOT in-memory. They survive process restarts.
+- Indexes are NOT stored separately from data. They live in the same
+  object store.
+
+To list all indexes for a View: `view.list_indexes()` (returns
+active indexes; tombstoned indexes excluded — see §4.5).
+
+### 4.5. `drop_index` / `unregister_index` (Ambiguity F, per RFC-0008)
+
+```python
+# In View class:
+view.drop_index(index_name: str) -> bool
+
+# In IndexedView class:
+view.unregister_index(index_name: str) -> None
+```
+
+Both methods logically delete the index using the **tombstone
+pattern** (RFC-0008):
+
+1. The index's Reference (`{view_name}__index__{index_name}`) is
+   rebound to `TOMBSTONE_HASH` (a fixed, globally-known hash).
+2. Subsequent `lookup_by_index()` / `find_by()` calls return `None`
+   immediately — readers see the index as deleted without waiting
+   for compaction.
+3. `list_indexes()` excludes tombstoned indexes.
+4. The previously-pointed-to index tree blob becomes unreachable;
+   `PondGC.collect()` (in `engineering/02_gc.py`) will sweep it on
+   the next run.
+5. `compact_tombstones(kernel)` (in `pond-sdk/maintenance.py`) can
+   later remove the name's row from the roots SQLite table,
+   reclaiming ~80 bytes of name-row storage. This is optional
+   maintenance; the system is correct without it.
+
+`drop_index` returns `True` if the index existed and was dropped,
+`False` if it was not registered or already tombstoned.
+`unregister_index` returns `None` and is idempotent.
+
+To revive a tombstoned index: call `create_index` / `register_index`
+again. The new index overwrites the tombstone Reference.
+
+---
+
+## 5. Version control
+
+### 5.1. `branch(name) -> str`
+
+```python
+view.branch(name: str) -> str
+```
+
+Creates a new branch pointing at the current HEAD. Returns the
+fully-qualified branch name (`f"{view_name}__branch__{name}"`).
+Branching is O(1) — it creates one new Reference.
+
+Raises `ValueError("No commits to branch from")` if the View has no
+commits.
+
+### 5.2. `checkout(name) -> None`
+
+```python
+view.checkout(name: str) -> None
+```
+
+Switches the View's HEAD to the named branch. After checkout, new
+commits advance the branch's head, not the previous branch's head.
+
+The staging area is cleared on checkout. Pending changes are lost.
+Commit staged changes before checkout if you want to keep them.
+
+### 5.3. `list_branches() -> list[str]`
+
+Returns the short names (without the `{view_name}__branch__` prefix)
+of all branches.
+
+---
+
+## 6. History, diff, merge (Ambiguities D, G, H)
+
+### 6.1. Merge semantics (Ambiguity D)
+
+```python
+view.merge(branch_name: str, message: str = "") -> str
+```
+
+Merges `branch_name` into the current branch. Returns the merge
+commit's hash.
+
+**Semantics: union merge, with the merged branch winning on
+conflict.** Specifically:
+
+1. Read the current branch's full state: `state_current = read_all()`
+2. Read the merged branch's full state: `state_branch = read_state_from_commit(branch_head)`
+3. Compute the merged state: `merged = dict(state_current); merged.update(state_branch)`
+4. Build a new Prolly tree from `merged`, write a new snapshot
+   commit, advance HEAD.
+
+This is **not** a 3-way merge. There is no common-ancestor
+computation, no conflict detection, no merge markers. If both
+branches modified the same key, the merged branch's value wins
+silently. This is the simplest correct merge policy; future RFCs
+may introduce 3-way merge as an option.
+
+When to use:
+- Append-only workloads (no conflicts possible).
+- Workloads where the merged branch is authoritative by design
+  (e.g., merging a feature branch into main where the feature
+  branch's changes should win).
+
+When NOT to use:
+- Workloads with concurrent edits to the same keys (use external
+  conflict resolution).
+- Workloads requiring audit trails of conflicts (use `diff()` first,
+  resolve manually, then `put()` + `commit()`).
+
+### 6.2. `history(limit) -> list[dict]` (Ambiguity H)
+
+```python
+view.history(limit: int = 20) -> list[dict]
+```
+
+Returns a list of commit records, most-recent first. Each record is
+a dict with EXACTLY these keys:
+
+| Key | Type | Description |
+|---|---|---|
+| `"commit"` | `str` | The first 12 characters of the commit hash (a short hash, like Git). |
+| `"message"` | `str` | The commit message. |
+| `"timestamp"` | `float` | Unix timestamp (seconds since epoch). |
+| `"index"` | `int` | The commit's position in the DAG (0 = first commit). |
+| `"type"` | `str` | Either `"snapshot"` or `"delta"`. |
+
+Example:
+```python
+[
+    {"commit": "abc123def456", "message": "add user:4",
+     "timestamp": 1721500000.0, "index": 3, "type": "delta"},
+    {"commit": "789012abcdef", "message": "initial",
+     "timestamp": 1721400000.0, "index": 0, "type": "snapshot"},
+]
+```
+
+### 6.3. `diff(a, b) -> dict` (Ambiguity G)
+
+```python
+view.diff(a: str, b: str) -> dict
+```
+
+Computes the diff between two commits. `a` and `b` are **commit
+hash prefixes** (the first N characters of a commit hash, minimum
+~8 characters for uniqueness). They are NOT branch names. They are
+NOT tags.
+
+The diff walks the commit DAG from HEAD to find commits whose hash
+starts with `a` (resp. `b`), then reads the full state at each
+commit, then computes the set difference.
+
+Returns a dict with EXACTLY these keys:
+
+| Key | Type | Description |
+|---|---|---|
+| `"added"` | `dict[str, str]` | Keys present in `b` but not `a`. Values are the first 12 chars of the blob hash. |
+| `"removed"` | `dict[str, str]` | Keys present in `a` but not `b`. Values are the first 12 chars of the blob hash. |
+| `"modified"` | `dict[str, dict]` | Keys present in both but with different blob hashes. Values are `{"old": hash[:12], "new": hash[:12]}`. |
+
+Raises `ValueError(f"Commit '{prefix}' not found")` if `a` or `b`
+does not match any commit in the View's history.
+
+To diff a branch against HEAD: first resolve the branch to its head
+commit hash via `kernel.resolve(f"{view_name}__branch__{branch_name}")`,
+then pass the first 12 chars of that hash to `diff()`.
+
+---
+
+## 7. Commit object format (Ambiguity J)
+
+A commit is a kernel blob encoded in a binary format (see
+`pond-sdk/binary_encoding.py`, `BinaryProllyTree.encode_commit`).
+The format is:
+
+```
+[1B: type=3 (commit marker)]
+[32B: parent commit hash (or 32 zero bytes if no parent)]
+[32B: snapshot tree root hash (or 32 zero bytes if delta-only)]
+[4B: delta_plus_count (uint32 LE)]
+[for each delta_plus entry:]
+  [2B: key_len (uint16 LE)]
+  [key_len B: key bytes (UTF-8)]
+  [32B: blob hash]
+[4B: delta_minus_count (uint32 LE)]
+[for each delta_minus key:]
+  [2B: key_len (uint16 LE)]
+  [key_len B: key bytes (UTF-8)]
+[2B: message_len (uint16 LE)]
+[message_len B: message bytes (UTF-8)]
+[8B: timestamp (float64 LE)]
+[4B: commit index (uint32 LE)]
+```
+
+A commit is one of two types:
+
+1. **Snapshot commit**: `snapshot` field is non-null. The commit
+   contains a full Prolly tree root. Reads can binary-search this
+   tree directly. `delta_plus` and `delta_minus` are empty.
+2. **Delta commit**: `snapshot` field is null. The commit contains
+   only the changes (`delta_plus` for additions/modifications,
+   `delta_minus` for deletions). Reads must walk the parent chain
+   to find a snapshot, then apply deltas in reverse order.
+
+The `COMPACTION_THRESHOLD` (default 4) controls when the View
+writes a snapshot commit instead of a delta commit. After every 4
+delta commits, the next commit is a snapshot (full state written).
+
+Views do NOT need to know this format. The `ProllyViewBase` class
+encodes and decodes commits transparently. This section is for
+developers building alternative View implementations that need to
+interoperate with `ProllyViewBase`'s commit format.
+
+---
+
+## 8. Tombstone helpers (per RFC-0008)
+
+The SDK provides Layer 1 helpers for logical deletion (see
+RFC-0008). These are in `pond-sdk/maintenance.py`:
+
+```python
+from maintenance import (
+    TOMBSTONE_HASH,        # The globally-known tombstone marker hash
+    drop_name,             # Logically delete a name (rebind to TOMBSTONE_HASH)
+    is_dropped,            # True iff name is bound to TOMBSTONE_HASH
+    resolve_active,        # Resolve a name, returning None for tombstoned
+    compact_tombstones,    # Layer 0.5 maintenance: remove tombstoned name rows
+)
+```
+
+Use these when you need to delete names (e.g., dropping a View,
+dropping a branch, dropping an index). The kernel itself does NOT
+have a `delete_name` primitive; tombstones are data, not a kernel
+feature. See RFC-0008 for the full rationale.
+
+---
+
+## 9. Encoding (override in subclasses)
+
+The default `View` class uses JSON for encoding:
+
+```python
+def encode(self, data: Any) -> bytes:
+    return json.dumps(data, sort_keys=True).encode()
+
+def decode(self, data: bytes) -> Any:
+    return json.loads(data)
+```
+
+Subclasses override these to use a different format. Examples:
+
+| View | Encode | Decode |
+|---|---|---|
+| `SQLView` | Arrow → Parquet | Parquet → Arrow |
+| `VectorView` | `struct.pack` floats | `struct.unpack` |
+| `GitView` | raw file bytes | raw file bytes |
+| Default `View` | JSON | JSON |
+
+The encode/decode pair MUST satisfy Law 1 (round-trip) from
+RFC-0007: `decode(encode(d)) == d` for all `d`. This is checkable;
+the `view_laws.py` harness verifies it.
+
+---
+
+## 10. What is deliberately NOT in the SDK
+
+- **No query planner.** Views expose `get`, `find_by`, `get_all`.
+  There is no SQL parser, no optimizer, no cost model. SQLView
+  (Layer 3) adds SQL parsing on top of the SDK; the SDK itself is
+  query-language-agnostic.
+- **No transactions.** `commit` is atomic for a single View. There
+  is no cross-View atomic commit, no 2PC, no isolation levels.
+  Views that need transactions implement their own protocol.
+- **No schema.** The SDK stores bytes; the View tracks its own
+  schema. There is no schema registry, no schema evolution support.
+- **No compression.** Views compress their blobs before `put()`.
+  The SDK does not compress automatically.
+- **No cache.** The SDK reads from the kernel on every `get()`.
+  Views cache if they want to (e.g., `IndexedView`'s
+  `_cached_entries`).
+- **No concurrency control.** The SDK is single-threaded. Use the
+  thread-safe wrapper from `engineering/01_concurrency.py` for
+  multi-threaded access.
+
+These omissions are deliberate. Each is a Layer 3 or Layer 4
+concern; adding it to the SDK would violate the design goal of
+keeping the SDK minimal. See `docs/NON_GOALS.md` for the full list.
+
+---
+
+## 11. Compliance checklist for new Views
+
+Before claiming a View is SDK-compliant, verify:
+
+- [ ] The View extends `View` or `IndexedView`.
+- [ ] The View's `encode`/`decode` pair satisfies round-trip
+      (Law 1 of RFC-0007).
+- [ ] The View's operations are deterministic (Law 2 of RFC-0007).
+- [ ] The View does not call `kernel.reference` inside `get` or
+      `find_by` (read paths are pure).
+- [ ] The View does not reach past the SDK (no direct SQL on the
+      kernel's `root_db`, except via `maintenance.compact_tombstones`).
+- [ ] The View's indexes (if any) are stored as Prolly trees
+      following the naming convention in §4.4.
+- [ ] The View's `drop_index` / `unregister_index` use the
+      tombstone pattern from §4.5 (not "empty tree" workarounds).
+- [ ] The View passes the `view_laws.py` property-test harness
+      (see `pond-sdk/view_laws.py`).
+
+---
+
+## 12. Relationship to other documents
+
+- **Depends on:** RFC-0003 (Kernel Specification — the 3 primitives
+  the SDK is built on), RFC-0007 (View Algebra — the 5-tuple and
+  6 laws the SDK implements), RFC-0008 (Deletion as Data — the
+  tombstone pattern used by `drop_index`).
+- **Supersedes:** informal descriptions in
+  `docs/VIEW_AUTHORS_GUIDE.md`. Where the two disagree, this
+  document is correct.
+- **Operationalized by:** `pond-sdk/view_laws.py` (the property-test
+  harness that verifies SDK compliance).
+- **External validation:** the 10 ambiguities settled here were
+  identified by `validation/vector_report.md`. A second external
+  validation (re-running the vector challenge with this spec) is
+  the success criterion for Phase B.

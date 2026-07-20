@@ -151,6 +151,7 @@ only makes sense with `pond-feature-store` or `pond-semantic` present
 |---|---|---|
 | `README.md` | Project overview, hypothesis, status | You are new to Pond |
 | `DESIGN_GOALS.md` (this file) | Six design principles + repo map | You are starting any work on Pond |
+| `SDK_SPEC.md` | Authoritative SDK contract (settles all 10 validation ambiguities) | You are building a View or modifying the SDK |
 | `PACKAGES.md` | Package boundaries and removability discipline | You are adding or modifying a package |
 | `worklog.md` | Append-only research log | You need to know what previous agents did |
 
@@ -195,7 +196,7 @@ frozen.
 | Package | Layer | LOC | Responsibility |
 |---|---|---|---|
 | `pond-core` | 0 | ~140 | The 3 primitives. FROZEN. Do not modify without an Accepted RFC. |
-| `pond-sdk` | 1–2 | (see repo) | `View` base class, `IndexedView`, common View patterns |
+| `pond-sdk` | 1–2 | (see repo) | `View` base class, `IndexedView`, common View patterns, `maintenance.py` (tombstones per RFC-0008), `view_laws.py` (algebra property tests per RFC-0007) |
 | `pond-sql` | 3 | (see repo) | SQL View (CREATE/INSERT/SELECT/UPDATE/DELETE/ALTER + indexes + time travel) |
 | `pond-streaming` | 3 | (see repo) | Streaming View (topics, consumer groups, offsets) |
 | `pond-git` | 3 | (see repo) | Git View (init/add/commit/branch/checkout/merge/diff) |

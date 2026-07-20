@@ -12,6 +12,7 @@ without changing any lower layer. See §3 below.
 ```
 pond/
 ├── DESIGN_GOALS.md             # Six design principles + repo map (READ FIRST)
+├── SDK_SPEC.md                 # Authoritative SDK contract (settles 10 validation ambiguities)
 ├── PACKAGES.md                 # This file
 ├── README.md
 ├── worklog.md                  # Append-only research log
@@ -25,6 +26,8 @@ pond/
 │   ├── binary_encoding.py      # Binary Prolly tree encoding (metadata optimization)
 │   ├── auto_index.py           # Layer 2: IndexedView (auto-indexing, incremental)
 │   ├── view_sdk.py             # View base class + CrossView + SemanticView + adapters
+│   ├── maintenance.py          # Layer 0.5: tombstone helpers (RFC-0008) + compact_tombstones
+│   ├── view_laws.py            # Property-test harness for RFC-0007's 6 View algebra laws
 │   └── __init__.py
 │
 ├── pond-sql/                   # Layer 3: Domain — SQL database
