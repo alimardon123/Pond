@@ -14,7 +14,7 @@ authoritative source for its topic.
 | RFC-0004 | View Composition and Interoperability | Draft |
 | RFC-0005 | Materialization Calculus (renamed from Derived Structures) | Draft |
 | RFC-0006 | Layered Architecture | Draft |
-| RFC-0007 | View Algebra | Draft |
+| RFC-0007 | View Algebra | **Accepted** (verified by `view_laws.py` CI harness) |
 | RFC-0008 | Deletion as Data | Draft |
 | RFC-0009 | Architecture Metrics | Draft |
 

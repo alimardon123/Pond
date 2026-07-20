@@ -62,7 +62,7 @@ operations:
 |---|---|---|
 | `write(data: bytes) -> str` | core | Create an immutable content-addressed blob. Returns its 64-char hex SHA-256 hash. |
 | `read(hash_or_name: str) -> bytes` | core | Read a blob by hash, or resolve a name then read. |
-| `reference(name: str, hash: str) -> None` | core | Set a mutable name→hash mapping. The ONLY mutable operation. |
+| `reference(name: str, hash: str) -> None` | core | Set a mutable name→hash mapping. The ONLY mutable operation. **Validates that `hash` refers to an existing blob** — raises `ValueError` if not. |
 | `resolve(name: str) -> str \| None` | supporting | Resolve a name to its current hash. Returns `None` if unbound. |
 | `list_names() -> list[str]` | supporting | List all names in the root namespace. |
 | `read_blob(hash: str) -> bytes` | supporting | Read a blob by hash directly (no name resolution). Performance shortcut. |
@@ -72,7 +72,38 @@ primitives (e.g., `resolve` is `SELECT hash FROM roots WHERE name=?`
 on the kernel's internal SQLite). They do not extend the kernel's
 algebra. See `RFC-0003` for the formal kernel specification.
 
-### 1.3. Lifetime
+> **⚠ Important consequence of `reference()` validation:** you cannot
+> bind a name to a hash whose blob does not exist on disk. This
+> matters for tombstones (see §4.5, §8): `drop_name` handles this
+> for you by pre-writing the tombstone marker blob before rebinding.
+> Do NOT call `kernel.reference(name, TOMBSTONE_HASH)` directly
+> without first writing the marker blob — it will raise
+> `ValueError`.
+
+### 1.3. Constructing a View
+
+A View is constructed with its kernel instance and a name:
+
+```python
+view = View(kernel, name: str)
+# or:
+view = IndexedView(kernel, name: str)
+# or, for a custom View:
+view = MyView(kernel, name: str)   # MyView extends View or IndexedView
+```
+
+The `name` is the View's identifier in the kernel's root namespace.
+It appears in:
+- The kernel Reference pointing to the View's HEAD commit:
+  `kernel.resolve(name)` returns the HEAD commit hash.
+- Branch References: `f"{name}__branch__{branch_name}"`.
+- Index References: `f"{name}__index__{index_name}"`.
+
+The name must be a non-empty string. It must not contain `__`
+(double-underscore) — that sequence is reserved for the kernel
+namespace convention (see §2.5).
+
+### 1.4. Lifetime
 
 The kernel holds an open SQLite connection. Call `kernel.close()` to
 release it. The kernel is NOT thread-safe by default; see
@@ -146,6 +177,22 @@ If `message` is empty, a default message is generated
 
 Raises `ValueError("Nothing to commit")` if no changes are staged.
 
+### 2.5. Key naming conventions
+
+Keys passed to `put`/`get`/`delete` are arbitrary strings, but the
+following conventions apply:
+
+- **Reserved prefix `_` (underscore):** keys starting with `_` are
+  treated as internal by `get_all()` and `keys()` — they are excluded
+  from the iterable state. Use `_`-prefixed keys for View-internal
+  metadata (schema, indexes, semantic definitions).
+- **No `__` (double-underscore) in keys:** this sequence is reserved
+  for the kernel namespace convention
+  (`f"{view_name}__index__{name}"`, `f"{view_name}__branch__{name}"`).
+- **View authors choose their own key names** for non-internal data.
+  Suggested patterns: `"node:{id}"`, `"user:{id}"`, `"order:{id}"`,
+  `"edge:{from}:{to}:{type}"`. The SDK does not mandate a convention.
+
 ---
 
 ## 3. Reading data (Ambiguity C: `get()` complexity)
@@ -184,7 +231,28 @@ non-primary attribute, register an index and use `find_by()`.
 already provides O(log N) primary-key lookup. An index on the
 primary key is redundant.
 
-### 3.3. `get_all() -> dict[str, Any]`
+### 3.3. `find_by()` return shape
+
+```python
+view.find_by(index_name: str, index_key: str) -> Optional[Any]
+```
+
+Returns a **single decoded value** (the first match), or `None` if:
+- the index has no entry for `index_key`, OR
+- the index has been tombstoned (dropped via `unregister_index` or
+  `drop_index` — see §4.5).
+
+For **multi-valued lookups** (multiple entries match the same
+`index_key`), use:
+
+```python
+view.find_all_by(index_name: str, index_key: str) -> list[Any]
+```
+
+Returns a **list of decoded values** (possibly empty). Returns `[]`
+if the index is tombstoned or has no matching entries.
+
+### 3.4. `get_all() -> dict[str, Any]`
 
 ```python
 view.get_all() -> dict[str, Any]
@@ -197,7 +265,7 @@ metadata) are excluded.
 O(N/chunk_size + K) kernel reads. Use only for small Views or
 one-time bulk reads; for large Views, prefer `keys()` + `get()`.
 
-### 3.4. `keys() -> list[str]`, `count() -> int`, `exists(key) -> bool`
+### 3.5. `keys() -> list[str]`, `count() -> int`, `exists(key) -> bool`
 
 Standard read helpers. `keys()` returns non-internal keys. `count()`
 returns the number of non-internal entries. `exists(key)` returns
@@ -267,22 +335,55 @@ rebuilds but more stale reads.
 
 ### 4.4. Index persistence and naming (Ambiguity E)
 
-Indexes are stored as **Prolly trees in the kernel's object store**.
-Each index is a tree mapping `f"_index/{index_name}/{index_key}"`
-to the data blob's hash. The tree's root hash is stored in the
-kernel's root namespace under the name
+Indexes are stored as **kernel blobs** in the kernel's object store.
+Each index is a tree-like structure mapping
+`f"_index/{index_name}/{index_key}"` to either a single data blob's
+hash (single-valued index) or a serialized list of data blob hashes
+(multi-valued index — see §4.4.1 below). The index's root hash is
+stored in the kernel's root namespace under the name
 `f"{view_name}__index__{index_name}"`.
 
 Concretely:
-- The index tree is a kernel blob (created via `kernel.write`).
+- The index is a kernel blob (created via `kernel.write`).
 - The index's root pointer is a kernel Reference (created via
   `kernel.reference`).
 - Indexes are NOT in-memory. They survive process restarts.
 - Indexes are NOT stored separately from data. They live in the same
   object store.
 
+**Index format:** the SDK's built-in `View` and `IndexedView` classes
+store indexes as Prolly trees (content-addressed B-trees — see
+`pond-sdk/prolly_view.py` for the implementation). The Prolly tree
+format is **internal to `ProllyViewBase`**; View authors do NOT need
+to know it. If you are building a custom View directly on the kernel
+(without extending `View`/`IndexedView`), you may store your index as
+any kernel blob format you choose (JSON dict, length-prefixed binary,
+etc.) — the only requirements are (a) the root pointer is a Reference
+named `f"{view_name}__index__{index_name}"` and (b) the format is
+deterministic (rebuildable from the View's state, per RFC-0005
+Materialization Law 1).
+
 To list all indexes for a View: `view.list_indexes()` (returns
 active indexes; tombstoned indexes excluded — see §4.5).
+
+#### 4.4.1. Multi-valued indexes
+
+When multiple data entries share the same `index_key` (e.g., multiple
+nodes of type `"user"`), the index must store **multiple** data blob
+hashes for that key. Two storage patterns are supported:
+
+1. **List-at-leaf (recommended):** the index entry at
+   `_index/{index_name}/{index_key}` is a serialized list of data
+   blob hashes (JSON list, or length-prefixed binary).
+   `find_all_by(index_name, index_key)` deserializes the list and
+   returns all matching values.
+2. **Multi-entry (alternative):** store one index entry per match,
+   with keys like `_index/{index_name}/{index_key}/{ordinal}`.
+   More complex to scan, but allows incremental insertion without
+   rewriting the leaf.
+
+The SDK's built-in `IndexedView` uses pattern 1 by default. Custom
+Views may choose either pattern.
 
 ### 4.5. `drop_index` / `unregister_index` (Ambiguity F, per RFC-0008)
 
@@ -347,6 +448,16 @@ commits advance the branch's head, not the previous branch's head.
 The staging area is cleared on checkout. Pending changes are lost.
 Commit staged changes before checkout if you want to keep them.
 
+**Current-branch tracking is IN-MEMORY.** The currently-checked-out
+branch is stored in a `View` instance attribute
+(`self._active_branch` in the SDK). It is NOT persisted in the
+kernel namespace. On process restart, the View reverts to the
+default branch (the unnamed HEAD Reference at
+`kernel.resolve(view.name)`). To track current-branch across
+restarts, store it yourself under a name like
+`f"{view.name}__current_branch"` and call `checkout()` after
+constructing the View.
+
 ### 5.3. `list_branches() -> list[str]`
 
 Returns the short names (without the `{view_name}__branch__` prefix)
@@ -380,6 +491,14 @@ branches modified the same key, the merged branch's value wins
 silently. This is the simplest correct merge policy; future RFCs
 may introduce 3-way merge as an option.
 
+**Merge commit parents:** the merge commit has **1 parent** (the
+current HEAD at merge time). The merged branch's commit hash is NOT
+recorded as a second parent. This means `history()` walks only the
+current branch's chain — the merged branch's individual commits are
+not reachable via `history()`. They ARE reachable via `diff()`
+against the merge commit. A future RFC may introduce git-style
+2-parent merge commits with DAG-aware `history()`.
+
 When to use:
 - Append-only workloads (no conflicts possible).
 - Workloads where the merged branch is authoritative by design
@@ -406,8 +525,14 @@ a dict with EXACTLY these keys:
 | `"commit"` | `str` | The first 12 characters of the commit hash (a short hash, like Git). |
 | `"message"` | `str` | The commit message. |
 | `"timestamp"` | `float` | Unix timestamp (seconds since epoch). |
-| `"index"` | `int` | The commit's position in the DAG (0 = first commit). |
+| `"index"` | `int` | The commit's position along the current branch's chain (0 = first commit on this branch). Per-branch count, NOT a global DAG topological order. |
 | `"type"` | `str` | Either `"snapshot"` or `"delta"`. |
+
+`history()` walks the **single-parent chain** from HEAD backwards.
+It does NOT traverse merge-commit second parents (because merge
+commits have only 1 parent in this SDK — see §6.1). To inspect the
+merged branch's history, call `checkout(branch_name)` first, then
+`history()`.
 
 Example:
 ```python
@@ -489,11 +614,23 @@ A commit is one of two types:
 The `COMPACTION_THRESHOLD` (default 4) controls when the View
 writes a snapshot commit instead of a delta commit. After every 4
 delta commits, the next commit is a snapshot (full state written).
+**The first commit on a View is always a snapshot** (a delta commit
+with no parent is nonsensical — there is nothing to delta against).
 
-Views do NOT need to know this format. The `ProllyViewBase` class
-encodes and decodes commits transparently. This section is for
-developers building alternative View implementations that need to
-interoperate with `ProllyViewBase`'s commit format.
+**Who needs to know this format?**
+
+- **View authors extending `View` or `IndexedView`:** do NOT need
+  to know this format. `ProllyViewBase` encodes and decodes commits
+  transparently.
+- **Developers building alternative View implementations directly
+  on the kernel (without extending `View`/`IndexedView`):** you may
+  use any commit format you choose (JSON, length-prefixed binary,
+  etc.) — the only requirements are (a) the commit is a kernel blob,
+  (b) the HEAD commit hash is stored in a Reference named
+  `view.name`, and (c) the format is deterministic. The binary
+  format above is what `ProllyViewBase` uses; you do not have to
+  match it unless you want cross-View interoperability with
+  `ProllyViewBase`-based Views.
 
 ---
 
@@ -503,6 +640,7 @@ The SDK provides Layer 1 helpers for logical deletion (see
 RFC-0008). These are in `pond-sdk/maintenance.py`:
 
 ```python
+# Add pond-sdk/ to your PYTHONPATH, then:
 from maintenance import (
     TOMBSTONE_HASH,        # The globally-known tombstone marker hash
     drop_name,             # Logically delete a name (rebind to TOMBSTONE_HASH)
@@ -512,10 +650,27 @@ from maintenance import (
 )
 ```
 
-Use these when you need to delete names (e.g., dropping a View,
-dropping a branch, dropping an index). The kernel itself does NOT
-have a `delete_name` primitive; tombstones are data, not a kernel
-feature. See RFC-0008 for the full rationale.
+**Import path:** the helpers live in `pond-sdk/maintenance.py`. To
+import them, add the `pond-sdk/` directory to your `PYTHONPATH`
+(e.g., `sys.path.insert(0, "/path/to/pond-sdk")`) and use
+`from maintenance import ...`. If you are extending the SDK's `View`
+or `IndexedView` class, the import is already set up for you.
+
+**Important: `drop_name` handles the marker-blob pre-write for you.**
+`drop_name(kernel, name)` internally calls `_ensure_tombstone_blob(kernel)`
+which writes the constant marker blob `b"__pond_tombstone__"` (whose
+SHA-256 IS `TOMBSTONE_HASH`) before calling
+`kernel.reference(name, TOMBSTONE_HASH)`. This is necessary because
+the kernel's `reference()` validates that the target hash refers to
+an existing blob (see §1.2). Do NOT call
+`kernel.reference(name, TOMBSTONE_HASH)` directly without first
+writing the marker blob — it will raise
+`ValueError("Hash ... does not refer to an existing blob")`.
+
+Use these helpers when you need to delete names (e.g., dropping a
+View, dropping a branch, dropping an index). The kernel itself does
+NOT have a `delete_name` primitive; tombstones are data, not a
+kernel feature. See RFC-0008 for the full rationale.
 
 ---
 
@@ -576,7 +731,9 @@ keeping the SDK minimal. See `docs/NON_GOALS.md` for the full list.
 
 Before claiming a View is SDK-compliant, verify:
 
-- [ ] The View extends `View` or `IndexedView`.
+- [ ] The View extends `View` or `IndexedView`, OR is built directly
+      on the kernel following §7's "alternative View implementations"
+      guidance (in which case the format requirements from §7 apply).
 - [ ] The View's `encode`/`decode` pair satisfies round-trip
       (Law 1 of RFC-0007).
 - [ ] The View's operations are deterministic (Law 2 of RFC-0007).
@@ -584,10 +741,15 @@ Before claiming a View is SDK-compliant, verify:
       `find_by` (read paths are pure).
 - [ ] The View does not reach past the SDK (no direct SQL on the
       kernel's `root_db`, except via `maintenance.compact_tombstones`).
-- [ ] The View's indexes (if any) are stored as Prolly trees
-      following the naming convention in §4.4.
+- [ ] The View's indexes (if any) are stored as kernel blobs
+      following the naming convention in §4.4. The format may be
+      Prolly tree (if extending `ProllyViewBase`) or any
+      deterministic kernel-blob format (if building directly on the
+      kernel).
 - [ ] The View's `drop_index` / `unregister_index` use the
-      tombstone pattern from §4.5 (not "empty tree" workarounds).
+      tombstone pattern from §4.5 (via `drop_name` from
+      `maintenance.py`, NOT via direct `kernel.reference` to
+      `TOMBSTONE_HASH` — see §1.2 and §8).
 - [ ] The View passes the `view_laws.py` property-test harness
       (see `pond-sdk/view_laws.py`).
 

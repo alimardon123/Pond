@@ -2,7 +2,19 @@
 
 ## Status
 
-Draft — supersedes the draft definition in RFC-0001.
+**Accepted** — promoted from Draft after the property-test harness
+(`pond-sdk/view_laws.py`) was built and verified against:
+
+1. The SDK's own `View`, `IndexedView`, and `SemanticView` classes
+   (all pass all 6 laws; run via
+   `python pond-sdk/run_view_laws_ci.py`).
+2. An externally-built `GraphView` constructed from `SDK_SPEC.md`
+   alone (no access to pond-sdk internals; passes all 6 laws; run via
+   `python validation/run_graph_view_laws.py`).
+
+This RFC is now the authoritative specification of what a Pond View
+IS, mathematically. Violations are release-blocking bugs (RFC-0009
+metric E1, target 0).
 
 ## Abstract
 
@@ -20,6 +32,13 @@ The shift from RFC-0001 is: stop conflating "what a View IS" with
 two of them and freezing them into the definition was arbitrary.
 The algebra admits the full operation set; the definition admits
 only the structural skeleton.
+
+> **Acceptance evidence:** the `view_laws.py` harness in
+> `pond-sdk/` implements all 6 law checks as property tests. It
+> passes for all 3 SDK View classes AND for an external GraphView
+> built from `SDK_SPEC.md` alone (validation/graph_view_external.py,
+> from Task 12 external validation). The harness is CI-runnable via
+> `python pond-sdk/run_view_laws_ci.py`.
 
 ---
 
@@ -431,10 +450,15 @@ special cases.
 
 ## 12. Status of this RFC
 
-This RFC is a **draft for review**. The six laws have been verified
-against the eight reference Views by inspection; the verification
-is not yet automated. Phase B of the roadmap (SDK polish) includes
-building the `view_laws.py` property-test harness that will turn
-this inspection into a continuous CI check.
+This RFC is **Accepted**. The six laws have been verified against
+the eight reference Views by inspection AND against the SDK's three
+View classes (View, IndexedView, SemanticView) plus an externally-
+built GraphView via the automated `view_laws.py` property-test
+harness. The harness is CI-runnable
+(`python pond-sdk/run_view_laws_ci.py`) and is now metric E1
+(RFC-0009): a hard constraint with target 0 violations.
 
-Once the harness passes for all Views, this RFC moves to **Accepted**.
+Future work: extend the harness to cover all Layer 3 domain Views
+(SQLView, StreamingView, GitView, NotebookView, FeatureStoreView)
+once each has a `ViewContract` adapter. The harness is View-agnostic;
+adding a new View requires only writing its contract.
