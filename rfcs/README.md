@@ -18,6 +18,7 @@ authoritative source for its topic.
 | RFC-0008 | Deletion as Data | Draft |
 | RFC-0009 | Architecture Metrics | Draft |
 | RFC-0010 | ArrowView (Phase D Compatibility Adapter) | **Accepted** (verified by `pond-arrow/run_arrow_view_laws.py`) |
+| RFC-0011 | Feature Store (Phase E Flagship) | **Accepted** (verified by `pond-feature-store/feature_store.py` production tests) |
 
 ## Reference Documents (not RFCs — supporting material)
 

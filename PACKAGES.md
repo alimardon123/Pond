@@ -34,7 +34,9 @@ pond/
 ├── pond-streaming/             # Layer 3: Domain — Streaming
 ├── pond-git/                   # Layer 3: Domain — Version control
 ├── pond-notebook/              # Layer 3: Domain — Knowledge base
-├── pond-feature-store/         # Layer 3: Domain — ML Feature Store
+├── pond-feature-store/         # Layer 3: Domain — ML Feature Store (Phase E flagship)
+│   ├── feature_store.py        # FeatureStore (schema validation, versioning, point-in-time JOIN, batch serving)
+│   └── cli.py                  # 16-command CLI
 ├── pond-semantic/              # Layer 3: Domain — Semantic models
 ├── pond-vector/                # Layer 3: Domain — Vector DB (external validation)
 ├── pond-arrow/                 # Layer 3: Domain — Arrow IPC adapter (Phase D compatibility)
@@ -51,7 +53,8 @@ pond/
 │   ├── RFC-0007-view-algebra.md            # ACCEPTED (verified by view_laws.py)
 │   ├── RFC-0008-deletion-as-data.md        # Tombstones; no fourth primitive
 │   ├── RFC-0009-architecture-metrics.md    # Measurable design metrics
-│   └── RFC-0010-arrowview.md               # ACCEPTED (Phase D compatibility adapter)
+│   ├── RFC-0010-arrowview.md               # ACCEPTED (Phase D compatibility adapter)
+│   └── RFC-0011-feature-store.md           # ACCEPTED (Phase E flagship)
 │
 ├── docs/                       # Reference documents
 │   ├── ... (FORMAL_SPEC, FORMAL_ALGEBRA, NON_GOALS, etc.)

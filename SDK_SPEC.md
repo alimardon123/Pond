@@ -222,6 +222,45 @@ The key is generated via `uuid.uuid4().hex` — 32 hex characters,
 ~122 bits of entropy. Collisions are astronomically unlikely
 (~10^-37 probability for 10^12 records).
 
+**Hardening notes (settled per Phase B.4):**
+
+1. **Key format is fixed:** `uuid.uuid4().hex` — 32 lowercase hex
+   characters, no dashes. Do NOT parse the key; treat it as opaque.
+   The format may change in a future major version (e.g., to ULID
+   for time-sortability) but the contract is "32-char hex string
+   that uniquely identifies the row within this View."
+
+2. **Key uniqueness is per-View, not global.** Two `put_auto` calls
+   on different Views may (with vanishing probability) return the
+   same key — that's fine, they're in different namespaces. Within
+   a single View, two `put_auto` calls with different `data` always
+   return different keys (UUID4 collision probability is negligible).
+   Within a single View, two `put_auto` calls with the SAME `data`
+   return DIFFERENT keys (because the key is random, not derived
+   from content). If you want content-addressed dedup, use
+   `view.put(hashlib.sha256(view.encode(data)).hexdigest(), data)`
+   instead — `put_auto` does NOT dedup.
+
+3. **`put_auto` does NOT commit.** Like `put`, it stages the write.
+   The caller must call `commit(message)` afterward. This matches
+   the `put` contract — see §2.4.
+
+4. **`put_auto` is NOT thread-safe.** Two concurrent `put_auto`
+   calls on the same View instance may race on the staging area.
+   For multi-threaded access, use the thread-safe kernel wrapper
+   from `engineering/01_concurrency.py` and serialize View-level
+   operations externally.
+
+5. **The returned key is the primary key, not the blob hash.**
+   `put_auto` returns the generated primary key (used for `get`,
+   `delete`, `find_by`). The blob hash is internal; you don't need
+   it. If you want the blob hash too, capture the return value of
+   `view.put(key, data)` (which returns the blob hash) — but
+   `put_auto` returns the primary key, not the blob hash. This is
+   a deliberate asymmetry: `put` returns the blob hash (for
+   `put_raw` chaining); `put_auto` returns the primary key (for
+   `get` retrieval).
+
 #### 2.6.2. `KeylessView` — primary-keyless as a first-class mode
 
 ```python
@@ -435,6 +474,62 @@ with a separator: `lambda d: f"{d['a']}:{d['b']}"`. This gives
 prefix-scan capability on `col_a` but not on `col_b` alone. True
 multi-dimensional range queries require a Hilbert-curve
 materialization (see `docs/LIQUID_CLUSTERING_COMPARISON.md`).
+
+**Hardening notes (settled per Phase B.4):**
+
+1. **Order of returned keys is preserved in the index, but does not
+   affect lookup results.** If the extractor returns
+   `["alpha", "beta", "gamma"]`, the row is indexed under all three
+   keys. `find_by(index_name, "alpha")`, `find_by(index_name, "beta")`,
+   and `find_by(index_name, "gamma")` all return the row. The order
+   in the list affects only the order in which keys are added to the
+   Prolly tree during `_rebuild_index` (which is then sorted by the
+   tree itself, so the order is irrelevant for lookups).
+
+2. **Duplicate keys in the returned list are deduplicated.** If the
+   extractor returns `["alpha", "alpha", "beta"]`, the row is indexed
+   under `"alpha"` (once) and `"beta"` (once). The index tree stores
+   one entry per unique key.
+
+3. **Multiple rows with the same index_key: last-writer-wins for
+   `find_by`, all-matches for `find_all_by`.** If two rows both
+   return `"alpha"` from the extractor, the index entry for
+   `"alpha"` points to the second row's blob hash (last writer
+   wins). `find_by(index_name, "alpha")` returns the second row.
+   To retrieve all matching rows, use `find_all_by` (which currently
+   returns a list of up to 1 row due to the single-value index
+   format — see §4.4.1 for the multi-valued index pattern that
+   would return all matches).
+
+4. **Extractor exceptions propagate.** If the extractor raises an
+   exception (e.g., `KeyError` on a missing field), the exception
+   propagates up through `put` / `_rebuild_index`. The View does
+   NOT silently skip the row. If you want to skip rows with missing
+   fields, catch the exception inside the extractor and return
+   `None`:
+   ```python
+   def safe_tag_extractor(d):
+       try:
+           return d.get("tags", [])
+       except Exception:
+           return None  # row not indexed
+   ```
+
+5. **The extractor is called once per row per index rebuild.** For
+   `eager` mode, that's once per commit. For `lazy` mode, that's
+   once per rebuild (which happens when staleness exceeds budget).
+   For incremental updates, the extractor is called once per
+   `put` (to track the new row's index keys). The extractor should
+   be cheap (O(1) on the data). If your extractor is expensive
+   (e.g., parses a JSON string), cache the parsed result inside
+   the data dict before `put`.
+
+6. **The extractor receives the DECODED data, not the raw bytes.**
+   For `View` and `IndexedView`, this is the dict returned by
+   `view.decode(view.encode(data))` — i.e., the same value the
+   caller passed to `put`. For `ArrowView`, the extractor receives
+   a row dict (converted from the Arrow Table). See §4.2 for the
+   full signature.
 
 ### 4.3. Index modes (`IndexedView` only)
 
@@ -852,6 +947,53 @@ target_view.commit(f"piped {n} keys")
    after `pipe` returns. If the source changes during the pipe, the
    changes are NOT visible to the in-progress pipe (the state was
    snapshotted at call time).
+
+**Hardening notes (settled per Phase B.4):**
+
+1. **`pipe` iterates keys in arbitrary order.** The order of keys
+   returned by `from_view.base.read_all()` is the Prolly tree's
+   sorted order (lexicographic by key). This is deterministic for
+   a given source state, but the caller should NOT rely on a
+   specific order — if order matters (e.g., for reproducible
+   builds), sort the keys explicitly after `pipe`.
+
+2. **`pipe` is NOT atomic with respect to the source.** The source
+   View may be modified concurrently while `pipe` is running. The
+   `read_all()` call snapshots the state at one instant, but the
+   Prolly tree may be rebuilt between the snapshot and the iteration.
+   In practice, this is safe because `read_all()` returns a dict
+   (materialized in memory); subsequent modifications to the source
+   View do not affect the in-progress pipe. But the pipe may miss
+   writes that happened during the iteration.
+
+3. **`share_blob` does NOT verify the blob still exists.** It looks
+   up `from_view.base.lookup(from_key)` at call time and stages
+   the returned hash. If the source View is later modified (e.g.,
+   the key is deleted, or a tombstone is applied), the target's
+   staged reference is unaffected — the blob hash is still valid
+   (the kernel's content-addressed store keeps the blob until GC).
+   The target's commit will succeed.
+
+4. **Cross-View operations do NOT create a transaction log.** There
+   is no record that "View B's row X came from View A's row Y."
+   If you need provenance tracking, store the source View name and
+   key in the target row's data:
+   ```python
+   def transformer(key, data):
+       return key, {**data, "_provenance": {"source_view": from_view.name, "source_key": key}}
+   ```
+   This is a View-level concern, not a CrossView feature.
+
+5. **`write_to` does NOT check for key conflicts.** If the target
+   View already has a row with the same key, `write_to` silently
+   overwrites it (the new blob hash replaces the old in the staging
+   area; the old blob is GC'd later). To detect conflicts, call
+   `to_view.exists(key)` before `write_to`.
+
+6. **CrossView methods are NOT thread-safe.** They use the source
+   and target Views' internal staging areas, which are not protected
+   by locks. For multi-threaded access, serialize CrossView calls
+   externally.
 
 ---
 
