@@ -57,6 +57,7 @@ class AutoIndex:
         self.incremental = incremental  # use incremental updates vs full rebuild
         self.pending_additions: dict[str, str] = {}  # index_key → blob_hash (not yet merged)
         self.pending_deletions: set[str] = set()  # index_keys to remove
+        self._cached_entries: Optional[dict[str, str]] = None  # in-memory cache of index entries
 
 
 class IndexedView:
@@ -221,7 +222,7 @@ class IndexedView:
     # ------------------------------------------------------------------
 
     def _rebuild_index(self, idx: AutoIndex) -> str:
-        """Rebuild an index from current data. METADATA ONLY. Full O(N) scan."""
+        """Rebuild an index from current data. Full O(N) scan. Populates cache."""
         state = self.base.read_all()
         index_entries = {}
         for pk, bh in state.items():
@@ -235,31 +236,26 @@ class IndexedView:
         idx.last_built_at_commit = self._commit_count
         idx.pending_additions.clear()
         idx.pending_deletions.clear()
+        idx._cached_entries = index_entries  # cache for incremental updates
         self.kernel.reference(f"{self.name}__index__{idx.name}", idx.tree_root)
         return idx.tree_root
 
     def _incremental_update_index(self, idx: AutoIndex) -> str:
         """Incrementally update an index by merging pending changes.
-        O(delta) instead of O(N) — only processes changed entries.
+        O(delta) with cache, O(index_size + delta) without cache.
 
-        How it works:
-        1. Read the current index tree (O(tree_depth) = O(log N))
-        2. Apply pending additions (new key→hash mappings)
-        3. Apply pending deletions (remove old keys)
-        4. Build a new Prolly tree from the merged entries
-        5. Clear pending changes
-
-        For large indexes with small deltas, this is much faster than
-        a full rebuild. The tradeoff: we read the full index tree once
-        (to get all entries), then merge. A true incremental Prolly tree
-        (like Dolt's chunk-level CoW) would avoid reading the full tree,
-        but that's a future optimization.
+        With in-memory cache: reads cached entries (O(1)), applies delta (O(delta)),
+        builds new tree (O(index_size + delta)). Avoids re-reading the index tree
+        from the kernel on every update.
         """
         if not idx.tree_root:
             return self._rebuild_index(idx)
 
-        # Read current index entries
-        current_entries = ProllyTree.read_all(self.kernel, idx.tree_root)
+        # Use cached entries if available, otherwise read from tree
+        if idx._cached_entries is not None:
+            current_entries = dict(idx._cached_entries)  # copy
+        else:
+            current_entries = ProllyTree.read_all(self.kernel, idx.tree_root)
 
         # Apply pending additions (overwrites existing keys with same index_key)
         current_entries.update(idx.pending_additions)
@@ -271,6 +267,7 @@ class IndexedView:
         # Build new tree
         idx.tree_root = ProllyTree.build(self.kernel, current_entries)
         idx.last_built_at_commit = self._commit_count
+        idx._cached_entries = current_entries  # update cache
         idx.pending_additions.clear()
         idx.pending_deletions.clear()
         self.kernel.reference(f"{self.name}__index__{idx.name}", idx.tree_root)
@@ -299,6 +296,7 @@ class IndexedView:
         for idx in self._auto_indexes.values():
             idx.tree_root = None
             idx.last_built_at_commit = -1
+            idx._cached_entries = None
     def list_branches(self) -> list[str]: return self.base.list_branches()
     def merge(self, name: str) -> str: return self.base.merge(name)
     def undo(self, steps: int = 1) -> str:
@@ -308,6 +306,7 @@ class IndexedView:
         for idx in self._auto_indexes.values():
             idx.tree_root = None
             idx.last_built_at_commit = -1
+            idx._cached_entries = None
         return result
     def history(self, limit: int = 20) -> list[dict]: return self.base.history(limit)
     def diff(self, a: str, b: str) -> dict: return self.base.diff(a, b)

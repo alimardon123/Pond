@@ -315,11 +315,13 @@ class OssieSemanticView(View):
         self.put(f"_semantic/relationships/{name}", rel)
 
     def list_metrics(self) -> list[str]:
-        return [k[len("_semantic/metrics/"):] for k in self.keys()
+        state = self.base.read_all()
+        return [k[len("_semantic/metrics/"):] for k in state
                 if k.startswith("_semantic/metrics/")]
 
     def list_dimensions(self) -> list[str]:
-        return [k[len("_semantic/dimensions/"):] for k in self.keys()
+        state = self.base.read_all()
+        return [k[len("_semantic/dimensions/"):] for k in state
                 if k.startswith("_semantic/dimensions/")]
 
     def get_metric(self, name: str) -> Optional[dict]:
