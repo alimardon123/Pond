@@ -11,6 +11,9 @@ authoritative source for its topic.
 | RFC-0001 | What Is a View? | Draft |
 | RFC-0002 | Elegance Metrics | Draft |
 | RFC-0003 | Kernel Specification (Frozen) | Accepted |
+| RFC-0004 | View Composition and Interoperability | Draft |
+| RFC-0005 | Derived Structure Calculus | Draft |
+| RFC-0006 | Layered Architecture | Draft |
 
 ## Reference Documents (not RFCs — supporting material)
 

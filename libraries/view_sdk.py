@@ -219,27 +219,48 @@ class CrossView:
 # OssieSemanticView — aligned with Apache Ossie open semantic interchange spec
 # ===========================================================================
 
-class OssieSemanticView(View):
+class SemanticModelAdapter:
+    """Abstract interface for semantic model formats.
+    Pond supports multiple semantic model standards (Ossie, Cube, dbt, etc.)
+    via adapters. The kernel and View SDK are NOT coupled to any specific format."""
+    def export_model(self, view: 'View') -> dict:
+        raise NotImplementedError
+    def import_model(self, view: 'View', model: dict) -> None:
+        raise NotImplementedError
+
+
+class OssieAdapter(SemanticModelAdapter):
+    """Apache Ossie adapter — one implementation of the semantic model interface."""
+
+    def export_model(self, view: 'View') -> dict:
+        """Export semantic definitions in Ossie format."""
+        state = view.base.read_all()
+        model = {"name": view.name, "datasets": [], "metrics": [], "relationships": []}
+        for key in state:
+            if key.startswith("_semantic/metrics/"):
+                model["metrics"].append(view.decode(view.kernel.read_blob(state[key])))
+            elif key.startswith("_semantic/relationships/"):
+                model["relationships"].append(view.decode(view.kernel.read_blob(state[key])))
+        return model
+
+    def import_model(self, view: 'View', model: dict) -> None:
+        """Import an Ossie-format model into the View."""
+        for metric in model.get("metrics", []):
+            view.put(f"_semantic/metrics/{metric['name']}", metric)
+        for rel in model.get("relationships", []):
+            view.put(f"_semantic/relationships/{rel['name']}", rel)
+
+
+class SemanticView(View):
     """
-    A semantic model View aligned with Apache Ossie spec.
+    A View that manages semantic models (metrics, dimensions, relationships).
 
-    Apache Ossie (incubating) is an open specification for exchanging
-    semantic models across platforms. It defines:
-      - SemanticModel: top-level container
-      - Datasets: logical entities (source, primary_key, fields)
-      - Fields: row-level attributes (expression, dimension flag)
-      - Relationships: FK constraints (from/to columns, composite keys)
-      - Metrics: aggregate calculations with multi-dialect expressions
+    NOT coupled to any specific semantic model standard. Uses adapters:
+      - OssieAdapter for Apache Ossie format
+      - Future: CubeAdapter, DbtAdapter, etc.
 
-    This View stores Ossie-format semantic models as Pond blobs.
-    It can import/export Ossie YAML/JSON.
-
-    Key Ossie patterns adopted:
-      - Multi-dialect expressions (one metric, many SQL dialects)
-      - ai_context on every entity (LLM grounding)
-      - custom_extensions for vendor-specific data
-      - Composability (federated domain models)
-      - Clear separation: interchange spec ≠ query runtime
+    The View stores metric/dimension/relationship definitions as blobs.
+    Adapters translate between the internal format and external standards.
     """
 
     def import_ossie_model(self, model: dict) -> str:
