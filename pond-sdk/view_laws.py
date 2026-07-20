@@ -236,15 +236,27 @@ class ViewLaws:
         This is the integrated form of Law 1 + Law 3: not only must
         encode/decode round-trip in isolation, but the full put→commit→get
         cycle must preserve the data.
+
+        For Views that auto-generate keys (e.g., KeylessView), the
+        harness uses the key returned by `put` for the subsequent
+        `get`. For Views that use caller-supplied keys, the returned
+        key may be the blob hash (not the lookup key); in that case
+        the harness falls back to the original key.
         """
         failures = []
         for i in range(num_samples):
             key = f"law3_key_{i}"
             data = contract.sample_data(i)
             try:
-                contract.put(key, data)
+                returned_key = contract.put(key, data)
                 contract.commit(f"law3 test {i}")
-                retrieved = contract.get(key)
+                # Try the returned key first (for auto-key Views); fall
+                # back to the original key (for caller-supplied-key Views).
+                retrieved = None
+                if returned_key is not None:
+                    retrieved = contract.get(returned_key)
+                if retrieved is None:
+                    retrieved = contract.get(key)
                 if retrieved != data:
                     failures.append(
                         f"sample {i}: put/get mismatch. "
@@ -343,7 +355,7 @@ class ViewLaws:
         test_data = contract.sample_data(42)
 
         try:
-            contract.put(test_key, test_data)
+            returned_key = contract.put(test_key, test_data)
             contract.commit("law5 composition test")
 
             # The data is now in the kernel. The contract's bound View
@@ -368,8 +380,14 @@ class ViewLaws:
                     detail="View name not bound in kernel; cannot verify recoverability from fresh instance (skipped)",
                 )
 
-            # Verify the data is recoverable via the contract's get()
-            retrieved = contract.get(test_key)
+            # Verify the data is recoverable via the contract's get().
+            # For auto-key Views, use the returned key; for caller-key
+            # Views, fall back to the original key.
+            retrieved = None
+            if returned_key is not None:
+                retrieved = contract.get(returned_key)
+            if retrieved is None:
+                retrieved = contract.get(test_key)
             if retrieved != test_data:
                 return LawResult(
                     "Law 5: Composition (structural)",

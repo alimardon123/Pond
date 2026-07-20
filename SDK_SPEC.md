@@ -14,12 +14,13 @@
 
 ---
 
-## 0. The 10 ambiguities this document settles
+## 0. The ambiguities this document settles
 
-The external validation report
-(`validation/vector_report.md`) identified 10 ambiguities (A–J) that
-caused friction when a fresh agent tried to build a `VectorView`
-from the SDK spec. This document settles each one. Cross-reference
+The external validation report (`validation/vector_report.md`)
+identified 10 ambiguities (A–J) that caused friction when a fresh
+agent tried to build a `VectorView` from the SDK spec. A second
+external validation (`validation/graph_challenge_report.md`)
+found 3 more (K–M). This document settles each one. Cross-reference
 table:
 
 | ID | Ambiguity | Settled in section |
@@ -34,6 +35,9 @@ table:
 | H | `history()` return shape | §6.2 |
 | I | `put_raw` semantics | §2.3 |
 | J | Commit object format | §7 |
+| K | Multi-key (multi-valued) indexes | §4.2.1 (new) |
+| L | Auto-key mode and primary-keyless Views | §2.6 (new) |
+| M | Cross-View read/write semantics | §8.1 (new) |
 
 ---
 
@@ -193,6 +197,85 @@ following conventions apply:
   Suggested patterns: `"node:{id}"`, `"user:{id}"`, `"order:{id}"`,
   `"edge:{from}:{to}:{type}"`. The SDK does not mandate a convention.
 
+### 2.6. Auto-key mode and primary-keyless Views (Ambiguity L)
+
+Pond Views require a primary key on every `put`. Some workloads
+(event logs, time-series, audit trails, append-only streams) have
+no natural primary key. For these, the SDK provides two ways to
+auto-generate keys:
+
+#### 2.6.1. `put_auto(data)` — auto-key on a regular View
+
+```python
+view = View(kernel, "events")
+key = view.put_auto({"event": "click", "user": "u1", "ts": 1721500000})
+# `key` is a 32-char hex string (UUID4 without dashes).
+# Retrieve later via:
+event = view.get(key)
+```
+
+`put_auto` is available on both `View` and `IndexedView`. It
+generates a UUID4 hex key, calls `put(key, data)` internally, and
+returns the generated key so the caller can retrieve the data later.
+
+The key is generated via `uuid.uuid4().hex` — 32 hex characters,
+~122 bits of entropy. Collisions are astronomically unlikely
+(~10^-37 probability for 10^12 records).
+
+#### 2.6.2. `KeylessView` — primary-keyless as a first-class mode
+
+```python
+from view_sdk import KeylessView
+
+view = KeylessView(kernel, "audit_log")
+key = view.put(None, {"action": "login", "user": "alice"})  # key MUST be None
+# or use put_many for batch inserts:
+keys = view.put_many([
+    {"action": "click", "user": "bob"},
+    {"action": "view", "user": "bob"},
+])
+view.commit("audit events")
+```
+
+`KeylessView` is a subclass of `View` that overrides `put` to
+require `key=None`. Passing a non-None key raises `TypeError` —
+if you want to supply your own keys, use the regular `View` class.
+
+`KeylessView.put(None, data)` is equivalent to `View.put_auto(data)`.
+The class exists to make primary-keyless mode a first-class design
+choice, not a per-call decision.
+
+#### 2.6.3. Indexed lookups on keyless data
+
+For keyless Views, lookups by primary key are usually meaningless
+(the caller doesn't have the auto-generated key). Instead, register
+indexes on fields WITHIN the data and use `find_by` / `find_all_by`:
+
+```python
+view = KeylessView(kernel, "events")
+# (KeylessView doesn't have register_index; use IndexedView if you
+# need auto-keying AND indexes.)
+idx_view = IndexedView(kernel, "events")
+idx_view.register_index("by_user", lambda d: d.get("user", ""), mode="lazy")
+idx_view.register_index("by_event", lambda d: d.get("event", ""), mode="lazy")
+
+k = idx_view.put_auto({"event": "click", "user": "alice"})
+idx_view.commit("insert")
+
+# Look up by indexed field — no need to know `k`:
+clicks = idx_view.find_by("by_event", "click")
+alice_events = idx_view.find_by("by_user", "alice")
+```
+
+#### 2.6.4. When to use which
+
+| Pattern | When to use |
+|---|---|
+| `View.put(key, data)` | You have a natural primary key (user_id, order_id). |
+| `View.put_auto(data)` | You mostly have keys but occasionally need auto (mixed workload). |
+| `KeylessView.put(None, data)` | You never have keys; the entire View is append-only. |
+| `IndexedView.put_auto(data)` + indexes | Append-only AND you need indexed lookups. |
+
 ---
 
 ## 3. Reading data (Ambiguity C: `get()` complexity)
@@ -317,6 +400,41 @@ index by it, add the primary key to the data before `put()`:
 view.put("user:1", {"id": "user:1", "name": "Alice"})
 view.register_index("by_id", lambda d: d["id"])
 ```
+
+### 4.2.1. Multi-key (multi-valued) indexes (Ambiguity K)
+
+The extractor may return either a single string or a **list of
+strings**. When it returns a list, the row is indexed under EACH
+key in the list. This is the "multi-key index" pattern.
+
+```python
+# Index a document by all of its tags (list-valued field)
+view.register_index("by_tag", lambda d: d.get("tags", []))
+
+view.put("doc1", {"title": "Arrow Guide", "tags": ["arrow", "storage", "perf"]})
+view.put("doc2", {"title": "Pond RFC",    "tags": ["storage", "kernel"]})
+view.put("doc3", {"title": "DuckDB Tips", "tags": ["arrow", "sql"]})
+view.commit("insert 3 docs")
+
+# Now find_by("by_tag", "arrow") returns doc1 OR doc3 (first match).
+# Use find_all_by("by_tag", "arrow") for all matches.
+arrow_doc = view.find_by("by_tag", "arrow")
+```
+
+Extractor return value semantics:
+
+| Return type | Behavior |
+|---|---|
+| `str` (single key) | Row indexed under that one key. Backward-compatible with the original single-key API. |
+| `list[str]` (multi-key) | Row indexed under each key in the list. Use for list-valued fields (tags, categories) or when one row should be findable via multiple lookup keys. |
+| `None` or `[]` (empty) | Row is NOT indexed. Use this to conditionally skip indexing (e.g., only index active users: `lambda d: d["user_id"] if d.get("active") else None`). |
+| Other types (int, etc.) | Coerced to string via `str()`. Avoid relying on this; always return `str` or `list[str]`. |
+
+For composite keys (e.g., `(col_a, col_b)`), use string concatenation
+with a separator: `lambda d: f"{d['a']}:{d['b']}"`. This gives
+prefix-scan capability on `col_a` but not on `col_b` alone. True
+multi-dimensional range queries require a Hilbert-curve
+materialization (see `docs/LIQUID_CLUSTERING_COMPARISON.md`).
 
 ### 4.3. Index modes (`IndexedView` only)
 
@@ -671,6 +789,69 @@ Use these helpers when you need to delete names (e.g., dropping a
 View, dropping a branch, dropping an index). The kernel itself does
 NOT have a `delete_name` primitive; tombstones are data, not a
 kernel feature. See RFC-0008 for the full rationale.
+
+### 8.1. Cross-View read/write semantics (Ambiguity M)
+
+The `CrossView` class (in `pond-sdk/view_sdk.py`) provides static
+methods for reading and writing across Views. Semantics:
+
+```python
+from view_sdk import CrossView
+
+# Read a single key from one View's current HEAD
+data = CrossView.read_from(source_view, "user:1")
+
+# Read all non-internal keys from one View's current HEAD
+all_data = CrossView.read_all_from(source_view)
+
+# Stage a write on a target View (does NOT commit; caller must commit)
+CrossView.write_to(target_view, "user:1", data)
+target_view.commit("copied user:1")
+
+# Zero-copy blob sharing: copy the HASH, not the CONTENT
+ok = CrossView.share_blob(from_view=source_view, from_key="user:1",
+                          to_view=target_view, to_key="user:1")
+# Both Views now reference the same kernel blob (content-addressed dedup)
+
+# Bulk copy: pipe all keys from source to target
+n = CrossView.pipe(source_view, target_view)
+# Or with a transformer (re-encode on the way through):
+n = CrossView.pipe(source_view, target_view,
+                   transformer=lambda k, v: (k.upper(), {"src": v}))
+target_view.commit(f"piped {n} keys")
+```
+
+**Five semantics rules (settled):**
+
+1. **Source = HEAD commit of the source View's currently-checked-out
+   branch.** CrossView does NOT take a commit-hash argument; it
+   always reads from the source View's current HEAD. To read from
+   a specific historical commit, check out that commit's branch
+   first, then call CrossView.
+
+2. **Tombstoned indexes are skipped.** `read_all_from` returns only
+   non-internal user keys (those NOT starting with `_`). Tombstoned
+   index References (which resolve to `TOMBSTONE_HASH`) are not
+   visible because they live in the root namespace, not in the
+   View's state.
+
+3. **Zero-copy sharing.** `share_blob` copies the blob HASH, not
+   the blob CONTENT. Both Views reference the same kernel blob
+   (content-addressed dedup for free). The blob's lifetime is the
+   union of the two Views' lifetimes — it is GC'd only when neither
+   View references it.
+
+4. **No cross-View atomicity.** `write_to` followed by `commit` on
+   the target View is atomic for the target, but there is no
+   cross-View atomic commit. If you need atomic multi-View commits,
+   use a higher-level coordinator (future RFC).
+
+5. **Pipe is non-transactional.** `pipe` reads the source's current
+   state at call time and writes to the target's staging area. The
+   target is NOT committed; the caller must call `to_view.commit()`
+   after `pipe` returns. If the source changes during the pipe, the
+   changes are NOT visible to the in-progress pipe (the state was
+   snapshotted at call time).
 
 ---
 

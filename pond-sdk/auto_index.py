@@ -33,7 +33,8 @@ import json
 import time
 import sys
 import os
-from typing import Optional, Any, Callable
+import uuid
+from typing import Optional, Any, Callable, Union
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,9 +45,17 @@ from maintenance import drop_name, is_dropped, resolve_active, TOMBSTONE_HASH
 
 
 class AutoIndex:
-    """Configuration for an automatic index."""
+    """Configuration for an automatic index.
 
-    def __init__(self, name: str, extractor: Callable[[Any], str],
+    The extractor may return either:
+      - a single string (single-key index): one row -> one index entry
+      - a list of strings (multi-key index): one row -> multiple index
+        entries, one per returned key. Use this to index list-valued
+        fields (e.g., tags, categories) or to allow the same row to
+        appear under multiple lookup keys.
+    """
+
+    def __init__(self, name: str, extractor: Callable[[Any], Union[str, list[str]]],
                  mode: str = "lazy", staleness_budget: int = 5,
                  incremental: bool = True):
         self.name = name
@@ -56,9 +65,29 @@ class AutoIndex:
         self.last_built_at_commit = -1  # commit index when last built
         self.tree_root: Optional[str] = None  # cached tree root
         self.incremental = incremental  # use incremental updates vs full rebuild
-        self.pending_additions: dict[str, str] = {}  # index_key → blob_hash (not yet merged)
+        self.pending_additions: dict[str, str] = {}  # index_key -> blob_hash (not yet merged)
         self.pending_deletions: set[str] = set()  # index_keys to remove
         self._cached_entries: Optional[dict[str, str]] = None  # in-memory cache of index entries
+
+    @staticmethod
+    def extract_keys(extractor, data) -> list[str]:
+        """Call the extractor and normalize the result to a list of keys.
+
+        Handles three cases:
+          - extractor returns a single str: wrap in a list.
+          - extractor returns a list of str: use as-is.
+          - extractor returns None or empty list: return [] (row not
+            indexed).
+        """
+        result = extractor(data)
+        if result is None:
+            return []
+        if isinstance(result, str):
+            return [result]
+        if isinstance(result, list):
+            return [str(k) for k in result if k is not None]
+        # Coerce other types (int, etc.) to string for safety
+        return [str(result)]
 
 
 class IndexedView:
@@ -88,14 +117,25 @@ class IndexedView:
     # Register auto-indexes
     # ------------------------------------------------------------------
 
-    def register_index(self, name: str, extractor: Callable[[Any], str],
+    def register_index(self, name: str, extractor: Callable[[Any], Union[str, list[str]]],
                        mode: str = "lazy", staleness_budget: int = 5) -> None:
         """Register an automatic index.
 
-        mode:
-          'eager' — rebuild on every commit (slow writes, fresh reads)
-          'lazy' — rebuild on read when stale (fast writes, eventually-fresh)
-          'background' — not implemented yet (would need a background thread)
+        Args:
+            name: the index name (appears in
+                `f"{view_name}__index__{name}"`).
+            extractor: function(decoded_data) -> str | list[str].
+                If a single string is returned, the row is indexed
+                under that one key. If a list of strings is returned,
+                the row is indexed under EACH key in the list
+                (multi-key index — useful for indexing list-valued
+                fields like tags or categories). If None or empty
+                list, the row is not indexed.
+            mode: 'eager' (rebuild on commit), 'lazy' (rebuild on
+                read when stale, default), 'background' (not yet
+                implemented).
+            staleness_budget: max commits before a lazy index is
+                rebuilt. Lower = fresher indexes but more rebuilds.
         """
         self._auto_indexes[name] = AutoIndex(name, extractor, mode, staleness_budget)
 
@@ -138,10 +178,22 @@ class IndexedView:
         # Track for incremental index updates
         for idx in self._auto_indexes.values():
             if idx.incremental and idx.tree_root is not None:
-                idx_key = idx.extractor(data)
-                full_key = f"_index/{idx.name}/{idx_key}"
-                idx.pending_additions[full_key] = blob_hash
+                # Multi-key aware: extractor may return one or many keys.
+                idx_keys = AutoIndex.extract_keys(idx.extractor, data)
+                for idx_key in idx_keys:
+                    full_key = f"_index/{idx.name}/{idx_key}"
+                    idx.pending_additions[full_key] = blob_hash
         return blob_hash
+
+    def put_auto(self, data: Any) -> str:
+        """Stage data with an auto-generated UUID4 key. Returns the key.
+
+        See View.put_auto for full documentation. The generated key is
+        a 32-char hex string (UUID4 without dashes).
+        """
+        key = uuid.uuid4().hex
+        self.put(key, data)
+        return key
 
     def put_raw(self, key: str, blob_hash: str) -> None:
         self.base.stage(key, blob_hash)
@@ -204,13 +256,15 @@ class IndexedView:
         if self.kernel.resolve(ref_name) == TOMBSTONE_HASH:
             return None
 
-        # Check staleness for LAZY mode
-        if idx.mode == "lazy":
+        # Build the index if it has never been built. This handles the
+        # case where an EAGER index was registered AFTER data was
+        # already committed (no commit has triggered the eager rebuild
+        # yet), and the LAZY case where this is the first read.
+        if idx.tree_root is None:
+            self._rebuild_index(idx)
+        elif idx.mode == "lazy":
             staleness = self._commit_count - idx.last_built_at_commit
-            if idx.tree_root is None:
-                # First build — full rebuild
-                self._rebuild_index(idx)
-            elif staleness > idx.staleness_budget:
+            if staleness > idx.staleness_budget:
                 # Stale beyond budget — full rebuild
                 self._rebuild_index(idx)
             elif idx.incremental and (idx.pending_additions or idx.pending_deletions):
@@ -252,15 +306,22 @@ class IndexedView:
     # ------------------------------------------------------------------
 
     def _rebuild_index(self, idx: AutoIndex) -> str:
-        """Rebuild an index from current data. Full O(N) scan. Populates cache."""
+        """Rebuild an index from current data. Full O(N) scan. Populates cache.
+
+        Multi-key aware: if the extractor returns a list, the row is
+        indexed under each key in the list. Multiple rows can map to
+        the same index_key (last writer wins for single-value lookup;
+        use find_all_by for multi-value lookups — see SDK_SPEC.md §4.4.1).
+        """
         state = self.base.read_all()
         index_entries = {}
         for pk, bh in state.items():
             if pk.startswith("_"):
                 continue
             data = self.decode(self.kernel.read_blob(bh))
-            idx_key = idx.extractor(data)
-            index_entries[f"_index/{idx.name}/{idx_key}"] = bh
+            idx_keys = AutoIndex.extract_keys(idx.extractor, data)
+            for idx_key in idx_keys:
+                index_entries[f"_index/{idx.name}/{idx_key}"] = bh
 
         idx.tree_root = ProllyTree.build(self.kernel, index_entries)
         idx.last_built_at_commit = self._commit_count

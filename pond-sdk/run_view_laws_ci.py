@@ -108,11 +108,84 @@ def make_semantic_view_contract(kernel) -> tuple:
     )
 
 
+def make_multikey_view_contract(kernel) -> tuple:
+    """Contract for IndexedView with a multi-key (list-returning) extractor.
+
+    Tests Phase B.3 multikey index support: extractor returns a list of
+    tags, and the row is indexed under each tag.
+    """
+    from auto_index import IndexedView
+    view = IndexedView(kernel, "ci_multikey")
+    view.register_index("by_tag",
+                         lambda d: d.get("tags", []),
+                         mode="eager")
+    view.register_index("by_id",
+                         lambda d: str(d.get("id", 0)),
+                         mode="eager")
+
+    def build_mat(name: str) -> bytes:
+        idx = view._auto_indexes.get(name)
+        if idx is None:
+            return b""
+        view._rebuild_index(idx)
+        return (idx.tree_root or "").encode()
+
+    return view, ViewContract(
+        name="ci_multikey",
+        encode=view.encode,
+        decode=view.decode,
+        put=view.put,
+        get=view.get,
+        delete=view.delete,
+        commit=view.commit,
+        keys=view.keys,
+        get_all=view.get_all,
+        list_materializations=lambda: ["by_tag", "by_id"],
+        build_materialization=build_mat,
+        sample_data=lambda i: {
+            "id": i,
+            "name": f"item-{i}",
+            "tags": [f"tag-{i % 3}", f"category-{i % 2}", "common"],
+        },
+    )
+
+
+def make_keyless_view_contract(kernel) -> tuple:
+    """Contract for KeylessView (primary-keyless, auto-generated UUID keys).
+
+    Tests Phase B.3 KeylessView: put(None, data) generates a UUID4 key.
+    """
+    from view_sdk import KeylessView
+    view = KeylessView(kernel, "ci_keyless")
+
+    def keyless_put(key, data):
+        # KeylessView requires key=None; the contract's put signature
+        # passes a key, so we ignore it and call view.put(None, data).
+        return view.put(None, data)
+
+    return view, ViewContract(
+        name="ci_keyless",
+        encode=view.encode,
+        decode=view.decode,
+        put=keyless_put,
+        get=view.get,
+        delete=view.delete,
+        commit=view.commit,
+        keys=view.keys,
+        get_all=view.get_all,
+        list_materializations=lambda: [],
+        build_materialization=None,
+        sample_data=lambda i: {"event": f"event-{i}", "ts": i * 1000},
+    )
+
+
 # Registry of View contracts to test
 VIEW_CONTRACTS = [
     ("Default View", make_default_view_contract),
     ("IndexedView", make_indexed_view_contract),
     ("SemanticView", make_semantic_view_contract),
+    ("Multikey IndexedView", make_multikey_view_contract),
+    ("KeylessView", make_keyless_view_contract),
 ]
 
 

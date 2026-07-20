@@ -19,7 +19,8 @@ import time
 import sys
 import os
 import hashlib
-from typing import Optional, Any, Callable
+import uuid
+from typing import Optional, Any, Callable, Union
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +62,26 @@ class View:
         blob_hash = self.kernel.write(self.encode(data))
         self.base.stage(key, blob_hash)
         return blob_hash
+
+    def put_auto(self, data: Any) -> str:
+        """Stage data with an auto-generated primary key. Returns the key.
+
+        The key is a 32-character hex string (UUID4 without dashes).
+        Use this when your data does not have a natural primary key
+        (event logs, time-series, append-only streams). The generated
+        key is returned so you can retrieve the data later via get(key).
+
+        This is a Layer 2 SDK convenience. The kernel still requires
+        a key; this method generates one on the caller's behalf.
+
+        The key is generated via uuid4 (random, ~122 bits of entropy).
+        Collisions are astronomically unlikely (~10^-37 probability
+        for 10^12 records).
+        """
+        key = uuid.uuid4().hex  # 32-char hex string, no dashes
+        blob_hash = self.kernel.write(self.encode(data))
+        self.base.stage(key, blob_hash)
+        return key
 
     def put_raw(self, key: str, blob_hash: str) -> None:
         self.base.stage(key, blob_hash)
@@ -207,32 +228,166 @@ class View:
 
 
 # ===========================================================================
+# KeylessView — primary-keyless View as a first-class mode
+# ===========================================================================
+
+class KeylessView(View):
+    """A View where primary keys are auto-generated, not user-supplied.
+
+    Use this when your data does not have a natural primary key:
+    event logs, time-series, metrics, append-only streams, audit
+    trails. The View generates a UUID4 for each row; the caller
+    receives the key from put() and can use it for later retrieval.
+
+    This is the first-class version of the auto-key pattern. Instead
+    of calling `view.put_auto(data)` on a regular View, you construct
+    a KeylessView and call `view.put(data)` — the key generation is
+    built into the put path.
+
+    Internally, KeylessView just overrides put() to delegate to
+    put_auto(). All other View operations (get, delete, branch, merge,
+    history, indexes) work unchanged. The View's state space is the
+    same as a regular View; the only difference is the put() signature.
+
+    For indexed lookups on KeylessView data, register indexes on
+    fields WITHIN the data (e.g., a timestamp, a user_id). Use
+    find_by / find_all_by to query without knowing the primary key.
+    """
+
+    def put(self, key: Optional[str], data: Any) -> str:
+        """Stage data with an auto-generated key. Returns the key.
+
+        Args:
+            key: MUST be None for KeylessView. Passing a non-None key
+                raises TypeError — if you want to supply your own
+                keys, use the regular `View` class instead.
+            data: the data to store.
+
+        Returns:
+            The auto-generated 32-char hex key (UUID4 without dashes).
+            Use this key to retrieve the data via get(key) later.
+        """
+        if key is not None:
+            raise TypeError(
+                "KeylessView.put() does not accept a key. "
+                "Pass key=None, or use the regular View class if you "
+                "want to supply your own keys."
+            )
+        return self.put_auto(data)
+
+    def put_many(self, rows: list[Any]) -> list[str]:
+        """Stage multiple rows, each with an auto-generated key.
+
+        Args:
+            rows: list of data values to store.
+
+        Returns:
+            List of generated keys, one per row.
+        """
+        return [self.put_auto(row) for row in rows]
+
+
+# ===========================================================================
 # CrossView — read/write across Views
 # ===========================================================================
 
 class CrossView:
+    """Cross-View read/write operations.
+
+    Semantics (settled per Phase B.3 SDK polish):
+
+    - **Source = HEAD commit of the source View's currently-checked-out
+      branch.** CrossView does NOT take a commit-hash argument; it
+      always reads from the source View's current HEAD. To read from
+      a specific historical commit, check out that commit's branch
+      first, then call CrossView.
+    - **Tombstoned indexes are skipped.** If `from_view` has tombstoned
+      indexes (per RFC-0008), `read_all_from` returns only non-internal
+      user keys; tombstoned index References are excluded (they start
+      with `{view_name}__index__` and resolve to TOMBSTONE_HASH).
+    - **Zero-copy sharing.** `share_blob` copies the blob HASH, not
+      the blob CONTENT. The two Views now reference the same kernel
+      blob (content-addressed dedup for free).
+    - **No cross-View atomicity.** A `write_to` followed by a `commit`
+      on the target View is atomic for the target, but there is no
+      cross-View atomic commit. If you need atomic multi-View commits,
+      use a higher-level coordinator (future RFC).
+    - **Pipe is non-transactional.** `pipe` reads the source's current
+      state at call time and writes to the target's staging area. The
+      target is NOT committed; the caller must call `to_view.commit()`
+      after `pipe` returns.
+    """
     @staticmethod
     def read_from(view: View, key: str) -> Optional[Any]:
+        """Read a single key from the view's current HEAD.
+
+        Returns None if the key does not exist or was deleted.
+        """
         return view.get(key)
+
     @staticmethod
     def read_all_from(view: View) -> dict[str, Any]:
+        """Read all non-internal keys from the view's current HEAD.
+
+        Keys starting with `_` (internal: schema, index metadata,
+        semantic definitions) are excluded. Tombstoned names are
+        excluded (they are not in `view.get_all()` because `get_all`
+        walks the View state, not the root namespace).
+        """
         return view.get_all()
+
     @staticmethod
     def write_to(view: View, key: str, data: Any) -> str:
+        """Stage a write on the target view. Does NOT commit.
+
+        The caller must call `view.commit(message)` after one or more
+        `write_to` calls to make the changes durable.
+        """
         return view.put(key, data)
+
     @staticmethod
-    def share_blob(from_view: View, from_key: str, to_view: View, to_key: str) -> bool:
+    def share_blob(from_view: View, from_key: str,
+                    to_view: View, to_key: str) -> bool:
+        """Zero-copy: share a blob's HASH from one View to another.
+
+        The blob's CONTENT is not copied. Both Views now reference
+        the same kernel blob (content-addressed dedup for free).
+
+        Returns True if the source key existed and the share succeeded,
+        False if the source key was not found.
+
+        The target View's staging area is updated; the caller must
+        call `to_view.commit(message)` to make the share durable.
+        """
         h = from_view.base.lookup(from_key)
-        if h is None: return False
+        if h is None:
+            return False
         to_view.put_raw(to_key, h)
         return True
+
     @staticmethod
     def pipe(from_view: View, to_view: View,
              transformer: Optional[Callable] = None) -> int:
+        """Copy all non-internal keys from `from_view` to `to_view`.
+
+        If `transformer` is None: zero-copy share (each blob hash is
+        staged directly via `put_raw`, no re-encoding).
+
+        If `transformer` is provided: re-encode path. The transformer
+        receives `(key, decoded_data)` and returns `(new_key, new_data)`.
+        The new_data is re-encoded via `to_view.encode` and written as
+        a new blob.
+
+        The target View's staging area is updated; the caller must
+        call `to_view.commit(message)` to make the pipe durable.
+
+        Returns the number of keys copied.
+        """
         state = from_view.base.read_all()
         count = 0
         for key, h in state.items():
-            if key.startswith("_"): continue
+            if key.startswith("_"):
+                continue
             if transformer:
                 data = from_view.decode(from_view.kernel.read_blob(h))
                 to_key, to_data = transformer(key, data)
