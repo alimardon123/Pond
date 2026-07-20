@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "libraries"))
 from pond_minimal import PondMinimal
 from auto_index import IndexedView
-from view_sdk import CrossView, OssieSemanticView
+from view_sdk import CrossView, SemanticView
 
 
 @dataclass
@@ -217,7 +217,7 @@ class FeatureStore(IndexedView):
     # Semantic model integration
     # ------------------------------------------------------------------
 
-    def register_with_semantic_view(self, semantic: OssieSemanticView) -> None:
+    def register_with_semantic_view(self, semantic: SemanticView) -> None:
         """Register features as semantic metrics/dimensions."""
         for feat_name in self.list_features():
             feat = self.get_feature_definition(feat_name)
