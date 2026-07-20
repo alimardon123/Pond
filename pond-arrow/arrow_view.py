@@ -495,10 +495,17 @@ def _test_arrow_interop():
     view.put_row("o3", {"product": "Widget", "amount": 50, "region": "US"})
     view.commit("insert 3 orders")
 
-    df = view.to_pandas()
-    assert len(df) == 3
-    assert "product" in df.columns
-    assert (df["product"] == "Widget").sum() == 2
+    # pandas interop (graceful skip if pandas not installed, matching
+    # the DuckDB and Polars test pattern)
+    try:
+        import pandas as pd  # noqa: F401 — just checking availability
+        df = view.to_pandas()
+        assert len(df) == 3
+        assert "product" in df.columns
+        assert (df["product"] == "Widget").sum() == 2
+        print("PASS: ArrowView interoperates with pandas (DataFrame conversion)")
+    except ImportError:
+        print("SKIP: pandas not installed; skipping pandas interop test")
 
     try:
         import duckdb

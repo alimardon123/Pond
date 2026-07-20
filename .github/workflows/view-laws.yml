@@ -23,8 +23,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # pyarrow is required for the ArrowView adapter tests.
-          # duckdb and polars are optional but tested when present.
-          pip install pyarrow duckdb polars
+          # duckdb, polars, and pandas are tested when present (interop
+          # tests gracefully skip if any are missing, but we install all
+          # so the tests actually exercise the interop paths).
+          pip install pyarrow duckdb polars pandas
 
       - name: Run view_laws.py CI harness (5 SDK Views)
         run: python pond-sdk/run_view_laws_ci.py
