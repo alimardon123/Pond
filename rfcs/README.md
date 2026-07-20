@@ -8,25 +8,29 @@ authoritative source for its topic.
 
 | RFC | Title | Status |
 |---|---|---|
-| RFC-0001 | What Is a View? | Draft |
+| RFC-0001 | What Is a View? | Draft (superseded by RFC-0007) |
 | RFC-0002 | Elegance Metrics | Draft |
-| RFC-0003 | Kernel Specification (Frozen) | Accepted |
+| RFC-0003 | Kernel Specification (Frozen) | **Accepted** |
 | RFC-0004 | View Composition and Interoperability | Draft |
-| RFC-0005 | Derived Structure Calculus | Draft |
+| RFC-0005 | Materialization Calculus (renamed from Derived Structures) | Draft |
 | RFC-0006 | Layered Architecture | Draft |
+| RFC-0007 | View Algebra | Draft |
+| RFC-0008 | Deletion as Data | Draft |
+| RFC-0009 | Architecture Metrics | Draft |
 
 ## Reference Documents (not RFCs — supporting material)
 
 | Document | Purpose |
 |---|---|
-| FORMAL_SPEC.md | 5 storage laws + 7 composition laws + preconditions/postconditions |
-| FORMAL_ALGEBRA.md | Mathematical definition + 8 theorems + lower-bound proof + equivalence analysis |
-| VIEW_AUTHORS_GUIDE.md | 6 guarantees + 7 conventions + 12 unspecified (the View boundary) |
-| VIEW_INTEROP_SPEC.md | 10 ambiguities from independent implementation, classified |
-| REJECTED_DESIGNS.md | 15 rejected architectural decisions with reasons |
-| NON_GOALS.md | 15 things Pond deliberately does NOT solve |
-| PEER_COMPARISON.md | vs Git, Irmin, IPFS, LakeFS, FDB, Dolt |
-| PROBLEM_TAXONOMY.md | 7 categories for classifying all issues |
+| `DESIGN_GOALS.md` (top-level) | Six design principles + repo map; **read this first** |
+| `FORMAL_SPEC.md` | 5 storage laws + 7 composition laws + preconditions/postconditions |
+| `FORMAL_ALGEBRA.md` | Mathematical definition + 8 theorems + lower-bound proof + equivalence analysis |
+| `VIEW_AUTHORS_GUIDE.md` | 6 guarantees + 7 conventions + 12 unspecified (the View boundary) |
+| `VIEW_INTEROP_SPEC.md` | 10 ambiguities from independent implementation, classified |
+| `REJECTED_DESIGNS.md` | 15+ rejected architectural decisions with reasons |
+| `NON_GOALS.md` | 15 things Pond deliberately does NOT solve |
+| `PEER_COMPARISON.md` | vs Git, Irmin, IPFS, LakeFS, FDB, Dolt |
+| `PROBLEM_TAXONOMY.md` | 7 categories for classifying all issues |
 
 ## RFC Process
 

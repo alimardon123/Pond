@@ -1,4 +1,4 @@
-# RFC-0005: Derived Structure Calculus
+# RFC-0005: Materialization Calculus
 
 ## Status
 
@@ -9,8 +9,21 @@ the lower-bound proof.
 
 Every auxiliary object in Pond (indexes, materialized views, statistics,
 bloom filters, feature vectors, semantic aggregates, search indexes,
-zone maps, histograms) is the same thing: a **derived structure** — a
+zone maps, histograms) is the same thing: a **materialization** — a
 function of a snapshot. This RFC formalizes that unification.
+
+> **Terminology note (post-review):** This RFC was originally titled
+> "Derived Structure Calculus." The architecture review (see
+> `DESIGN_GOALS.md` and `worklog.md`) recommended adopting the
+database-literature term "materialization" — the same concept used by
+> materialized views, materialized features, materialized aggregates.
+> The calculus `materialization = f(snapshot)` is more elegant and
+> aligns with industry vocabulary. The old term "derived structure"
+> remains as a synonym in earlier documents; new work uses
+> "materialization."
+>
+> In RFC-0007 (View Algebra), materializations are the `M` component
+> of the View 5-tuple `V = (Σ, A, E, D, M)`.
 
 ---
 
@@ -35,16 +48,16 @@ derived = f(snapshot)
 ```
 
 A snapshot is a point-in-time view of a View's state (a commit hash).
-A derived structure is any object computed from that snapshot.
+A materialization is any object computed from that snapshot.
 
 ---
 
 ## 2. Formal Definition
 
-A **Derived Structure** D is a 4-tuple:
+A **Materialization** M is a 4-tuple:
 
 ```
-D = (Source, Function, Trigger, Storage)
+M = (Source, Function, Trigger, Storage)
 ```
 
 where:
@@ -72,32 +85,32 @@ where:
 
 ---
 
-## 3. The Derived Structure Laws
+## 3. The Materialization Laws
 
 ### Law 1: Determinism
 ```
-∀ snapshot S: Function(S) = D
+∀ snapshot S: Function(S) = M
 ```
-The same snapshot always produces the same derived structure. This is
+The same snapshot always produces the same materialization. This is
 guaranteed by content-addressing: the same keys→hashes always produce
 the same derived bytes.
 
 ### Law 2: Derivability
 ```
-∀ D: ∃ S such that Function(S) = D
+∀ M: ∃ S such that Function(S) = M
 ```
-Every derived structure can be recomputed from its source snapshot.
-If the derived structure is lost, it can be rebuilt. This is the
-"derived = cache" principle — derived structures are never canonical.
+Every materialization can be recomputed from its source snapshot.
+If the materialization is lost, it can be rebuilt. This is the
+"materialization = cache" principle — materializations are never canonical.
 
 ### Law 3: Staleness
 ```
 If Source changes from S₁ to S₂, then:
-  D₁ = Function(S₁)  (stale)
-  D₂ = Function(S₂)  (fresh)
-  D₁ ≠ D₂ (unless Function is constant for S₁ and S₂)
+  M₁ = Function(S₁)  (stale)
+  M₂ = Function(S₂)  (fresh)
+  M₁ ≠ M₂ (unless Function is constant for S₁ and S₂)
 ```
-A derived structure may be stale (computed from an old snapshot).
+A materialization may be stale (computed from an old snapshot).
 Staleness is bounded by the Trigger policy:
 - Eager: staleness = 0 (always fresh)
 - Lazy with budget K: staleness ≤ K commits
@@ -105,24 +118,24 @@ Staleness is bounded by the Trigger policy:
 
 ### Law 4: Independence
 ```
-Derived structures do not affect the source snapshot.
+Materializations do not affect the source snapshot.
 ```
-Computing, updating, or deleting a derived structure does NOT modify
+Computing, updating, or deleting a materialization does NOT modify
 the data it was derived from. (Kernel Law 1: immutability + Law 4:
 references don't mutate objects.)
 
 ### Law 5: Composability
 ```
-If D₁ = f₁(S) and D₂ = f₂(D₁), then D₂ = (f₂ ∘ f₁)(S)
+If M₁ = f₁(S) and M₂ = f₂(M₁), then M₂ = (f₂ ∘ f₁)(S)
 ```
-Derived structures can be derived from other derived structures.
-Example: a search index (D₂) derived from a materialized view (D₁)
+Materializations can be derived from other materializations.
+Example: a search index (M₂) derived from a materialized view (M₁)
 derived from a table (S). The composition f₂ ∘ f₁ is itself a
-derived structure.
+materialization.
 
 ---
 
-## 4. Unification: everything is a Derived Structure
+## 4. Unification: everything is a Materialization
 
 | Current concept | Source | Function | Trigger | Storage |
 |---|---|---|---|---|
@@ -137,7 +150,7 @@ derived structure.
 | Histogram | View snapshot | bucket values | lazy | JSON blob |
 | Vector index (HNSW) | Vector View | build ANN graph | eager | Binary blob |
 
-**ALL of these are the same abstraction:** `derived = f(snapshot)`.
+**ALL of these are the same abstraction:** `materialization = f(snapshot)`.
 
 The only differences are:
 1. The Function (what to compute)
@@ -146,11 +159,11 @@ The only differences are:
 
 ---
 
-## 5. The DerivedStructure API
+## 5. The Materialization API
 
 ```python
-class DerivedStructure:
-    """A derived structure: f(snapshot) → stored result."""
+class Materialization:
+    """A materialization: f(snapshot) → stored result."""
 
     def __init__(self, name: str, source_view: View,
                  function: Callable[[dict], bytes],
@@ -189,12 +202,12 @@ class DerivedStructure:
 
 ## 6. What this unification gives us
 
-### 6.1. One API for all derived structures
+### 6.1. One API for all materializations
 Instead of separate APIs for indexes, statistics, bloom filters, etc.,
-there's one API: `DerivedStructure(name, source, function, trigger)`.
+there's one API: `Materialization(name, source, function, trigger)`.
 
 ### 6.2. One set of laws
-All derived structures satisfy the same 5 laws (determinism, derivability,
+All materializations satisfy the same 5 laws (determinism, derivability,
 staleness, independence, composability). No special cases.
 
 ### 6.3. One trigger policy
@@ -203,48 +216,48 @@ a bloom filter can be eager; a histogram can be manual. Same mechanism.
 
 ### 6.4. Composability
 A search index can be derived from a materialized view (which is derived
-from a table). The composition is itself a derived structure. No special
-"derived-from-derived" API needed.
+from a table). The composition is itself a materialization. No special
+"materialization-of-materialization" API needed.
 
 ### 6.5. GC simplification
-All derived structures are rebuildable from their source. GC can safely
-delete any derived structure — it will be rebuilt on next access. This
+All materializations are rebuildable from their source. GC can safely
+delete any materialization — it will be rebuilt on next access. This
 simplifies the GC story (Composition Law 3: GC reachability).
 
-### 6.6. The "Derived Structure" admission rule
-A new concept enters the Derived Structure layer if and only if:
+### 6.6. The "Materialization" admission rule
+A new concept enters the Materialization layer if and only if:
 1. It is a function of a snapshot (deterministic, derivable)
 2. It is NOT the source data itself (not canonical)
 3. It can be rebuilt from the source (lossless re-derivation)
 
-If a concept fails any criterion, it's NOT a derived structure — it's
+If a concept fails any criterion, it's NOT a materialization — it's
 either source data (canonical) or a View (has its own commit history).
 
 ---
 
 ## 7. Relationship to the Kernel
 
-Derived structures are **entirely above the kernel**. The kernel knows
+Materializations are **entirely above the kernel**. The kernel knows
 nothing about them. The kernel provides:
 - Write (to store derived data as blobs)
 - Read (to retrieve derived data)
 - Reference (to name derived data)
 
-The Derived Structure layer sits between the kernel and the View layer:
+The Materialization layer sits between the kernel and the View layer:
 ```
 Kernel (3 primitives)
-  → Derived Structure Layer (f(snapshot) → stored result)
+  → Materialization Layer (f(snapshot) → stored result)
     → View Layer (domain-specific logic)
 ```
 
-Or, more accurately, Derived Structures are used BY Views:
+Or, more accurately, Materializations are used BY Views:
 ```
 Kernel
   → ProllyViewBase (versioning, branching, history)
-    → View (domain logic + Derived Structures for optimization)
+    → View (domain logic + Materializations for optimization)
 ```
 
-A View uses Derived Structures for:
+A View uses Materializations for:
 - Indexes (fast lookups)
 - Statistics (query optimization)
 - Bloom filters (skip unnecessary reads)
@@ -274,5 +287,5 @@ All of these are `f(snapshot)` — derived, rebuildable, non-canonical.
    what's the propagation order? This is a build-system problem
    (like Make/Bazel). Could Pond adopt a similar model?
 
-These are research questions. The Derived Structure Calculus is the
+These are research questions. The Materialization Calculus is the
 starting point, not the final answer.
