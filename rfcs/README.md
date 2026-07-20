@@ -17,6 +17,7 @@ authoritative source for its topic.
 | RFC-0007 | View Algebra | **Accepted** (verified by `view_laws.py` CI harness) |
 | RFC-0008 | Deletion as Data | Draft |
 | RFC-0009 | Architecture Metrics | Draft |
+| RFC-0010 | ArrowView (Phase D Compatibility Adapter) | **Accepted** (verified by `pond-arrow/run_arrow_view_laws.py`) |
 
 ## Reference Documents (not RFCs — supporting material)
 

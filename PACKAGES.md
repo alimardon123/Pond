@@ -37,6 +37,9 @@ pond/
 ├── pond-feature-store/         # Layer 3: Domain — ML Feature Store
 ├── pond-semantic/              # Layer 3: Domain — Semantic models
 ├── pond-vector/                # Layer 3: Domain — Vector DB (external validation)
+├── pond-arrow/                 # Layer 3: Domain — Arrow IPC adapter (Phase D compatibility)
+│   ├── arrow_view.py           # ArrowView (View Algebra + Arrow ecosystem interop)
+│   └── run_arrow_view_laws.py  # view_laws.py harness runner for ArrowView
 │
 ├── rfcs/                       # Architecture specifications
 │   ├── RFC-0001-what-is-a-view.md          # Draft (superseded by RFC-0007)
@@ -45,11 +48,14 @@ pond/
 │   ├── RFC-0004-view-composition.md
 │   ├── RFC-0005-derived-structures.md      # Renamed to Materialization Calculus
 │   ├── RFC-0006-layered-architecture.md
-│   ├── RFC-0007-view-algebra.md            # Formal 5-tuple + 6 laws
+│   ├── RFC-0007-view-algebra.md            # ACCEPTED (verified by view_laws.py)
 │   ├── RFC-0008-deletion-as-data.md        # Tombstones; no fourth primitive
-│   └── RFC-0009-architecture-metrics.md    # Measurable design metrics
+│   ├── RFC-0009-architecture-metrics.md    # Measurable design metrics
+│   └── RFC-0010-arrowview.md               # ACCEPTED (Phase D compatibility adapter)
 │
 ├── docs/                       # Reference documents
+│   ├── ... (FORMAL_SPEC, FORMAL_ALGEBRA, NON_GOALS, etc.)
+│   └── LIQUID_CLUSTERING_COMPARISON.md  # Databricks Liquid Clustering vs Pond analysis
 ├── engineering/                # Engineering milestones (concurrency, GC, S3)
 ├── validation/                 # External validation (vector challenge + report)
 ├── destruction/                # Historical destruction-phase experiments
