@@ -54,7 +54,23 @@ from binary_encoding import BinaryProllyTree
 # ---------------------------------------------------------------------------
 
 TARGET_CHUNK_ENTRIES = 64       # target entries per leaf chunk (~4KB for 64-byte entries)
-COMPACTION_THRESHOLD = 4        # compact after this many delta entries
+# COMPACTION_THRESHOLD = 4 would mean: write delta commits for 3 commits,
+# then a snapshot on the 4th. This optimizes for write speed but penalizes
+# lookups (must walk the delta chain to find the snapshot).
+#
+# For object-store readiness, we set COMPACTION_THRESHOLD = 1: EVERY commit
+# is a snapshot. This eliminates the commit-chain walk in lookup (the #1
+# object-store cost identified by the Cost Simulator). Lookups become
+# O(log N) with no chain walk — just HEAD → commit → tree → leaf → blob.
+#
+# Tradeoff: commits are O(N) (must build a full Prolly tree every time)
+# instead of O(1) (delta only). On local disk this is fast. On object
+# storage, the Prolly tree is content-addressed and deduped (unchanged
+# chunks are shared), so only changed chunks are written.
+#
+# The delta journal code is preserved for future use (e.g., a local-disk
+# mode that optimizes for write speed), but the default is always-snapshot.
+COMPACTION_THRESHOLD = 1  # always snapshot — eliminates commit-chain walk
 ROLLING_HASH_WINDOW = 48        # window size for boundary detection
 ROLLING_HASH_MASK = (1 << 16) - 1  # 16-bit mask → ~1/65536 boundary probability
 # But we want ~1/TARGET_CHUNK_ENTRIES probability, so adjust:
@@ -321,25 +337,29 @@ class ProllyViewBase:
 
     def lookup(self, key: str) -> Optional[str]:
         """
-        Look up a single key. O(log N) Prolly tree + O(K) via delta journal.
+        Look up a single key.
 
-        Path:
-        1. Walk commits from HEAD, applying deltas (O(K) where K ≤ COMPACTION_THRESHOLD)
-        2. If key found in a delta, return it
-        3. If key marked as deleted in a delta, return None
-        4. When we reach a snapshot, look up in the Prolly tree (O(log N))
+        With COMPACTION_THRESHOLD=1 (always-snapshot), this is:
+          1. HEAD resolve (1 HEAD)
+          2. Read commit (1 GET) → get snapshot root
+          3. Walk Prolly tree to leaf (O(log N) GETs)
+          4. Return the blob hash
+
+        Total: 1 HEAD + 1 GET (commit) + O(log N) GETs (tree) = O(log N) RTTs.
+        No commit-chain walk needed — every commit is a snapshot.
+
+        If a delta commit is encountered (e.g., from old data with
+        COMPACTION_THRESHOLD > 1), the code falls back to the chain walk.
         """
         head = self.kernel.resolve(self.name)
         if not head:
             return None
 
         current = head
-        steps = 0
         while current:
             commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
-            steps += 1
 
-            # Check delta
+            # Check delta (for backward compat with old delta commits)
             delta = commit.get("delta")
             if delta:
                 if key in delta.get("+", {}):
@@ -347,7 +367,7 @@ class ProllyViewBase:
                 if key in delta.get("-", []):
                     return None
             else:
-                # This is a snapshot commit — look up in the Prolly tree
+                # This is a snapshot commit — look up in the Prolly tree directly
                 snapshot_root = commit.get("snapshot")
                 if snapshot_root:
                     return ProllyTree.lookup(self.kernel, snapshot_root, key)
@@ -355,15 +375,7 @@ class ProllyViewBase:
                 return None
 
             current = commit.get("parent")
-            # REMOVED the old safety valve (steps > COMPACTION_THRESHOLD + 1).
-            # That valve was WRONG: it stopped the walk before reaching the
-            # snapshot commit, causing keys to be "not found" at scale.
-            # The walk MUST continue until we find a snapshot commit (which
-            # has the full state). The snapshot is at most
-            # COMPACTION_THRESHOLD commits back, but we walk until we find it.
 
-        # We reached the end of the commit chain without finding a snapshot
-        # or the key. Return None.
         return None
 
     # ------------------------------------------------------------------
@@ -371,18 +383,30 @@ class ProllyViewBase:
     # ------------------------------------------------------------------
 
     def read_all(self) -> dict[str, str]:
-        """Read the complete current state. O(N/chunk + K) GETs."""
+        """Read the complete current state.
+
+        With COMPACTION_THRESHOLD=1 (always-snapshot), this reads the
+        snapshot tree directly — no delta walk needed. 1 GET (commit) +
+        O(N/chunk_size) GETs (tree leaves).
+        """
         head = self.kernel.resolve(self.name)
         if not head:
             return {}
 
-        # Collect delta commits until we find a snapshot
+        # Read HEAD commit
+        commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(head))
+
+        # If HEAD is a snapshot, read the tree directly (the common case)
+        snapshot_root = commit.get("snapshot")
+        if snapshot_root:
+            return ProllyTree.read_all(self.kernel, snapshot_root)
+
+        # Fallback: HEAD is a delta (old data) — walk the chain
         deltas = []
         current = head
         while current:
             commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
             if commit.get("snapshot"):
-                # Found the snapshot — read the Prolly tree
                 state = ProllyTree.read_all(self.kernel, commit["snapshot"])
                 break
             elif commit.get("delta"):
@@ -394,7 +418,6 @@ class ProllyViewBase:
         else:
             state = {}
 
-        # Apply deltas in reverse (oldest first)
         for delta in reversed(deltas):
             for k, h in delta.get("+", {}).items():
                 state[k] = h

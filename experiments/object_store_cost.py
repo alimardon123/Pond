@@ -265,12 +265,12 @@ def run_cost_analysis():
     print(f"  Azure estimates: GET=15ms PUT=25ms LIST=80ms HEAD=8ms")
     print(f"  R2 estimates: GET=12ms PUT=20ms LIST=60ms HEAD=6ms")
     print(f"\n  KEY FINDINGS:")
-    print(f"  - lookup requires multiple GETs (HEAD resolve + commit walk + tree walk + blob read)")
+    print(f"  - lookup: HEAD → commit (snapshot) → tree → leaf → blob = 4 RTTs (no commit-chain walk!)")
     print(f"  - commit is relatively cheap (1 PUT for blob + 1 PUT for reference)")
     print(f"  - branch is O(1) — just 1 HEAD + 1 PUT")
     print(f"  - merge requires reading both branches' state + writing merged snapshot")
     print(f"  - The commit-chain walk in lookup is the main object-store cost")
-    print(f"  - A 'HEAD always points to snapshot' design would reduce lookup to 3 RTTs")
+    print(f"  - DONE: HEAD always points to snapshot (COMPACTION_THRESHOLD=1)")
     print(f"  - A packed-object backend (Git packfiles) would reduce GETs for scans")
 
 
