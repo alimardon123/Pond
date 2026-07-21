@@ -451,3 +451,33 @@ Task: Phase B.4 SDK hardening + Phase E flagship (Feature Store to production qu
 ## Stage Summary
 
 Phase B.4 (SDK hardening) + Phase E (Feature Store flagship) complete. SDK_SPEC.md now has 17 hardening notes across put_auto (5), multikey (6), and CrossView (6) — future agents cannot reintroduce ambiguity. Feature Store is now production-quality: schema validation prevents corrupt data, feature versioning enables reproducible ML, point-in-time JOIN prevents label leakage (THE killer feature), batch online serving is 500x faster than naive, O(1) freshness via cache, and data survives process restart. All 7 production test sections pass. RFC-0011 Accepted. No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). pond-feature-store is removable (depends only on pond-sdk). Per user's sequencing, did NOT add more adapters and did NOT revisit replication. Next (per user's step 4): only after the flagship stabilizes, add one more external adapter OR revisit deeper replication work.
+
+---
+Task ID: 17
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Feature Store as polished, measurable, end-to-end reference product. Run it through a real ML workflow + write one compact reference use case document.
+
+## Work Log
+
+1. Read user's guidance: (1) make Feature Store the canonical reference implementation, run it through a real ML workflow end-to-end (ingest, version, point-in-time training set, online serving, freshness, restart, cross-view reads); (2) stop adding new framework surface; (3) write one compact reference use case document (NOT an RFC); (4) keep replication/Raft on hold until "what is replicated?" is answered.
+2. Wrote pond-feature-store/e2e_workflow.py (~400 LOC): a complete end-to-end ML workflow for e-commerce fraud detection. Exercises every production feature in a single narrative across 12 steps:
+   - Step 1: Source data ingestion (1000 synthetic orders as a source View)
+   - Step 2: Feature definitions (5 features with types, sources, transformations + entity registry)
+   - Step 3: Feature value writing (3 batch compute runs at different snapshot timestamps)
+   - Step 4: Feature versioning (redefine is_high_value_customer: threshold $500 -> $1000, v1 -> v2)
+   - Step 5: Point-in-time training set generation (200 events, label leakage check passes)
+   - Step 6: Online serving (single-entity real-time inference, 4.5ms)
+   - Step 7: Batch serving (50 customers x 5 features via get_feature_matrix, 12.6ms)
+   - Step 8: Freshness monitoring (O(1) per feature via cache)
+   - Step 9: Cross-View reads (ArrowView -> DuckDB SQL analytics)
+   - Step 10: Lineage (source -> feature -> transformation for all 5 features)
+   - Step 11: Persistence (close kernel, reopen, verify all 5 features + 800 entries + versioning + entity types + point-in-time JOIN survived)
+   - Step 12: Schema validation (3 bad writes rejected: string->float, 3.7->int, undefined feature)
+3. Ran the workflow. All 12 steps pass. Pseudo-model output shows sensible fraud signals: customer_total_spent ratio (fraud/clean) = 1.52, customer_order_count ratio = 1.32. Label leakage check: 0/5 first-ever orders have leaked features (expected 0). Persistence: 5 features + 800 entries survived restart, versioning [1,2] survived, entity types survived, point-in-time JOIN still works after restart.
+4. Wrote docs/FEATURE_STORE_USE_CASE.md (~350 lines): compact reference use case document. NOT an RFC. Covers: scenario (e-commerce fraud detection), input data, feature definitions, batch compute, versioning, point-in-time training set creation (with the label leakage check), online serving (with measured latency), batch serving (with measured latency), freshness monitoring, cross-view reads (ArrowView -> DuckDB), lineage, persistence, schema validation. Includes a measurements summary table and a "what this use case does NOT cover" section (streaming, transformations, materialized tables, distributed coordination, liquid-clustering materialization).
+5. Added e2e_workflow.py and feature_store.py to the CI workflow (.github/workflows/view-laws.yml) as mandatory test steps. CI now runs 8 test commands: view_laws CI (5 Views), ArrowView view_laws, GraphView view_laws, ArrowView functional, tombstone tests, Feature Store production tests, Feature Store e2e workflow.
+6. Appended this worklog entry.
+
+## Stage Summary
+
+Feature Store is now a polished, measurable, end-to-end reference product. The e2e_workflow.py script runs a realistic ML workflow (e-commerce fraud detection) through all 12 production features in a single narrative, with measured latencies (4.5ms online, 12.6ms batch, O(1) freshness). All steps pass. The reference use case document (docs/FEATURE_STORE_USE_CASE.md) captures the workflow compactly for future agents and external reviewers. The platform story holds up: one copy of data on the kernel serves online inference, offline training, batch scoring, SQL analytics, and lineage — without duplication or ETL. Per user's guidance: did NOT add new framework surface, did NOT write a new RFC, did NOT revisit replication. The Feature Store is now soaking as the canonical reference implementation. Next (only when ready): either one more external adapter (if it reveals a genuinely new compatibility problem) OR revisit replication (only after answering "what is replicated?").

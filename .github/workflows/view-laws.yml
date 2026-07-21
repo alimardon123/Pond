@@ -42,3 +42,9 @@ jobs:
 
       - name: Run tombstone helper tests (RFC-0008)
         run: python pond-sdk/maintenance.py
+
+      - name: Run Feature Store production tests (RFC-0011)
+        run: python pond-feature-store/feature_store.py
+
+      - name: Run Feature Store end-to-end ML workflow
+        run: python pond-feature-store/e2e_workflow.py
