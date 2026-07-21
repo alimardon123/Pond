@@ -563,3 +563,31 @@ Task: Acknowledge Phase F roadmap shift (features -> evidence) + implement elega
 ## Stage Summary
 
 Phase F roadmap shift documented in DESIGN_GOALS.md. The elegant cross-view reading API (ViewQuery) is the concrete ask from the user's review. It makes a View feel like a collection: `for row in view`, `view.where(region="US")`, `orders.join(customers, on="customer_id")`. The query is LAZY — nothing runs until you iterate or collect — which is designed for future execution engines (SQL, Polars, DataFusion) to push down filters and projections to the kernel level. All 7 ViewQuery tests pass. All existing tests pass (no regressions from __iter__/__len__/__contains__ on View). No kernel changes (pond-core still FROZEN). No new domain packages. No new RFC. This is a polish of existing surface, not a new feature — it makes the View the user already has feel like the collection it always should have been. Per the user's roadmap: next is evidence experiments (scale, history, multi-materialization, failure modes, independent implementations, Derived Structure calculus), NOT more features.
+
+---
+Task ID: 21
+Agent: main (Super Z, web-a5961fe6 session)
+Task: SharedDataset + NativeView — the "data is just bytes, Views are lenses" pattern. Multiple Views reading the SAME bytes.
+
+## Work Log
+
+1. Read user's vision: data should be like a Linux filesystem — bytes are just bytes, Views are readers that interpret them differently. No copying, no translation. A manifest (sidecar file) tracks which Views are enabled. Test with DuckDB, Polars, etc.
+2. Built pond-sdk/shared_dataset.py (~450 LOC including tests):
+   - SharedDataset: a named collection of Arrow IPC bytes in the kernel with a commit DAG and a manifest. Extends View (inherits branching, history, etc.). Data is stored as Arrow IPC — the canonical format that DuckDB, Polars, DataFusion, pandas all read natively (zero-copy).
+   - NativeView: abstract thin reader. Subclasses: ArrowNativeView (raw Arrow Table), DuckDBView (SQL via DuckDB), PolarsView (OLAP via Polars), PandasView (pandas DataFrame), DataFusionView (DataFusion SQL). Each reads the SAME Arrow bytes and presents them differently.
+   - Manifest system: enable_view/disable_view/list_enabled_views/is_view_enabled. The manifest is a small JSON blob stored alongside the data (like a sidecar file in a Linux directory). Tracks which Views are enabled with versions and metadata.
+   - In-memory manifest cache: enables multiple enable_view calls before commit to accumulate correctly (without overwriting each other).
+3. Wrote 6 tests, all pass:
+   - test_shared_dataset_basic: write records, read Arrow, iterate, len.
+   - test_multiple_readers_same_bytes: THE KEY TEST. Write data once. Read via Arrow, DuckDB (SQL), Polars (OLAP), pandas — all see the same total (650.0). Zero copying.
+   - test_manifest_enablement: enable, list, disable, is_enabled.
+   - test_manifest_persists_across_restart: manifest survives process restart.
+   - test_versioning_and_history: branch, checkout, history work (inherited from View).
+   - test_elegant_pattern: write once, enable 3 views (sql, olap, pandas), read via 4 readers (DuckDB, Polars, pandas, Arrow iterate). All see total_ltv=4500.0. Manifest tracks 3 enabled views.
+4. Verified no regressions: view_laws CI (5 Views, 6 laws), e2e workflow (12 steps) all pass.
+5. Added shared_dataset.py to CI workflow (10 test commands now).
+6. Appended this worklog entry.
+
+## Stage Summary
+
+The "data is just bytes, Views are lenses" pattern is now implemented. A SharedDataset stores data as Arrow IPC (canonical format). Multiple NativeView readers (DuckDB, Polars, pandas, Arrow, DataFusion) read the SAME bytes and present them differently — zero copying, zero translation, zero duplication. A manifest (sidecar file) tracks which Views are enabled, with versions and schemas. This is the Linux filesystem analogy the user described: bytes are bytes, readers interpret them. Key test result: write 4 orders once, read via DuckDB (SQL GROUP BY), Polars (filter + sum), pandas (filter), and Arrow (raw) — all see total=650.0 from the same bytes. This aligns with all 6 design goals: Simple (one shared dataset, thin readers), Powerful (same data, many interpretations), Performant (zero-copy Arrow), Scalable (readers are independent), Efficient (one copy of bytes), Beautiful (Linux filesystem analogy). No kernel changes (pond-core still FROZEN). This is the architectural pattern the user asked for — future execution engines (DuckDB, DataFusion, Polars) can plug into Pond data natively, reading the shared Arrow bytes without any Pond-specific translation layer.
