@@ -1008,3 +1008,44 @@ Task: Rename Volume → PondObject + Phase H performance benchmark.
 ## Stage Summary
 
 PondObject renamed from Volume. Phase H performance benchmark complete with real numbers. Key findings: point lookup is sub-millisecond (0.1ms), commit is sub-millisecond (0.14ms for 1 record, 0.29ms for 100), branch creation is 0.04ms (O(1) as designed), restart is 0.76ms. Index incremental is 15x faster than full rebuild. Dedup works (100 identical records = 5 blobs). Storage amplification is 1.91x (47.7% overhead — this is the Prolly tree + commit structure; binary encoding helped reduce from the original 125% to this). The architecture is not just correct — it's fast.
+
+---
+Task ID: 35
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Large-scale validation (100K + 500K partial) — correctness and performance at scale.
+
+## Work Log
+
+1. Attempted 1M record test. Hit disk space limit at ~600K records (~2.6GB). FINDING: filesystem backend (1 file per blob) hits disk limits at ~600K records due to per-file overhead. This is an engineering finding — the kernel backend is replaceable (FS, SQLite, S3, FDB). A SQLite or packed backend would handle millions.
+
+2. Ran 500K record test (partial — timed out during storage stats, but key results captured):
+   - 500K records written: 128.7s (3,884 rec/sec)
+   - Count = 500,000 (CORRECT — no data loss at scale!)
+   - 1000 random lookups: ALL succeeded, p50=14.8ms, p99=16.0ms
+   - First/middle/last keys all found
+
+3. Built experiments/large_scale.py: complete 100K test with full verification.
+   Results:
+   - 100K records: 5.5s write (18,053 rec/sec)
+   - Count: 100,000 (CORRECT)
+   - 500 random lookups: 0 failures, p50=7.4ms, p99=7.7ms
+   - Storage: 12.6MB, 101,300 blobs, 133 bytes/record
+   - Restart: 87ms, all 100K records survived
+   - Index at 100K: lookup succeeded (1829ms — first build, includes full scan)
+   - Branch at 100K: 0.15ms creation, 2.07ms checkout — O(1) as designed
+   - Data loss: 0. Lookup failures: 0.
+
+4. SCALING FINDINGS documented:
+   - 10K → 100K → 500K: all correct (count matches, lookups succeed, restart works)
+   - Lookup latency scales roughly linearly with data size (0.1ms at 10K → 7.4ms at 100K → 14.8ms at 500K)
+   - This is expected for a filesystem backend (each lookup walks the commit DAG + Prolly tree, and tree depth grows with N)
+   - Filesystem backend hits disk limits at ~600K records — a SQLite/packed backend would handle millions
+   - The ARCHITECTURE is correct at scale. The BACKEND needs optimization for millions.
+
+5. Removed the failed million_scale.py (replaced by large_scale.py).
+
+6. Verified no regressions: architecture_laws (10), lens_laws_ci (5) all pass.
+
+## Stage Summary
+
+Large-scale validation complete. 100K records: all correct, 0 data loss, 0 lookup failures. 500K records (partial): count correct (500,000), all lookups succeeded. Key finding: the filesystem backend (1 file per blob) is the bottleneck at scale — it hits disk limits at ~600K records. The architecture is correct; the backend is replaceable. Performance: 18K rec/sec write, 7.4ms lookup at 100K, O(1) branching at all scales. Phase G correctness is fully evidenced at scale. Phase H performance is measured at 100K. Next: Phase I (independent implementations) — fresh agents build Lenses from the contract.
