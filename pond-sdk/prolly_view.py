@@ -105,11 +105,23 @@ class ProllyTree:
             chunk = [(k, h) for k, h in sorted_items[i:i + TARGET_CHUNK_ENTRIES]]
             leaf_chunks.append(chunk)
 
+        # Build the tree bottom-up. The first level is leaves (encode_leaf).
+        # All subsequent levels are internal nodes (encode_internal).
+        #
+        # BUG FIX (Phase G): the original code used encode_leaf for ALL
+        # levels, causing multi-level trees to store internal-node entries
+        # as leaf entries. This caused data loss at scale (count showed
+        # ~157 instead of 10K) and index rebuild decode errors (tree
+        # node bytes were misinterpreted as JSON data).
         level = leaf_chunks
+        is_leaf_level = True
         while len(level) > 1:
             chunk_entries = []
             for chunk in level:
-                data = BinaryProllyTree.encode_leaf(chunk)
+                if is_leaf_level:
+                    data = BinaryProllyTree.encode_leaf(chunk)
+                else:
+                    data = BinaryProllyTree.encode_internal(chunk)
                 h = kernel.write(data)
                 max_key = chunk[-1][0]
                 chunk_entries.append((max_key, h))
@@ -122,12 +134,12 @@ class ProllyTree:
                 group = chunk_entries[i:i + TARGET_CHUNK_ENTRIES]
                 next_level.append(group)
             level = next_level
+            is_leaf_level = False
 
+        # If we exit the while loop with len(level) == 1, the root is
+        # an internal node (list of (max_key, child_hash) tuples).
         root = level[0]
-        if isinstance(root[0], tuple):
-            return kernel.write(BinaryProllyTree.encode_internal(root))
-        else:
-            return kernel.write(BinaryProllyTree.encode_leaf(root))
+        return kernel.write(BinaryProllyTree.encode_internal(root))
 
     @staticmethod
     def lookup(kernel: PondMinimal, root_hash: str, key: str) -> Optional[str]:
@@ -309,7 +321,7 @@ class ProllyViewBase:
 
     def lookup(self, key: str) -> Optional[str]:
         """
-        Look up a single key. O(log N) Prolly tree + O(K) delta journal.
+        Look up a single key. O(log N) Prolly tree + O(K) via delta journal.
 
         Path:
         1. Walk commits from HEAD, applying deltas (O(K) where K ≤ COMPACTION_THRESHOLD)
@@ -343,9 +355,15 @@ class ProllyViewBase:
                 return None
 
             current = commit.get("parent")
-            if steps > COMPACTION_THRESHOLD + 1:
-                break  # safety valve
+            # REMOVED the old safety valve (steps > COMPACTION_THRESHOLD + 1).
+            # That valve was WRONG: it stopped the walk before reaching the
+            # snapshot commit, causing keys to be "not found" at scale.
+            # The walk MUST continue until we find a snapshot commit (which
+            # has the full state). The snapshot is at most
+            # COMPACTION_THRESHOLD commits back, but we walk until we find it.
 
+        # We reached the end of the commit chain without finding a snapshot
+        # or the key. Return None.
         return None
 
     # ------------------------------------------------------------------

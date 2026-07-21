@@ -781,3 +781,44 @@ Task: Freeze the choice (RFC-0012 Accepted, TypedBlob deprecated) + formal Lens 
 ## Stage Summary
 
 The choice is frozen: context-based interpretation is the architecture. RFC-0012 Accepted, RFC-0013 Accepted, TypedBlob deprecated. External implementation challenge (7/10) confirms the contract is usable but needs 8 construction details filled in. Scale stress test reveals REAL engineering issues (not architectural): the Prolly tree implementation has data loss at 100K records (count shows 4080 instead of 100K), point lookups fail for older keys, and index rebuilds fail with decode errors on non-data blobs. History (1000 commits), restart recovery, and small-scale (1000 records) all work correctly. The architecture is sound; the ProllyViewBase implementation has scale bugs that need fixing. These are Phase F evidence findings — exactly what the user asked for. Next priority: fix the Prolly tree scale bugs (data loss + index rebuild decode error) before any more architectural work.
+
+---
+Task ID: 29
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Phase G Correctness — fix the two scale bugs (data loss + index rebuild decode error) + build Architecture Invariants test suite.
+
+## Work Log
+
+1. Read user's Phase G guidance: fix correctness bugs, build invariant tests, don't build anything new. Also answered the unstructured data question (yes, the kernel stores any bytes — video, images, PDFs — as content-addressed blobs, referenced by hash like Git LFS; proved with a test).
+
+2. ROOT CAUSE ANALYSIS: Both scale bugs had the SAME root cause — a bug in ProllyTree.build(). The build method used encode_leaf for ALL tree levels, even internal nodes above the first level. When the tree had >64 entries (requiring multiple levels), the second and subsequent levels were encoded as LEAF nodes instead of INTERNAL nodes. This caused:
+   - Data loss: read_all() misinterpreted internal nodes as leaves, extracting (max_key, child_hash) pairs as data entries. Only ~157 entries were visible instead of 10K/100K.
+   - Index rebuild decode error: _rebuild_index called decode() on blob hashes that pointed to tree node blobs (binary Prolly tree nodes) instead of user data blobs (JSON). UnicodeDecodeError.
+
+3. FIX 1 (ProllyTree.build): Added is_leaf_level flag. First level uses encode_leaf (correct — leaf nodes contain (key, data_hash) pairs). All subsequent levels use encode_internal (correct — internal nodes contain (max_key, child_hash) pairs). The final root is always encoded as internal.
+
+4. FIX 2 (lookup safety valve): Removed the `if steps > COMPACTION_THRESHOLD + 1: break` safety valve that was stopping the commit DAG walk before reaching the snapshot. This valve was wrong — it prevented lookups from finding keys in older snapshots. The walk MUST continue until it finds a snapshot commit.
+
+5. VERIFIED FIXES: Ran scale stress test. BOTH BUGS FIXED:
+   - Scale (100K records): count = 100,000 (was 4,080). Point lookup k050000 → user_50000 (was None). ✓
+   - Multi-materialization (10K records, 3 indexes): ALL 3 index lookups succeed (was UnicodeDecodeError). ✓
+
+6. Built Architecture Invariants test suite (pond-sdk/test_invariants.py, 7 invariants):
+   - Invariant 1: Every committed key is reachable after restart.
+   - Invariant 2: Branch checkout never changes blob hashes.
+   - Invariant 3: Lens interpretation never changes stored bytes.
+   - Invariant 4: Derived rebuild produces identical hashes.
+   - Invariant 5: History replay equals current snapshot.
+   - Invariant 6: Scale correctness (10K records, count = 10K).
+   - Invariant 7: Index rebuild at scale (10K records, lookup succeeds).
+   All 7 invariants pass.
+
+7. Verified no regressions: view_laws CI (5 Views, 6 laws), e2e workflow (12 steps), TypedBlob tests (5 tests) all pass.
+
+8. Added invariants to CI workflow (.github/workflows/view-laws.yml). CI now runs 14 test commands.
+
+9. Appended this worklog entry.
+
+## Stage Summary
+
+Phase G Correctness Sprint: both scale bugs FIXED. Root cause was a single bug in ProllyTree.build() that encoded internal nodes as leaf nodes — affecting any tree with >64 entries. The fix is 1 flag (is_leaf_level) + 1 removed safety valve. Architecture Invariants test suite built (7 invariants, all pass). Scale stress test now shows: 100K records, count=100K, point lookup works, 3 indexes work. The architecture was sound all along — the implementation had a bug. Per user's framing: "engineering finding that validates architectural assumptions." The architecture survived the pressure test; the implementation needed hardening. Next: million-scale validation, then independent reimplementation #2.
