@@ -100,7 +100,7 @@ is violated.
 ```
 Bytes • History • Names          ← Kernel (frozen, ~140 LOC)
         ↓
-    Datasets                       ← Named objects with metadata (type, source lens)
+    Volumes                        ← Named objects with type + namespace
         ↓
     Physical Structures             ← Acceleration (indexes, stats — deterministic)
         ↓
@@ -112,25 +112,30 @@ Bytes • History • Names          ← Kernel (frozen, ~140 LOC)
 Dependencies flow downward only. Each layer adds exactly one capability.
 No layer leaks upward. The kernel never changes.
 
-### Datasets
+### Volumes
 
-A Dataset is a named object in the kernel — like a table in a database,
-a repo in Git, or a notebook in Jupyter. It has:
+A Volume is a named object in the kernel — like a table in a database,
+a repo in Git, or a notebook in Jupyter. It lives in a hierarchical
+namespace (e.g., `analytics/orders`, `ml/features/user_stats`) and has:
 
-- A **type** (which Lens created it: "sql", "git", "feature_store", etc.)
-- A **source lens** (the Lens class that created it)
+- A **type** (which Lens family created it: "sql", "git", "feature_store", etc.)
 - A **description** (human-readable)
-- **Materialization info** (if it's a derived view: source dataset + type)
+- An optional **source** (parent volume name, for materialized views)
 
-The metadata is ONE small blob per dataset (stored as a kernel Name),
-NOT per record. The blob bytes stay pure. List all datasets via
-`Dataset.list(kernel)` — see every dataset with its type, like listing
-tables in a database.
+The metadata is ONE small blob per volume (stored as a kernel Name),
+NOT per record. List all volumes via `Volume.list(kernel)` — see every
+volume with its type, like listing tables in a database. List volumes
+in a namespace via `Volume.list(kernel, prefix="analytics/")`.
 
-Materialized views (indexes, aggregates, transforms) are themselves
-typed Datasets with `is_materialized=True` and `source_dataset` pointing
-to their parent. This gives full lineage: any dataset can trace back
-to its source.
+Namespaces are just the path structure of the volume name (using `/`
+as a separator, like a filesystem). No new kernel primitives — just a
+naming convention. `Volume.list_namespaces(kernel)` shows all
+namespaces.
+
+Materialized views (indexes, aggregates, transforms) are just volumes
+with `source` metadata pointing to their parent. No special API —
+just pass `source` when creating the volume. This gives lineage: any
+volume can trace back to its source.
 
 ---
 

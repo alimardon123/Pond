@@ -937,3 +937,42 @@ Task: Dataset layer + differential testing (Phase G).
 ## Stage Summary
 
 Dataset layer built: Kernel → Dataset → Physical Structures → Lens. Each dataset has a type (sql, git, feature_store, etc.) and source lens metadata. Materialized views (indexes, aggregates) are typed datasets with lineage. Dataset.list() shows all datasets with their types — like listing tables in a database. Metadata is ONE small blob per dataset, NOT per record. Differential testing: 1000 random scenarios, ALL PASSED. Pond matches the obviously-correct reference for every random operation sequence. This is the strongest correctness evidence so far. The architecture is validated under random pressure.
+
+---
+Task ID: 33
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Volume layer (simplified Dataset + namespace) + crash testing (Phase G).
+
+## Work Log
+
+1. Replaced Dataset with Volume (pond-sdk/volume.py, ~350 LOC). Changes from Dataset:
+   - Removed source_lens (redundant with type)
+   - Simplified materialized views: no separate create_materialized method. Just pass source= when creating a Volume. A materialized view is just a Volume with source metadata. No is_materialized/materialization_type fields — is_materialized is a property that checks if source is not None.
+   - Added namespace support: Volume names use "/" as path separator (analytics/orders, ml/features/user_stats). Volume.list_namespaces() shows all namespaces. Volume.list(prefix=) filters by namespace.
+   - Added basename/namespace properties.
+   - Renamed from "Dataset" to "Volume" — "Dataset" implies tabular data; "Volume" is format-agnostic (like Docker volumes).
+
+2. Updated POND.md: Dataset → Volume, added namespace explanation, simplified materialized view description.
+
+3. Removed old pond-sdk/dataset.py (superseded by volume.py).
+
+4. Built experiments/crash_test.py (~330 LOC, 8 crash tests):
+   - Test 1: Crash after commit — all committed data survives.
+   - Test 2: Crash during staging (before commit) — committed data survives, staged data correctly lost.
+   - Test 3: Crash after branch creation — branch and data survive.
+   - Test 4: Crash after merge — merged data survives.
+   - Test 5: Crash after delete + commit — deletion persists, deleted data stays deleted.
+   - Test 6: Crash after large batch (1000 records) — all 1000 records survive.
+   - Test 7: Crash with multiple volumes — all 3 volumes (orders, repo, features) survive.
+   - Test 8: Crash after index rebuild — index usable after restart.
+   All 8 crash tests PASS.
+
+5. Verified no regressions: lens_laws_ci (5 Views), architecture_laws (10 laws), feature_store (7 tests) all pass.
+
+6. Updated CI workflow: dataset.py → volume.py.
+
+7. Appended this worklog entry.
+
+## Stage Summary
+
+Volume layer built with namespace support. A Volume is a named object with type metadata and optional source (for materialized views). Namespaces use "/" path separators (analytics/orders, ml/features/user_stats). Materialized views simplified to just "a Volume with a source field" — no special API. Crash testing: all 8 scenarios PASS. Pond survives crashes with data intact — committed data always survives, staged data correctly lost (expected), branches/merges/deletes/multiple volumes all survive restart. The kernel's SQLite-backed object store provides durability without any special crash recovery logic. Phase G correctness is now well-evidenced: 1000 differential tests pass, 10 architecture laws hold, 8 crash tests pass.
