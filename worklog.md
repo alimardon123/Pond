@@ -532,3 +532,34 @@ Task: External user validation of Feature Store + apply fixes + GETTING_STARTED.
 ## Stage Summary
 
 External user validation complete (DX 6/10). The validator confirmed the architecture is sound and the workflow runs end-to-end, but found 3 real bugs (by_entity index broken for multi-feature, get_feature_matrix complexity claim wrong, put_row mutates caller's dict) and 3 documentation gaps (has_staged not exposed, transformation misleading, get_freshness semantics unclear). All 6 findings fixed. The by_entity index fix is the highest-impact: get_feature_value is now genuinely O(log N) for the normal multi-feature case (was O(N) due to last-writer-wins collisions). The get_feature_matrix fix makes it genuinely O(N+E·M) instead of O(M·N). All existing tests pass (feature_store, e2e_workflow, view_laws CI, ArrowView). The external validator's own app still works with my fixes. GETTING_STARTED.md written as the canonical onboarding path. Per user's guidance: did NOT add new platform surface, did NOT go to Raft, kept layout optimizations at materialization layer. The Feature Store is now soaking as the polished canonical reference implementation with honest external validation confirming it's usable (6/10, up from the SDK's 5/10 baseline, with a clear path to 8-9/10 if transformation engine, materialized online tables, and streaming ingestion are added).
+
+---
+Task ID: 20
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Acknowledge Phase F roadmap shift (features -> evidence) + implement elegant cross-view reading API (ViewQuery).
+
+## Work Log
+
+1. Read user's extensive architecture review. Key message: the project has shifted from "can Pond do this?" to "does Pond still feel elegant doing this?" The next phase is EVIDENCE, not features. Six evidence gaps identified: scale, long-lived history, multiple simultaneous materializations, failure modes, independent implementations, Derived Structure calculus. Concrete ask: "more direct, easy, simple and elegant way of reading data from other views" so future execution engines can access data seamlessly.
+2. Updated DESIGN_GOALS.md §8 with Phase F (Evidence, not features) as the CURRENT phase. Documented the 6 evidence gaps and what's explicitly NOT in Phase F (no new domain packages, no new SDK surface unless validation exposes a gap, no Raft). Marked Phase E (Feature Store) as COMPLETE.
+3. Built pond-sdk/view_query.py (~200 LOC): ViewQuery class — a lazy, composable query API for Views. Makes a View feel like a collection:
+   - __iter__: for row in view (yields decoded rows, not keys)
+   - __len__: len(view) == view.count()
+   - __contains__: key in view == view.exists(key)
+   - where(predicate or **kwargs): filter rows (lazy)
+   - select(*fields): project rows (lazy)
+   - map(fn): transform rows (lazy)
+   - join(other_view, on=field): LEFT JOIN with another View (lazy left, eager right)
+   - collect(): force evaluation, return list
+   - count(), first(), take(n): terminal operations
+   - JoinedQuery: result of join, supports further chaining
+4. Wired ViewQuery into View class (view_sdk.py): added __iter__, __len__, __contains__, where, select, map, join methods. These are thin wrappers that return ViewQuery(self).where(...) etc. No kernel changes, no new abstractions — just making the existing View feel like a collection.
+5. Wrote pond-sdk/test_view_query.py (~300 LOC, 7 tests): basic iteration, where filter (kwargs + predicate + chain), select projection, map transform, cross-view JOIN (LEFT JOIN semantics, merge, chain), laziness (no eval until iterate, first stops early), elegant pattern (join + where + map + collect in 5 lines). All 7 tests pass.
+6. Verified all existing tests still pass: view_laws CI (5 Views, 6 algebra laws), ArrowView (7 tests), Feature Store production tests, e2e workflow (12 steps). The __iter__ addition to View doesn't break anything.
+7. Updated GETTING_STARTED.md with a new "Elegant cross-view reading (ViewQuery)" section showing the full pattern: iteration, len/in, where (kwargs + predicate), select, map, join, chain, collect. Explained why the laziness matters for future execution engines.
+8. Added test_view_query.py to CI workflow (.github/workflows/view-laws.yml). CI now runs 9 test commands.
+9. Appended this worklog entry.
+
+## Stage Summary
+
+Phase F roadmap shift documented in DESIGN_GOALS.md. The elegant cross-view reading API (ViewQuery) is the concrete ask from the user's review. It makes a View feel like a collection: `for row in view`, `view.where(region="US")`, `orders.join(customers, on="customer_id")`. The query is LAZY — nothing runs until you iterate or collect — which is designed for future execution engines (SQL, Polars, DataFusion) to push down filters and projections to the kernel level. All 7 ViewQuery tests pass. All existing tests pass (no regressions from __iter__/__len__/__contains__ on View). No kernel changes (pond-core still FROZEN). No new domain packages. No new RFC. This is a polish of existing surface, not a new feature — it makes the View the user already has feel like the collection it always should have been. Per the user's roadmap: next is evidence experiments (scale, history, multi-materialization, failure modes, independent implementations, Derived Structure calculus), NOT more features.

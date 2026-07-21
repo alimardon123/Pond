@@ -231,19 +231,61 @@ Kernel (Write, Read, Reference — 3 primitives, ~140 LOC, FROZEN)
 Four layers of composition. Each layer uses ONLY the layer below.
 The kernel never changes. All richness is in the View layer.
 
-**Storage model:**
-```
-_features/{name}/{version}                    → feature definition blob
-_entities/{entity_type}                       → entity type definition blob
-_meta/latest_ts/{feature_name}                → cached latest timestamp (O(1) freshness)
-{feature_name}/v{version}/{entity_id}/{ts}    → feature value blob
+---
+
+## Elegant cross-view reading (ViewQuery)
+
+A View feels like a **collection**: iterable, filterable, joinable.
+This is the "direct, easy, simple and elegant way of reading data"
+per the architecture review.
+
+```python
+# Iterate rows directly
+for row in orders:
+    print(row["order_id"], row["amount"])
+
+# len(view) and `key in view` work
+print(f"{len(orders)} orders")
+if "order:1" in orders:
+    print("order:1 exists")
+
+# Filter with kwargs (field=value)
+for row in orders.where(region="US"):
+    ...
+
+# Filter with a predicate
+for row in orders.where(lambda r: r["amount"] > 100):
+    ...
+
+# Project
+for row in orders.select("order_id", "amount"):
+    ...
+
+# Chain: where + select + map (lazy, nothing runs until you iterate)
+us_totals = (orders
+             .where(region="US")
+             .select("order_id", "amount")
+             .map(lambda r: {**r, "amount_usd": r["amount"] * 1.1})
+             .collect())  # .collect() forces evaluation
+
+# Cross-view JOIN
+for row in orders.join(customers, on="customer_id"):
+    print(row["order_id"], row["customer_name"])
+
+# Chain join + where + select
+us_orders = (orders
+             .join(customers, on="customer_id")
+             .where(region="US")
+             .select("order_id", "amount", "name")
+             .collect())
 ```
 
-**Indexes (Prolly trees, content-addressed):**
-```
-by_entity  → composite key "{feature_name}|{version}|{entity_id}" → blob_hash
-by_feature → key "{feature_name}/v{version}" → blob_hash
-```
+**Why this matters:** the query is LAZY. Nothing is read from the
+View until you iterate or `.collect()`. This allows a future
+execution engine (SQL, Polars, DataFusion) to push down filters and
+projections to the kernel level — the API is designed for that
+future optimizer. Today the evaluation is Python-level, but the
+interface is already the right shape.
 
 ---
 

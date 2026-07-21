@@ -29,6 +29,7 @@ from prolly_view import ProllyViewBase, ProllyTree
 from binary_encoding import BinaryProllyTree
 from maintenance import (drop_name, is_dropped, resolve_active,
                          TOMBSTONE_HASH)
+from view_query import ViewQuery
 
 
 # ===========================================================================
@@ -114,6 +115,80 @@ class View:
 
     def count(self) -> int:
         return sum(1 for k in self.base.read_all() if not k.startswith("_"))
+
+    # ------------------------------------------------------------------
+    # Collection-like API — make View feel like an iterable of rows.
+    # This is the "direct, easy, simple and elegant way of reading
+    # data" per the architecture review. See view_query.py for the
+    # lazy query API (.where, .select, .map, .join).
+    # ------------------------------------------------------------------
+
+    def __iter__(self):
+        """Iterate over decoded rows (not keys).
+
+            for row in view:
+                print(row)
+
+        Equivalent to:
+            for key in view.keys():
+                row = view.get(key)
+                if row is not None:
+                    yield row
+        """
+        for key in self.keys():
+            row = self.get(key)
+            if row is not None:
+                yield row
+
+    def __len__(self) -> int:
+        """len(view) == view.count()."""
+        return self.count()
+
+    def __contains__(self, key: str) -> bool:
+        """key in view == view.exists(key)."""
+        return self.exists(key)
+
+    def where(self, predicate=None, **kwargs) -> ViewQuery:
+        """Start a lazy query that filters rows.
+
+            # Filter with kwargs
+            for row in view.where(region="US"):
+                ...
+
+            # Filter with a predicate
+            for row in view.where(lambda r: r["amount"] > 100):
+                ...
+
+        See ViewQuery for full chaining: .where().select().map().join().
+        """
+        return ViewQuery(self).where(predicate, **kwargs)
+
+    def select(self, *fields: str) -> ViewQuery:
+        """Start a lazy query that projects rows to only these fields.
+
+            for row in view.select("order_id", "amount"):
+                ...
+        """
+        return ViewQuery(self).select(*fields)
+
+    def map(self, fn: Callable) -> ViewQuery:
+        """Start a lazy query that transforms each row via fn(row).
+
+            for row in view.map(lambda r: {**r, "amount_usd": r["amount"] * 1.1}):
+                ...
+        """
+        return ViewQuery(self).map(fn)
+
+    def join(self, other, on: str):
+        """JOIN with another View.
+
+            for row in orders.join(customers, on="customer_id"):
+                print(row["order_id"], row["customer_name"])
+
+        LEFT JOIN semantics: left rows with no match are yielded as-is.
+        Right side wins on field conflicts.
+        """
+        return ViewQuery(self).join(other, on)
 
     # --- Version control ---
     def branch(self, name: str) -> str: return self.base.branch(name)

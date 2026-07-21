@@ -302,15 +302,65 @@ Arrow, DuckDB, Polars, DataFusion, Lance, Iceberg-compatible
 metadata adapters. Each is an adapter View satisfying the
 RFC-0007 algebra.
 
-### Phase E — One production-grade implementation
+### Phase E — One production-grade implementation (COMPLETE)
 
 Choose one flagship and make it excellent. Candidates:
-1. Feature Store (strongest current fit)
+1. Feature Store (strongest current fit) — **CHOSEN**
 2. Lakehouse metadata/catalog service (closest to original motivation)
 3. Git-compatible repository backend (excellent for validating
    versioning semantics)
 
 Build one so well that an external engineer would consider using it.
+
+**Status:** Feature Store is production-quality (RFC-0011 Accepted).
+External validation measured DX at 6/10 → 8/10 (estimated, after
+fixing the 3 high-impact findings). End-to-end ML workflow runs
+all 12 steps. GETTING_STARTED.md written.
+
+### Phase F — Evidence, not features (CURRENT)
+
+After Phase E, the project entered a different phase. The question
+shifted from "can Pond do this?" to "does Pond still feel elegant
+doing this?" This phase is about **evidence**, not features.
+
+**Six evidence gaps to close (in priority order):**
+
+1. **Scale.** Run 10M–100M records. Measure metadata ratio, index
+   depth, cache behavior, branch latency, GC, lookup tails.
+   Architecture changes around those sizes.
+
+2. **Long-lived history.** Millions of commits. Measure rollback,
+   branch, merge, GC after years of history.
+
+3. **Multiple simultaneous materializations.** One snapshot →
+   Arrow + Parquet + Iceberg + Vector DB + Search index + Feature
+   Store + Semantic model, all at once. No duplication. No sync
+   daemon. If this stays elegant, that's a strong architectural result.
+
+4. **Failure modes.** Disk full, half-written metadata, corrupt
+   derived index, missing blob, branch deleted, power failure,
+   hash collision simulation, clock skew, schema evolution.
+
+5. **Independent implementations.** Five different validators
+   (different models, different people, different languages).
+   If they independently produce similar SDKs, the abstractions
+   are probably correct.
+
+6. **The Derived Structure calculus.** Push RFC-0005 further: is
+   every optimization in Pond just a `DerivedStructure(source,
+   function, trigger, storage)`? If yes, that's the biggest
+   conceptual contribution.
+
+**What is explicitly NOT in Phase F:**
+
+- **No new domain packages.** SQL, Git, Notebook, Feature Store,
+  Streaming, Graph, Arrow, Vector, Semantic — that's sufficient.
+  Building ten more won't tell you much.
+- **No new SDK surface** unless external validation consistently
+  exposes a gap.
+- **No distributed coordination (Raft, Paxos).** Still deferred
+  until "what is replicated?" is answered. By the end of Phase F,
+  you'll know.
 
 ### What is explicitly NOT on the roadmap
 

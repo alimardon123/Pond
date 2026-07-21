@@ -48,3 +48,6 @@ jobs:
 
       - name: Run Feature Store end-to-end ML workflow
         run: python pond-feature-store/e2e_workflow.py
+
+      - name: Run ViewQuery tests (elegant cross-view reading)
+        run: python pond-sdk/test_view_query.py
