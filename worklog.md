@@ -738,3 +738,46 @@ Task: Falsification round — can context-based interpretation alone give us eve
 ## Stage Summary
 
 FALSIFICATION QUESTION ANSWERED: YES. Context-based interpretation alone provides universal readability, bidirectional write/read, branch/merge/history, derived structures, zero metadata overhead, pure bytes, transform-later capability, and kernel purity — all without blob-level metadata. The kernel does NOT need an envelope. The interpretation layer lives in CODE (the resolver, ~55 LOC), not in DATA (the blob). Cross-lens read has zero performance overhead (1.0x vs same-lens). The Lens Interpretation Contract is written. The user's architectural instinct is confirmed: "raw bytes in the kernel, Lens-specific encoding/decoding, shared resolver logic in code, no blob-level metadata overhead, emergent compatibility where possible, raw access always available." TypedBlob should be removed from the SDK; context-based interpretation is the right approach.
+
+---
+Task ID: 27
+Agent: general-purpose (external implementation challenge)
+Task: Implement LogLens from the Lens Interpretation Contract alone — no access to existing Lens implementations.
+
+Work Log:
+- Read worklog tail (~100 lines) for context. Read the 4 permitted documents: RFC-0013 (Lens Interpretation Contract), RFC-0012 (Lens Architecture), pond-core/pond_minimal.py (the 3-primitive kernel), DESIGN_GOALS.md.
+- Consulted pond-sdk/view_sdk.py ONLY to locate the `Lens` base class (alias for `View` at line 832). Did NOT read any domain Lens implementation (sql_view.py, arrow_view.py, feature_store.py, pond_git.py, notebook.py, etc.), did NOT read falsification_context.py, did NOT read typed_blob.py, did NOT read any test file.
+- Implemented in validation/log_lens_external.py (~336 non-blank LOC including tests):
+  - ContextResolver (37 LOC): implements RFC-0013 §8 interface (register, encode_for_key, decode_for_key). Longest-prefix match. Fallback to raw bytes on decode (§5).
+  - ContextLens (30 LOC): the generic Resolver-backed Lens. Overrides put/get/get_raw to delegate encode/decode to the resolver, keyed by the FULL key (caller supplies prefix). Inherits branch/checkout/list_branches/undo/commit/history from the View base class.
+  - LogLens (48 LOC): domain Lens for structured logs. JSON codec, "log/" prefix, fields {timestamp, level, message, service, trace_id}. Registers codec with the resolver at construction (§8).
+  - SqlLens (13 LOC): minimal sibling Lens ("sql/" prefix, JSON codec) used to demonstrate cross-Lens reading and shared branching.
+- Wrote a 7-requirement test in the same file (test_1 through test_7). All pass.
+- Debugging: hit two SDK details NOT specified in the contract. (a) put() stages in memory; commit() flushes to the kernel — get() returns None before commit. Fixed by committing before reads. (b) There is no implicit "main" branch to checkout back to; used undo(1) to walk the DAG back to baseline for the isolation check.
+- Verified kernel purity: log blobs start with b"{" (pure JSON), transformed text blobs are pure UTF-8 text, no envelope/header/manifest/sidecar. 14 blobs, 2 names, 1892 data bytes for the full 7-requirement run.
+- Wrote validation/log_lens_report.md (5 sections per the task spec). Contract clarity score: 7/10. Listed 8 specific gaps with RFC section citations.
+
+Stage Summary:
+- LogLens built and verified from the contract alone (no existing Lens code read). All 7 requirements pass. The contract is sufficient for PHILOSOPHY and CONSTRAINTS (Linux analogy, "bytes are bytes", codec-in-key, shared DAG, get_raw fallback) but under-specifies CONSTRUCTION (ContextLens class, stage/commit lifecycle, branching API, resolver match policy, fallback encoding). 8 concrete gaps cited with RFC sections. DX score 7/10 — would be 9/10 with 5 small contract additions (define ContextLens, state lifecycle, name branching API, specify match policy, specify fallback encoding). Implementation matches contract's ~55 LOC estimate (Resolver 37 LOC + ContextLens 30 LOC = 67 LOC, ~52 code-only). The architecture genuinely felt elegant: cross-Lens reading "just worked" because the resolver dispatches by KEY prefix not LENS prefix, and the shared commit DAG made branching visible across Lenses with no plumbing. The codec-in-the-key insight is the real contribution — it makes interpretation a property of the namespace, not the bytes. Files saved: validation/log_lens_external.py, validation/log_lens_report.md. Worklog appended.
+
+---
+Task ID: 28
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Freeze the choice (RFC-0012 Accepted, TypedBlob deprecated) + formal Lens contract (RFC-0013) + external implementation challenge + scale/history stress test.
+
+## Work Log
+
+1. Froze the choice: updated RFC-0012 status to Accepted. Context-based interpretation is the chosen approach. TypedBlob marked as DEPRECATED (not just experimental). The kernel stores pure bytes; the interpretation layer lives in code.
+2. Wrote RFC-0013: The Lens Interpretation Contract (~150 lines). Formal specification of what a Lens can assume (key prefix context, any lens reads any blob, raw bytes fallback, shared DAG), must NOT assume (no blob metadata, no global registry in kernel, no manifest), how fallback decoding works, how cross-lens reading works, how cross-lens transforms work, what is NOT stored in the kernel, the resolver design, verification results, compliance checklist.
+3. Launched external implementation challenge (Task 27). Fresh agent built a LogLens from the contract alone. Result: 7/10 contract clarity. All 7 requirements pass. 8 gaps found (ContextLens class not defined, who supplies prefix, stage/commit lifecycle invisible, branching API unnamed, resolver prefix-match policy, fallback encoding, no implicit main branch, ContextLens vs domain Lens relationship). These are actionable for future contract revision.
+4. Built scale/history stress test (experiments/scale_history_stress.py). Phase F evidence with REAL measurements:
+   - Scale (100K records): 6083 rec/sec write. BUT two CRITICAL findings: (a) point lookup of k050000 returns None (key not found at scale), (b) count shows only 4080 records (should be 100K) — DATA LOSS at scale. The Prolly tree + delta journal has bugs at scale.
+   - History (1000 commits): WORKS WELL. History walk 12ms, branch 0.23ms, checkout 0.17ms, undo 100 steps 1ms. 2399 blobs.
+   - Restart recovery: WORKS PERFECTLY. 1ms recovery, all data intact.
+   - Multi-materialization (10K records, 3 indexes): ALL 3 index lookups FAIL with UnicodeDecodeError — the index rebuild tries to decode non-JSON blobs (Prolly tree structure nodes) as JSON. Real bug.
+5. Updated rfcs/README.md (RFC-0012 and RFC-0013 both Accepted).
+6. Appended this worklog entry.
+
+## Stage Summary
+
+The choice is frozen: context-based interpretation is the architecture. RFC-0012 Accepted, RFC-0013 Accepted, TypedBlob deprecated. External implementation challenge (7/10) confirms the contract is usable but needs 8 construction details filled in. Scale stress test reveals REAL engineering issues (not architectural): the Prolly tree implementation has data loss at 100K records (count shows 4080 instead of 100K), point lookups fail for older keys, and index rebuilds fail with decode errors on non-data blobs. History (1000 commits), restart recovery, and small-scale (1000 records) all work correctly. The architecture is sound; the ProllyViewBase implementation has scale bugs that need fixing. These are Phase F evidence findings — exactly what the user asked for. Next priority: fix the Prolly tree scale bugs (data loss + index rebuild decode error) before any more architectural work.

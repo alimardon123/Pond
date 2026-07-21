@@ -1,25 +1,21 @@
 """
-TypedBlob — EXPERIMENTAL. NOT part of the core architecture.
+TypedBlob — DEPRECATED. NOT part of Pond's architecture.
 
-⚠ STATUS: Experimental. This module is one of three competing
-prototypes for the "interpretation layer" question. It is NOT
-merged into Pond's core architecture. See:
-  experiments/resolver_comparison/COMPARISON.md
+⚠ STATUS: DEPRECATED. The falsification round (Task 26) proved that
+context-based interpretation provides all 8 capabilities (universal
+readability, bidirectional write/read, branch/merge/history, derived
+structures, zero metadata, pure bytes, transform-later, kernel purity)
+WITHOUT any blob-level envelope. See:
+  - RFC-0012 (Accepted): context-based interpretation is the chosen approach
+  - RFC-0013: the formal Lens Interpretation Contract
+  - experiments/resolver_comparison/falsification_context.py: the proof
+  - docs/LENS_INTERPRETATION_CONTRACT.md: the one-page contract
 
-The question: how does a Lens read a blob written by a different
-Lens, when the blob's encoding doesn't match?
+This module is kept as an experimental artifact for reference only.
+Do NOT use it in production. It will be removed in a future cleanup.
 
-This prototype (Envelope): wraps each blob in a 5-byte envelope
-[codec_id][payload_len][payload]. The codec_id tells a global
-CodecRegistry which decoder to use.
-
-Concern (from architecture review): this makes the kernel store
-"typed bytes" instead of "bytes." It creates a Pond Binary Format
-and hidden coupling via the CodecRegistry. It drifts from the
-"kernel owns only Bytes, History, Names" philosophy.
-
-Kept for comparison against the other two prototypes. Do NOT use
-in production until the comparison is resolved.
+The kernel stores pure bytes. The interpretation layer lives in CODE
+(the resolver), not in DATA (the blob).
 """
 
 from __future__ import annotations

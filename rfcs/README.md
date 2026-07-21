@@ -19,7 +19,8 @@ authoritative source for its topic.
 | RFC-0009 | Architecture Metrics | Draft |
 | RFC-0010 | ArrowView (Phase D Compatibility Adapter) | **Accepted** (verified by `pond-arrow/run_arrow_view_laws.py`) |
 | RFC-0011 | Feature Store (Phase E Flagship) | **Accepted** (verified by `pond-feature-store/feature_store.py` production tests) |
-| RFC-0012 | The Lens Architecture | Draft (the defining architectural contribution; verified by `pond-sdk/test_lens_architecture.py`) |
+| RFC-0012 | The Lens Architecture | **Accepted** (context-based interpretation; verified by falsification test) |
+| RFC-0013 | The Lens Interpretation Contract | **Accepted** (formal contract; verified by falsification test) |
 
 ## Reference Documents (not RFCs — supporting material)
 

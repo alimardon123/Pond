@@ -2,9 +2,17 @@
 
 ## Status
 
-Draft — the most important architectural clarification since RFC-0007
-(View Algebra). Renames "View" to "Lens" and answers the open
-research question about mutual interpretability.
+**Accepted** — the defining architectural contribution of Pond.
+
+Context-based interpretation is the chosen approach (see falsification
+results in `experiments/resolver_comparison/falsification_context.py`).
+The kernel stores pure bytes — no envelope, no codec registry in the
+data path, no blob-level metadata. The interpretation layer lives in
+CODE (the resolver), not in DATA (the blob).
+
+TypedBlob (the envelope approach) is deprecated. It remains in
+`pond-sdk/typed_blob.py` as an experimental artifact for reference
+only. Do not use it in production.
 
 ---
 
