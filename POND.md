@@ -100,7 +100,7 @@ is violated.
 ```
 Bytes • History • Names          ← Kernel (frozen, ~140 LOC)
         ↓
-    Volumes                        ← Named objects with type + namespace
+    PondObjects                        ← Named objects with type + namespace
         ↓
     Physical Structures             ← Acceleration (indexes, stats — deterministic)
         ↓
@@ -112,30 +112,30 @@ Bytes • History • Names          ← Kernel (frozen, ~140 LOC)
 Dependencies flow downward only. Each layer adds exactly one capability.
 No layer leaks upward. The kernel never changes.
 
-### Volumes
+### PondObjects
 
-A Volume is a named object in the kernel — like a table in a database,
+A PondObject is a named object in the kernel — like a table in a database,
 a repo in Git, or a notebook in Jupyter. It lives in a hierarchical
 namespace (e.g., `analytics/orders`, `ml/features/user_stats`) and has:
 
 - A **type** (which Lens family created it: "sql", "git", "feature_store", etc.)
 - A **description** (human-readable)
-- An optional **source** (parent volume name, for materialized views)
+- An optional **source** (parent PondObject name, for materialized views)
 
-The metadata is ONE small blob per volume (stored as a kernel Name),
-NOT per record. List all volumes via `Volume.list(kernel)` — see every
-volume with its type, like listing tables in a database. List volumes
-in a namespace via `Volume.list(kernel, prefix="analytics/")`.
+The metadata is ONE small blob per PondObject (stored as a kernel Name),
+NOT per record. List all PondObjects via `PondObject.list(kernel)` — see every
+PondObject with its type, like listing tables in a database. List PondObjects
+in a namespace via `PondObject.list(kernel, prefix="analytics/")`.
 
-Namespaces are just the path structure of the volume name (using `/`
+Namespaces are just the path structure of the PondObject name (using `/`
 as a separator, like a filesystem). No new kernel primitives — just a
-naming convention. `Volume.list_namespaces(kernel)` shows all
+naming convention. `PondObject.list_namespaces(kernel)` shows all
 namespaces.
 
-Materialized views (indexes, aggregates, transforms) are just volumes
+Materialized views (indexes, aggregates, transforms) are just PondObjects
 with `source` metadata pointing to their parent. No special API —
-just pass `source` when creating the volume. This gives lineage: any
-volume can trace back to its source.
+just pass `source` when creating the PondObject. This gives lineage: any
+PondObject can trace back to its source.
 
 ---
 

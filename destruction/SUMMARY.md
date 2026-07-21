@@ -46,7 +46,7 @@ confirmed the two known issues and found no others.
 - **Storage:** 6 backends (FS, memory, SQLite, Redis, S3, FDB) all
   implement the kernel with zero special cases. S3 works with just
   PutObject + GetObject.
-- **Scale:** Data volume scales linearly to 100PB. Metadata ratio
+- **Scale:** Data PondObject scales linearly to 100PB. Metadata ratio
   *decreases* with scale. Object count is 1:1 with logical data.
 - **Human:** A stranger could implement Git, Iceberg, OCI, Feature Store,
   and LakeFS from the 3-primitive spec.

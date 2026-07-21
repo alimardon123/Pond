@@ -210,7 +210,7 @@ Task: PB-scale catalog reality
 
 ## Stage Summary
 
-Report below delivered to the user. Bottom line: the user's design (Raft-replicated DuckDB hot catalog + Parquet cold tier on S3) scales to ~10 PB comfortably and to 100 PB+ with one change — push per-column-per-file stats to the cold Parquet tier rather than keeping them in the Raft hot tier. The single wall is `ducklake_file_column_stats` (or its Iceberg/Delta equivalent): at 1 PB / 100 cols it's already ~50 GB; at 100 PB it's 5-10 TB, which neither DuckDB-in-RAM nor Postgres can hold comfortably. The file-list itself (`ducklake_data_file`, 8M rows at 1 PB / 800M rows at 100 PB) is fine in DuckDB up to ~100 PB; beyond that, shard by table. Raft throughput (5K-50K tx/sec) vs catalog write rate (1-100/sec) = 100-1000× headroom — the consensus layer is never the bottleneck at lakehouse-catalog write volumes. The DB-vs-S3 split the user proposes matches what every PB-scale catalog in production does (Snowflake FDB + S3, BigQuery Spanner + Colossus, Nessie Postgres + S3, Polaris Postgres + S3) — the only question is where to draw the line, and the answer is: keep snapshots + file-list in the hot DB, push column stats + manifest content to cold Parquet.
+Report below delivered to the user. Bottom line: the user's design (Raft-replicated DuckDB hot catalog + Parquet cold tier on S3) scales to ~10 PB comfortably and to 100 PB+ with one change — push per-column-per-file stats to the cold Parquet tier rather than keeping them in the Raft hot tier. The single wall is `ducklake_file_column_stats` (or its Iceberg/Delta equivalent): at 1 PB / 100 cols it's already ~50 GB; at 100 PB it's 5-10 TB, which neither DuckDB-in-RAM nor Postgres can hold comfortably. The file-list itself (`ducklake_data_file`, 8M rows at 1 PB / 800M rows at 100 PB) is fine in DuckDB up to ~100 PB; beyond that, shard by table. Raft throughput (5K-50K tx/sec) vs catalog write rate (1-100/sec) = 100-1000× headroom — the consensus layer is never the bottleneck at lakehouse-catalog write PondObjects. The DB-vs-S3 split the user proposes matches what every PB-scale catalog in production does (Snowflake FDB + S3, BigQuery Spanner + Colossus, Nessie Postgres + S3, Polaris Postgres + S3) — the only question is where to draw the line, and the answer is: keep snapshots + file-list in the hot DB, push column stats + manifest content to cold Parquet.
 
 ---
 Task ID: 9
@@ -941,20 +941,20 @@ Dataset layer built: Kernel → Dataset → Physical Structures → Lens. Each d
 ---
 Task ID: 33
 Agent: main (Super Z, web-a5961fe6 session)
-Task: Volume layer (simplified Dataset + namespace) + crash testing (Phase G).
+Task: PondObject layer (simplified Dataset + namespace) + crash testing (Phase G).
 
 ## Work Log
 
-1. Replaced Dataset with Volume (pond-sdk/volume.py, ~350 LOC). Changes from Dataset:
+1. Replaced Dataset with PondObject (pond-sdk/PondObject.py, ~350 LOC). Changes from Dataset:
    - Removed source_lens (redundant with type)
-   - Simplified materialized views: no separate create_materialized method. Just pass source= when creating a Volume. A materialized view is just a Volume with source metadata. No is_materialized/materialization_type fields — is_materialized is a property that checks if source is not None.
-   - Added namespace support: Volume names use "/" as path separator (analytics/orders, ml/features/user_stats). Volume.list_namespaces() shows all namespaces. Volume.list(prefix=) filters by namespace.
+   - Simplified materialized views: no separate create_materialized method. Just pass source= when creating a PondObject. A materialized view is just a PondObject with source metadata. No is_materialized/materialization_type fields — is_materialized is a property that checks if source is not None.
+   - Added namespace support: PondObject names use "/" as path separator (analytics/orders, ml/features/user_stats). PondObject.list_namespaces() shows all namespaces. PondObject.list(prefix=) filters by namespace.
    - Added basename/namespace properties.
-   - Renamed from "Dataset" to "Volume" — "Dataset" implies tabular data; "Volume" is format-agnostic (like Docker volumes).
+   - Renamed from "Dataset" to "PondObject" — "Dataset" implies tabular data; "PondObject" is format-agnostic (like Docker PondObjects).
 
-2. Updated POND.md: Dataset → Volume, added namespace explanation, simplified materialized view description.
+2. Updated POND.md: Dataset → PondObject, added namespace explanation, simplified materialized view description.
 
-3. Removed old pond-sdk/dataset.py (superseded by volume.py).
+3. Removed old pond-sdk/dataset.py (superseded by PondObject.py).
 
 4. Built experiments/crash_test.py (~330 LOC, 8 crash tests):
    - Test 1: Crash after commit — all committed data survives.
@@ -963,16 +963,48 @@ Task: Volume layer (simplified Dataset + namespace) + crash testing (Phase G).
    - Test 4: Crash after merge — merged data survives.
    - Test 5: Crash after delete + commit — deletion persists, deleted data stays deleted.
    - Test 6: Crash after large batch (1000 records) — all 1000 records survive.
-   - Test 7: Crash with multiple volumes — all 3 volumes (orders, repo, features) survive.
+   - Test 7: Crash with multiple PondObjects — all 3 PondObjects (orders, repo, features) survive.
    - Test 8: Crash after index rebuild — index usable after restart.
    All 8 crash tests PASS.
 
 5. Verified no regressions: lens_laws_ci (5 Views), architecture_laws (10 laws), feature_store (7 tests) all pass.
 
-6. Updated CI workflow: dataset.py → volume.py.
+6. Updated CI workflow: dataset.py → PondObject.py.
 
 7. Appended this worklog entry.
 
 ## Stage Summary
 
-Volume layer built with namespace support. A Volume is a named object with type metadata and optional source (for materialized views). Namespaces use "/" path separators (analytics/orders, ml/features/user_stats). Materialized views simplified to just "a Volume with a source field" — no special API. Crash testing: all 8 scenarios PASS. Pond survives crashes with data intact — committed data always survives, staged data correctly lost (expected), branches/merges/deletes/multiple volumes all survive restart. The kernel's SQLite-backed object store provides durability without any special crash recovery logic. Phase G correctness is now well-evidenced: 1000 differential tests pass, 10 architecture laws hold, 8 crash tests pass.
+PondObject layer built with namespace support. A PondObject is a named object with type metadata and optional source (for materialized views). Namespaces use "/" path separators (analytics/orders, ml/features/user_stats). Materialized views simplified to just "a PondObject with a source field" — no special API. Crash testing: all 8 scenarios PASS. Pond survives crashes with data intact — committed data always survives, staged data correctly lost (expected), branches/merges/deletes/multiple PondObjects all survive restart. The kernel's SQLite-backed object store provides durability without any special crash recovery logic. Phase G correctness is now well-evidenced: 1000 differential tests pass, 10 architecture laws hold, 8 crash tests pass.
+
+---
+Task ID: 34
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Rename Volume → PondObject + Phase H performance benchmark.
+
+## Work Log
+
+1. Renamed Volume → PondObject per user's feedback. "Volume" conflicts with Unity Catalog's volume concept (unstructured file storage). "PondObject" is unambiguous — an object in the Pond kernel. Updated all references across .py and .md files. Updated CI workflow. All tests pass.
+
+2. Built experiments/performance_benchmark.py (~300 LOC): Phase H performance measurement. Measures 7 categories:
+
+   PERFORMANCE DASHBOARD:
+   - Point lookup (10K records): 0.104ms per lookup
+   - Commit (1 record): 0.14ms
+   - Commit (100 records): 0.29ms
+   - Branch creation: 0.042ms
+   - Checkout: 0.060ms
+   - Restart + count (1K records): 0.76ms
+   - Index rebuild (5K records): 66ms
+   - Index incremental (1 record): 4.29ms (15x faster than full rebuild)
+   - Storage amplification: 1.91x (47.7% overhead)
+   - Bytes per record: 83 bytes
+   - Dedup (100 identical records): 5 blobs (vs 100 without dedup)
+
+3. Verified no regressions: lens_laws_ci (5), architecture_laws (10), pond_object (4), crash_test (8) all pass.
+
+4. Appended this worklog entry.
+
+## Stage Summary
+
+PondObject renamed from Volume. Phase H performance benchmark complete with real numbers. Key findings: point lookup is sub-millisecond (0.1ms), commit is sub-millisecond (0.14ms for 1 record, 0.29ms for 100), branch creation is 0.04ms (O(1) as designed), restart is 0.76ms. Index incremental is 15x faster than full rebuild. Dedup works (100 identical records = 5 blobs). Storage amplification is 1.91x (47.7% overhead — this is the Prolly tree + commit structure; binary encoding helped reduce from the original 125% to this). The architecture is not just correct — it's fast.
