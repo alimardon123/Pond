@@ -29,7 +29,7 @@ jobs:
           pip install pyarrow duckdb polars pandas
 
       - name: Run view_laws.py CI harness (5 SDK Views)
-        run: python pond-sdk/run_view_laws_ci.py
+        run: python pond-sdk/run_lens_laws_ci.py
 
       - name: Run view_laws.py on ArrowView (Phase D adapter)
         run: python pond-arrow/run_arrow_view_laws.py
@@ -50,16 +50,16 @@ jobs:
         run: python pond-feature-store/e2e_workflow.py
 
       - name: Run ViewQuery tests (elegant cross-view reading)
-        run: python pond-sdk/test_view_query.py
+        run: python pond-sdk/test_lens_query.py
 
       - name: Run shared Views test (multiple Views, same bytes, no overhead)
-        run: python pond-sdk/test_shared_views.py
+        run: python pond-sdk/test_shared_lenses.py
 
       - name: Run Lens Architecture test (RFC-0012 milestone)
         run: python pond-sdk/test_lens_architecture.py
 
       - name: Run TypedBlob middle layer test (any lens, any blob)
-        run: python pond-sdk/test_typed_blob.py
+        run: python pond-sdk/experiments/resolver_comparison/test_typed_blob.py
 
       - name: Run Architecture Laws (executable specification)
         run: python pond-sdk/architecture_laws.py

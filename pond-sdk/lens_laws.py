@@ -12,7 +12,7 @@ algebra V = (Sigma, A, E, D, M):
   Law 6: Kernel independence — the kernel never inspects blob contents
 
 Usage:
-    from view_laws import ViewLaws, ViewContract
+    from lens_laws import ViewLaws, ViewContract
     laws = ViewLaws(kernel)
     result = laws.check_all(my_view)
 
@@ -475,7 +475,7 @@ class ViewLaws:
 def _test_default_view_passes_laws():
     """Smoke test: the default View class should pass all 6 laws."""
     import shutil
-    from view_sdk import View
+    from lens_sdk import View
 
     bench_dir = "/tmp/pond_view_laws_test"
     if os.path.exists(bench_dir):

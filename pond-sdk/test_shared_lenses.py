@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, HERE)
 
 from pond_minimal import PondMinimal
-from view_sdk import View
+from lens_sdk import View
 
 
 # ---------------------------------------------------------------------------

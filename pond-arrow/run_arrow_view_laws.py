@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(POND_ROOT, "pond-arrow"))
 
 import pyarrow as pa
 from pond_minimal import PondMinimal
-from view_laws import ViewLaws, ViewContract
+from lens_laws import ViewLaws, ViewContract
 from arrow_view import ArrowView
 
 

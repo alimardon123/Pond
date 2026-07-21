@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 
 from pond_minimal import PondMinimal
-from view_sdk import Lens
+from lens_sdk import Lens
 
 
 def timed(label: str, fn):
@@ -200,7 +200,7 @@ def run_multi_materialization_test():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    from view_sdk import IndexedLens
+    from lens_sdk import IndexedLens
     view = IndexedLens(kernel, "multi_mat")
     # Register 3 indexes simultaneously
     view.register_index("by_region", lambda d: d.get("region", ""), mode="lazy")

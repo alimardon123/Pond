@@ -346,7 +346,7 @@ Two Views are **state-equivalent** iff they have the same `Σ`. Two
 Views are **algebra-equivalent** iff they have the same `Σ` and `A`.
 Algebra-equivalent Views are interchangeable for users.
 
-This gives us a formal foundation for `VIEW_INTEROP_SPEC.md` (which
+This gives us a formal foundation for `LENS_INTEROP_SPEC.md` (which
 previously used informal notions of "compatible Views").
 
 ---

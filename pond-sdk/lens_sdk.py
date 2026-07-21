@@ -29,7 +29,7 @@ from prolly_view import ProllyViewBase, ProllyTree
 from binary_encoding import BinaryProllyTree
 from maintenance import (drop_name, is_dropped, resolve_active,
                          TOMBSTONE_HASH)
-from view_query import ViewQuery
+from lens_query import ViewQuery
 
 
 # ===========================================================================
@@ -822,7 +822,7 @@ if __name__ == "__main__":
 # See RFC-0012 for the rename rationale.
 #
 # "View" is kept for backward compatibility. New code should use "Lens":
-#   from view_sdk import Lens, IndexedLens, KeylessLens, SemanticLens
+#   from lens_sdk import Lens, IndexedLens, KeylessLens, SemanticLens
 #
 # The Lens name captures Pond's philosophy: the bytes don't change;
 # only the way you observe and manipulate them changes. Like a lens

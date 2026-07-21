@@ -56,7 +56,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from pond_minimal import PondMinimal
-from view_sdk import View
+from lens_sdk import View
 
 
 # ---------------------------------------------------------------------------

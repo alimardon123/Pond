@@ -27,8 +27,8 @@ misleading. Fixing this requires clarifying the spec, not changing the kernel.
 **Examples:** the 10 ambiguities from the independent implementation
 challenge (HEAD tracking, object format, tree structure, etc.).
 
-**Action:** update FORMAL_SPEC.md, VIEW_AUTHORS_GUIDE.md, or
-VIEW_INTEROP_SPEC.md.
+**Action:** update FORMAL_SPEC.md, LENS_AUTHORS_GUIDE.md, or
+LENS_INTEROP_SPEC.md.
 
 ---
 
@@ -101,7 +101,7 @@ authorization, compression, replication, streaming engine.
 | Finding 7 (SQLite thread-binding) | **Engineering** | Needs thread-safe root store or FDB backend |
 | CAS candidate | **Architecture** (rejected) | Fails universality criterion |
 | Multi-tenancy | **Architecture** (rejected) | Solved at View level (capability tokens) |
-| 10 ambiguities | **Specification** | Documented in VIEW_INTEROP_SPEC.md |
+| 10 ambiguities | **Specification** | Documented in LENS_INTEROP_SPEC.md |
 | Index friction (5 Views) | **Ergonomics** | Needs shared index library (View-level) |
 | View composition | **Research** | Open question in RFC-0001 |
 | Is Pond novel? | **Research** | Equivalence analysis says "no" (isomorphic to Git/IPFS/Irmin/Dolt/LakeFS) |

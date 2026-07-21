@@ -36,7 +36,7 @@ sys.path.insert(0, SCRIPT_DIR)  # for feature_store.py
 
 from pond_minimal import PondMinimal
 from feature_store import FeatureStore
-from view_sdk import View, SemanticView
+from lens_sdk import View, SemanticView
 
 
 def get_store():

@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.join(POND_ROOT, "pond-sdk"))
 sys.path.insert(0, os.path.join(POND_ROOT, "pond-core"))
 
 from pond_minimal import PondMinimal          # the 3-primitive kernel
-from view_sdk import Lens                     # Lens is the alias for View (RFC-0012 §2)
+from lens_sdk import Lens                     # Lens is the alias for View (RFC-0012 §2)
 
 
 # ---------------------------------------------------------------------------

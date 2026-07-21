@@ -45,7 +45,7 @@ import struct
 from typing import Any
 
 from auto_index import IndexedView          # Layer 2
-from view_sdk import CrossView               # cross-view helpers (available)
+from lens_sdk import CrossView               # cross-view helpers (available)
 
 
 class VectorView(IndexedView):

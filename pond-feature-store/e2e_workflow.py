@@ -53,7 +53,7 @@ sys.path.insert(0, _HERE)
 
 from pond_minimal import PondMinimal
 from feature_store import FeatureStore
-from view_sdk import View, CrossView
+from lens_sdk import View, CrossView
 
 
 # ---------------------------------------------------------------------------

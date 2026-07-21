@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, HERE)
 
 from pond_minimal import PondMinimal
-from view_sdk import Lens  # Using the new preferred name
+from lens_sdk import Lens  # Using the new preferred name
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +380,7 @@ def test_lenses_are_independent():
 
 def test_lens_alias_works():
     """Verify: Lens is an alias for View (backward compatible)."""
-    from view_sdk import Lens, View
+    from lens_sdk import Lens, View
     assert Lens is View
 
     # Can construct via either name

@@ -9,7 +9,7 @@
 > read this one.
 >
 > **Source of truth:** This document supersedes informal descriptions
-> in `docs/VIEW_AUTHORS_GUIDE.md`. Where the two disagree, this
+> in `docs/LENS_AUTHORS_GUIDE.md`. Where the two disagree, this
 > document is correct.
 
 ---
@@ -1085,7 +1085,7 @@ Before claiming a View is SDK-compliant, verify:
   6 laws the SDK implements), RFC-0008 (Deletion as Data — the
   tombstone pattern used by `drop_index`).
 - **Supersedes:** informal descriptions in
-  `docs/VIEW_AUTHORS_GUIDE.md`. Where the two disagree, this
+  `docs/LENS_AUTHORS_GUIDE.md`. Where the two disagree, this
   document is correct.
 - **Operationalized by:** `pond-sdk/view_laws.py` (the property-test
   harness that verifies SDK compliance).

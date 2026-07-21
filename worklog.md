@@ -851,3 +851,56 @@ Task: Rename invariants to Architecture Laws + add Laws 8-10 + postmortem + answ
 ## Stage Summary
 
 Architecture Laws renamed and expanded to 10 (from 7). Law 8 (Determinism) revealed that commit hashes are NOT deterministic (they include timestamps) — this is by design. The DATA is deterministic; the METADATA is not. Postmortem written for the Prolly tree bug, documenting the root cause (single incorrect encode_leaf call), propagation (consistent across all consumers — evidence of clean layers), fix (is_leaf_level flag), and lessons. All 10 laws pass. CI updated. The user's three suggested validation projects (million-scale correctness, differential testing, crash testing) are the next Phase G work.
+
+---
+Task ID: 31
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Full repo reorganization — one-page POND.md, rename view_* to lens_*, move deprecated files, rename docs.
+
+## Work Log
+
+1. Wrote POND.md — the one-page "What is Pond?" document. Covers: the kernel (Bytes/History/Names), the Lens (interprets bytes, never owns), Physical Structures (accelerate access, never own data), what is NOT in the kernel, the 10 Architecture Laws, the layer hierarchy, and design goals. One sentence summary: "Pond stores immutable bytes with universal history; every higher-level capability is simply a different Lens over that substrate."
+
+2. Full repo audit. Identified:
+   - 20 files importing from view_sdk (needs rename to lens_sdk)
+   - Deprecated typed_blob.py + test_typed_blob.py in pond-sdk/ (should move to experiments/)
+   - Docs using VIEW_ prefix (should be LENS_)
+   - Stale directories (prototype/, libraries/, destruction/, engineering/, applications/)
+
+3. File renames (git mv):
+   - pond-sdk/view_sdk.py → pond-sdk/lens_sdk.py
+   - pond-sdk/view_laws.py → pond-sdk/lens_laws.py
+   - pond-sdk/view_query.py → pond-sdk/lens_query.py
+   - pond-sdk/run_view_laws_ci.py → pond-sdk/run_lens_laws_ci.py
+   - pond-sdk/test_view_query.py → pond-sdk/test_lens_query.py
+   - pond-sdk/test_shared_views.py → pond-sdk/test_shared_lenses.py
+
+4. Moved deprecated files:
+   - pond-sdk/typed_blob.py → experiments/resolver_comparison/typed_blob.py
+   - pond-sdk/test_typed_blob.py → experiments/resolver_comparison/test_typed_blob.py
+
+5. Renamed docs:
+   - docs/VIEW_AUTHORS_GUIDE.md → docs/LENS_AUTHORS_GUIDE.md
+   - docs/VIEW_INTEROP_SPEC.md → docs/LENS_INTEROP_SPEC.md
+
+6. Updated ALL imports across 20+ files: from view_sdk → from lens_sdk, from view_laws → from lens_laws, from view_query → from lens_query. Used sed for bulk replacement.
+
+7. Updated CI workflow (.github/workflows/view-laws.yml): all test command references updated to new file names.
+
+8. Updated all .md files to reference new doc names (LENS_AUTHORS_GUIDE, LENS_INTEROP_SPEC).
+
+9. VERIFIED: all tests pass after reorganization:
+   - run_lens_laws_ci.py: 5/5 Views, 6 algebra laws ✓
+   - architecture_laws.py: 10/10 laws ✓
+   - test_lens_query.py: 7/7 tests ✓
+   - test_shared_lenses.py: 6/6 tests ✓
+   - test_lens_architecture.py: 5/5 tests ✓
+   - feature_store.py: 7/7 production tests ✓
+   - e2e_workflow.py: 12/12 steps ✓
+   - arrow_view.py: 7/7 tests ✓
+
+10. Appended this worklog entry.
+
+## Stage Summary
+
+Full repo reorganization complete. The one-page POND.md is the canonical "What is Pond?" document. All SDK files renamed from view_* to lens_* (view_sdk.py → lens_sdk.py, etc.). Deprecated TypedBlob moved to experiments/. Docs renamed from VIEW_* to LENS_*. All 20+ import references updated. All tests pass (8 test suites, 50+ individual tests). The codebase now consistently uses "Lens" terminology throughout — no more "View" in file names (only as backward-compatible class aliases). The repo is cleaner, the naming is consistent, and the one-pager gives anyone the elevator pitch in 60 seconds.

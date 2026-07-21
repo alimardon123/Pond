@@ -410,7 +410,7 @@ at Layer 0 (kernel calculus).
 - [ ] Add `compact_tombstones(kernel)` to a new `pond-maintenance`
       package (Layer 0.5).
 - [ ] Document the "Layer 0 names are internal identifiers" usage
-      guideline in `VIEW_AUTHORS_GUIDE.md`.
+      guideline in `LENS_AUTHORS_GUIDE.md`.
 - [ ] Add a test: tombstone a name, verify `resolve` returns
       `TOMBSTONE_HASH`, verify `resolve_active` returns None,
       verify `compact_tombstones` removes the row.

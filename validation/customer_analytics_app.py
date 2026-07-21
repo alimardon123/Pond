@@ -47,7 +47,7 @@ for _pkg in ("pond-core", "pond-sdk", "pond-feature-store", "pond-arrow"):
     sys.path.insert(0, os.path.join(_REPO_ROOT, _pkg))
 
 from pond_minimal import PondMinimal
-from view_sdk import View, CrossView
+from lens_sdk import View, CrossView
 from feature_store import FeatureStore
 from arrow_view import ArrowView
 

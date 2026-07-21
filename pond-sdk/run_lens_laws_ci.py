@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "prototype"))
 sys.path.insert(0, HERE)
 
 from pond_minimal import PondMinimal
-from view_laws import ViewLaws, ViewContract
+from lens_laws import ViewLaws, ViewContract
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ from view_laws import ViewLaws, ViewContract
 
 def make_default_view_contract(kernel) -> tuple:
     """Contract for the default View class."""
-    from view_sdk import View
+    from lens_sdk import View
     view = View(kernel, "ci_default")
     return view, ViewContract(
         name="ci_default",
@@ -90,7 +90,7 @@ def make_indexed_view_contract(kernel) -> tuple:
 
 def make_semantic_view_contract(kernel) -> tuple:
     """Contract for SemanticView (a subclass of View)."""
-    from view_sdk import SemanticView
+    from lens_sdk import SemanticView
     view = SemanticView(kernel, "ci_semantic")
     return view, ViewContract(
         name="ci_semantic",
@@ -155,7 +155,7 @@ def make_keyless_view_contract(kernel) -> tuple:
 
     Tests Phase B.3 KeylessView: put(None, data) generates a UUID4 key.
     """
-    from view_sdk import KeylessView
+    from lens_sdk import KeylessView
     view = KeylessView(kernel, "ci_keyless")
 
     def keyless_put(key, data):
