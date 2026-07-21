@@ -44,7 +44,7 @@ Materialized views:
   creating the Collection:
 
     Collection.create(kernel, "analytics/orders_by_region",
-                  type="sql", source="analytics/orders")
+                  labels=["sql"], created_by="SqlLens", source="analytics/orders")
 
   This records lineage (orders_by_region ← orders) without any
   special machinery. The materialized view has its own commit DAG;
@@ -52,7 +52,7 @@ Materialized views:
 
 Usage:
     # Create a Collection
-    vol = Collection.create(kernel, "analytics/orders", type="sql",
+    vol = Collection.create(kernel, "analytics/orders", labels=["sql"], created_by="SqlLens",
                          description="Customer orders table")
 
     # Use a Lens to read/write it
@@ -74,7 +74,7 @@ Usage:
 
     # Create a materialized view (just a Collection with source)
     mv = Collection.create(kernel, "analytics/orders_by_region",
-                       type="sql", source="analytics/orders",
+                       labels=["sql"], created_by="SqlLens", source="analytics/orders",
                        description="Orders aggregated by region")
 """
 
@@ -128,24 +128,31 @@ class Collection:
 
     @classmethod
     def create(cls, kernel: PondMinimal, name: str,
-               type: str = "generic",
+               labels: Optional[list[str]] = None,
                description: str = "",
                source: Optional[str] = None,
+               created_by: str = "",
                **extra) -> "Collection":
         """Create a new Collection with metadata.
+
+        Collections are NEUTRAL — they don't have a "type" that ties them
+        to one Lens family. Instead, they have:
+        - labels: neutral tags for organization (e.g., ["analytics", "production"])
+        - created_by: provenance — which Lens created this (informational, not
+          authoritative; any Lens can read/write any Collection)
+
+        This preserves the architecture's key principle: Collections are
+        interpreted by Lenses, not owned by them.
 
         Args:
             kernel: the Pond kernel.
             name: the Collection name (may include namespace path,
                 e.g., "analytics/orders").
-            type: the lens type that created this Collection
-                (e.g., "sql", "git", "feature_store", "notebook",
-                "arrow", "streaming", "vector", "semantic").
+            labels: optional list of neutral tags for organization/filtering.
+                e.g., ["analytics", "finance", "production"].
             description: human-readable description.
             source: optional source Collection name (for materialized views).
-                If provided, this Collection is a materialized view derived
-                from the source Collection. The view has its own commit DAG;
-                it's a separate Collection that tracks its lineage.
+            created_by: optional — which Lens created this (provenance only).
             **extra: additional metadata fields.
 
         Returns:
@@ -160,10 +167,11 @@ class Collection:
 
         meta = {
             "name": name,
-            "type": type,
+            "labels": labels or [],
             "description": description,
             "created_at": time.time(),
-            "source": source,  # None for base Collections; parent name for views
+            "source": source,
+            "created_by": created_by,
             **extra,
         }
         meta_bytes = json.dumps(meta, sort_keys=True).encode()
@@ -183,9 +191,21 @@ class Collection:
         return json.loads(self.kernel.read_blob(h))
 
     @property
-    def type(self) -> str:
-        """The lens type that created this Collection (e.g., 'sql', 'git')."""
-        return self._meta.get("type", "generic")
+    def labels(self) -> list[str]:
+        """Neutral tags for organization (e.g., ['analytics', 'production']).
+
+        Collections are NOT typed — they don't belong to one Lens family.
+        Any Lens can read/write any Collection. Labels are for filtering
+        and organization, not for restricting access."""
+        return self._meta.get("labels", [])
+
+    @property
+    def created_by(self) -> str:
+        """Which Lens created this Collection (provenance only).
+
+        Informational, not authoritative. Any Lens can read/write any
+        Collection regardless of created_by."""
+        return self._meta.get("created_by", "")
 
     @property
     def description(self) -> str:
@@ -266,9 +286,9 @@ class Collection:
         return sorted(Collections, key=lambda m: m.get("name", ""))
 
     @staticmethod
-    def list_by_type(kernel: PondMinimal, type: str) -> list[dict]:
-        """List all Collections of a given type (e.g., 'sql', 'git')."""
-        return [v for v in Collection.list(kernel) if v.get("type") == type]
+    def list_by_label(kernel: PondMinimal, label: str) -> list[dict]:
+        """List all Collections with a given label."""
+        return [v for v in Collection.list(kernel) if label in v.get("labels", [])]
 
     @staticmethod
     def list_namespaces(kernel: PondMinimal) -> list[str]:
@@ -331,15 +351,15 @@ def test_Collection_create_and_list():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    Collection.create(kernel, "analytics/orders", type="sql",
+    Collection.create(kernel, "analytics/orders", labels=["sql"], created_by="SqlLens",
                    description="Customer orders table")
-    Collection.create(kernel, "analytics/customers", type="sql",
+    Collection.create(kernel, "analytics/customers", labels=["sql"], created_by="SqlLens",
                    description="Customer profiles")
-    Collection.create(kernel, "ml/features/user_stats", type="feature_store",
+    Collection.create(kernel, "ml/features/user_stats", labels=["feature_store"], created_by="FeatureStoreLens",
                    description="User feature statistics")
-    Collection.create(kernel, "repo/main", type="git",
+    Collection.create(kernel, "repo/main", labels=["git"], created_by="GitLens",
                    description="Source code repository")
-    Collection.create(kernel, "notebooks/analysis", type="notebook",
+    Collection.create(kernel, "notebooks/analysis", labels=["notebook"], created_by="NotebookLens",
                    description="Analysis notebook")
 
     # List all
@@ -350,7 +370,7 @@ def test_Collection_create_and_list():
     assert "ml/features/user_stats" in names
 
     # List by type
-    sql_Collections = Collection.list_by_type(kernel, "sql")
+    sql_Collections = Collection.list_by_label(kernel, "sql")
     assert len(sql_Collections) == 2
 
     # List by namespace prefix
@@ -367,7 +387,7 @@ def test_Collection_create_and_list():
 
     # Verify metadata
     vol = Collection(kernel, "analytics/orders")
-    assert vol.type == "sql"
+    assert vol.labels == ["sql"]
     assert vol.description == "Customer orders table"
     assert vol.namespace == "analytics"
     assert vol.basename == "orders"
@@ -376,7 +396,7 @@ def test_Collection_create_and_list():
 
     kernel.close()
     shutil.rmtree(bench, ignore_errors=True)
-    print("PASS: Collection create, list, list_by_type, list_namespaces, namespace/basename")
+    print("PASS: Collection create, list, list_by_label, list_namespaces, namespace/basename")
 
 
 def test_materialized_views():
@@ -387,14 +407,14 @@ def test_materialized_views():
     kernel = PondMinimal(bench)
 
     # Create a base Collection
-    Collection.create(kernel, "analytics/orders", type="sql",
+    Collection.create(kernel, "analytics/orders", labels=["sql"], created_by="SqlLens",
                    description="Orders table")
 
     # Create materialized views (just Collections with source=)
-    Collection.create(kernel, "analytics/orders_by_region", type="sql",
+    Collection.create(kernel, "analytics/orders_by_region", labels=["sql"], created_by="SqlLens",
                    source="analytics/orders",
                    description="Orders aggregated by region")
-    Collection.create(kernel, "analytics/orders_index_customer", type="sql",
+    Collection.create(kernel, "analytics/orders_index_customer", labels=["sql"], created_by="SqlLens",
                    source="analytics/orders",
                    description="Index on customer_id")
 
@@ -428,7 +448,7 @@ def test_Collection_with_lens():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    Collection.create(kernel, "analytics/users", type="sql",
+    Collection.create(kernel, "analytics/users", labels=["sql"], created_by="SqlLens",
                    description="User table")
 
     from lens_sdk import Lens
@@ -441,7 +461,7 @@ def test_Collection_with_lens():
     assert lens.count() == 2
 
     vol = Collection(kernel, "analytics/users")
-    assert vol.type == "sql"
+    assert vol.labels == ["sql"]
     assert vol.namespace == "analytics"
     assert vol.basename == "users"
 
@@ -462,7 +482,7 @@ def test_Collection_persists():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    Collection.create(kernel, "analytics/orders", type="sql",
+    Collection.create(kernel, "analytics/orders", labels=["sql"], created_by="SqlLens",
                    description="Orders table")
     kernel.close()
 
@@ -470,7 +490,7 @@ def test_Collection_persists():
     Collections = Collection.list(kernel2)
     assert len(Collections) == 1
     assert Collections[0]["name"] == "analytics/orders"
-    assert Collections[0]["type"] == "sql"
+    assert "sql" in Collections[0].get("labels", [])
 
     vol = Collection(kernel2, "analytics/orders")
     assert vol.description == "Orders table"

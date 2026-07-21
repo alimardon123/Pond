@@ -1199,3 +1199,83 @@ Task: Rename PondObject → Collection + write "The Pond Storage Model" paper.
 ## Stage Summary
 
 PondObject → Collection renamed. "The Pond Storage Model" paper written (~2000 lines, 13 sections). This is the canonical document that explains Pond to the world: why existing systems duplicate metadata, how the 3-primitive kernel avoids this, how Lenses provide multi-domain interpretation without metadata, and honest assessment of where Pond fails. The paper exposes 5 open questions that need resolution before the architecture is fully settled. The most important: staging should belong to a Workspace/Transaction layer (not Lens), and the Lens hierarchy might need inversion (Lens on top, not middle). These are the next architectural decisions to make.
+
+---
+Task ID: 40
+Agent: general-purpose (Red Team reviewer)
+Task: Falsify the Pond Storage Model paper as a hostile SIGMOD/VLDB reviewer.
+
+## Work Log
+
+1. Read `/home/z/my-project/pond_repo/worklog.md` tail (Tasks 5–39) for context. The repo is at the stage where the Pond Storage Model paper (docs/POND_STORAGE_MODEL.md, ~818 lines) has been written (Task 39) and is the canonical specification.
+
+2. Read the four required documents in full:
+   - `docs/POND_STORAGE_MODEL.md` (818 lines, 15 sections) — the paper under review.
+   - `POND.md` (159 lines) — the one-page summary.
+   - `rfcs/RFC-0013-lens-interpretation-contract.md` (251 lines) — the Lens contract.
+   - `pond-core/pond_minimal.py` (200 lines) — the kernel implementation.
+
+3. Cross-referenced paper claims against actual code to verify or falsify each:
+   - `pond-sdk/architecture_laws.py` (461 lines) — the 10 executable laws.
+   - `pond-sdk/collection.py` (518 lines) — Collection layer.
+   - `pond-sdk/lens_sdk.py` (~850 lines) — Lens/View SDK.
+   - `pond-sdk/prolly_view.py` (631 lines) — Prolly tree + delta journal.
+   - `pond-sdk/maintenance.py` (316 lines) — tombstone/GC helpers.
+   - `docs/FORMAL_ALGEBRA.md` (531 lines) — formal spec + lower-bound proof.
+   - `rfcs/RFC-0005-derived-structures.md` (292 lines) — materialization calculus.
+   - `rfcs/RFC-0007-view-algebra.md` (465 lines) — View algebra.
+   - `experiments/crash_test.py` (331 lines) — the "8 crash tests."
+   - `experiments/performance_benchmark.py` (361 lines) — performance harness.
+
+4. Ran targeted falsification experiments (Python, in-repo):
+   a. **Kernel precondition divergence**: `pond-vector/pond_minimal.py` accepts `reference(name, non_existent_hash)`; `pond-core/pond_minimal.py` raises `ValueError`. Same spec, two implementations, different semantics. CONFIRMED.
+   b. **Read heuristic bug**: A name consisting of exactly 64 lowercase hex chars is misclassified as a hash. `read("a"*64)` returns `ValueError: Blob aaa...aaa not found on disk` instead of resolving the name. CONFIRMED.
+   c. **Commit DAG is a linked list**: `prolly_view.py:merge()` (line 478–501) creates a commit with `parent_hash` = current branch HEAD only; the merged branch's commit is read for state but NOT recorded as a second parent. No merge commits exist. CONFIRMED.
+   d. **Crash tests don't crash**: `experiments/crash_test.py:45` `crash_and_recover()` just returns `PondMinimal(bench)` — does not kill a process, does not truncate files, does not disable fsync. The "8 crash tests" verify reopen, not crash survival. CONFIRMED.
+   e. **Three kernel copies**: `pond-core/pond_minimal.py` (7677 bytes), `prototype/pond_minimal.py` (7677 bytes, identical), `pond-vector/pond_minimal.py` (1549 bytes, divergent in-memory mock). "Frozen kernel" claim undermined. CONFIRMED.
+   f. **Architecture Laws misnumbered**: paper's Law 6 (Branch) and Law 7 (Merge) have NO corresponding executable test; code's `law_6`/`law_7` test Scale/Index (duplicating `law_9`/`law_10`). CONFIRMED.
+   g. **Law 8 (Determinism) waived**: `law_8_determinism` docstring admits commit hashes are non-deterministic (include `time.time()`); test only checks blob-hash determinism. CONFIRMED.
+   h. **O(log N) contradicted by measurement**: paper §12 admits 0.1ms→14.8ms (148×) for 10K→500K (50×) — two orders of magnitude worse than O(log N) predicts. CONFIRMED.
+   i. **No fsync/synchronous PRAGMA**: `pond_minimal.py` opens SQLite with `isolation_level=None` and no `PRAGMA synchronous`; blob writes use `open(path,"wb")` with no `fsync`. Crash-safety claim unverified. CONFIRMED.
+
+5. Identified falsifications of 6 of 7 headline claims (C2 no-metadata, C3 bytes-are-bytes, C4 f(snapshot), C5 O(log N), C6 commit DAG, C7 architecture laws). C1 (three primitives necessary) survives in weakened form; sufficiency is falsified by the paper's own §12/§13 admission that atomic multi-key writes are impossible.
+
+6. Wrote the hostile review to `/home/z/my-project/pond_repo/validation/red_team_review.md` (~14 KB, 14 sections). Verdict: REJECT. Three most damaging findings: (1) commit DAG is a linked list, (2) O(log N) contradicted by paper's own measurement, (3) "no metadata" claim is false and self-contradictory.
+
+7. Appended this worklog entry.
+
+## Stage Summary
+
+As a hostile SIGMOD/VLDB reviewer, I attempted to falsify the Pond Storage Model paper. The model does NOT survive the review in its current form. Six of seven headline claims are falsified by the paper's own text or by the accompanying code: the "commit DAG" is a singly-linked list (merge records no second parent); the O(log N) lookup claim is contradicted by the paper's own measured 148× latency growth for 50× scale-up; the "no translation metadata" claim is false (key prefixes, Resolver registrations, `__meta`/`__index__`/`__branch__` sidecar Names, and the tombstone marker are all metadata); the "bytes are just bytes" principle is violated by a fragile 64-hex-char heuristic in `Read()`; the "every optimization is f(snapshot)" claim is falsified by learned indexes, randomized sketches, caches, and compression dictionaries; and the "10 Architecture Laws" are misnumbered between paper and code, with Laws 6 (Branch) and 7 (Merge) having no executable test. The "8 crash tests" do not actually crash anything. The kernel exists in three divergent copies. The staging problem (admitted in §12/§13) cannot be solved without changing the kernel, contradicting the "frozen" claim. The closest competitor (Dolt, from which the Prolly tree is borrowed) is omitted from comparison. Overall verdict: REJECT. The kernel idea is sound; the paper oversells it. Path to acceptance is in §12 of the review: complete the proofs, compare against Dolt/IPFS, run real crash tests, validate at 10M+ scale, reconcile terminology, acknowledge the metadata that exists, and either prove or retract the Physical Structure calculus. The review is saved at validation/red_team_review.md.
+
+---
+Task ID: 41
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Collection labels fix + paper chapters + Red Team Architecture Review.
+
+## Work Log
+
+1. Fixed Collection.type → Collection.labels per user's architectural feedback. Collections are now NEUTRAL — they don't have a "type" that ties them to one Lens family. Instead they have:
+   - labels: neutral tags for organization (e.g., ["analytics", "production"])
+   - created_by: provenance only (which Lens created this, informational not authoritative)
+   This preserves the key principle: Collections are interpreted by Lenses, not owned by them.
+
+2. Added two new chapters to the Pond Storage Model paper:
+   - §14: "Why Not Universal Schema?" — explains why Pond rejects Arrow/Protobuf/Avro/Iceberg as canonical formats (lowest-common-denominator, coordination problem, permanent dependency, violates "bytes are just bytes")
+   - §15: "What Pond Does NOT Know" — the most important section. Pond doesn't know SQL, tables, rows, columns, Git, JSON, Arrow, images, vectors, indexes, statistics. It ONLY knows Bytes, References, History. Everything else is interpretation.
+
+3. Launched Red Team Architecture Review (Task 40). Fresh agent acted as hostile SIGMOD reviewer. Verdict: REJECT. Found 12 categories of issues. Most damaging:
+
+   FINDING 1: "Commit DAG" is a linked list, not a DAG. Merge creates 1-parent commits, not 2-parent. Branch topology is unrecoverable. The paper's claim of a "commit DAG" is misleading.
+
+   FINDING 2: O(log N) lookup claim contradicted by measurements. 0.1ms at 10K → 14.8ms at 500K = 148x slowdown for 50x scale-up. O(log N) predicts ~1.4x. The delta journal walk is the bottleneck, not the Prolly tree.
+
+   FINDING 3: "No translation metadata" is self-contradictory. Key prefixes, __meta blobs, __index__/__branch__ names, tombstone markers are ALL metadata — relocated from files to naming conventions, not eliminated.
+
+   Additional findings: crash tests don't actually crash, Laws 6/7 have no executable tests, Law 8 (Determinism) is waived in its own test, three divergent kernel copies exist, Dolt (the Prolly tree source) is omitted from comparison, Physical Structure calculus falsified by learned indexes/caches/sketches.
+
+4. These are REAL findings. The paper oversells. The kernel idea is sound but the claims around it need to be honest.
+
+## Stage Summary
+
+Collection fixed (neutral labels, not type). Paper has 15 chapters now. Red Team review: REJECT. The model's CORE (3 primitives, immutable bytes, content-addressing) survives. The CLAIMS around it (O(log N), commit DAG, no metadata, Physical Structure universality) are overstated and need correction. The most important corrections: (1) admit the commit structure is a linked list, not a DAG, (2) admit the O(log N) claim is violated by the delta journal walk, (3) admit that key prefixes and naming conventions ARE metadata (just in Names, not in blobs), (4) add executable tests for Branch and Merge laws, (5) add Dolt to the comparison, (6) acknowledge Physical Structure calculus limitations. The staging/Workspace problem is confirmed as the most important missing abstraction. The Red Team review is the most valuable artifact produced in this session — it shows exactly where the architecture is solid and where the claims are overstated.

@@ -654,3 +654,164 @@ is simply a different Lens over that substrate.**
 For implementation details, see the codebase. For formal proofs, see
 RFC-0003 (Kernel Specification) and RFC-0007 (View/Lens Algebra). For
 the Lens contract, see RFC-0013.*
+
+---
+
+## 14. Why Not Universal Schema?
+
+A natural question: why not define one canonical metadata model that
+all systems can agree on? Why not Apache Arrow? Why not Protobuf?
+Why not Avro? Why not Iceberg metadata?
+
+### The temptation
+
+A universal schema seems elegant: define one format, everyone agrees,
+no translation needed. Apache Arrow aims for this (a canonical
+in-memory columnar format). Iceberg defines a universal table
+metadata model. Protobuf defines a universal serialization format.
+
+### Why Pond rejects this
+
+**1. Universal schemas become lowest-common-denominator formats.**
+
+Arrow is excellent for columnar analytics. But it's terrible for:
+- Git trees (hierarchical, not tabular)
+- Notebook cells (mixed types: code, markdown, output, attachments)
+- Feature vectors (numeric arrays, not rows)
+- Unstructured data (JPEG, MP4, PDF)
+
+Forcing everything into Arrow would make non-tabular workloads
+unnaturally complex. Forcing everything into JSON would make tabular
+workloads inefficient. Any universal format favors some workloads
+and penalizes others.
+
+**2. Universal schemas create a coordination problem.**
+
+If Arrow is the universal format, every new workload must wait for
+Arrow to support its use case. Adding graph data to Arrow requires
+a community RFC. Adding notebook cells requires another. The format
+becomes a bottleneck.
+
+Pond's approach: each Lens chooses its own format. No coordination
+needed. A new workload can be added without modifying any existing
+component.
+
+**3. Universal schemas become permanent dependencies.**
+
+If Pond standardized on Arrow, every Pond deployment would depend
+on Arrow. If Arrow changes its format, Pond changes. If Arrow is
+abandoned, Pond is orphaned.
+
+Pond's approach: the kernel has no format dependency. Lenses choose
+their formats independently. If Arrow is replaced by something
+better, only the ArrowLens changes — the kernel and all other Lenses
+are unaffected.
+
+**4. Universal schemas conflict with the "bytes are just bytes" principle.**
+
+The kernel stores bytes. It doesn't know what format they're in.
+A universal schema would require the kernel to know the format —
+violating the core principle that makes the architecture work.
+
+### What Pond does instead
+
+Pond allows EMERGENT compatibility. Lenses that choose the same
+format (e.g., both use JSON) can read each other's data for free —
+not because a universal schema was imposed, but because both
+independently chose JSON. Lenses that choose different formats
+coexist without interference.
+
+This is exactly how Unix works: the filesystem doesn't mandate a
+universal file format. Applications choose their formats. When two
+applications happen to use the same format (e.g., both read UTF-8
+text), they interoperate for free. When they don't, they coexist.
+
+---
+
+## 15. What Pond Does NOT Know
+
+This is perhaps the most important section. Pond's power comes from
+what it doesn't know.
+
+### Pond does NOT know:
+
+- SQL
+- Tables
+- Rows
+- Columns
+- Schemas
+- Git
+- Trees
+- Commits (as a concept — the kernel stores commit-like blobs, but
+  doesn't know they're "commits")
+- JSON
+- XML
+- Arrow
+- Parquet
+- Images
+- Videos
+- Vectors
+- Embeddings
+- Notebooks
+- Feature stores
+- Indexes (the kernel stores index-like blobs, but doesn't know
+  they're "indexes")
+- Statistics
+- Bloom filters
+- Caches
+- Histograms
+- Compression
+- Encryption
+- Transactions
+- Permissions
+- Users
+- Tenants
+
+### Pond ONLY knows:
+
+- **Bytes** — immutable, content-addressed blobs
+- **References** — mutable name → hash mappings
+- **History** — the commit DAG (which is itself just bytes + references)
+
+### Everything else is interpretation.
+
+This is not a limitation. This is the architecture's defining
+strength. By knowing nothing about the data, the kernel:
+
+1. Never needs to be updated for new formats
+2. Never creates format-specific metadata
+3. Never imposes format lock-in
+4. Never becomes a bottleneck for new workloads
+5. Never needs to be "extended" to support a new domain
+
+The cost of this ignorance is that higher layers (Lenses, Physical
+Structures, Applications) must provide their own interpretation. But
+that cost is exactly what makes the architecture composable: each
+layer adds exactly one capability, without coupling to the others.
+
+### The Unix analogy
+
+The Unix filesystem stores bytes. It doesn't know:
+- Python (.py files)
+- JPEG (.jpg files)
+- ELF binaries
+- SQLite databases
+- tar archives
+
+Applications interpret the bytes. When two applications agree on a
+format (e.g., both read UTF-8), they interoperate. When they don't,
+they coexist. The filesystem never needs to be updated to support a
+new file format.
+
+Pond is the same: the kernel stores bytes. Lenses interpret them.
+When two Lenses agree on a format, they interoperate. When they
+don't, they coexist. The kernel never needs to be updated to support
+a new domain.
+
+This is Pond's defining contribution: **a storage substrate that
+knows nothing about what it stores, enabling universal
+interoperability through interpretation rather than standardization.**
+
+---
+
+*End of The Pond Storage Model*
