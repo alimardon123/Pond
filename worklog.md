@@ -904,3 +904,36 @@ Task: Full repo reorganization — one-page POND.md, rename view_* to lens_*, mo
 ## Stage Summary
 
 Full repo reorganization complete. The one-page POND.md is the canonical "What is Pond?" document. All SDK files renamed from view_* to lens_* (view_sdk.py → lens_sdk.py, etc.). Deprecated TypedBlob moved to experiments/. Docs renamed from VIEW_* to LENS_*. All 20+ import references updated. All tests pass (8 test suites, 50+ individual tests). The codebase now consistently uses "Lens" terminology throughout — no more "View" in file names (only as backward-compatible class aliases). The repo is cleaner, the naming is consistent, and the one-pager gives anyone the elevator pitch in 60 seconds.
+
+---
+Task ID: 32
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Dataset layer + differential testing (Phase G).
+
+## Work Log
+
+1. Built pond-sdk/dataset.py (~350 LOC): the Dataset layer between Kernel and Lens. A Dataset is a named object with metadata (type, source_lens, description, is_materialized, source_dataset, materialization_type). Metadata is ONE small blob per dataset (stored as a kernel Name "{name}__meta"), NOT per record. The blob bytes stay pure.
+   - Dataset.create(): create a new dataset with type metadata.
+   - Dataset.create_materialized(): create a materialized view (index, aggregate, transform) with lineage to source dataset.
+   - Dataset.list(): list all datasets with their types — like listing tables in a database.
+   - Dataset.list_by_type(): list datasets of a given type (sql, git, feature_store, etc.).
+   - Dataset.list_base() / list_materialized(): separate base datasets from materialized views.
+   - 4 tests pass: create+list, materialized views, dataset+lens integration, persistence across restart.
+
+2. Updated POND.md with the Dataset layer in the hierarchy: Kernel → Datasets → Physical Structures → Lenses → Applications. Added Datasets section explaining metadata, listing, and materialized view lineage.
+
+3. Built experiments/differential_test.py (~320 LOC): differential testing framework.
+   - ReferenceStore: trivially-correct key-value store (dict per commit, full snapshots). Matches Pond's semantics: staged writes NOT visible until commit.
+   - PondStore: wraps Lens to match the reference interface.
+   - Generates 1000 random operation sequences (put, delete, commit, get, count, keys). Runs both stores. Compares every result (get values, counts, key lists, final state).
+   - RESULT: ALL 1000 SCENARIOS MATCHED. Pond's state matches the obviously-correct reference for every random operation sequence tested. Zero failures. 9.6 seconds.
+
+4. Added Dataset tests and differential testing to CI workflow.
+
+5. Verified no regressions: lens_laws_ci (5 Views), architecture_laws (10 laws), feature_store (7 tests) all pass.
+
+6. Appended this worklog entry.
+
+## Stage Summary
+
+Dataset layer built: Kernel → Dataset → Physical Structures → Lens. Each dataset has a type (sql, git, feature_store, etc.) and source lens metadata. Materialized views (indexes, aggregates) are typed datasets with lineage. Dataset.list() shows all datasets with their types — like listing tables in a database. Metadata is ONE small blob per dataset, NOT per record. Differential testing: 1000 random scenarios, ALL PASSED. Pond matches the obviously-correct reference for every random operation sequence. This is the strongest correctness evidence so far. The architecture is validated under random pressure.

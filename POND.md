@@ -100,15 +100,37 @@ is violated.
 ```
 Bytes • History • Names          ← Kernel (frozen, ~140 LOC)
         ↓
-    Lenses                         ← Interpretation (code, not data)
+    Datasets                       ← Named objects with metadata (type, source lens)
         ↓
-    Physical Structures             ← Acceleration (deterministic)
+    Physical Structures             ← Acceleration (indexes, stats — deterministic)
+        ↓
+    Lenses                          ← Interpretation (code, not data)
         ↓
     Applications                    ← SQL, Git, Feature Store, Notebook
 ```
 
 Dependencies flow downward only. Each layer adds exactly one capability.
 No layer leaks upward. The kernel never changes.
+
+### Datasets
+
+A Dataset is a named object in the kernel — like a table in a database,
+a repo in Git, or a notebook in Jupyter. It has:
+
+- A **type** (which Lens created it: "sql", "git", "feature_store", etc.)
+- A **source lens** (the Lens class that created it)
+- A **description** (human-readable)
+- **Materialization info** (if it's a derived view: source dataset + type)
+
+The metadata is ONE small blob per dataset (stored as a kernel Name),
+NOT per record. The blob bytes stay pure. List all datasets via
+`Dataset.list(kernel)` — see every dataset with its type, like listing
+tables in a database.
+
+Materialized views (indexes, aggregates, transforms) are themselves
+typed Datasets with `is_materialized=True` and `source_dataset` pointing
+to their parent. This gives full lineage: any dataset can trace back
+to its source.
 
 ---
 

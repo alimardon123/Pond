@@ -63,3 +63,9 @@ jobs:
 
       - name: Run Architecture Laws (executable specification)
         run: python pond-sdk/architecture_laws.py
+
+      - name: Run Dataset layer tests
+        run: python pond-sdk/dataset.py
+
+      - name: Run differential testing (reference vs Pond, 100 scenarios)
+        run: python -c "from experiments.differential_test import run_differential_test; r = run_differential_test(100, 30); print(f'Passed: {r[\"passed\"]}/{r[\"scenarios\"]}'); assert r['failed'] == 0"
