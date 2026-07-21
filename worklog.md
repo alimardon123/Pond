@@ -680,3 +680,33 @@ Task: TypedBlob middle layer — any lens can read any blob, cross-lens indexing
 ## Stage Summary
 
 The TypedBlob middle layer is built. Any lens can read any blob in the shared byte graph and get the fully decoded value — because the envelope carries a codec_id and the CodecRegistry knows how to decode all registered codecs. This is better than "get raw bytes and transform later" — the middle layer decodes for you. Cross-lens indexing works (the extractor receives decoded payloads regardless of which lens wrote them). Bidirectional branching works (any lens branches, all see it, shared commit DAG). Minimal overhead (5 bytes per blob envelope). NO manifest, NO enable_view, NO per-lens metadata. The "enablement" is in the codec registry (code), not in the data. This answers the user's ask: Option B-like middle layer, with derives (indexes) positioned as cross-lens materializations, and full bidirectionality. No kernel changes (pond-core still FROZEN).
+
+---
+Task ID: 25
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Resolver comparison — three competing prototypes for the interpretation layer. NO merging into core architecture.
+
+## Work Log
+
+1. Read user's STRONG pushback on TypedBlob (scored 4/10). Key concerns: (a) TypedBlob makes the kernel store "typed bytes" not "bytes"; (b) it creates hidden coupling via CodecRegistry; (c) it drifts from "kernel owns only Bytes, History, Names"; (d) the codec belongs to the LENS, not the bytes. User's ask: build three competing prototypes, score them against 6 criteria, let experiments decide. Do NOT merge any into core.
+2. Marked pond-sdk/typed_blob.py as EXPERIMENTAL (not part of core architecture). Added warning header pointing to the comparison document.
+3. Built three prototypes in experiments/resolver_comparison/:
+   - prototype1_context.py: Context-based interpretation. NO metadata in blobs. The key prefix (sql/, git/, nb/) provides the context. Like Git: Git knows it's asking for a blob/tree/commit from context, not from the object. The resolver uses the key prefix to determine which codec to use. Kernel stores pure bytes.
+   - prototype2_envelope.py: Minimal envelope (current TypedBlob approach). 5-byte envelope [codec_id][payload_len][payload]. CodecRegistry decodes via codec_id. Kept for comparison.
+   - prototype3_self_describing.py: Self-describing payloads. NO envelope, NO key context. The resolver SNIFFS the first few bytes (like Unix file(1)): starts with { → JSON, starts with "100644 blob" → Git tree, starts with ARROW1 → Arrow IPC. Kernel stores pure bytes.
+4. All three prototypes pass the same test scenario: SQL writes JSON, Git writes Git tree, any lens reads any blob.
+5. Scored all three against 6 criteria:
+   - Kernel simplicity: Context ⭐⭐⭐⭐⭐, Envelope ⭐⭐⭐, Self-describing ⭐⭐⭐⭐⭐
+   - Universal readability: Context ⭐⭐⭐⭐, Envelope ⭐⭐⭐⭐⭐, Self-describing ⭐⭐⭐⭐
+   - Zero metadata overhead: Context ⭐⭐⭐⭐⭐, Envelope ⭐⭐, Self-describing ⭐⭐⭐⭐⭐
+   - Independent implementations: Context ⭐⭐⭐⭐, Envelope ⭐⭐⭐, Self-describing ⭐⭐⭐⭐
+   - Long-term extensibility: all ⭐⭐⭐⭐
+   - Alignment with "bytes are bytes": Context ⭐⭐⭐⭐⭐, Envelope ⭐⭐, Self-describing ⭐⭐⭐⭐⭐
+   - TOTAL: Context 28/30, Envelope 21/30, Self-describing 27/30
+6. Wrote experiments/resolver_comparison/COMPARISON.md (~200 lines): full scorecard, detailed analysis per criterion, key insight (both Context and Self-describing preserve kernel purity; Envelope does not), recommendation (hypothesis: Self-describing + Context fallback is the right architecture), what this means for TypedBlob (experimental, not core), next steps (test against real formats, external validation, then decide).
+7. Key finding: the user's instinct is correct. The Envelope (TypedBlob) drifts from the philosophy. Both Context-based and Self-describing preserve the kernel's purity. The hypothesis is: Self-describing as primary (works for JSON, Git, Arrow, Parquet — all self-describing) + Context as fallback for non-self-describing formats. NO envelope needed.
+8. Appended this worklog entry.
+
+## Stage Summary
+
+Three competing prototypes built and scored. NO merging into core architecture — all three are research artifacts. The user's pushback on TypedBlob is validated: it scores lowest (21/30) on the 6 criteria, primarily because it drifts from "bytes are just bytes." Both Context-based (28/30) and Self-describing (27/30) preserve the kernel's purity. The hypothesis: Self-describing payloads + Context fallback is the right architecture — zero blob overhead, universal readability for common formats, kernel stays pure. But this is a hypothesis, not a decision. Next steps: test against real formats (Arrow, Parquet, Git), external validation, then decide. TypedBlob marked as EXPERIMENTAL. The architectural question is now properly framed: "What is the smallest possible interpretation layer that allows every Lens to read every object while keeping the kernel completely format-agnostic?" Three concrete answers exist. The experiments will determine the winner.

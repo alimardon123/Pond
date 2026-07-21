@@ -1,41 +1,25 @@
 """
-TypedBlob — a thin typed-envelope layer between the kernel and lenses.
+TypedBlob — EXPERIMENTAL. NOT part of the core architecture.
 
-This is the "middle layer" the user asked for: any lens can read any
-blob, even if the encoding doesn't match. The lens gets the raw
-payload and can transform it later.
+⚠ STATUS: Experimental. This module is one of three competing
+prototypes for the "interpretation layer" question. It is NOT
+merged into Pond's core architecture. See:
+  experiments/resolver_comparison/COMPARISON.md
 
-Design:
-  - The kernel stores raw bytes (unchanged — FROZEN kernel).
-  - TypedBlob wraps data in a minimal envelope:
-      [1 byte: codec_id][4 bytes: payload_len (uint32 LE)][payload bytes]
-  - codec_id identifies the encoding (0=raw, 1=json, 2=git_tree, ...).
-  - The envelope IS bytes — the kernel doesn't interpret it.
-  - CodecRegistry maps codec_id → (encode, decode) functions.
-  - TypedLens uses the envelope. Any TypedLens can read any blob:
-      - If the codec_id matches a registered codec → decode natively.
-      - If not → return the raw payload bytes (transform later).
-  - TypedIndex: an index whose extractor receives decoded payloads,
-    regardless of which lens wrote them. Cross-lens indexing works
-    because the middle layer decodes based on codec_id.
+The question: how does a Lens read a blob written by a different
+Lens, when the blob's encoding doesn't match?
 
-Bidirectionality:
-  - Any lens can write (encodes via its codec, wraps in envelope).
-  - Any lens can read (unwraps envelope, decodes or returns raw).
-  - Any lens can branch/checkout/merge (shared commit DAG).
-  - All lenses see the same keys, same history, same branches.
+This prototype (Envelope): wraps each blob in a 5-byte envelope
+[codec_id][payload_len][payload]. The codec_id tells a global
+CodecRegistry which decoder to use.
 
-Overhead:
-  - 5 bytes per blob (1 byte codec_id + 4 bytes payload_len).
-  - NO manifest. NO enable_view. NO per-lens metadata.
-  - The codec_id is IN the blob, not in a sidecar.
+Concern (from architecture review): this makes the kernel store
+"typed bytes" instead of "bytes." It creates a Pond Binary Format
+and hidden coupling via the CodecRegistry. It drifts from the
+"kernel owns only Bytes, History, Names" philosophy.
 
-This is NOT Option B (canonical IR). There is no universal object
-format. Each codec is independent. The envelope only carries the
-codec_id so the reader knows how to interpret the payload — or
-that it can't interpret it (in which case it returns raw bytes).
-
-See RFC-0012 §3 (updated) for the architectural positioning.
+Kept for comparison against the other two prototypes. Do NOT use
+in production until the comparison is resolved.
 """
 
 from __future__ import annotations
