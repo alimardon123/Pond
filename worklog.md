@@ -591,3 +591,28 @@ Task: SharedDataset + NativeView — the "data is just bytes, Views are lenses" 
 ## Stage Summary
 
 The "data is just bytes, Views are lenses" pattern is now implemented. A SharedDataset stores data as Arrow IPC (canonical format). Multiple NativeView readers (DuckDB, Polars, pandas, Arrow, DataFusion) read the SAME bytes and present them differently — zero copying, zero translation, zero duplication. A manifest (sidecar file) tracks which Views are enabled, with versions and schemas. This is the Linux filesystem analogy the user described: bytes are bytes, readers interpret them. Key test result: write 4 orders once, read via DuckDB (SQL GROUP BY), Polars (filter + sum), pandas (filter), and Arrow (raw) — all see total=650.0 from the same bytes. This aligns with all 6 design goals: Simple (one shared dataset, thin readers), Powerful (same data, many interpretations), Performant (zero-copy Arrow), Scalable (readers are independent), Efficient (one copy of bytes), Beautiful (Linux filesystem analogy). No kernel changes (pond-core still FROZEN). This is the architectural pattern the user asked for — future execution engines (DuckDB, DataFusion, Polars) can plug into Pond data natively, reading the shared Arrow bytes without any Pond-specific translation layer.
+
+---
+Task ID: 22
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Correct the shared-data pattern — remove SharedDataset (Arrow-specific + manifest overhead), build the right pattern: multiple Views sharing same Prolly tree, each with own encode/decode, NO metadata.
+
+## Work Log
+
+1. Read user's correction: the SharedDataset/NativeView approach was wrong. (a) It stored Arrow IPC bytes — that's format-aware storage. The kernel shouldn't know about Arrow. (b) It had a manifest with enable_view metadata — that's exactly the overhead the user said to avoid (like Apache XTable / Delta Uniform). The user wants: the existing Pond kernel already stores raw bytes. Multiple Views (Git, SQL, Notebook, FeatureStore) should share the same underlying data by reading/writing the same Prolly tree. Each View is just a translation layer (encode/decode). No metadata. No manifest. No overhead. One write → all Views see it.
+2. Removed pond-sdk/shared_dataset.py (the wrong approach). Updated CI workflow to replace it.
+3. Built pond-sdk/test_shared_views.py (~350 LOC, 6 tests): the correct pattern. Multiple View subclasses (JsonView, RawView, TextView, CsvView) all with the same View name "shared" — they share the same Prolly tree. Each has its own encode/decode. The bytes are format-agnostic (the kernel doesn't know what format they're in).
+4. Tests:
+   - test_shared_data_one_write_all_read: THE KEY TEST. JsonView writes {"name":"Alice","age":30} as JSON bytes. RawView reads those same bytes as raw bytes. TextView reads them as UTF-8 text. JsonView reads them as a dict. All read the SAME underlying blob — just interpreted differently. Zero overhead.
+   - test_write_via_different_views: JsonView, RawView, TextView each write different keys. All share the same HEAD. Any View can list all keys and read any key (via get_raw if the decoder doesn't match).
+   - test_no_metadata_overhead: explicitly verifies NO manifest, NO enable_view, NO sidecar files in the kernel. Only 3 blobs (data + tree + commit). This is the anti-XTable test.
+   - test_incompatible_decoders_coexist: JsonView + CsvView on the same tree. Each writes its own format. Both coexist. Bytes are intact. Decoders are independent.
+   - test_count_and_iterate_shared: both Views see the same count (10) and same keys. JsonView iterates dicts; RawView iterates bytes.
+   - test_versioning_shared: branch via JsonView; RawView sees and can checkout the same branch. Same commit DAG.
+5. All 6 tests pass. All existing tests pass (view_laws CI, e2e workflow). No regressions.
+6. Updated CI workflow: replaced shared_dataset.py with test_shared_views.py.
+7. Appended this worklog entry.
+
+## Stage Summary
+
+Corrected the shared-data pattern. The wrong approach (SharedDataset with Arrow IPC + manifest) is removed. The right pattern is: multiple Views with the same name share the same Prolly tree. Each View has its own encode/decode. The bytes are format-agnostic (the kernel stores bytes, not Arrow/Parquet/JSON). NO manifest, NO enable_view, NO per-View metadata — just 3 blobs (data + tree + commit). This is the anti-XTable / anti-Delta-Uniform pattern: zero overhead for multi-View access. One write → all Views read the same bytes immediately. Views with compatible decoders can read each other's data; Views with incompatible decoders coexist (they just can't decode each other's blobs). The "enablement" is in the code (having a View instance with the right decoder), not in the data. This aligns with all 6 design goals and with the user's vision: "bytes itself shouldn't be aware of arrow, parquet or any other thing. They are smallest units of data from which we should be able to read them in our suitable structure."

@@ -52,5 +52,5 @@ jobs:
       - name: Run ViewQuery tests (elegant cross-view reading)
         run: python pond-sdk/test_view_query.py
 
-      - name: Run SharedDataset tests (shared bytes, multiple readers)
-        run: python pond-sdk/shared_dataset.py
+      - name: Run shared Views test (multiple Views, same bytes, no overhead)
+        run: python pond-sdk/test_shared_views.py
