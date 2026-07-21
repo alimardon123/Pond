@@ -158,8 +158,17 @@ class FeatureStore(IndexedView):
     def __init__(self, kernel: PondMinimal, name: str = "feature_store"):
         super().__init__(kernel, name)
         # Auto-indexes for fast lookups. Both are lazy (default) for fast writes.
+        #
+        # by_entity uses a COMPOSITE key "{feature_name}|{version}|{entity_id}"
+        # so that each (feature, entity) pair gets its own index entry. This
+        # makes get_feature_value O(log N) for the normal multi-feature case
+        # (one entity has many features). The previous design used entity_id
+        # alone as the key, which caused last-writer-wins collisions and
+        # forced an O(N) fallback scan whenever the indexed feature didn't
+        # match the requested one. See validation/customer_analytics_report.md
+        # finding (a) for the measured impact.
         self.register_index("by_entity",
-                             lambda d: d.get("entity_id", ""),
+                             lambda d: f"{d.get('feature_name', '')}|v{d.get('version', 1)}|{d.get('entity_id', '')}",
                              mode="lazy", staleness_budget=3)
         self.register_index("by_feature",
                              lambda d: f"{d.get('feature_name', '')}/v{d.get('version', 1)}",
@@ -170,6 +179,16 @@ class FeatureStore(IndexedView):
         # Key: (feature_name, version) -> definition dict.
         self._staged_features: dict[tuple[str, int], dict] = {}
 
+    def has_staged(self) -> bool:
+        """Check whether there are uncommitted staged changes.
+
+        Exposed on FeatureStore so callers don't need to reach into
+        `self.base.has_staged()` directly. Returns True if there are
+        staged feature values, deletes, or feature definitions waiting
+        for a commit.
+        """
+        return self.base.has_staged()
+
     # ------------------------------------------------------------------
     # Feature definitions (with versioning)
     # ------------------------------------------------------------------
@@ -179,8 +198,26 @@ class FeatureStore(IndexedView):
                        tags: list = None) -> int:
         """Define a feature, or increment its version if it already exists.
 
-        Returns the feature's version number (1 for a new feature,
-        2+ for a redefined feature).
+        Args:
+            name: the feature's name (e.g., 'customer_total_spent').
+            feature_type: one of {int, float, string, bool, vector, any, json}.
+                Type-checked on every write_feature_value call.
+            source: the source View name (e.g., 'orders'). Descriptive
+                only — used for lineage, not for actual ingestion.
+            transformation: **descriptive only** — a human-readable
+                description of how the feature is computed (e.g.,
+                'SUM(amount) GROUP BY customer_id'). This is NOT
+                executed; you must compute the feature value yourself
+                and pass it to write_feature_value. An actual
+                transformation engine is future work (see
+                docs/FEATURE_STORE_USE_CASE.md §"What this does NOT
+                cover").
+            description: human-readable description of the feature.
+            tags: optional list of tags for grouping/filtering.
+
+        Returns:
+            The feature's version number (1 for a new feature,
+            2+ for a redefined feature).
 
         Schema validation on the type: must be one of
         {int, float, string, bool, vector, any, json}.
@@ -422,7 +459,12 @@ class FeatureStore(IndexedView):
 
     def get_feature_value(self, feature_name: str, entity_id: str,
                           version: Optional[int] = None) -> Optional[Any]:
-        """Get the latest feature value for an entity. O(log N) via index.
+        """Get the latest feature value for an entity. O(log N) via composite index.
+
+        Uses the by_entity index with composite key
+        "{feature_name}|{version}|{entity_id}" so each (feature, entity)
+        pair has its own index entry. This is O(log N) even when one
+        entity has many features (the normal case).
 
         Args:
             feature_name: the feature's name.
@@ -438,16 +480,19 @@ class FeatureStore(IndexedView):
             return None
         v = feat["version"]
 
-        # Use the by_entity index to find candidate records for this entity
-        result = self.find_by("by_entity", entity_id)
-        if (result is not None
-                and result.get("feature_name") == feature_name
-                and result.get("version") == v):
+        # Direct index lookup using the composite key. This is O(log N)
+        # and works correctly even when the entity has many features,
+        # because each (feature, version, entity) triple has its own
+        # index entry.
+        index_key = f"{feature_name}|v{v}|{entity_id}"
+        result = self.find_by("by_entity", index_key)
+        if result is not None:
             return result.get("value")
 
         # Fallback: scan for the latest record matching feature+entity+version.
-        # This is O(N) but only runs when the index is stale or the
-        # entity has multiple features and the indexed one isn't this one.
+        # This runs only when the index is stale (lazy mode, not yet rebuilt)
+        # or when no value exists for this combination. In steady state
+        # (index fresh), this path is never taken.
         state = self.base.read_all()
         prefix = f"{feature_name}/v{v}/{entity_id}/"
         latest_ts = -1.0
@@ -480,43 +525,55 @@ class FeatureStore(IndexedView):
         Returns a list of rows, one per entity_id. Each row is a dict:
             {"entity_id": entity_id, feature_name: value, ...}
 
+        Single full-state scan, partitioned by feature prefix. For N
+        total records, M features, and E entities:
+            Complexity: O(N + E * M) for the scan + row assembly.
         This is more efficient than calling get_feature_vector in a loop
-        because it scans the index once per feature, not once per
-        (entity, feature) pair. For N entities and M features:
-            get_feature_vector loop: O(N * M * log N)
-            get_feature_matrix:      O(N + M * log N)
+        (O(E * M * log N) via E*M index lookups) because it does ONE
+        full-state scan instead of E*M index lookups.
 
         Use this for batch ML inference (e.g., scoring 10K users against
         50 features).
         """
-        # For each feature, build an {entity_id: value} map by scanning
-        # the by_entity index once.
-        feature_maps: dict[str, dict[str, Any]] = {}
+        # Resolve feature versions upfront (one call per feature).
+        feature_versions: dict[str, Optional[int]] = {}
+        feature_prefixes: dict[str, str] = {}
         for fname in feature_names:
             feat = self.get_feature_definition(fname)
             if feat is None:
-                feature_maps[fname] = {}
-                continue
-            v = feat["version"]
-            # Scan all values for this feature+version, pick latest per entity
-            state = self.base.read_all()
-            prefix = f"{fname}/v{v}/"
-            ent_values: dict[str, tuple[float, Any]] = {}  # entity_id -> (ts, value)
-            for key, h in state.items():
+                feature_versions[fname] = None
+            else:
+                v = feat["version"]
+                feature_versions[fname] = v
+                feature_prefixes[fname] = f"{fname}/v{v}/"
+
+        # SINGLE full-state scan. Partition records by feature as we go.
+        # ent_values[fname][entity_id] = (timestamp, value)
+        ent_values: dict[str, dict[str, tuple[float, Any]]] = {
+            fname: {} for fname in feature_names
+        }
+        state = self.base.read_all()
+        for key, h in state.items():
+            # Check which feature this key belongs to. A key looks like
+            # "{feature_name}/v{version}/{entity_id}/{timestamp}". We
+            # check against each feature's prefix.
+            for fname, prefix in feature_prefixes.items():
                 if key.startswith(prefix):
                     record = json.loads(self.kernel.read_blob(h))
                     eid = record["entity_id"]
                     ts = record["timestamp"]
-                    if eid not in ent_values or ts > ent_values[eid][0]:
-                        ent_values[eid] = (ts, record["value"])
-            feature_maps[fname] = {eid: val for eid, (_, val) in ent_values.items()}
+                    cur = ent_values[fname].get(eid)
+                    if cur is None or ts > cur[0]:
+                        ent_values[fname][eid] = (ts, record["value"])
+                    break  # key matches at most one feature prefix
 
-        # Build the result rows
+        # Build the result rows: one per entity_id
         rows = []
         for entity_id in entity_ids:
             row = {"entity_id": entity_id}
             for fname in feature_names:
-                row[fname] = feature_maps[fname].get(entity_id)
+                ev = ent_values[fname].get(entity_id)
+                row[fname] = ev[1] if ev is not None else None
             rows.append(row)
         return rows
 
@@ -732,10 +789,28 @@ class FeatureStore(IndexedView):
         self.put(cache_key, cache_record)
 
     def get_freshness(self, feature_name: str) -> Optional[float]:
-        """Get the age of the latest feature value (seconds since last write).
+        """Get the age of the latest feature value's EVENT timestamp.
 
-        O(1) via the cached latest timestamp. Returns None if the feature
-        has no values.
+        Returns `time.time() - latest_event_timestamp`, where
+        `latest_event_timestamp` is the `timestamp` argument passed to
+        the most recent `write_feature_value` call for this feature.
+
+        **Important:** this is the age of the data's NOMINAL event
+        timestamp, NOT the wall-clock time when the write happened.
+        If you write a feature value with `timestamp=1704067200`
+        (Jan 1 2024) and call `get_freshness` from a 2026 process,
+        it will return ~80 million seconds — because the data's
+        event timestamp is from 2024, even though you just wrote it.
+
+        This is the correct semantic for feature-store freshness
+        monitoring: you want to know "how stale is the data I'm
+        serving," which is based on the event timestamp, not the
+        write time. If you want wall-clock write freshness, store
+        `time.time()` as the `timestamp` argument in
+        `write_feature_value`.
+
+        O(1) via the cached latest timestamp. Returns None if the
+        feature has no values.
         """
         cache_key = f"_meta/latest_ts/{feature_name}"
         current = self.base.lookup(cache_key)
@@ -1013,7 +1088,7 @@ def test_production_features():
     # --- Persistence test ---
     print("\n--- Persistence test ---")
     # Only commit if there's something staged
-    if fs.has_staged() if hasattr(fs, 'has_staged') else fs.base.has_staged():
+    if fs.has_staged():
         fs.commit("final commit before restart")
     kernel.close()
 

@@ -176,13 +176,22 @@ class ArrowView(View):
                 `delete_row`, and the by_pk index).
             row: the row data as a dict. Keys must match the View's
                 schema (or the first row's keys, if no schema was set).
+                **This method does NOT mutate `row`** — it copies the
+                dict before adding the internal `_pk` field, so the
+                caller's dict is unchanged.
 
         Returns:
             The staged row's primary key (echoed back for convenience).
         """
         pk_field = self._pk_field
+        # Copy the row dict to avoid mutating the caller's dict when we
+        # add the _pk field. (External validation finding: put_row was
+        # mutating the caller's row in place, which is a surprising side
+        # effect. See validation/customer_analytics_report.md finding (c).)
         if pk_field not in row:
             row = {**row, pk_field: primary_key}
+        else:
+            row = dict(row)  # still copy, to avoid aliasing
         if self._schema is None:
             # Infer schema from this row (AFTER adding _pk so the schema
             # includes the primary-key field)
