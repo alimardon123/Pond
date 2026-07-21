@@ -822,3 +822,32 @@ Task: Phase G Correctness — fix the two scale bugs (data loss + index rebuild 
 ## Stage Summary
 
 Phase G Correctness Sprint: both scale bugs FIXED. Root cause was a single bug in ProllyTree.build() that encoded internal nodes as leaf nodes — affecting any tree with >64 entries. The fix is 1 flag (is_leaf_level) + 1 removed safety valve. Architecture Invariants test suite built (7 invariants, all pass). Scale stress test now shows: 100K records, count=100K, point lookup works, 3 indexes work. The architecture was sound all along — the implementation had a bug. Per user's framing: "engineering finding that validates architectural assumptions." The architecture survived the pressure test; the implementation needed hardening. Next: million-scale validation, then independent reimplementation #2.
+
+---
+Task ID: 30
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Rename invariants to Architecture Laws + add Laws 8-10 + postmortem + answer user's questions about features and architecture.
+
+## Work Log
+
+1. Answered user's questions: (a) incremental indexes, semantic lens, and pkless all still exist and work; (b) the terminology is Kernel > Lens (named object) > Key (entry identity) > Blob (content-addressed bytes); (c) multiple objects per kernel (like a database, not a single table) — one kernel holds many Lenses, each with its own HEAD/history/branches but sharing the same blob store.
+
+2. Renamed test_invariants.py to architecture_laws.py per user's suggestion. Changed all "Invariant N" to "Law N". These are executable specifications, not unit tests.
+
+3. Added Law 8 (Determinism): same writes in same order produce same blob hashes. FINDING: commit hashes differ because they include time.time() — this is BY DESIGN (commit identity includes temporal info). The DATA is deterministic; the commit METADATA is not. Law checks data determinism (same keys, values, blob hashes), not commit-hash determinism.
+
+4. Added Law 9 (Scale): 10K records, count must equal 10K. Regression test for the Prolly tree build bug.
+
+5. Added Law 10 (Index): 10K records, index lookup must succeed. Regression test for the index rebuild decode error.
+
+6. All 10 Architecture Laws pass.
+
+7. Wrote docs/POSTMORTEM_PROLLY_TREE_BUG.md (~100 lines): full postmortem of the Prolly tree internal-node encoding bug. Documents the bug, why it caused data loss (max_key entries visible instead of all keys), why it caused index rebuild failures (child_hash misinterpreted as data_hash → decode error), why it propagated consistently (clean layer boundaries), the fix (is_leaf_level flag), and 4 lessons learned.
+
+8. Updated CI workflow: architecture_laws.py replaces test_invariants.py.
+
+9. Appended this worklog entry.
+
+## Stage Summary
+
+Architecture Laws renamed and expanded to 10 (from 7). Law 8 (Determinism) revealed that commit hashes are NOT deterministic (they include timestamps) — this is by design. The DATA is deterministic; the METADATA is not. Postmortem written for the Prolly tree bug, documenting the root cause (single incorrect encode_leaf call), propagation (consistent across all consumers — evidence of clean layers), fix (is_leaf_level flag), and lessons. All 10 laws pass. CI updated. The user's three suggested validation projects (million-scale correctness, differential testing, crash testing) are the next Phase G work.

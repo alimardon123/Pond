@@ -61,5 +61,5 @@ jobs:
       - name: Run TypedBlob middle layer test (any lens, any blob)
         run: python pond-sdk/test_typed_blob.py
 
-      - name: Run Architecture Invariants (Phase G correctness)
-        run: python pond-sdk/test_invariants.py
+      - name: Run Architecture Laws (executable specification)
+        run: python pond-sdk/architecture_laws.py
