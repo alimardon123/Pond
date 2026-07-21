@@ -830,7 +830,17 @@ if __name__ == "__main__":
 # ===========================================================================
 
 Lens = View
-IndexedLens = None  # set below after import
 KeylessLens = KeylessView
 SemanticLens = SemanticView
 OssieLens = SemanticView  # backward compat for old name
+
+# IndexedLens needs to reference IndexedView from auto_index.py.
+# Import it lazily to avoid circular imports.
+def _get_indexed_lens():
+    from auto_index import IndexedView
+    return IndexedView
+
+# Use a property-like approach so `IndexedLens` works as a class.
+# Since IndexedView is in a different module, we import it here.
+from auto_index import IndexedView as _IndexedView
+IndexedLens = _IndexedView

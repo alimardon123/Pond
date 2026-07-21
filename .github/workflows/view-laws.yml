@@ -57,3 +57,6 @@ jobs:
 
       - name: Run Lens Architecture test (RFC-0012 milestone)
         run: python pond-sdk/test_lens_architecture.py
+
+      - name: Run TypedBlob middle layer test (any lens, any blob)
+        run: python pond-sdk/test_typed_blob.py

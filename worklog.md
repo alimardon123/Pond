@@ -650,3 +650,33 @@ Task: The Lens Architecture — rename "View" to "Lens", answer the milestone re
 ## Stage Summary
 
 The Lens Architecture is Pond's defining architectural contribution. The kernel owns only Bytes, History, Names — everything above is a Lens (interpretation layer). Multiple domain lenses (SQL, Git, Notebook, FeatureStore) share the same immutable byte graph without metadata duplication, without translation writes, while preserving their own semantics. The milestone question is answered: YES. The proof is in test_lens_architecture.py: 3 lenses, 5 keys, 7 blobs, zero metadata. Emergent overlap: lenses with matching encodings (e.g., both JSON) can read each other's data for free — not designed, just a consequence of encoding choice. This is like Linux: the filesystem stores bytes; applications interpret them. "View" renamed to "Lens" via backward-compatible aliases. RFC-0012 drafted. No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). This is NOT Raft, NOT another adapter, NOT a new feature — it's the architectural clarification that makes Pond fundamentally different from other storage systems.
+
+---
+Task ID: 24
+Agent: main (Super Z, web-a5961fe6 session)
+Task: TypedBlob middle layer — any lens can read any blob, cross-lens indexing, bidirectional branching.
+
+## Work Log
+
+1. Read user's ask: (a) any lens should be able to read data from any other lens, even if encoding is "weird" — can consume and transform later; (b) consider how derives (indexes) position in multi-lens env; (c) writes/reads/branching should be fully bidirectional from any lens. "Maybe Option B like thing works. Or some other middle layer between kernel and lens."
+2. Built pond-sdk/typed_blob.py (~350 LOC): the middle layer.
+   - TypedBlob envelope: [1B codec_id][4B payload_len][payload]. 5 bytes overhead per blob. The kernel stores this as raw bytes — the kernel doesn't interpret the envelope.
+   - CodecRegistry: global registry mapping codec_id → (encode, decode). Registers 5 built-in codecs at import time: raw(0), json(1), git_tree(2), notebook(3), csv(5). User-defined codecs can be registered for IDs 100-255.
+   - TypedLens: a Lens that uses the TypedBlob envelope. Writing: encodes via the lens's codec, wraps in envelope. Reading: unwraps envelope, decodes via the registered codec (ANY registered codec, not just the lens's own). If codec isn't registered, returns raw payload bytes.
+   - TypedIndex: a cross-lens index. The extractor receives DECODED payloads regardless of which lens wrote them. The middle layer decodes based on codec_id. Can index across all blobs in the shared byte graph.
+   - get_typed(): any lens can inspect any blob's codec metadata (codec_id, codec_name, decoded, value).
+3. KEY RESULT: the behavior is BETTER than what was asked for. The user asked for "read even if weird, can transform later." The TypedBlob envelope actually gives fully decoded values — because the codec_id in the envelope tells the registry which codec to use, and the registry knows ALL registered codecs. So Git lens reading a JSON blob gets the decoded dict, not raw bytes. Any lens gets any blob's decoded value.
+4. Built pond-sdk/test_typed_blob.py (5 tests, all pass):
+   - test_any_lens_reads_any_blob: SQL writes JSON, Git writes git_tree. All 3 lenses (SQL, Git, Notebook) read ALL blobs and get decoded dicts. Git transforms SQL data into Git tree (consume + transform).
+   - test_cross_lens_index: index built across JSON blobs (SQL) and Git blobs. Extractor receives decoded dicts for JSON, skips Git blobs (extractor returns None for non-dict payloads).
+   - test_bidirectional_branching: SQL creates branch, Git and Notebook see it. Git commits on branch, SQL sees it. SQL commits on branch, Notebook sees it. All share same commit DAG.
+   - test_envelope_overhead: 5 bytes per blob. No manifest, no enable_view, no sidecar. The anti-XTable property.
+   - test_transform_later: Git lens reads SQL blob (decoded via registry), extracts 'files' list, transforms into Git tree, writes back. SQL lens can also read the Git tree (decoded via registry).
+5. Fixed IndexedLens alias (was None — circular import issue). Now imports IndexedView at end of view_sdk.py.
+6. All existing tests pass (view_laws CI, e2e workflow, lens architecture). No regressions.
+7. Added test_typed_blob.py to CI workflow (12 test commands now).
+8. Appended this worklog entry.
+
+## Stage Summary
+
+The TypedBlob middle layer is built. Any lens can read any blob in the shared byte graph and get the fully decoded value — because the envelope carries a codec_id and the CodecRegistry knows how to decode all registered codecs. This is better than "get raw bytes and transform later" — the middle layer decodes for you. Cross-lens indexing works (the extractor receives decoded payloads regardless of which lens wrote them). Bidirectional branching works (any lens branches, all see it, shared commit DAG). Minimal overhead (5 bytes per blob envelope). NO manifest, NO enable_view, NO per-lens metadata. The "enablement" is in the codec registry (code), not in the data. This answers the user's ask: Option B-like middle layer, with derives (indexes) positioned as cross-lens materializations, and full bidirectionality. No kernel changes (pond-core still FROZEN).
