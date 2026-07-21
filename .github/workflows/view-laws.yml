@@ -54,3 +54,6 @@ jobs:
 
       - name: Run shared Views test (multiple Views, same bytes, no overhead)
         run: python pond-sdk/test_shared_views.py
+
+      - name: Run Lens Architecture test (RFC-0012 milestone)
+        run: python pond-sdk/test_lens_architecture.py

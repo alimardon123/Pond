@@ -616,3 +616,37 @@ Task: Correct the shared-data pattern — remove SharedDataset (Arrow-specific +
 ## Stage Summary
 
 Corrected the shared-data pattern. The wrong approach (SharedDataset with Arrow IPC + manifest) is removed. The right pattern is: multiple Views with the same name share the same Prolly tree. Each View has its own encode/decode. The bytes are format-agnostic (the kernel stores bytes, not Arrow/Parquet/JSON). NO manifest, NO enable_view, NO per-View metadata — just 3 blobs (data + tree + commit). This is the anti-XTable / anti-Delta-Uniform pattern: zero overhead for multi-View access. One write → all Views read the same bytes immediately. Views with compatible decoders can read each other's data; Views with incompatible decoders coexist (they just can't decode each other's blobs). The "enablement" is in the code (having a View instance with the right decoder), not in the data. This aligns with all 6 design goals and with the user's vision: "bytes itself shouldn't be aware of arrow, parquet or any other thing. They are smallest units of data from which we should be able to read them in our suitable structure."
+
+---
+Task ID: 23
+Agent: main (Super Z, web-a5961fe6 session)
+Task: The Lens Architecture — rename "View" to "Lens", answer the milestone research question, build concrete proof.
+
+## Work Log
+
+1. Read user's architectural clarification. The most important since RFC-0007. Three key insights:
+   (a) The kernel owns only Bytes, History, Names. Everything above is "a way of interpreting those bytes" — not owning, copying, or converting.
+   (b) "View" is the wrong name — conflates with SQL VIEW, Materialized View, etc. The user's preferred rename: "Lens" — different ways of seeing the same data.
+   (c) The open research question: can multiple independent domain lenses operate over the same byte graph without metadata duplication? Three options: A (each owns encoding), B (canonical IR), C (intentional overlap). User wants this answered conclusively.
+2. Added "Lens" as an alias for "View" in pond-sdk/view_sdk.py. Backward compatible: `from view_sdk import Lens` works, `from view_sdk import View` still works. Also added KeylessLens, SemanticLens aliases. Documented the rename rationale in a header comment.
+3. Wrote RFC-0012: The Lens Architecture (~250 lines). Covers:
+   - §1: The clarification (kernel owns Bytes/History/Names; everything else is interpretation)
+   - §2: The rename ("View" → "Lens"; implementation via aliases)
+   - §3: The open research question answered. Pond chooses Option C (pragmatic overlap) but with a twist: overlap is EMERGENT, not designed. The kernel doesn't enforce interpretability. Lenses choose encodings; if two happen to match (e.g., both JSON), they get mutual interpretability for free. Like Linux: the filesystem doesn't enforce that .py is readable by Python; Python chose to interpret bytes as Python source.
+   - §4: What this is NOT (not XTable, not Delta Uniform, not a universal format, not a translation layer)
+   - §5: The milestone question answered (YES — proven by test_lens_architecture.py)
+   - §6: Relationship to other RFCs
+   - §7: What this means for the roadmap
+4. Built pond-sdk/test_lens_architecture.py (~350 LOC, 5 tests):
+   - test_three_lenses_same_byte_graph: THE MILESTONE TEST. SqlLens, GitLens, NotebookLens all share the same byte graph (same View name "workspace"). Each writes its own encoding (JSON rows, Git tree format, notebook JSON). All see the same 5 keys. Each reads its own data correctly. Can't read each other's data (different encodings). BUT raw bytes are intact (get_raw works for any lens). Emergent overlap: NotebookLens reads SQL data (both use JSON — not designed, just emergent).
+   - test_no_metadata_duplication: 7 blobs total. NO manifest, NO enable_view, NO sidecar. The anti-XTable / anti-Delta-Uniform property.
+   - test_shared_history_and_branching: SQL branch visible to Git. Git commit visible to SQL. Same commit DAG.
+   - test_lenses_are_independent: SQL writes JSON, Git writes tree format. Each reads its own correctly. Bytes are different.
+   - test_lens_alias_works: Lens is View (backward compatible).
+5. All 5 tests pass. All existing tests pass (view_laws CI, e2e workflow). No regressions.
+6. Updated rfcs/README.md (RFC-0012 added), CI workflow (test_lens_architecture.py added as mandatory step).
+7. Appended this worklog entry.
+
+## Stage Summary
+
+The Lens Architecture is Pond's defining architectural contribution. The kernel owns only Bytes, History, Names — everything above is a Lens (interpretation layer). Multiple domain lenses (SQL, Git, Notebook, FeatureStore) share the same immutable byte graph without metadata duplication, without translation writes, while preserving their own semantics. The milestone question is answered: YES. The proof is in test_lens_architecture.py: 3 lenses, 5 keys, 7 blobs, zero metadata. Emergent overlap: lenses with matching encodings (e.g., both JSON) can read each other's data for free — not designed, just a consequence of encoding choice. This is like Linux: the filesystem stores bytes; applications interpret them. "View" renamed to "Lens" via backward-compatible aliases. RFC-0012 drafted. No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). This is NOT Raft, NOT another adapter, NOT a new feature — it's the architectural clarification that makes Pond fundamentally different from other storage systems.

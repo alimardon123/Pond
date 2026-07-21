@@ -33,6 +33,23 @@ from view_query import ViewQuery
 
 
 # ===========================================================================
+# Naming: "Lens" is the preferred term for what was called "View".
+#
+# A Pond Lens is an interpretation layer over immutable bytes — like a
+# lens that focuses light differently without changing the light itself.
+# The old name "View" conflated with SQL VIEW, Materialized View, etc.
+# "Lens" captures the actual philosophy: the bytes don't change; only
+# the way you observe and manipulate them changes.
+#
+# Both names work. `View` is kept for backward compatibility. New code
+# should use `Lens`. See RFC-0012 for the full rationale.
+#
+# The aliases (Lens = View, etc.) are defined at the END of this file,
+# after all classes are declared.
+# ===========================================================================
+
+
+# ===========================================================================
 # Enhanced View with full index management
 # ===========================================================================
 
@@ -798,3 +815,22 @@ def test_all():
 
 if __name__ == "__main__":
     test_all()
+
+
+# ===========================================================================
+# Lens aliases — the preferred names going forward.
+# See RFC-0012 for the rename rationale.
+#
+# "View" is kept for backward compatibility. New code should use "Lens":
+#   from view_sdk import Lens, IndexedLens, KeylessLens, SemanticLens
+#
+# The Lens name captures Pond's philosophy: the bytes don't change;
+# only the way you observe and manipulate them changes. Like a lens
+# that focuses light differently without changing the light itself.
+# ===========================================================================
+
+Lens = View
+IndexedLens = None  # set below after import
+KeylessLens = KeylessView
+SemanticLens = SemanticView
+OssieLens = SemanticView  # backward compat for old name
