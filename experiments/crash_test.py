@@ -234,11 +234,11 @@ def test_crash_with_multiple_volumes():
     bench = "/tmp/pond_crash7"
     kernel = setup_kernel(bench)
 
-    from pond_object import PondObject
+    from collection import Collection
 
-    PondObject.create(kernel, "analytics/orders", type="sql")
-    PondObject.create(kernel, "repo/main", type="git")
-    PondObject.create(kernel, "ml/features", type="feature_store")
+    Collection.create(kernel, "analytics/orders", type="sql")
+    Collection.create(kernel, "repo/main", type="git")
+    Collection.create(kernel, "ml/features", type="feature_store")
 
     orders = Lens(kernel, "analytics/orders")
     orders.put("o1", {"amount": 100})
@@ -256,7 +256,7 @@ def test_crash_with_multiple_volumes():
 
     # Reopen — all volumes must survive
     kernel2 = crash_and_recover(bench)
-    volumes = PondObject.list(kernel2)
+    volumes = Collection.list(kernel2)
     assert len(volumes) == 3, f"Expected 3 volumes, got {len(volumes)}"
 
     orders2 = Lens(kernel2, "analytics/orders")

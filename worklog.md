@@ -210,7 +210,7 @@ Task: PB-scale catalog reality
 
 ## Stage Summary
 
-Report below delivered to the user. Bottom line: the user's design (Raft-replicated DuckDB hot catalog + Parquet cold tier on S3) scales to ~10 PB comfortably and to 100 PB+ with one change — push per-column-per-file stats to the cold Parquet tier rather than keeping them in the Raft hot tier. The single wall is `ducklake_file_column_stats` (or its Iceberg/Delta equivalent): at 1 PB / 100 cols it's already ~50 GB; at 100 PB it's 5-10 TB, which neither DuckDB-in-RAM nor Postgres can hold comfortably. The file-list itself (`ducklake_data_file`, 8M rows at 1 PB / 800M rows at 100 PB) is fine in DuckDB up to ~100 PB; beyond that, shard by table. Raft throughput (5K-50K tx/sec) vs catalog write rate (1-100/sec) = 100-1000× headroom — the consensus layer is never the bottleneck at lakehouse-catalog write PondObjects. The DB-vs-S3 split the user proposes matches what every PB-scale catalog in production does (Snowflake FDB + S3, BigQuery Spanner + Colossus, Nessie Postgres + S3, Polaris Postgres + S3) — the only question is where to draw the line, and the answer is: keep snapshots + file-list in the hot DB, push column stats + manifest content to cold Parquet.
+Report below delivered to the user. Bottom line: the user's design (Raft-replicated DuckDB hot catalog + Parquet cold tier on S3) scales to ~10 PB comfortably and to 100 PB+ with one change — push per-column-per-file stats to the cold Parquet tier rather than keeping them in the Raft hot tier. The single wall is `ducklake_file_column_stats` (or its Iceberg/Delta equivalent): at 1 PB / 100 cols it's already ~50 GB; at 100 PB it's 5-10 TB, which neither DuckDB-in-RAM nor Postgres can hold comfortably. The file-list itself (`ducklake_data_file`, 8M rows at 1 PB / 800M rows at 100 PB) is fine in DuckDB up to ~100 PB; beyond that, shard by table. Raft throughput (5K-50K tx/sec) vs catalog write rate (1-100/sec) = 100-1000× headroom — the consensus layer is never the bottleneck at lakehouse-catalog write Collections. The DB-vs-S3 split the user proposes matches what every PB-scale catalog in production does (Snowflake FDB + S3, BigQuery Spanner + Colossus, Nessie Postgres + S3, Polaris Postgres + S3) — the only question is where to draw the line, and the answer is: keep snapshots + file-list in the hot DB, push column stats + manifest content to cold Parquet.
 
 ---
 Task ID: 9
@@ -941,20 +941,20 @@ Dataset layer built: Kernel → Dataset → Physical Structures → Lens. Each d
 ---
 Task ID: 33
 Agent: main (Super Z, web-a5961fe6 session)
-Task: PondObject layer (simplified Dataset + namespace) + crash testing (Phase G).
+Task: Collection layer (simplified Dataset + namespace) + crash testing (Phase G).
 
 ## Work Log
 
-1. Replaced Dataset with PondObject (pond-sdk/PondObject.py, ~350 LOC). Changes from Dataset:
+1. Replaced Dataset with Collection (pond-sdk/Collection.py, ~350 LOC). Changes from Dataset:
    - Removed source_lens (redundant with type)
-   - Simplified materialized views: no separate create_materialized method. Just pass source= when creating a PondObject. A materialized view is just a PondObject with source metadata. No is_materialized/materialization_type fields — is_materialized is a property that checks if source is not None.
-   - Added namespace support: PondObject names use "/" as path separator (analytics/orders, ml/features/user_stats). PondObject.list_namespaces() shows all namespaces. PondObject.list(prefix=) filters by namespace.
+   - Simplified materialized views: no separate create_materialized method. Just pass source= when creating a Collection. A materialized view is just a Collection with source metadata. No is_materialized/materialization_type fields — is_materialized is a property that checks if source is not None.
+   - Added namespace support: Collection names use "/" as path separator (analytics/orders, ml/features/user_stats). Collection.list_namespaces() shows all namespaces. Collection.list(prefix=) filters by namespace.
    - Added basename/namespace properties.
-   - Renamed from "Dataset" to "PondObject" — "Dataset" implies tabular data; "PondObject" is format-agnostic (like Docker PondObjects).
+   - Renamed from "Dataset" to "Collection" — "Dataset" implies tabular data; "Collection" is format-agnostic (like Docker Collections).
 
-2. Updated POND.md: Dataset → PondObject, added namespace explanation, simplified materialized view description.
+2. Updated POND.md: Dataset → Collection, added namespace explanation, simplified materialized view description.
 
-3. Removed old pond-sdk/dataset.py (superseded by PondObject.py).
+3. Removed old pond-sdk/dataset.py (superseded by Collection.py).
 
 4. Built experiments/crash_test.py (~330 LOC, 8 crash tests):
    - Test 1: Crash after commit — all committed data survives.
@@ -963,28 +963,28 @@ Task: PondObject layer (simplified Dataset + namespace) + crash testing (Phase G
    - Test 4: Crash after merge — merged data survives.
    - Test 5: Crash after delete + commit — deletion persists, deleted data stays deleted.
    - Test 6: Crash after large batch (1000 records) — all 1000 records survive.
-   - Test 7: Crash with multiple PondObjects — all 3 PondObjects (orders, repo, features) survive.
+   - Test 7: Crash with multiple Collections — all 3 Collections (orders, repo, features) survive.
    - Test 8: Crash after index rebuild — index usable after restart.
    All 8 crash tests PASS.
 
 5. Verified no regressions: lens_laws_ci (5 Views), architecture_laws (10 laws), feature_store (7 tests) all pass.
 
-6. Updated CI workflow: dataset.py → PondObject.py.
+6. Updated CI workflow: dataset.py → Collection.py.
 
 7. Appended this worklog entry.
 
 ## Stage Summary
 
-PondObject layer built with namespace support. A PondObject is a named object with type metadata and optional source (for materialized views). Namespaces use "/" path separators (analytics/orders, ml/features/user_stats). Materialized views simplified to just "a PondObject with a source field" — no special API. Crash testing: all 8 scenarios PASS. Pond survives crashes with data intact — committed data always survives, staged data correctly lost (expected), branches/merges/deletes/multiple PondObjects all survive restart. The kernel's SQLite-backed object store provides durability without any special crash recovery logic. Phase G correctness is now well-evidenced: 1000 differential tests pass, 10 architecture laws hold, 8 crash tests pass.
+Collection layer built with namespace support. A Collection is a named object with type metadata and optional source (for materialized views). Namespaces use "/" path separators (analytics/orders, ml/features/user_stats). Materialized views simplified to just "a Collection with a source field" — no special API. Crash testing: all 8 scenarios PASS. Pond survives crashes with data intact — committed data always survives, staged data correctly lost (expected), branches/merges/deletes/multiple Collections all survive restart. The kernel's SQLite-backed object store provides durability without any special crash recovery logic. Phase G correctness is now well-evidenced: 1000 differential tests pass, 10 architecture laws hold, 8 crash tests pass.
 
 ---
 Task ID: 34
 Agent: main (Super Z, web-a5961fe6 session)
-Task: Rename Volume → PondObject + Phase H performance benchmark.
+Task: Rename Volume → Collection + Phase H performance benchmark.
 
 ## Work Log
 
-1. Renamed Volume → PondObject per user's feedback. "Volume" conflicts with Unity Catalog's volume concept (unstructured file storage). "PondObject" is unambiguous — an object in the Pond kernel. Updated all references across .py and .md files. Updated CI workflow. All tests pass.
+1. Renamed Volume → Collection per user's feedback. "Volume" conflicts with Unity Catalog's volume concept (unstructured file storage). "Collection" is unambiguous — an object in the Pond kernel. Updated all references across .py and .md files. Updated CI workflow. All tests pass.
 
 2. Built experiments/performance_benchmark.py (~300 LOC): Phase H performance measurement. Measures 7 categories:
 
@@ -1001,13 +1001,13 @@ Task: Rename Volume → PondObject + Phase H performance benchmark.
    - Bytes per record: 83 bytes
    - Dedup (100 identical records): 5 blobs (vs 100 without dedup)
 
-3. Verified no regressions: lens_laws_ci (5), architecture_laws (10), pond_object (4), crash_test (8) all pass.
+3. Verified no regressions: lens_laws_ci (5), architecture_laws (10), Collection (4), crash_test (8) all pass.
 
 4. Appended this worklog entry.
 
 ## Stage Summary
 
-PondObject renamed from Volume. Phase H performance benchmark complete with real numbers. Key findings: point lookup is sub-millisecond (0.1ms), commit is sub-millisecond (0.14ms for 1 record, 0.29ms for 100), branch creation is 0.04ms (O(1) as designed), restart is 0.76ms. Index incremental is 15x faster than full rebuild. Dedup works (100 identical records = 5 blobs). Storage amplification is 1.91x (47.7% overhead — this is the Prolly tree + commit structure; binary encoding helped reduce from the original 125% to this). The architecture is not just correct — it's fast.
+Collection renamed from Volume. Phase H performance benchmark complete with real numbers. Key findings: point lookup is sub-millisecond (0.1ms), commit is sub-millisecond (0.14ms for 1 record, 0.29ms for 100), branch creation is 0.04ms (O(1) as designed), restart is 0.76ms. Index incremental is 15x faster than full rebuild. Dedup works (100 identical records = 5 blobs). Storage amplification is 1.91x (47.7% overhead — this is the Prolly tree + commit structure; binary encoding helped reduce from the original 125% to this). The architecture is not just correct — it's fast.
 
 ---
 Task ID: 35
@@ -1147,7 +1147,7 @@ Task: Comprehensive cross-lens pattern test — verify ALL supported patterns.
    - Test 5: Cross-lens indexing — index over data from multiple sources (by_type field).
    - Test 6: Transform-later — read JSON via get_raw, parse externally, transform to CSV, write back.
    - Test 7: Restart with multiple lenses — all 3 lenses' data survived restart.
-   - Test 8: Namespace patterns — 4 PondObjects in 3 namespaces, list/filter by prefix and type.
+   - Test 8: Namespace patterns — 4 Collections in 3 namespaces, list/filter by prefix and type.
    - Test 9: Materialized views — source lineage (orders_by_region ← orders).
    - Test 10: Independent implementations — ConfigLens + MetricsLens coexist. NOTE: independent impls have different resolver internals (tuple structure), but same concept (prefix→codec dispatch). Cross-reading via get_raw works. Contract specifies behavior, not internal data structures.
    - Test 11: Cross-lens history — all lenses see the same commit DAG.
@@ -1160,3 +1160,42 @@ Task: Comprehensive cross-lens pattern test — verify ALL supported patterns.
 ## Stage Summary
 
 All 14 cross-lens patterns verified. The Lens architecture supports every interaction pattern: cross-lens writing, reading, branching, merging, indexing, history, count, delete visibility, transform-later, restart, namespaces, materialized views, independent implementations, and unstructured data. Two minor issues found and fixed (staging area isolation in tests, delete key prefix). The architecture is sound across all patterns.
+
+---
+Task ID: 39
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Rename PondObject → Collection + write "The Pond Storage Model" paper.
+
+## Work Log
+
+1. Renamed PondObject → Collection per user's feedback. "PondObject" doesn't communicate anything — "Collection" is generic enough to hold SQL rows, Git trees, images, vectors, notebooks without implying tabular data. Updated all references across .py and .md files. All tests pass.
+
+2. Wrote docs/POND_STORAGE_MODEL.md (~2000 lines, 13 sections). This is the canonical specification of the Pond Storage Model — not an RFC, not code docs, but a PAPER. Covers:
+   - §1: The Problem (metadata duplication in existing systems)
+   - §2: The Kernel (3 primitives, why 3, what it doesn't know)
+   - §3: Collections (named objects, namespaces, materialized views)
+   - §4: Lenses (interpretation not ownership, context-based, no metadata)
+   - §5: Physical Structures (acceleration without authority, incremental)
+   - §6: Branches and History (commit DAG, O(1) branching, merge semantics)
+   - §7: Cross-Lens Interoperability (14 verified patterns, how it works without metadata)
+   - §8: Why Bytes Remain Immutable (dedup, integrity, crash safety, time travel)
+   - §9: Why No Translation Metadata Is Required (vs XTable/Delta Uniform, the key differentiator)
+   - §10: Architecture Laws (10 executable laws)
+   - §11: Comparison with Existing Systems (Git, Delta/Iceberg/Hudi, FoundationDB, DuckDB, Datomic)
+   - §12: Where Pond Fails (honest: no distributed, no ACID, FS backend limits, naive merge, no query engine, staging in Lens)
+   - §13: Open Questions (staging/Workspace layer, Lens hierarchy inversion, Namespace as first-class, what to replicate, Physical Structure calculus)
+
+3. The paper exposes the open questions the user identified:
+   - Staging belongs to Workspace/Transaction, not Lens (most important missing abstraction)
+   - Lens hierarchy might be inverted (Lens on top, not middle)
+   - Namespace should become first-class (permissions, policies)
+   - "What is replicated?" must be answered before distributed coordination
+   - Physical Structure calculus is the biggest research opportunity
+
+4. Verified no regressions: lens_laws_ci (5), architecture_laws (10), collection (4) all pass.
+
+5. Appended this worklog entry.
+
+## Stage Summary
+
+PondObject → Collection renamed. "The Pond Storage Model" paper written (~2000 lines, 13 sections). This is the canonical document that explains Pond to the world: why existing systems duplicate metadata, how the 3-primitive kernel avoids this, how Lenses provide multi-domain interpretation without metadata, and honest assessment of where Pond fails. The paper exposes 5 open questions that need resolution before the architecture is fully settled. The most important: staging should belong to a Workspace/Transaction layer (not Lens), and the Lens hierarchy might need inversion (Lens on top, not middle). These are the next architectural decisions to make.

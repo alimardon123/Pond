@@ -1,8 +1,8 @@
 """
-PondObject — a named collection of bytes in the kernel with metadata and
+Collection — a named collection of bytes in the kernel with metadata and
 namespace support.
 
-A PondObject is the "object" in Pond — like a table in a database, a repo
+A Collection is the "object" in Pond — like a table in a database, a repo
 in Git, or a notebook in Jupyter. It lives in a namespace path
 (e.g., "analytics/orders" or "ml/features/user_stats") and has a type
 that identifies which Lens family created it.
@@ -12,47 +12,47 @@ Architecture:
       ↓
   Namespace (path structure: analytics/orders, ml/features)
       ↓
-  PondObject (named object + type metadata)
+  Collection (named object + type metadata)
       ↓
   Physical Structures (indexes, stats — accelerate access)
       ↓
   Lens (interprets bytes, never owns them)
 
-Why "PondObject" instead of "Dataset":
+Why "Collection" instead of "Dataset":
   - "Dataset" implies tabular data (ML datasets, Spark datasets).
-  - "PondObject" is format-agnostic — a Docker PondObject can hold any bytes.
-  - A Pond PondObject can hold SQL rows, Git trees, notebook cells, or
-    raw binary attachments. "PondObject" communicates that flexibility.
-  - "PondObject" also has a storage-engine connotation (disk PondObject,
-    logical PondObject) that fits Pond's storage-substrate identity.
+  - "Collection" is format-agnostic — a Docker Collection can hold any bytes.
+  - A Pond Collection can hold SQL rows, Git trees, notebook cells, or
+    raw binary attachments. "Collection" communicates that flexibility.
+  - "Collection" also has a storage-engine connotation (disk Collection,
+    logical Collection) that fits Pond's storage-substrate identity.
 
 Namespace:
-  PondObjects live in a hierarchical namespace, like a filesystem:
-    analytics/orders          ← a SQL PondObject
-    analytics/customers       ← another SQL PondObject
-    ml/features/user_stats    ← a feature store PondObject
-    repo/main                 ← a Git PondObject
-    notebooks/analysis        ← a notebook PondObject
+  Collections live in a hierarchical namespace, like a filesystem:
+    analytics/orders          ← a SQL Collection
+    analytics/customers       ← another SQL Collection
+    ml/features/user_stats    ← a feature store Collection
+    repo/main                 ← a Git Collection
+    notebooks/analysis        ← a notebook Collection
 
   The namespace is just the path structure of the kernel Name.
   No new kernel primitives — just a naming convention.
 
 Materialized views:
-  A materialized view is a PondObject whose data is derived from another
-  PondObject. It's just a PondObject with optional `source` metadata pointing
-  to the parent PondObject. No separate API — just pass `source` when
-  creating the PondObject:
+  A materialized view is a Collection whose data is derived from another
+  Collection. It's just a Collection with optional `source` metadata pointing
+  to the parent Collection. No separate API — just pass `source` when
+  creating the Collection:
 
-    PondObject.create(kernel, "analytics/orders_by_region",
+    Collection.create(kernel, "analytics/orders_by_region",
                   type="sql", source="analytics/orders")
 
   This records lineage (orders_by_region ← orders) without any
   special machinery. The materialized view has its own commit DAG;
-  it's a separate PondObject that happens to track its source.
+  it's a separate Collection that happens to track its source.
 
 Usage:
-    # Create a PondObject
-    vol = PondObject.create(kernel, "analytics/orders", type="sql",
+    # Create a Collection
+    vol = Collection.create(kernel, "analytics/orders", type="sql",
                          description="Customer orders table")
 
     # Use a Lens to read/write it
@@ -60,20 +60,20 @@ Usage:
     lens.put("order:1", {"amount": 100})
     lens.commit("insert order 1")
 
-    # List all PondObjects
-    PondObjects = PondObject.list(kernel)
+    # List all Collections
+    Collections = Collection.list(kernel)
     # [{"name": "analytics/orders", "type": "sql", "description": "..."}]
 
-    # List PondObjects in a namespace
-    analytics_PondObjects = PondObject.list(kernel, prefix="analytics/")
+    # List Collections in a namespace
+    analytics_Collections = Collection.list(kernel, prefix="analytics/")
     # [{"name": "analytics/orders", ...}, {"name": "analytics/customers", ...}]
 
     # List namespaces
-    namespaces = PondObject.list_namespaces(kernel)
+    namespaces = Collection.list_namespaces(kernel)
     # ["analytics", "ml/features", "notebooks", "repo"]
 
-    # Create a materialized view (just a PondObject with source)
-    mv = PondObject.create(kernel, "analytics/orders_by_region",
+    # Create a materialized view (just a Collection with source)
+    mv = Collection.create(kernel, "analytics/orders_by_region",
                        type="sql", source="analytics/orders",
                        description="Orders aggregated by region")
 """
@@ -95,30 +95,30 @@ from pond_minimal import PondMinimal
 
 
 # ---------------------------------------------------------------------------
-# PondObject — named object + type metadata + namespace
+# Collection — named object + type metadata + namespace
 # ---------------------------------------------------------------------------
 
-class PondObject:
+class Collection:
     """A named collection of bytes in the kernel with type metadata.
 
-    A PondObject is the "object" — a table, a repo, a notebook, a feature
+    A Collection is the "object" — a table, a repo, a notebook, a feature
     store. The Lens is how you read/write it. Multiple Lenses can
-    share a PondObject.
+    share a Collection.
 
-    PondObjects live in a hierarchical namespace (e.g., "analytics/orders").
-    The metadata is ONE small JSON blob per PondObject, stored as a kernel
+    Collections live in a hierarchical namespace (e.g., "analytics/orders").
+    The metadata is ONE small JSON blob per Collection, stored as a kernel
     reference (Name: "{name}__meta"). NOT per record.
     """
 
     def __init__(self, kernel: PondMinimal, name: str):
-        """Open an existing PondObject. Raises ValueError if it doesn't exist."""
+        """Open an existing Collection. Raises ValueError if it doesn't exist."""
         self.kernel = kernel
         self.name = name
         meta = self._read_meta()
         if meta is None:
             raise ValueError(
-                f"PondObject '{name}' does not exist. "
-                f"Use PondObject.create() to create it."
+                f"Collection '{name}' does not exist. "
+                f"Use Collection.create() to create it."
             )
         self._meta = meta
 
@@ -131,31 +131,31 @@ class PondObject:
                type: str = "generic",
                description: str = "",
                source: Optional[str] = None,
-               **extra) -> "PondObject":
-        """Create a new PondObject with metadata.
+               **extra) -> "Collection":
+        """Create a new Collection with metadata.
 
         Args:
             kernel: the Pond kernel.
-            name: the PondObject name (may include namespace path,
+            name: the Collection name (may include namespace path,
                 e.g., "analytics/orders").
-            type: the lens type that created this PondObject
+            type: the lens type that created this Collection
                 (e.g., "sql", "git", "feature_store", "notebook",
                 "arrow", "streaming", "vector", "semantic").
             description: human-readable description.
-            source: optional source PondObject name (for materialized views).
-                If provided, this PondObject is a materialized view derived
-                from the source PondObject. The view has its own commit DAG;
-                it's a separate PondObject that tracks its lineage.
+            source: optional source Collection name (for materialized views).
+                If provided, this Collection is a materialized view derived
+                from the source Collection. The view has its own commit DAG;
+                it's a separate Collection that tracks its lineage.
             **extra: additional metadata fields.
 
         Returns:
-            A PondObject instance.
+            A Collection instance.
         """
         meta_ref = f"{name}__meta"
         if kernel.resolve(meta_ref) is not None:
             raise ValueError(
-                f"PondObject '{name}' already exists. "
-                f"Use PondObject(kernel, '{name}') to open it."
+                f"Collection '{name}' already exists. "
+                f"Use Collection(kernel, '{name}') to open it."
             )
 
         meta = {
@@ -163,7 +163,7 @@ class PondObject:
             "type": type,
             "description": description,
             "created_at": time.time(),
-            "source": source,  # None for base PondObjects; parent name for views
+            "source": source,  # None for base Collections; parent name for views
             **extra,
         }
         meta_bytes = json.dumps(meta, sort_keys=True).encode()
@@ -184,7 +184,7 @@ class PondObject:
 
     @property
     def type(self) -> str:
-        """The lens type that created this PondObject (e.g., 'sql', 'git')."""
+        """The lens type that created this Collection (e.g., 'sql', 'git')."""
         return self._meta.get("type", "generic")
 
     @property
@@ -193,8 +193,8 @@ class PondObject:
 
     @property
     def source(self) -> Optional[str]:
-        """The source PondObject name (if this is a materialized view).
-        None for base PondObjects."""
+        """The source Collection name (if this is a materialized view).
+        None for base Collections."""
         return self._meta.get("source")
 
     @property
@@ -236,23 +236,23 @@ class PondObject:
         return self.name.rsplit("/", 1)[-1]
 
     # ------------------------------------------------------------------
-    # Registry — list PondObjects and namespaces
+    # Registry — list Collections and namespaces
     # ------------------------------------------------------------------
 
     @staticmethod
     def list(kernel: PondMinimal, prefix: Optional[str] = None) -> list[dict]:
-        """List all PondObjects in the kernel, optionally filtered by namespace.
+        """List all Collections in the kernel, optionally filtered by namespace.
 
         Args:
             kernel: the Pond kernel.
             prefix: optional namespace prefix (e.g., "analytics/").
-                Only PondObjects whose name starts with this prefix are listed.
+                Only Collections whose name starts with this prefix are listed.
 
         Returns:
             List of metadata dicts, sorted by name.
         """
         names = kernel.list_names()
-        PondObjects = []
+        Collections = []
         for name in names:
             if not name.endswith("__meta"):
                 continue
@@ -262,25 +262,25 @@ class PondObject:
             h = kernel.resolve(name)
             if h:
                 meta = json.loads(kernel.read_blob(h))
-                PondObjects.append(meta)
-        return sorted(PondObjects, key=lambda m: m.get("name", ""))
+                Collections.append(meta)
+        return sorted(Collections, key=lambda m: m.get("name", ""))
 
     @staticmethod
     def list_by_type(kernel: PondMinimal, type: str) -> list[dict]:
-        """List all PondObjects of a given type (e.g., 'sql', 'git')."""
-        return [v for v in PondObject.list(kernel) if v.get("type") == type]
+        """List all Collections of a given type (e.g., 'sql', 'git')."""
+        return [v for v in Collection.list(kernel) if v.get("type") == type]
 
     @staticmethod
     def list_namespaces(kernel: PondMinimal) -> list[str]:
-        """List all namespaces (unique namespace paths across all PondObjects).
+        """List all namespaces (unique namespace paths across all Collections).
 
         Example:
-            >>> PondObject.list_namespaces(kernel)
+            >>> Collection.list_namespaces(kernel)
             ["analytics", "ml/features", "notebooks", "repo"]
         """
-        PondObjects = PondObject.list(kernel)
+        Collections = Collection.list(kernel)
         namespaces = set()
-        for vol in PondObjects:
+        for vol in Collections:
             name = vol.get("name", "")
             if "/" in name:
                 # Add all parent namespaces
@@ -291,31 +291,31 @@ class PondObject:
 
     @staticmethod
     def list_views(kernel: PondMinimal, source: Optional[str] = None) -> list[dict]:
-        """List all materialized views, optionally filtered by source PondObject.
+        """List all materialized views, optionally filtered by source Collection.
 
         Args:
             kernel: the Pond kernel.
-            source: optional source PondObject name. If provided, only views
+            source: optional source Collection name. If provided, only views
                 derived from this source are listed.
         """
-        views = [v for v in PondObject.list(kernel) if v.get("source") is not None]
+        views = [v for v in Collection.list(kernel) if v.get("source") is not None]
         if source:
             views = [v for v in views if v.get("source") == source]
         return views
 
     @staticmethod
     def list_base(kernel: PondMinimal) -> list[dict]:
-        """List all base PondObjects (not materialized views)."""
-        return [v for v in PondObject.list(kernel) if v.get("source") is None]
+        """List all base Collections (not materialized views)."""
+        return [v for v in Collection.list(kernel) if v.get("source") is None]
 
     @staticmethod
     def exists(kernel: PondMinimal, name: str) -> bool:
         return kernel.resolve(f"{name}__meta") is not None
 
     @staticmethod
-    def open(kernel: PondMinimal, name: str) -> Optional["PondObject"]:
+    def open(kernel: PondMinimal, name: str) -> Optional["Collection"]:
         try:
-            return PondObject(kernel, name)
+            return Collection(kernel, name)
         except ValueError:
             return None
 
@@ -324,49 +324,49 @@ class PondObject:
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_PondObject_create_and_list():
+def test_Collection_create_and_list():
     import shutil
-    bench = "/tmp/pond_PondObject_test"
+    bench = "/tmp/pond_Collection_test"
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    PondObject.create(kernel, "analytics/orders", type="sql",
+    Collection.create(kernel, "analytics/orders", type="sql",
                    description="Customer orders table")
-    PondObject.create(kernel, "analytics/customers", type="sql",
+    Collection.create(kernel, "analytics/customers", type="sql",
                    description="Customer profiles")
-    PondObject.create(kernel, "ml/features/user_stats", type="feature_store",
+    Collection.create(kernel, "ml/features/user_stats", type="feature_store",
                    description="User feature statistics")
-    PondObject.create(kernel, "repo/main", type="git",
+    Collection.create(kernel, "repo/main", type="git",
                    description="Source code repository")
-    PondObject.create(kernel, "notebooks/analysis", type="notebook",
+    Collection.create(kernel, "notebooks/analysis", type="notebook",
                    description="Analysis notebook")
 
     # List all
-    PondObjects = PondObject.list(kernel)
-    assert len(PondObjects) == 5
-    names = [v["name"] for v in PondObjects]
+    Collections = Collection.list(kernel)
+    assert len(Collections) == 5
+    names = [v["name"] for v in Collections]
     assert "analytics/orders" in names
     assert "ml/features/user_stats" in names
 
     # List by type
-    sql_PondObjects = PondObject.list_by_type(kernel, "sql")
-    assert len(sql_PondObjects) == 2
+    sql_Collections = Collection.list_by_type(kernel, "sql")
+    assert len(sql_Collections) == 2
 
     # List by namespace prefix
-    analytics = PondObject.list(kernel, prefix="analytics/")
+    analytics = Collection.list(kernel, prefix="analytics/")
     assert len(analytics) == 2
     assert all(v["name"].startswith("analytics/") for v in analytics)
 
     # List namespaces
-    namespaces = PondObject.list_namespaces(kernel)
+    namespaces = Collection.list_namespaces(kernel)
     assert "analytics" in namespaces
     assert "ml/features" in namespaces
     assert "repo" in namespaces
     assert "notebooks" in namespaces
 
     # Verify metadata
-    vol = PondObject(kernel, "analytics/orders")
+    vol = Collection(kernel, "analytics/orders")
     assert vol.type == "sql"
     assert vol.description == "Customer orders table"
     assert vol.namespace == "analytics"
@@ -376,43 +376,43 @@ def test_PondObject_create_and_list():
 
     kernel.close()
     shutil.rmtree(bench, ignore_errors=True)
-    print("PASS: PondObject create, list, list_by_type, list_namespaces, namespace/basename")
+    print("PASS: Collection create, list, list_by_type, list_namespaces, namespace/basename")
 
 
 def test_materialized_views():
     import shutil
-    bench = "/tmp/pond_PondObject_views"
+    bench = "/tmp/pond_Collection_views"
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    # Create a base PondObject
-    PondObject.create(kernel, "analytics/orders", type="sql",
+    # Create a base Collection
+    Collection.create(kernel, "analytics/orders", type="sql",
                    description="Orders table")
 
-    # Create materialized views (just PondObjects with source=)
-    PondObject.create(kernel, "analytics/orders_by_region", type="sql",
+    # Create materialized views (just Collections with source=)
+    Collection.create(kernel, "analytics/orders_by_region", type="sql",
                    source="analytics/orders",
                    description="Orders aggregated by region")
-    PondObject.create(kernel, "analytics/orders_index_customer", type="sql",
+    Collection.create(kernel, "analytics/orders_index_customer", type="sql",
                    source="analytics/orders",
                    description="Index on customer_id")
 
-    # List base PondObjects
-    base = PondObject.list_base(kernel)
+    # List base Collections
+    base = Collection.list_base(kernel)
     assert len(base) == 1
     assert base[0]["name"] == "analytics/orders"
 
     # List materialized views
-    views = PondObject.list_views(kernel)
+    views = Collection.list_views(kernel)
     assert len(views) == 2
 
     # List views for a specific source
-    order_views = PondObject.list_views(kernel, source="analytics/orders")
+    order_views = Collection.list_views(kernel, source="analytics/orders")
     assert len(order_views) == 2
 
     # Verify view metadata
-    mv = PondObject(kernel, "analytics/orders_by_region")
+    mv = Collection(kernel, "analytics/orders_by_region")
     assert mv.is_materialized is True
     assert mv.source == "analytics/orders"
 
@@ -421,14 +421,14 @@ def test_materialized_views():
     print("PASS: Materialized views (source metadata, list_views, list_base, lineage)")
 
 
-def test_PondObject_with_lens():
+def test_Collection_with_lens():
     import shutil
-    bench = "/tmp/pond_PondObject_lens"
+    bench = "/tmp/pond_Collection_lens"
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    PondObject.create(kernel, "analytics/users", type="sql",
+    Collection.create(kernel, "analytics/users", type="sql",
                    description="User table")
 
     from lens_sdk import Lens
@@ -440,7 +440,7 @@ def test_PondObject_with_lens():
     assert lens.get("user:1") == {"name": "Alice", "age": 30}
     assert lens.count() == 2
 
-    vol = PondObject(kernel, "analytics/users")
+    vol = Collection(kernel, "analytics/users")
     assert vol.type == "sql"
     assert vol.namespace == "analytics"
     assert vol.basename == "users"
@@ -452,44 +452,44 @@ def test_PondObject_with_lens():
 
     kernel.close()
     shutil.rmtree(bench, ignore_errors=True)
-    print("PASS: PondObject + Lens integration (namespace path, metadata is small)")
+    print("PASS: Collection + Lens integration (namespace path, metadata is small)")
 
 
-def test_PondObject_persists():
+def test_Collection_persists():
     import shutil
-    bench = "/tmp/pond_PondObject_persist"
+    bench = "/tmp/pond_Collection_persist"
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    PondObject.create(kernel, "analytics/orders", type="sql",
+    Collection.create(kernel, "analytics/orders", type="sql",
                    description="Orders table")
     kernel.close()
 
     kernel2 = PondMinimal(bench)
-    PondObjects = PondObject.list(kernel2)
-    assert len(PondObjects) == 1
-    assert PondObjects[0]["name"] == "analytics/orders"
-    assert PondObjects[0]["type"] == "sql"
+    Collections = Collection.list(kernel2)
+    assert len(Collections) == 1
+    assert Collections[0]["name"] == "analytics/orders"
+    assert Collections[0]["type"] == "sql"
 
-    vol = PondObject(kernel2, "analytics/orders")
+    vol = Collection(kernel2, "analytics/orders")
     assert vol.description == "Orders table"
     assert vol.namespace == "analytics"
 
     kernel2.close()
     shutil.rmtree(bench, ignore_errors=True)
-    print("PASS: PondObject metadata persists across restart (with namespace)")
+    print("PASS: Collection metadata persists across restart (with namespace)")
 
 
 def _run_all_tests():
-    print("=== PondObject Layer Tests ===\n")
-    test_PondObject_create_and_list()
+    print("=== Collection Layer Tests ===\n")
+    test_Collection_create_and_list()
     print()
     test_materialized_views()
     print()
-    test_PondObject_with_lens()
+    test_Collection_with_lens()
     print()
-    test_PondObject_persists()
+    test_Collection_persists()
     print("\n=== ALL TESTS PASSED ===")
 
 

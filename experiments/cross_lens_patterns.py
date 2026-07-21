@@ -10,7 +10,7 @@ Tests every interaction pattern the Lens architecture supports:
   5. Cross-lens indexing (index over data from multiple lenses)
   6. Transform-later (read via lens A, transform, write via lens B)
   7. Restart with multiple lenses (all survive)
-  8. Namespace patterns (multiple PondObjects in different namespaces)
+  8. Namespace patterns (multiple Collections in different namespaces)
   9. Materialized views (source lineage)
   10. Independent implementations cross-reading (ConfigLens + MetricsLens)
   11. Cross-lens history (all lenses see the same commit DAG)
@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 
 from pond_minimal import PondMinimal
 from lens_sdk import Lens, IndexedLens
-from pond_object import PondObject
+from collection import Collection
 
 
 # ---------------------------------------------------------------------------
@@ -356,39 +356,39 @@ def test_7_restart_multiple_lenses():
 
 
 def test_8_namespace_patterns():
-    """Multiple PondObjects in different namespaces."""
+    """Multiple Collections in different namespaces."""
     print("--- Test 8: Namespace patterns ---")
     bench = "/tmp/pond_xl_ns"
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    PondObject.create(kernel, "analytics/orders", type="sql", description="Orders")
-    PondObject.create(kernel, "analytics/customers", type="sql", description="Customers")
-    PondObject.create(kernel, "ml/features/stats", type="feature_store", description="Features")
-    PondObject.create(kernel, "repo/main", type="git", description="Repo")
+    Collection.create(kernel, "analytics/orders", type="sql", description="Orders")
+    Collection.create(kernel, "analytics/customers", type="sql", description="Customers")
+    Collection.create(kernel, "ml/features/stats", type="feature_store", description="Features")
+    Collection.create(kernel, "repo/main", type="git", description="Repo")
 
     # List all
-    all_objs = PondObject.list(kernel)
+    all_objs = Collection.list(kernel)
     assert len(all_objs) == 4
 
     # List by namespace prefix
-    analytics = PondObject.list(kernel, prefix="analytics/")
+    analytics = Collection.list(kernel, prefix="analytics/")
     assert len(analytics) == 2
 
     # List namespaces
-    namespaces = PondObject.list_namespaces(kernel)
+    namespaces = Collection.list_namespaces(kernel)
     assert "analytics" in namespaces
     assert "ml/features" in namespaces
     assert "repo" in namespaces
 
     # List by type
-    sql_objs = PondObject.list_by_type(kernel, "sql")
+    sql_objs = Collection.list_by_type(kernel, "sql")
     assert len(sql_objs) == 2
 
     kernel.close()
     shutil.rmtree(bench, ignore_errors=True)
-    print("  PASS: 4 PondObjects in 3 namespaces, list/filter by prefix and type")
+    print("  PASS: 4 Collections in 3 namespaces, list/filter by prefix and type")
 
 
 def test_9_materialized_views():
@@ -400,26 +400,26 @@ def test_9_materialized_views():
     kernel = PondMinimal(bench)
 
     # Create base volume
-    PondObject.create(kernel, "analytics/orders", type="sql", description="Orders")
+    Collection.create(kernel, "analytics/orders", type="sql", description="Orders")
 
     # Create materialized views (just volumes with source=)
-    PondObject.create(kernel, "analytics/orders_by_region",
+    Collection.create(kernel, "analytics/orders_by_region",
                        type="sql", source="analytics/orders",
                        description="Orders by region")
 
     # List base volumes
-    base = PondObject.list_base(kernel)
+    base = Collection.list_base(kernel)
     assert len(base) == 1
     assert base[0]["name"] == "analytics/orders"
 
     # List materialized views
-    views = PondObject.list_views(kernel)
+    views = Collection.list_views(kernel)
     assert len(views) == 1
     assert views[0]["name"] == "analytics/orders_by_region"
     assert views[0]["source"] == "analytics/orders"
 
     # Verify lineage
-    mv = PondObject(kernel, "analytics/orders_by_region")
+    mv = Collection(kernel, "analytics/orders_by_region")
     assert mv.is_materialized
     assert mv.source == "analytics/orders"
 
