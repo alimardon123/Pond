@@ -710,3 +710,31 @@ Task: Resolver comparison — three competing prototypes for the interpretation 
 ## Stage Summary
 
 Three competing prototypes built and scored. NO merging into core architecture — all three are research artifacts. The user's pushback on TypedBlob is validated: it scores lowest (21/30) on the 6 criteria, primarily because it drifts from "bytes are just bytes." Both Context-based (28/30) and Self-describing (27/30) preserve the kernel's purity. The hypothesis: Self-describing payloads + Context fallback is the right architecture — zero blob overhead, universal readability for common formats, kernel stays pure. But this is a hypothesis, not a decision. Next steps: test against real formats (Arrow, Parquet, Git), external validation, then decide. TypedBlob marked as EXPERIMENTAL. The architectural question is now properly framed: "What is the smallest possible interpretation layer that allows every Lens to read every object while keeping the kernel completely format-agnostic?" Three concrete answers exist. The experiments will determine the winner.
+
+---
+Task ID: 26
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Falsification round — can context-based interpretation alone give us everything without blob-level metadata?
+
+## Work Log
+
+1. Read user's final guidance: run a falsification round. Test context-based interpretation against REAL formats (Arrow IPC, Git tree, JSON, FeatureStore records). Score on 8 criteria. Write a one-page Lens Interpretation Contract. Answer honestly.
+2. Built experiments/resolver_comparison/falsification_context.py (~600 LOC): comprehensive test with REAL formats (pyarrow Arrow IPC, real Git tree objects, real JSON, real notebook cells, real feature store records). 5 lenses (SQL, Arrow, Git, Notebook, FeatureStore) all sharing the same byte graph. Measures all 8 criteria.
+3. Fixed Arrow IPC assertion: Arrow IPC STREAM format starts with continuation marker 0xFFFFFFFF, not "ARROW1" (that's the FILE format). The key point: no Pond envelope.
+4. ALL 8 TESTS PASS:
+   - Universal readability: 25/25 reads succeeded. Every lens read every blob — SQL read Arrow Table, Git read FeatureStore record, Arrow read SQL row, etc.
+   - Bidirectional write/read: SQL writes → Arrow reads; Arrow writes → SQL reads; Git writes → FeatureStore reads.
+   - Branch/merge/history: SQL creates branch, all 5 lenses see it. Git commits on branch, SQL reads it. 9 commits shared across all lenses.
+   - Derived structures: cross-lens index on "region" field. Built across JSON blobs (SQL) and found US record.
+   - Zero metadata overhead: NO manifest, NO enable_view, NO codec metadata. 21 blobs total (data + tree + commit only).
+   - Pure bytes: SQL blob starts with { (pure JSON), Arrow blob starts with 0xFFFFFFFF (pure Arrow IPC stream), Git blob starts with 100644 (pure Git tree). NO envelope.
+   - Transform-later: SQL lens read Arrow Table, transformed into 3 SQL rows. Arrow lens read SQL rows, transformed into Arrow Table.
+   - Kernel purity: kernel stores ONLY bytes (pure), history (commit DAG), names (references). Format-agnostic.
+5. Performance: cross-lens read has 1.0x overhead vs same-lens read (NO performance penalty). Write: 13522 rec/sec. Read: 3071 rec/sec. Cross-lens read: 3067 rec/sec.
+6. Implementation size: ~55 LOC (ContextResolver ~30 LOC + ContextLens ~25 LOC) vs ~200 LOC for the TypedBlob envelope approach.
+7. Wrote docs/LENS_INTERPRETATION_CONTRACT.md (~100 lines): one-page contract defining what a Lens can assume, must NOT assume, how fallback decoding works, how cross-lens transforms work, what is NOT stored in the kernel, the resolver design, and verification results.
+8. Appended this worklog entry.
+
+## Stage Summary
+
+FALSIFICATION QUESTION ANSWERED: YES. Context-based interpretation alone provides universal readability, bidirectional write/read, branch/merge/history, derived structures, zero metadata overhead, pure bytes, transform-later capability, and kernel purity — all without blob-level metadata. The kernel does NOT need an envelope. The interpretation layer lives in CODE (the resolver, ~55 LOC), not in DATA (the blob). Cross-lens read has zero performance overhead (1.0x vs same-lens). The Lens Interpretation Contract is written. The user's architectural instinct is confirmed: "raw bytes in the kernel, Lens-specific encoding/decoding, shared resolver logic in code, no blob-level metadata overhead, emergent compatibility where possible, raw access always available." TypedBlob should be removed from the SDK; context-based interpretation is the right approach.
