@@ -119,16 +119,20 @@ class BinaryProllyTree:
     def encode_commit(parent_hash: Optional[str], tree_hash: str,
                       delta_plus: dict, delta_minus: list,
                       snapshot: Optional[str], message: str,
-                      timestamp: float, index: int) -> bytes:
-        """Encode a commit as binary."""
-        # Format: [1B: type=3][32B: parent (or zeros)][32B: tree_root]
-        # [4B: delta_plus_count][delta_plus entries]
-        # [4B: delta_minus_count][delta_minus entries]
-        # [1B: has_snapshot][32B: snapshot (if has)]
-        # [2B: msg_len][msg][8B: timestamp][4B: index]
+                      timestamp: float, index: int,
+                      second_parent: Optional[str] = None) -> bytes:
+        """Encode a commit as binary.
+
+        Format: [1B: type=3][32B: parent (or zeros)][32B: tree_root]
+        [4B: delta_plus_count][delta_plus entries]
+        [4B: delta_minus_count][delta_minus entries]
+        [1B: has_snapshot][32B: snapshot (if has)]
+        [1B: has_second_parent][32B: second_parent (if has)]  ← NEW for merge commits
+        [2B: msg_len][msg][8B: timestamp][4B: index]
+        """
         buf = struct.pack("<B", 3)  # type = commit
 
-        # Parent hash
+        # Parent hash (first parent)
         if parent_hash:
             buf += bytes.fromhex(parent_hash)
         else:
@@ -154,6 +158,13 @@ class BinaryProllyTree:
             key_bytes = key.encode()
             buf += struct.pack("<H", len(key_bytes))
             buf += key_bytes
+
+        # Second parent (for merge commits) — NEW
+        if second_parent:
+            buf += struct.pack("<B", 1)  # has_second_parent = True
+            buf += bytes.fromhex(second_parent)
+        else:
+            buf += struct.pack("<B", 0)  # has_second_parent = False
 
         # Message
         msg_bytes = message.encode()
@@ -203,6 +214,18 @@ class BinaryProllyTree:
             pos += key_len
             delta_minus.append(key)
 
+        # Second parent (for merge commits) — NEW
+        # Try to read: if there's enough data, read the has_second_parent flag
+        second_parent = None
+        if pos < len(data):
+            has_second_parent = struct.unpack("<B", data[pos:pos+1])[0]
+            pos += 1
+            if has_second_parent:
+                second_parent = data[pos:pos+32].hex()
+                pos += 32
+                if second_parent == '0' * 64:
+                    second_parent = None
+
         # Message
         msg_len = struct.unpack("<H", data[pos:pos+2])[0]
         pos += 2
@@ -215,6 +238,7 @@ class BinaryProllyTree:
         return {
             "type": "commit",
             "parent": parent,
+            "second_parent": second_parent,  # NEW
             "snapshot": snapshot,
             "delta": {"+": delta_plus, "-": delta_minus} if delta_plus or delta_minus else None,
             "message": message,

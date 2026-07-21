@@ -363,10 +363,10 @@ def test_8_namespace_patterns():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    Collection.create(kernel, "analytics/orders", type="sql", description="Orders")
-    Collection.create(kernel, "analytics/customers", type="sql", description="Customers")
-    Collection.create(kernel, "ml/features/stats", type="feature_store", description="Features")
-    Collection.create(kernel, "repo/main", type="git", description="Repo")
+    Collection.create(kernel, "analytics/orders", labels=["sql"], created_by="SqlLens", description="Orders")
+    Collection.create(kernel, "analytics/customers", labels=["sql"], created_by="SqlLens", description="Customers")
+    Collection.create(kernel, "ml/features/stats", labels=["feature_store"], created_by="FeatureStoreLens", description="Features")
+    Collection.create(kernel, "repo/main", labels=["git"], created_by="GitLens", description="Repo")
 
     # List all
     all_objs = Collection.list(kernel)
@@ -383,7 +383,7 @@ def test_8_namespace_patterns():
     assert "repo" in namespaces
 
     # List by type
-    sql_objs = Collection.list_by_type(kernel, "sql")
+    sql_objs = Collection.list_by_label(kernel, "sql")
     assert len(sql_objs) == 2
 
     kernel.close()
@@ -400,11 +400,11 @@ def test_9_materialized_views():
     kernel = PondMinimal(bench)
 
     # Create base volume
-    Collection.create(kernel, "analytics/orders", type="sql", description="Orders")
+    Collection.create(kernel, "analytics/orders", labels=["sql"], created_by="SqlLens", description="Orders")
 
     # Create materialized views (just volumes with source=)
     Collection.create(kernel, "analytics/orders_by_region",
-                       type="sql", source="analytics/orders",
+                       labels=["sql"], created_by="SqlLens", source="analytics/orders",
                        description="Orders by region")
 
     # List base volumes

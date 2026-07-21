@@ -1279,3 +1279,40 @@ Task: Collection labels fix + paper chapters + Red Team Architecture Review.
 ## Stage Summary
 
 Collection fixed (neutral labels, not type). Paper has 15 chapters now. Red Team review: REJECT. The model's CORE (3 primitives, immutable bytes, content-addressing) survives. The CLAIMS around it (O(log N), commit DAG, no metadata, Physical Structure universality) are overstated and need correction. The most important corrections: (1) admit the commit structure is a linked list, not a DAG, (2) admit the O(log N) claim is violated by the delta journal walk, (3) admit that key prefixes and naming conventions ARE metadata (just in Names, not in blobs), (4) add executable tests for Branch and Merge laws, (5) add Dolt to the comparison, (6) acknowledge Physical Structure calculus limitations. The staging/Workspace problem is confirmed as the most important missing abstraction. The Red Team review is the most valuable artifact produced in this session — it shows exactly where the architecture is solid and where the claims are overstated.
+
+---
+Task ID: 42
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Fix Red Team findings (true merge DAG + Branch/Merge laws) + Object Store Cost Simulator.
+
+## Work Log
+
+1. Fixed Finding 1 (merge DAG): merge() now creates TRUE 2-parent commits. Binary encoding extended with second_parent field. History shows "merge" type with second_parent. Verified by Law 12.
+
+2. Fixed Finding 5 (missing Branch/Merge laws): Added Law 11 (Branch — 10 branches create 0 new blobs) and Law 12 (Merge — commit has 2 parents, history shows merge type, data from both branches visible). All 12 laws pass.
+
+3. Built experiments/object_store_cost.py (~250 LOC): Object Store Cost Simulator. Instruments the kernel to count GETs, PUTs, LISTs, HEADs per operation. Estimates S3/Azure/R2 latency.
+
+   RESULTS (100 records):
+   - lookup: 5 RTTs (4 GET + 1 HEAD), ~90ms on S3
+   - commit (1 rec): 5 RTTs (1 GET + 3 PUT + 1 HEAD), ~120ms on S3
+   - branch: 2 RTTs (1 PUT + 1 HEAD), ~40ms on S3 — O(1) as designed
+   - checkout: 4 RTTs, ~70ms on S3
+   - merge: 19 RTTs (11 GET + 5 PUT + 3 HEAD), ~400ms on S3 — expensive!
+   - count: 5 RTTs, ~90ms on S3
+   - history(10): 4 RTTs, ~70ms on S3
+   - index rebuild(10): 18 RTTs, ~360ms on S3
+   - get_all (scan): 107 RTTs (!), ~2130ms on S3 — CATASTROPHIC for scans
+
+   KEY FINDINGS:
+   - lookup is 5 RTTs: HEAD(resolve) + GET(commit) + GET(commit/snapshot) + GET(tree) + GET(blob). Acceptable but not great.
+   - merge is 19 RTTs: reads both branches' full state + writes merged snapshot. Expensive.
+   - get_all scan is 107 RTTs for 100 records = 1 GET per record + tree overhead. CATASTROPHIC on object storage. Needs packed objects (Git packfiles / SSTables).
+   - branch is 2 RTTs: O(1) as designed. Excellent.
+   - The commit-chain walk in lookup is the main object-store cost. A "HEAD always points to snapshot" design would reduce lookup to 3 RTTs.
+
+4. All 12 architecture laws pass. All existing tests pass (lens_laws_ci, feature_store, cross_lens_patterns).
+
+## Stage Summary
+
+Two Red Team findings fixed: merge now creates true 2-parent DAG commits (Law 12 verifies), and Branch/Merge are now executable laws (Laws 11-12). Object Store Cost Simulator built — reveals the exact round-trip cost of each operation on S3/Azure/R2. The scan operation (get_all) is the biggest concern: 107 RTTs for 100 records. This confirms the need for a packed-object backend (Git packfiles / SSTables style) where multiple blobs are packed into a single large file with an offset table. The lookup cost (5 RTTs) is acceptable but could be reduced to 3 with a "HEAD always points to snapshot" design. Branch cost (2 RTTs) is excellent. The simulator is the design document for object-store optimization.

@@ -437,6 +437,101 @@ def law_10_index():
     print(f"PASS: Law 10 (Index) — {N} records, index lookup succeeds")
 
 
+# (old _run_all and __main__ removed — new versions with laws 11-12 at end of file)
+
+
+# ---------------------------------------------------------------------------
+# Law 11: Branch Law — branch creation never duplicates blobs.
+# ---------------------------------------------------------------------------
+
+def law_11_branch_no_duplication():
+    """Branch creation is O(1): creates a new Reference, does NOT copy any blobs."""
+    bench = "/tmp/pond_law11"
+    if os.path.exists(bench): shutil.rmtree(bench)
+    os.makedirs(bench)
+    kernel = PondMinimal(bench)
+    lens = Lens(kernel, "law11")
+
+    lens.put("k1", {"v": 1})
+    lens.put("k2", {"v": 2})
+    lens.commit("2 records")
+
+    stats_before = kernel.storage_stats()
+    blobs_before = stats_before["blob_count"]
+
+    # Create 10 branches
+    for i in range(10):
+        lens.branch(f"branch_{i}")
+
+    stats_after = kernel.storage_stats()
+    blobs_after = stats_after["blob_count"]
+
+    # Branch creation should NOT add any blobs (only References/Names)
+    assert blobs_after == blobs_before, \
+        f"LAW 11 VIOLATED: branch created new blobs ({blobs_before} → {blobs_after})"
+
+    kernel.close()
+    shutil.rmtree(bench, ignore_errors=True)
+    print(f"PASS: Law 11 (Branch) — 10 branches created 0 new blobs ({blobs_before} → {blobs_after})")
+
+
+# ---------------------------------------------------------------------------
+# Law 12: Merge Law — merge creates a true DAG commit with 2 parents.
+# ---------------------------------------------------------------------------
+
+def law_12_merge_true_dag():
+    """Merge creates a commit with TWO parents (true DAG topology).
+
+    The Red Team found that merge previously created 1-parent commits,
+    making the "commit DAG" claim false. This law verifies that merge
+    commits now have a second_parent, preserving branch topology.
+    """
+    bench = "/tmp/pond_law12"
+    if os.path.exists(bench): shutil.rmtree(bench)
+    os.makedirs(bench)
+    kernel = PondMinimal(bench)
+    lens = Lens(kernel, "law12")
+
+    lens.put("k1", {"v": 1})
+    lens.commit("main")
+
+    lens.branch("feature")
+    lens.checkout("feature")
+    lens.put("k2", {"v": 2})
+    lens.commit("feature")
+
+    lens.undo(1)  # back to main HEAD
+    lens.merge("feature")
+
+    # Verify the HEAD commit has a second_parent (true merge)
+    head = kernel.resolve("law12")
+    from binary_encoding import BinaryProllyTree
+    commit = BinaryProllyTree.decode_commit(kernel.read_blob(head))
+
+    assert commit.get("second_parent") is not None, \
+        "LAW 12 VIOLATED: merge commit has no second_parent (not a true DAG)"
+    assert commit["parent"] is not None, \
+        "LAW 12 VIOLATED: merge commit has no first parent"
+    assert commit["second_parent"] != commit["parent"], \
+        "LAW 12 VIOLATED: both parents are the same (not a real merge)"
+
+    # Verify history shows the merge
+    history = lens.history()
+    merge_entry = history[0]  # HEAD is the merge commit
+    assert merge_entry["type"] == "merge", \
+        f"LAW 12 VIOLATED: HEAD is type '{merge_entry['type']}', expected 'merge'"
+    assert "second_parent" in merge_entry, \
+        "LAW 12 VIOLATED: history doesn't show second_parent"
+
+    # Verify data: both k1 (from main) and k2 (from feature) are visible
+    assert lens.get("k1") == {"v": 1}
+    assert lens.get("k2") == {"v": 2}
+
+    kernel.close()
+    shutil.rmtree(bench, ignore_errors=True)
+    print("PASS: Law 12 (Merge) — merge commit has 2 parents, history shows 'merge' type, data from both branches visible")
+
+
 def _run_all():
     print("=== Architecture Laws ===")
     print("  These are Pond's executable specification.")
@@ -452,8 +547,10 @@ def _run_all():
     law_8_determinism()
     law_9_scale()
     law_10_index()
+    law_11_branch_no_duplication()
+    law_12_merge_true_dag()
 
-    print("\n=== ALL 10 ARCHITECTURE LAWS HOLD ===")
+    print("\n=== ALL 12 ARCHITECTURE LAWS HOLD ===")
 
 
 if __name__ == "__main__":

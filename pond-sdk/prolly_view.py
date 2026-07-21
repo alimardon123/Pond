@@ -408,7 +408,7 @@ class ProllyViewBase:
     # ------------------------------------------------------------------
 
     def history(self, limit: int = 20) -> list[dict]:
-        """Walk commit history."""
+        """Walk commit history (first-parent line)."""
         head = self.kernel.resolve(self.name)
         if not head:
             return []
@@ -416,13 +416,18 @@ class ProllyViewBase:
         current = head
         while current and len(history) < limit:
             commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
-            history.append({
+            entry = {
                 "commit": current[:12],
                 "message": commit.get("message", ""),
                 "timestamp": commit.get("timestamp", 0),
                 "index": commit.get("index", 0),
                 "type": "snapshot" if commit.get("snapshot") else "delta",
-            })
+            }
+            # Show merge commits with second_parent (true DAG topology)
+            if commit.get("second_parent"):
+                entry["second_parent"] = commit["second_parent"][:12]
+                entry["type"] = "merge"
+            history.append(entry)
             current = commit.get("parent")
         return history
 
@@ -476,25 +481,38 @@ class ProllyViewBase:
     # ------------------------------------------------------------------
 
     def merge(self, branch_name: str, message: str = "") -> str:
+        """Merge a branch into the current HEAD.
+
+        Creates a TRUE merge commit with TWO parents:
+          - parent: current HEAD (the branch being merged INTO)
+          - second_parent: the branch HEAD being merged FROM
+
+        This preserves branch topology in the commit DAG, unlike the
+        previous implementation which only recorded one parent.
+
+        Semantics: union with last-writer-wins (merged branch's values
+        override current values for matching keys).
+        """
         full_name = f"{self.name}__branch__{branch_name}"
         branch_head = self.kernel.resolve(full_name)
         if not branch_head:
             raise ValueError(f"Branch '{branch_name}' does not exist")
 
         current_state = self.read_all()
-        # Read branch state directly from the branch's commit chain
         branch_state = self._read_state_from_commit(branch_head)
 
         merged = dict(current_state)
         merged.update(branch_state)
 
-        # Build a Prolly tree for the merged state
+        # Build a Prolly tree for the merged state (always a snapshot)
         tree_root = ProllyTree.build(self.kernel, merged)
 
         parent_hash = self.kernel.resolve(self.name)
+        # TRUE MERGE COMMIT: two parents (current HEAD + branch HEAD)
         commit_data = BinaryProllyTree.encode_commit(
             parent_hash, tree_root, {}, [], tree_root,
-            message or f"merge '{branch_name}'", time.time(), self._commit_index)
+            message or f"merge '{branch_name}'", time.time(), self._commit_index,
+            second_parent=branch_head)  # ← NEW: second parent for true DAG
         commit_hash = self.kernel.write(commit_data)
         self.kernel.reference(self.name, commit_hash)
         self._commit_index += 1
