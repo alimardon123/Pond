@@ -1618,3 +1618,38 @@ Task: Phase B — Architecture Falsification. 12 adversarial tests.
 ## Stage Summary
 
 Phase B complete. 12 adversarial tests, all pass. Two real bugs found and fixed (lookup crash on tombstoned HEAD/snapshot pointer). One real finding documented (GC doesn't respect snapshot pointers). The architecture survived: concurrent writers, crashes, corrupted blobs, lost references, GC interaction, branch explosion, deep history, large values, empty operations, RTT budget verification, and stale snapshot pointers. The architecture is robust under adversarial pressure. Next: Phase C (one production-quality object-store-native backend).
+
+---
+Task ID: 50
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Phase C — Object-Store-Native backend (no SQLite, OSN7 compliant).
+
+## Work Log
+
+1. Built experiments/object_store_backend.py (~350 LOC): ObjectStoreKernel.
+   - NO SQLite database. References are individual files (1 file per ref).
+   - Same API as PondMinimal: write(), read(), read_blob(), reference(), resolve(), list_names().
+   - References stored as files in .pond/refs/ directory. Each file contains just the 64-char hash.
+   - Namespace hierarchy via directory structure (analytics/orders → refs/analytics/orders).
+   - Satisfies OSN7 (no local metadata dependence) from the Object Store Native specification.
+
+2. 8 tests pass:
+   - Basic operations (write, read, reference, resolve, list)
+   - No SQLite (verified no .sqlite files exist)
+   - Namespace hierarchy (analytics/orders, ml/features)
+   - Works with Lens (put, get, commit, branch, history, snapshot pointer)
+   - Persistence (100 records survived restart, no SQLite)
+   - Reference overwrite (last-writer-wins)
+   - Differential test (50 puts, 2 deletes, verify count + lookups)
+   - Storage stats (correct blob and ref counts)
+
+3. On S3, each reference maps to 1 object:
+   - reference() = 1 PUT (write ref object)
+   - resolve() = 1 GET (read ref object)
+   - list_names() = 1 LIST (list ref prefix)
+
+4. This closes the OSN7 gap identified in POND_FORMAL_ALGEBRAS.md §5.
+
+## Stage Summary
+
+Phase C started. Object-store-native backend built — no SQLite, references as individual files. Satisfies OSN7 (no local metadata dependence). Works with Lens, persists across restart, passes differential tests. On S3, each reference is 1 object (PUT to set, GET to resolve). The backend is drop-in compatible with PondMinimal — same API, different storage strategy. Combined with the packed-object backend (scan optimization) and the tiered commit model (fast writes + fast reads), Pond now has a complete path to object-store-native deployment.
