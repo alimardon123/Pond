@@ -386,24 +386,34 @@ class ProllyViewBase:
         snap_hash = self.kernel.resolve(self._snapshot_ref)
         head = self.kernel.resolve(self.name)
         if snap_hash and head and head != snap_hash:
-            # Walk deltas from HEAD to snapshot
-            current = head
-            while current and current != snap_hash:
-                commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
-                delta = commit.get("delta")
-                if delta:
-                    if key in delta.get("+", {}):
-                        return delta["+"][key]
-                    if key in delta.get("-", []):
-                        return None  # deleted in a delta after snapshot
-                current = commit.get("parent")
+            # Check if HEAD is a valid commit (not a tombstone or garbage)
+            try:
+                # Walk deltas from HEAD to snapshot
+                current = head
+                while current and current != snap_hash:
+                    commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
+                    delta = commit.get("delta")
+                    if delta:
+                        if key in delta.get("+", {}):
+                            return delta["+"][key]
+                        if key in delta.get("-", []):
+                            return None  # deleted in a delta after snapshot
+                    current = commit.get("parent")
+            except (struct.error, ValueError, IndexError):
+                # HEAD is not a valid commit (e.g., tombstoned or corrupted)
+                # Fall through to snapshot lookup
+                pass
 
         # Not in deltas — look up in the snapshot
         if snap_hash:
-            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(snap_hash))
-            snapshot_root = commit.get("snapshot")
-            if snapshot_root:
-                return ProllyTree.lookup(self.kernel, snapshot_root, key)
+            try:
+                commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(snap_hash))
+                snapshot_root = commit.get("snapshot")
+                if snapshot_root:
+                    return ProllyTree.lookup(self.kernel, snapshot_root, key)
+            except (struct.error, ValueError, IndexError):
+                # Snapshot pointer is invalid (tombstoned or corrupted)
+                pass
 
         # Fallback: walk from HEAD (old data without snapshot pointer)
         return self._lookup_from_head(key)
