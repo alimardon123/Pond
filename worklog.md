@@ -1542,3 +1542,43 @@ Task: Week 1 — Mathematical Model. No implementation. Only models.
 ## Stage Summary
 
 Week 1 complete. The mathematical model is written. Key findings: (1) Collection is not fundamental — it's a reference namespace, eliminating a layer. (2) Physical Structure hypothesis mostly holds but caches are a counterexample. (3) RTT budget defined — lookup needs to go from 5 to 3 (embed snapshot root in HEAD), merge needs to go from 19 to 8 (diff-based). (4) Merge semantics are Lens-level, not kernel-level. (5) History can potentially be logarithmic via skip pointers. The model is now specification-driven, not implementation-driven. Next: Week 2 (RTT-first redesign), Week 3 (extreme Red Team), Week 4 (real workloads).
+
+---
+Task ID: 48
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Phase A — Formalize ALL algebras. No implementation. Only models.
+
+## Work Log
+
+1. Wrote docs/POND_FORMAL_ALGEBRAS.md (~700 lines, 8 sections). This is the complete formal specification of Pond's algebras — the model that all future implementations must satisfy.
+
+2. EIGHT ALGEBRAS FORMALIZED:
+
+   A. REFERENCE ALGEBRA: References are the only mutable state. All roles (HEAD, branch, snapshot, tag, workspace, lock, lease, materialization, pack, replica) are just Ref(name, hash) with different naming conventions. 5 reference laws (R1-R5: atomicity, last-writer-wins, compare-and-swap, tombstone, prefix listing). Cost model for object stores (CAS requires 2 RTTs on S3, native on FDB).
+
+   B. MERGE ALGEBRA: Three-layer model: Kernel (topology only — records parents), Lens (semantics — defines how to merge two states), Application (policy — conflict resolution). Current union merge is one implementation; 3-way, CRDT, timestamp are alternatives. Diff-based merge reduces cost from O(|A|+|B|) to O(|changed|). 4 merge laws (M1-M4).
+
+   C. GARBAGE COLLECTION MODEL: Tracing GC (mark + sweep). NOT a kernel concept — it's a maintenance operation. Reachability defined formally. Manifest-based GC (1 GET for manifest instead of walking graph) is a Physical Structure optimization. 5 GC laws (G1-G5: safety, liveness, idempotency, non-blocking, tombstone interaction).
+
+   D. RTT CALCULUS: Every operation has a cost vector (GET, PUT, LIST, HEAD, RANGE, bytes, parallelizable). 4 theorems: T1 (lookup ≤ 3 via embedded snapshot root), T2 (scan ≤ 5 via pack), T3 (commit ≤ 3 via delta), T4 (branch ≤ 2). Latency estimation for S3/Azure/R2/Local.
+
+   E. OBJECT STORE NATIVE SPECIFICATION: 8 properties (OSN1-OSN8: append-only, no rename, no directories, bounded RTT, eventual consistency tolerant, resumable, no local metadata dependence, range-read friendly). Pond is compliant on 6, partial on 2 (OSN4 merge unbounded, OSN7 SQLite root namespace).
+
+   F. PHYSICAL STRUCTURE TAXONOMY: 5 categories classified: Search (indexes, bloom, trie, vector), Statistics (histograms, sketches, zone maps), Layout (pack files, manifests, sort orders), Derived Data (materialized views, aggregates, features), Execution (query plans). Cache is SEPARATE — it violates P1 (determinism) because it depends on access patterns, not just snapshots. This is a genuine finding.
+
+   G. WORKSPACE ALGEBRA: Staging independent of Lens. Workspace owns staging/savepoints/transactions; Lens only encodes/decodes. 5 laws (W1-W5: isolation, atomicity, savepoint rollback, Lens independence, ephemeral). This separates concerns and enables cross-Lens transactions.
+
+   H. HISTORY AS MATHEMATICAL OBJECT: History is a Physical Structure (derivable from commit blobs). 5 alternative representations analyzed: linked list (current), Prolly tree of commits, skip pointers (Git commit-graph), event log (event sourcing), segmented history. Recommendation: skip pointers (Option B) for O(log N) history access — simple, proven, doesn't change the commit model.
+
+3. KEY FINDINGS:
+   - Collection is NOT fundamental (just a reference namespace) — confirmed
+   - Cache is NOT a Physical Structure (depends on access patterns) — proven
+   - History IS a Physical Structure (derivable from commits) — new insight
+   - Merge is three-layer (kernel topology → Lens semantics → Application policy) — formalized
+   - Object Store Native is definable (8 properties) — Pond compliant on 6/8
+   - RTT budgets are provable as theorems (T1-T4) — not just targets
+   - Workspace separates staging from Lens — Lens becomes pure interpretation
+
+## Stage Summary
+
+Phase A complete. All 8 algebras formalized. The model is now specification-driven. Key insights: (1) References are the universal mutable state — all roles are naming conventions. (2) Merge is three-layer — kernel provides topology, Lens provides semantics, Application provides policy. (3) Cache is fundamentally different from Physical Structures. (4) History is itself a Physical Structure. (5) Object Store Native is definable as 8 properties. (6) RTT budgets are theorems, not aspirations. Next: Phase B (falsify under adversarial conditions) and Phase C (one production-quality object-store-native backend).
