@@ -1495,3 +1495,50 @@ Task: Honest paper corrections + packed-object backend prototype.
 ## Stage Summary
 
 Paper corrected with honest claims (O(K + log N), minimized metadata, acknowledged Dolt). Packed-object backend prototyped — reduces scan RTTs from N to 1 (100x speedup on S3). The pack is an internal optimization that doesn't change the kernel API. Combined with the Tiered Commit Model (fast writes + fast point lookups), Pond now has a credible path to object-store readiness: O(1) streaming writes, O(K + log N) point lookups, O(1) pack scans, O(1) branching, 2-parent merge DAG. All from 3 kernel primitives, ~140 LOC, frozen.
+
+---
+Task ID: 47
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Week 1 — Mathematical Model. No implementation. Only models.
+
+## Work Log
+
+1. Wrote docs/POND_MATHEMATICAL_MODEL.md (~500 lines, 9 sections). This is the model-driven (not implementation-driven) specification of Pond. Every component answers: "Is this the inevitable consequence of the model, or merely one implementation?"
+
+2. KEY CHALLENGES ANSWERED:
+
+   Challenge 1: Is Collection fundamental?
+   ANSWER: No. Collection is a reference namespace — a set of related References sharing a name prefix. The kernel doesn't need a Collection concept. Collection is emergent from naming conventions. The hierarchy simplifies to: Kernel → Lens → Physical Structures → Applications. Collection is not a layer; it's a pattern.
+
+   Challenge 2: Should snapshot pointer be a Reference, embedded, or derivable?
+   ANSWER: Separate Reference (current design) is correct for object-store-first. O(1) snapshot access is worth 1 extra RTT. But the snapshot pointer is NOT a kernel concept — it's a Lens-level optimization. Different Lenses could choose different strategies.
+
+   Challenge 3: Can history become logarithmic?
+   ANSWER: Open research question. Three approaches: skip pointers (like Git commit-graph), Prolly tree of commits, or periodic history snapshots. Current O(N) walk is acceptable for most workloads. For millions of commits, skip pointers are pragmatic.
+
+3. FORMAL ALGEBRA defined:
+
+   Kernel Axioms: A1 (Immutability), A2 (Content-addressing), A3 (Name mutability), A4 (Referential integrity)
+   Lens Laws: L1 (Round-trip), L2 (Purity of read), L3 (Encoding preservation), L4 (Determinism), L5 (Kernel independence), L6 (Composition), L7 (Context-based interpretation)
+   Physical Structure Laws: P1 (Determinism), P2 (Derivability), P3 (Independence), P4 (Composability)
+
+4. PHYSICAL STRUCTURE HYPOTHESIS investigated:
+   "Every storage optimization is f(snapshot) → artifact."
+   VERDICT: Holds for indexes, stats, bloom filters, zone maps, packs, materialized views. Does NOT hold for caches (which depend on access patterns, not just snapshots). Caches are a separate category. This is a genuine finding, not just intuition.
+
+5. RTT BUDGET defined for every operation:
+   - Lookup: ≤3 (current 4-5, gap: embed snapshot root in HEAD reference)
+   - Scan: ≤5 (current 4 with pack, ✓ met)
+   - Streaming commit: ≤3 (current 2-3, ✓ met)
+   - Branch: ≤2 (current 2, ✓ met)
+   - Merge: ≤8 (current ~19, gap: need diff-based merge)
+   - History: ≤log(N) (current O(N), gap: need skip pointers)
+
+6. MERGE ALGEBRA formalized:
+   Current: full-state union, O(|A| + |B|). Should be: diff-based, O(changed_chunks). Merge semantics are a Lens-level concern, not a kernel concern. The kernel provides parents; the Lens defines how to merge.
+
+7. 8 OPEN QUESTIONS listed — these are the questions that need answering before the model is complete.
+
+## Stage Summary
+
+Week 1 complete. The mathematical model is written. Key findings: (1) Collection is not fundamental — it's a reference namespace, eliminating a layer. (2) Physical Structure hypothesis mostly holds but caches are a counterexample. (3) RTT budget defined — lookup needs to go from 5 to 3 (embed snapshot root in HEAD), merge needs to go from 19 to 8 (diff-based). (4) Merge semantics are Lens-level, not kernel-level. (5) History can potentially be logarithmic via skip pointers. The model is now specification-driven, not implementation-driven. Next: Week 2 (RTT-first redesign), Week 3 (extreme Red Team), Week 4 (real workloads).
