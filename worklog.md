@@ -1653,3 +1653,77 @@ Task: Phase C — Object-Store-Native backend (no SQLite, OSN7 compliant).
 ## Stage Summary
 
 Phase C started. Object-store-native backend built — no SQLite, references as individual files. Satisfies OSN7 (no local metadata dependence). Works with Lens, persists across restart, passes differential tests. On S3, each reference is 1 object (PUT to set, GET to resolve). The backend is drop-in compatible with PondMinimal — same API, different storage strategy. Combined with the packed-object backend (scan optimization) and the tiered commit model (fast writes + fast reads), Pond now has a complete path to object-store-native deployment.
+
+---
+Task ID: 51
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Second Red Team Review — attack the mathematical model + apply fixes.
+
+## Work Log
+
+1. Performed Second Red Team Review (validation/second_red_team_review.md, ~400 lines). Attacked the mathematical model from FDB/Git/Dolt/Iceberg/Pebble/WarpStream perspectives. Found:
+
+   FATAL findings (3):
+   - "State" is missing as primary primitive. Every optimization operates on State, not Bytes. Bytes is the encoding, not the primitive.
+   - "Manifest" is missing. Packed storage requires logical→physical mapping. Manifest is NOT a Physical Structure (it changes kernel read behavior).
+   - Snapshot↔Commit circularity. Snapshot defined in terms of commit, commit defined in terms of blob, blob defined in terms of bytes, but "snapshot" is also used to define "state" which defines Physical Structures which includes "history" which is derived from commits.
+
+   SERIOUS findings (5):
+   - R2 (last-writer-wins) conflicts with W2 (workspace atomicity) for concurrent commits
+   - P3 (Physical Structure independence) violated by packed storage (manifest changes kernel reads)
+   - Workspace is redundant — it's just an uncommitted delta commit
+   - History is redundant — it's already acknowledged as a Physical Structure
+   - Concurrency model is undefined (should be explicit: C3, last-writer-wins)
+   - Consistency model is undefined (read-after-write? eventual?)
+   - Range Read has no formal algebra
+   - Incrementally maintained views are a counterexample to Physical Structure calculus (depend on prior state, not just snapshot)
+
+   MINOR findings (4):
+   - Names assumed unique (not stated)
+   - Writes assumed durable (not stated for distributed)
+   - Time assumed monotonic (commits include timestamps)
+   - OSN missing conditional writes, multipart upload, eventual consistency
+
+2. Applied the most critical fix: introduced State as primary primitive (docs/POND_MODEL_REVISION.md, ~300 lines):
+   - State is the abstract mathematical object (format-agnostic, Lens-defined, immutable, serializable)
+   - Bytes are the ENCODING of State (not the primitive)
+   - Kernel stores bytes; Lenses decode bytes into State
+   - Physical Structures become f(State) → artifact (cleaner than f(snapshot))
+   - Commits become (parent, encode(State) or Δ(State), metadata)
+   - History becomes a sequence of (State, σ) pairs
+   - Merge becomes combine(State_A, State_B) → State_merged
+
+3. Added Manifest Algebra:
+   - Manifest = { Hash → PhysicalLocation }
+   - PhysicalLocation = (object_id, offset, length)
+   - 4 laws (M1-M4: completeness, immutability, indirection, composability)
+   - read_blob(h) checks Manifest first (range read from pack) vs standalone (GET)
+
+4. Added Range Read Algebra:
+   - RangeRead(object_id, offset, length) → bytes
+   - Cost: 1 RANGE (cheaper than 1 GET for large objects)
+   - 2 laws (RR1: partial = full, RR2: composable)
+
+5. Added Concurrency Algebra:
+   - Explicit: C3 (last-writer-wins, losers' commits are orphaned, detectable via GC)
+
+6. Added Consistency Algebra:
+   - Read-after-write: yes (single-node), eventually (distributed)
+   - Monotonic reads: no guarantee
+   - Consistent prefix: no guarantee
+
+7. Eliminated redundant algebras:
+   - Workspace → merged into Commit Model (it's an uncommitted delta)
+   - History → merged into Physical Structure Taxonomy (it's f(commits) → graph)
+
+8. Added 4 new design principles (7-10):
+   - Model-driven (every choice must be inevitable consequence of model)
+   - Object-store-native (bounded RTT budget, no local metadata)
+   - Semantic isolation (semantic metadata never enters kernel)
+   - Falsifiable (every claim must be executable or formally expressible)
+
+9. Classified incrementally maintained views as "Stateful Physical Structures" — they depend on (snapshot, prior_state), not just snapshot. This is a new subcategory.
+
+## Stage Summary
+
+Second Red Team: WEAK REJECT. The model's foundation (3 primitives, content-addressing, Lens separation) is sound. But "Bytes" is the wrong primitive — "State" is. Manifest is missing for packed storage. Workspace and History are over-formalized. Applied: State as primary primitive, Manifest Algebra, Range Read Algebra, Concurrency/Consistency models. Eliminated Workspace and History as separate algebras. Added 4 design principles. The revised model is simpler: State → encode → Bytes → Kernel → Manifest → Physical Storage → decode → State → Lens → Physical Structures → Applications. 11 algebras (was 8, added 4, eliminated 2, merged 1). Next: update DESIGN_GOALS.md with new principles, update paper with revised model.
