@@ -238,22 +238,31 @@ class ProllyTree:
 
 class ProllyViewBase:
     """
-    Base class for all Pond Views. Uses Prolly trees + bounded delta journal.
+    Base class for all Pond Lenses. Uses Prolly trees + Tiered Commit Model.
+
+    The Tiered Commit Model provides BOTH fast writes AND fast reads:
+      - Tier 1 (Delta): O(1) write for streaming/OLTP
+      - Tier 2 (Snapshot): O(changed_chunks) write, O(log N) read
+      - Auto-compaction: every TIER1_DELTA_THRESHOLD deltas → new snapshot
+
+    KEY INNOVATION — Snapshot Pointer:
+      HEAD ({name}) points to latest commit (snapshot OR delta).
+      {name}__snapshot always points to latest SNAPSHOT.
+      Lookups read snapshot pointer directly — NO commit-chain walk.
 
     Properties:
-      - O(log N) point lookups (Prolly tree binary search)
-      - O(1) commits (delta journal, ≤K entries before compaction)
-      - O(1) history access (commit DAG)
-      - O(d) diff (content-addressed tree comparison)
-      - Structural sharing across versions (same chunks → same hash)
-      - History independence (same keys → same tree, regardless of insert order)
+      - O(log N) point lookups (via snapshot pointer → Prolly tree)
+      - O(1) streaming writes (delta commits)
+      - O(changed_chunks) batch commits (snapshot with structural sharing)
+      - O(1) branching (just a Reference)
+      - Full history (all commits preserved in the chain)
+      - History-vs-state separation (lookups don't depend on history depth)
 
-    S3 round trips:
-      Point lookup: 2-5 GETs (commit + journal + tree path)
-      Commit: 2-3 PUTs (blob + delta/snapshot + reference)
-      Branch: 1 PUT
-      History: O(1) per commit
-      Diff: O(d) where d = changed chunks
+    Object store round trips:
+      Point lookup: 3-4 GETs (snapshot commit + tree path + blob)
+      Streaming commit: 2 PUTs (delta blob + reference)
+      Snapshot commit: O(changed_chunks) PUTs (tree chunks + commit + reference)
+      Branch: 1 PUT (reference only)
     """
 
     def __init__(self, kernel: PondMinimal, name: str):
@@ -263,6 +272,24 @@ class ProllyViewBase:
         self._staged_del: set[str] = set()
         self._commit_index = self._compute_index()
         self._active_branch: Optional[str] = None
+        self._delta_count_since_snapshot = 0
+
+        # Snapshot pointer — always points to the latest snapshot commit.
+        # This decouples current-state access from history access.
+        self._snapshot_ref = f"{name}__snapshot"
+
+        # Initialize snapshot pointer if it doesn't exist but HEAD does
+        if self.kernel.resolve(self._snapshot_ref) is None:
+            head = self.kernel.resolve(self.name)
+            if head:
+                snap = self._find_latest_snapshot(head)
+                if snap:
+                    self.kernel.reference(self._snapshot_ref, snap)
+
+        # Count deltas since last snapshot
+        self._delta_count_since_snapshot = self._count_deltas_since_snapshot(
+            self.kernel.resolve(self.name)
+        )
 
     # ------------------------------------------------------------------
     # Staging
@@ -284,12 +311,16 @@ class ProllyViewBase:
     # ------------------------------------------------------------------
 
     def commit(self, message: str = "") -> str:
-        """
-        Commit staged changes.
+        """Commit staged changes using the Tiered Commit Model.
 
-        If the delta journal is below COMPACTION_THRESHOLD: write a delta
-        entry (O(1) — just the changed keys). Otherwise: compact by building
-        a new Prolly tree from the full state (O(log N)), and reset the journal.
+        Decision: write a delta (Tier 1, O(1)) or a snapshot (Tier 2, O(changed_chunks))?
+
+        - First commit (no parent): always snapshot
+        - delta_count >= TIER1_DELTA_THRESHOLD (16): write snapshot (compaction)
+        - Otherwise: write delta (fast streaming write)
+
+        The snapshot pointer ({name}__snapshot) is updated whenever a
+        snapshot is written. Lookups read the snapshot pointer directly.
         """
         if not self.has_staged():
             raise ValueError("Nothing to commit")
@@ -297,12 +328,13 @@ class ProllyViewBase:
         parent_hash = self.kernel.resolve(self.name)
         index = self._commit_index
 
-        # Count deltas since last compaction
-        delta_count = self._count_deltas_since_snapshot(parent_hash)
+        write_snapshot = (
+            parent_hash is None  # first commit
+            or self._delta_count_since_snapshot >= 16  # compaction threshold
+        )
 
-        # Always compact if there's no parent (first commit) or if we hit the threshold
-        if delta_count >= COMPACTION_THRESHOLD or parent_hash is None:
-            # COMPACT: build a full Prolly tree snapshot
+        if write_snapshot:
+            # TIER 2: Snapshot commit (fast reads)
             full_state = self._compute_full_state(parent_hash)
             for k, h in self._staged_add.items():
                 full_state[k] = h
@@ -312,15 +344,20 @@ class ProllyViewBase:
 
             commit_data = BinaryProllyTree.encode_commit(
                 parent_hash, tree_root, {}, [], tree_root,
-                message or f"compaction commit #{index}", time.time(), index)
+                message or f"snapshot commit #{index}", time.time(), index)
             commit_hash = self.kernel.write(commit_data)
+
+            # Update snapshot pointer
+            self.kernel.reference(self._snapshot_ref, commit_hash)
+            self._delta_count_since_snapshot = 0
         else:
-            # DELTA: write just the changed entries
+            # TIER 1: Delta commit (fast writes, for streaming)
             commit_data = BinaryProllyTree.encode_commit(
                 parent_hash, None,
                 dict(self._staged_add), list(self._staged_del),
                 None, message or f"delta commit #{index}", time.time(), index)
             commit_hash = self.kernel.write(commit_data)
+            self._delta_count_since_snapshot += 1
 
         self.kernel.reference(self.name, commit_hash)
         if self._active_branch:
@@ -336,30 +373,64 @@ class ProllyViewBase:
     # ------------------------------------------------------------------
 
     def lookup(self, key: str) -> Optional[str]:
+        """O(log N) lookup via snapshot pointer + delta check. No full chain walk.
+
+        1. Check deltas between HEAD and snapshot (for additions AND deletions)
+        2. If found in a delta (+): return it
+        3. If found in a delta (-): return None (deleted)
+        4. Otherwise: look up in the snapshot's Prolly tree (O(log N))
+
+        This gives O(K + log N) lookups where K = deltas since snapshot (≤ 16).
         """
-        Look up a single key.
+        # Check deltas FIRST (for both additions and deletions after snapshot)
+        snap_hash = self.kernel.resolve(self._snapshot_ref)
+        head = self.kernel.resolve(self.name)
+        if snap_hash and head and head != snap_hash:
+            # Walk deltas from HEAD to snapshot
+            current = head
+            while current and current != snap_hash:
+                commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
+                delta = commit.get("delta")
+                if delta:
+                    if key in delta.get("+", {}):
+                        return delta["+"][key]
+                    if key in delta.get("-", []):
+                        return None  # deleted in a delta after snapshot
+                current = commit.get("parent")
 
-        With COMPACTION_THRESHOLD=1 (always-snapshot), this is:
-          1. HEAD resolve (1 HEAD)
-          2. Read commit (1 GET) → get snapshot root
-          3. Walk Prolly tree to leaf (O(log N) GETs)
-          4. Return the blob hash
+        # Not in deltas — look up in the snapshot
+        if snap_hash:
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(snap_hash))
+            snapshot_root = commit.get("snapshot")
+            if snapshot_root:
+                return ProllyTree.lookup(self.kernel, snapshot_root, key)
 
-        Total: 1 HEAD + 1 GET (commit) + O(log N) GETs (tree) = O(log N) RTTs.
-        No commit-chain walk needed — every commit is a snapshot.
+        # Fallback: walk from HEAD (old data without snapshot pointer)
+        return self._lookup_from_head(key)
 
-        If a delta commit is encountered (e.g., from old data with
-        COMPACTION_THRESHOLD > 1), the code falls back to the chain walk.
-        """
+    def _lookup_in_deltas(self, key: str, snapshot_hash: str) -> Optional[str]:
+        """Check delta commits between HEAD and the snapshot for the key."""
+        head = self.kernel.resolve(self.name)
+        current = head
+        while current and current != snapshot_hash:
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
+            delta = commit.get("delta")
+            if delta:
+                if key in delta.get("+", {}):
+                    return delta["+"][key]
+                if key in delta.get("-", []):
+                    return None  # deleted in a delta
+            current = commit.get("parent")
+        return None  # not in snapshot, not in deltas
+
+    def _lookup_from_head(self, key: str) -> Optional[str]:
+        """Fallback: walk commit chain from HEAD (for old data)."""
         head = self.kernel.resolve(self.name)
         if not head:
             return None
-
         current = head
         while current:
             commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
-
-            # Check delta (for backward compat with old delta commits)
             delta = commit.get("delta")
             if delta:
                 if key in delta.get("+", {}):
@@ -367,15 +438,11 @@ class ProllyViewBase:
                 if key in delta.get("-", []):
                     return None
             else:
-                # This is a snapshot commit — look up in the Prolly tree directly
                 snapshot_root = commit.get("snapshot")
                 if snapshot_root:
                     return ProllyTree.lookup(self.kernel, snapshot_root, key)
-                # No snapshot and no delta — empty state
                 return None
-
             current = commit.get("parent")
-
         return None
 
     # ------------------------------------------------------------------
@@ -383,48 +450,38 @@ class ProllyViewBase:
     # ------------------------------------------------------------------
 
     def read_all(self) -> dict[str, str]:
-        """Read the complete current state.
+        """Read the complete current state via snapshot pointer + deltas.
 
-        With COMPACTION_THRESHOLD=1 (always-snapshot), this reads the
-        snapshot tree directly — no delta walk needed. 1 GET (commit) +
-        O(N/chunk_size) GETs (tree leaves).
+        1. Read snapshot → get Prolly tree root → read all leaves
+        2. Apply deltas between snapshot and HEAD
         """
+        snap_hash = self.kernel.resolve(self._snapshot_ref)
+        if snap_hash:
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(snap_hash))
+            snapshot_root = commit.get("snapshot")
+            if snapshot_root:
+                state = ProllyTree.read_all(self.kernel, snapshot_root)
+                # Apply deltas between snapshot and HEAD
+                head = self.kernel.resolve(self.name)
+                current = head
+                deltas = []
+                while current and current != snap_hash:
+                    c = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
+                    if c.get("delta"):
+                        deltas.append(c["delta"])
+                    current = c.get("parent")
+                for delta in reversed(deltas):
+                    for k, h in delta.get("+", {}).items():
+                        state[k] = h
+                    for k in delta.get("-", []):
+                        state.pop(k, None)
+                return state
+
+        # Fallback: walk from HEAD (old data)
         head = self.kernel.resolve(self.name)
         if not head:
             return {}
-
-        # Read HEAD commit
-        commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(head))
-
-        # If HEAD is a snapshot, read the tree directly (the common case)
-        snapshot_root = commit.get("snapshot")
-        if snapshot_root:
-            return ProllyTree.read_all(self.kernel, snapshot_root)
-
-        # Fallback: HEAD is a delta (old data) — walk the chain
-        deltas = []
-        current = head
-        while current:
-            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
-            if commit.get("snapshot"):
-                state = ProllyTree.read_all(self.kernel, commit["snapshot"])
-                break
-            elif commit.get("delta"):
-                deltas.append(commit["delta"])
-                current = commit.get("parent")
-            else:
-                state = {}
-                break
-        else:
-            state = {}
-
-        for delta in reversed(deltas):
-            for k, h in delta.get("+", {}).items():
-                state[k] = h
-            for k in delta.get("-", []):
-                state.pop(k, None)
-
-        return state
+        return self._read_state_from_commit(head)
 
     # ------------------------------------------------------------------
     # History — O(1) per commit (linear walk, but skip pointers possible)
@@ -472,6 +529,11 @@ class ProllyViewBase:
         if not h:
             raise ValueError(f"Branch '{branch_name}' does not exist")
         self.kernel.reference(self.name, h)
+        # Update snapshot pointer for the branch's HEAD
+        snap = self._find_latest_snapshot(h)
+        if snap:
+            self.kernel.reference(self._snapshot_ref, snap)
+        self._delta_count_since_snapshot = self._count_deltas_since_snapshot(h)
         self._staged_add.clear()
         self._staged_del.clear()
         self._commit_index = self._compute_index()
@@ -493,6 +555,11 @@ class ProllyViewBase:
                 break
             head = commit["parent"]
         self.kernel.reference(self.name, head)
+        # Update snapshot pointer
+        snap = self._find_latest_snapshot(head)
+        if snap:
+            self.kernel.reference(self._snapshot_ref, snap)
+        self._delta_count_since_snapshot = self._count_deltas_since_snapshot(head)
         self._staged_add.clear()
         self._staged_del.clear()
         self._commit_index = self._compute_index()
@@ -538,6 +605,9 @@ class ProllyViewBase:
             second_parent=branch_head)  # ← NEW: second parent for true DAG
         commit_hash = self.kernel.write(commit_data)
         self.kernel.reference(self.name, commit_hash)
+        # Update snapshot pointer — merge always creates a snapshot
+        self.kernel.reference(self._snapshot_ref, commit_hash)
+        self._delta_count_since_snapshot = 0
         self._commit_index += 1
         return commit_hash
 
@@ -603,6 +673,16 @@ class ProllyViewBase:
             return commit.get("index", 0) + 1
         except Exception:
             return 0
+
+    def _find_latest_snapshot(self, commit_hash: str) -> Optional[str]:
+        """Walk the commit chain to find the latest snapshot commit."""
+        current = commit_hash
+        while current:
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
+            if commit.get("snapshot"):
+                return current
+            current = commit.get("parent")
+        return None
 
     def _count_deltas_since_snapshot(self, from_hash: Optional[str]) -> int:
         """Count delta commits since the last snapshot."""

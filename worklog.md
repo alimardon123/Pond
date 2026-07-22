@@ -1404,3 +1404,52 @@ Task: Tiered Commit Model — fast writes + fast reads + streaming + history.
 ## Stage Summary
 
 The Tiered Commit Model solves the fundamental tension: fast writes vs fast reads. Delta commits (Tier 1) give O(1) writes for streaming. Snapshot commits (Tier 2) give O(log N) reads for lookups. The snapshot pointer ({name}__snapshot) decouples current-state access from history access — lookups go directly to the latest snapshot without walking the delta chain. Auto-compaction (every 16 deltas) keeps the delta chain short. All 3 tests pass. The model supports streaming, OLTP, OLAP, point lookups, scans, history, and branching — all from one unified commit model.
+
+---
+Task ID: 45
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Integrate Tiered Commit Model into ProllyViewBase + comprehensive research.
+
+## Work Log
+
+1. Deep research on modern storage systems:
+   - Apache Paimon: LSM-tree storage with changelog producers (lookup/full-compaction). Merge-on-read with compaction.
+   - WarpStream: diskless, Kafka-compatible, writes directly to S3. No local disk. Stateless brokers.
+   - Apache Fluss: ultra-low-latency streaming storage, KvTablet for sub-ms point lookups, integrates with Paimon for lakehouse.
+   - Redpanda: tiered storage — local for hot data, S3 for cold. Log segments offloaded async.
+   - Dolt: Prolly trees with chunk-level structural sharing. O(changed_chunks) per snapshot, not O(N).
+   - Apache Hudi: copy-on-write (rewrite base files) vs merge-on-read (delta logs + base files). Compaction merges delta logs into base.
+   - Apache Iceberg: snapshot = manifest list → manifests → data files. Metadata hierarchy for fast reads.
+   - FoundationDB: WAL for fast writes, background compaction into SSTables for reads.
+   - LSM trees: memtable (in-memory) for writes, flushed to SSTables for reads. Reads merge memtable + SSTables.
+
+2. KEY INSIGHT FROM RESEARCH: All modern systems separate "current state" from "history":
+   - Paimon: LSM levels (current) + changelog (history)
+   - Hudi: base files (current) + delta logs (recent writes)
+   - Iceberg: snapshot metadata (current) + snapshot log (history)
+   - FoundationDB: SSTables (current) + WAL (recent writes)
+   Pond's Tiered Commit Model does the same: snapshot pointer (current) + delta chain (recent writes) + commit history (full history).
+
+3. Integrated the Tiered Commit Model into ProllyViewBase:
+   - commit(): writes delta (Tier 1, O(1)) or snapshot (Tier 2, O(changed_chunks)) based on delta count
+   - lookup(): checks deltas FIRST (for additions AND deletions), then falls back to snapshot tree
+   - read_all(): reads snapshot tree + applies deltas
+   - checkout(): updates snapshot pointer for the branch's HEAD
+   - undo(): updates snapshot pointer
+   - merge(): always creates a snapshot (and updates snapshot pointer)
+   - Added _find_latest_snapshot() helper
+
+4. CRITICAL BUG FOUND AND FIXED: The initial lookup checked the snapshot first, then deltas. This meant if a key was deleted in a delta AFTER the snapshot, the snapshot still had it and returned it. FIX: check deltas FIRST (for both + and - entries), then fall back to snapshot. This is the same pattern as LSM trees (check memtable first, then SSTables).
+
+5. ALL tests pass:
+   - 12 architecture laws ✓
+   - 5 lens algebra laws ✓
+   - 7 feature store production tests ✓
+   - 12 e2e workflow steps ✓
+   - 1000 differential tests ✓
+   - 8 crash tests ✓
+   - 14 cross-lens pattern tests ✓
+
+## Stage Summary
+
+Tiered Commit Model integrated into ProllyViewBase. The model provides BOTH fast writes (O(1) delta commits for streaming) AND fast reads (O(K + log N) lookups via snapshot pointer + delta check, where K ≤ 16). The snapshot pointer ({name}__snapshot) decouples current-state access from history access. Auto-compaction every 16 deltas keeps the delta chain short. The critical bug (deltas checked after snapshot) was found by the differential test and fixed by checking deltas first — same pattern as LSM trees. All 1000+ tests pass. The model now supports: streaming (O(1) writes), OLTP (fast point lookups), OLAP (fast scans via snapshot tree), branching (O(1)), merging (2-parent DAG), history (full chain preserved), and restart (snapshot pointer persists).
