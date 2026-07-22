@@ -20,13 +20,18 @@ Pond proposes a different model: the storage substrate stores only
 immutable bytes with a commit DAG and mutable name references. Everything
 above — SQL tables, Git repositories, notebooks, feature stores, vector
 indexes — is a Lens: an interpretation layer that reads and writes bytes
-without owning them. Multiple Lenses share the same byte graph. No
-translation metadata is written. No format lock-in occurs.
+without owning them. Multiple Lenses share the same byte graph. Pond
+minimizes storage metadata and keeps semantic metadata out of the
+storage layer — no format-specific catalogs, manifests, or translation
+files are written to the object store. No format lock-in occurs.
 
-This paper formalizes the Pond Storage Model, proves its properties
-through executable architecture laws, and compares it against existing
-systems to show where it is stronger, where it is weaker, and where it
-represents a genuinely different way of thinking about storage.
+This paper formalizes the Pond Storage Model, validates its properties
+through executable architecture laws and differential testing, and
+compares it against existing systems to show where it is stronger,
+where it is weaker, and where it represents a genuinely different way
+of thinking about storage. The paper is honest about limitations:
+Pond is single-node, has no ACID transactions, and its lookup cost
+depends on the number of uncommitted deltas (not purely O(log N)).
 
 ---
 
@@ -253,11 +258,14 @@ The `IndexedLens` class tracks pending additions and applies them via
 
 ## 6. Branches and History
 
-The commit DAG is a linked list of commits, each pointing to its parent.
+The commit DAG is a chain of commits, each pointing to its parent.
+Merge commits have two parents (the current HEAD and the merged
+branch HEAD), preserving branch topology.
 A commit is either:
 
 - A **snapshot commit**: contains a full Prolly tree root (the complete
-  state at that point). O(log N) lookup.
+  state at that point). O(log N) lookup via the Prolly tree.
+  Delta commits contain only the changed keys (O(1) write).
 - A **delta commit**: contains only the changes (additions and deletions)
   since the parent. O(1) write.
 
@@ -498,6 +506,25 @@ ordered range scans, production scale (Apple, Snowflake).
 **Where Pond wins:** immutable history (time travel), content-addressed
 dedup, multi-domain Lenses, no format lock-in.
 
+### vs. Dolt
+
+| Dimension | Dolt | Pond |
+|---|---|---|
+| Primitives | SQL engine + Prolly tree storage | Write, Read, Reference (3 primitives) |
+| Data model | Relational (tables, rows) | Format-agnostic bytes |
+| Versioning | Git-like (commit, branch, merge, diff) | Same (commit DAG, branch, merge, diff) |
+| Prolly tree | Native (invented the concept) | Adopted (cites Dolt's approach) |
+| Structural sharing | Chunk-level (same chunks shared across versions) | Same (content-addressed chunks) |
+| Multi-domain | No (SQL only) | Yes (any Lens: SQL, Git, Notebook, etc.) |
+| Format awareness | Kernel knows table schema | Kernel is format-agnostic |
+| Maturity | Production (20K+ GitHub stars, funded company) | Research prototype |
+
+**Where Dolt wins:** production maturity, SQL optimization, real-world deployment, the Prolly tree implementation (Pond borrowed from Dolt).
+
+**Where Pond wins:** multi-domain (Dolt is SQL-only; Pond serves SQL + Git + Notebook + Feature Store on the same bytes), format-agnostic kernel (Dolt's kernel knows tables; Pond's knows nothing), cross-domain interoperability (Dolt can't read a Git repo; Pond can serve both on the same byte graph).
+
+**Honest acknowledgment:** Pond's Prolly tree implementation is directly inspired by Dolt's. The core innovation is not the Prolly tree itself — it's the separation of storage (bytes) from interpretation (Lenses) that allows multiple domains to share the same immutable substrate.
+
 ### vs. DuckDB
 
 | Dimension | DuckDB | Pond |
@@ -556,12 +583,15 @@ issue — the backend is replaceable.
 Point lookup is 0.1ms at 10K records but 14.8ms at 500K. The delta
 journal walk + Prolly tree traversal grows with history depth. A
 snapshot-on-every-commit strategy (or skip pointers) would keep lookups
-O(log N) regardless of history depth.
+O(K + log N) regardless of total history depth, where K is the
+number of deltas since the last snapshot (bounded by the
+compaction threshold, default 16).
 
 ### No streaming ingestion
-Pond is batch-oriented. Streaming (sub-second ingestion) requires a
-different commit strategy (append-only logs, not full-state snapshots).
-A StreamingLens could address this.
+Pond's Tiered Commit Model supports streaming via O(1) delta commits
+(fast writes between snapshots). However, there is no native streaming
+API (no Kafka-like consumer groups, no watermarks, no exactly-once
+semantics). A StreamingLens could provide these on top of the kernel.
 
 ### Merge is naive
 Union with last-writer-wins. No conflict detection, no 3-way merge.
@@ -627,7 +657,9 @@ to serve any workload without duplication.
 The kernel is 3 primitives and ~140 lines of code. It has been frozen.
 Every higher-level capability — SQL tables, Git repositories, notebooks,
 feature stores, vector indexes — is a Lens that interprets the same
-bytes differently. No translation metadata is written. No format
+bytes differently. Pond minimizes storage metadata and keeps semantic
+metadata out of the storage layer — no format-specific catalogs,
+manifests, or translation files are written. No format
 lock-in occurs. No data is duplicated.
 
 The architecture has been validated through:
