@@ -41,7 +41,7 @@ def main():
     print("=" * 76)
     print()
     print("  Thesis: storage should not know about SQL, vectors, graph, streaming.")
-    print("  Each is a View that interprets the same immutable objects differently.")
+    print("  Each is a Lens that interprets the same immutable objects differently.")
     print()
     print("  Test: write one blob, reference it from 3 different View-specific Trees.")
     print()
@@ -233,7 +233,7 @@ def main():
     # The SQL view reads it as Parquet. The Vector view reads it as Parquet
     # too (because that's how we wrote it) but interprets the embedding
     # column. The Streaming view reads it as Parquet and treats each row
-    # as a log entry. The interpretation is in the View, not the storage.
+    # as a log entry. The interpretation is in the Lens, not the storage.
     # ------------------------------------------------------------------
     print("  [5] Each View interprets the same bytes differently...")
 

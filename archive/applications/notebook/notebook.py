@@ -1,7 +1,7 @@
 """
 Pond Notebook — a production-quality application built on the Pond kernel.
 
-This is NOT a toy View. It's a real application that a developer might
+This is NOT a toy Lens. It's a real application that a developer might
 actually want to use: a personal notebook with pages, full-text search,
 version history, branching for draft experiments, and undo.
 
@@ -11,7 +11,7 @@ Is it elegant, or does everything become awkward?"
 Every awkwardness is documented in friction_diary.md.
 
 Architecture:
-  - NotebookView manages pages (title, body, tags, attachments)
+  - NotebookLens manages pages (title, body, tags, attachments)
   - Each page is a JSON blob (content-addressed)
   - A "notebook commit" is a tree of page_name -> page_hash
   - Branching = Reference to a commit (experimental drafts)
@@ -60,7 +60,7 @@ class Page:
 
 
 # ---------------------------------------------------------------------------
-# View-level helpers (Tree + Commit patterns)
+# Lens-level helpers (Tree + Commit patterns)
 # ---------------------------------------------------------------------------
 
 def write_tree(kernel: PondMinimal, entries: dict[str, str]) -> str:
@@ -98,7 +98,7 @@ def read_commit(kernel: PondMinimal, commit_hash: str) -> dict:
 # Notebook View — production quality
 # ---------------------------------------------------------------------------
 
-class NotebookView:
+class NotebookLens:
     """
     A personal notebook with pages, search, history, branching, and undo.
 

@@ -4,7 +4,7 @@ Independent Git-like Version Control View built on the Pond Kernel.
 This module was implemented PURELY from the "Pond Kernel - Formal Specification"
 provided in the task. No existing Pond code was read or consulted.
 
-The only kernel surface this View depends on is the four-method API the task
+The only kernel surface this Lens depends on is the four-method API the task
 tells us to assume:
 
     kernel.write(data: bytes) -> str          # content-addressed store -> hex hash
@@ -13,18 +13,18 @@ tells us to assume:
     kernel.resolve(name: str) -> str | None   # resolve a name to its hash (None if unbound)
 
 Everything else here -- object formats, ref layout, HEAD tracking, the staging
-area, the tree/commit schemas, error types -- is a View-level invention built on
+area, the tree/commit schemas, error types -- is a Lens-level invention built on
 top of the immutable, content-addressed kernel, because the spec is silent on
 all of it. Those inventions are documented inline and in the accompanying report.
 """
 
 import json
 import time
-import hashlib  # used ONLY by the in-memory test kernel, never by the View itself
+import hashlib  # used ONLY by the in-memory test kernel, never by the Lens itself
 
 
 # ===========================================================================
-# Object-format conventions (View-level invention; spec is silent)
+# Object-format conventions (Lens-level invention; spec is silent)
 # ===========================================================================
 #
 # Three kinds of immutable objects, all stored as raw bytes via kernel.write:
@@ -39,9 +39,9 @@ import hashlib  # used ONLY by the in-memory test kernel, never by the View itse
 # deliberate simplification: the spec says nothing about tree structure, and a
 # flat full-snapshot tree is easy to reason about and sufficient for the
 # required operations. (Cost: every commit stores a full path map; no sub-tree
-# sharing. Acceptable for a View demo.)
+# sharing. Acceptable for a Lens demo.)
 #
-# Names (kernel.reference) used by this View:
+# Names (kernel.reference) used by this Lens:
 #
 #   refs/heads/<branch>  -> commit hash            (a branch tip)
 #   HEAD                 -> head-state-object hash
@@ -55,12 +55,12 @@ import hashlib  # used ONLY by the in-memory test kernel, never by the View itse
 #                   or   {"type": "detached", "commit": <hash>}
 #
 # The staging area (index) is transient View state held in memory, mirroring
-# git's conceptual model where the index is itself a View concern.
+# git's conceptual model where the index is itself a Lens concern.
 # ===========================================================================
 
 
 class PondError(Exception):
-    """Base error for View-level failures."""
+    """Base error for Lens-level failures."""
 
 
 class NotFound(PondError):
@@ -80,7 +80,7 @@ def _is_hex_hash(s):
     )
 
 
-class GitView:
+class GitLens:
     """A Git-like VCS View layered on the Pond kernel."""
 
     def __init__(self, kernel, author="independent-view <view@pond>"):
@@ -272,7 +272,7 @@ class GitView:
 # ===========================================================================
 # Minimal in-memory realization of the Pond kernel -- TEST HARNESS ONLY.
 #
-# This is NOT part of the View. It exists so the demo scenario is runnable
+# This is NOT part of the Lens. It exists so the demo scenario is runnable
 # end-to-end. The View talks to it exclusively through write/read/reference/
 # resolve, exactly the contract the spec describes.
 # ===========================================================================
@@ -310,7 +310,7 @@ class InMemoryKernel:
 # ===========================================================================
 def demo():
     kernel = InMemoryKernel()
-    repo = GitView(kernel)
+    repo = GitLens(kernel)
     repo.init()
 
     repo.add("file1.txt", "hello")
@@ -351,8 +351,8 @@ def demo():
     print("  file3.txt:", repo.read_file("file3.txt").decode())
 
     # Sanity: persistence across a fresh View instance (HEAD ref survives).
-    repo2 = GitView(kernel)
-    print("\n--- new View instance, same kernel ---")
+    repo2 = GitLens(kernel)
+    print("\n--- new Lens instance, same kernel ---")
     print("  HEAD     :", repo2.head())
     print("  file1.txt:", repo2.read_file("file1.txt").decode())
 

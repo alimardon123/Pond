@@ -248,31 +248,31 @@ Task: Respond to architecture review (Phase A+C: formalize Views, deletion as da
 
 ## Work Log
 
-1. Read the user's architecture review in full. Scored the project: kernel 9.8/10, layered arch 9.7/10, SDK 9.3/10, docs 8.7/10, ecosystem 8.5/10, DX 6/10, production readiness 6.5/10. Key insights: weaknesses are now product engineering, not architecture; external validation was the most valuable thing done; the missing delete operation deserves careful thought; the biggest missing piece is a formal model of "what is a View?"; roadmap should be Phase A (freeze) → B (polish SDK) → C (formalize Views) → D (compatibility) → E (one flagship).
-2. Inspected repo state: pond-core/pond_minimal.py (~140 LOC, 3 primitives), existing RFCs 0001-0006, validation/vector_report.md (DX 5/10, finding F: "impossible to delete a name"), engineering/02_gc.py (existing PondGC), docs/NON_GOALS.md (already lists GC as View-level utility).
+1. Read the user's architecture review in full. Scored the project: kernel 9.8/10, layered arch 9.7/10, SDK 9.3/10, docs 8.7/10, ecosystem 8.5/10, DX 6/10, production readiness 6.5/10. Key insights: weaknesses are now product engineering, not architecture; external validation was the most valuable thing done; the missing delete operation deserves careful thought; the biggest missing piece is a formal model of "what is a Lens?"; roadmap should be Phase A (freeze) → B (polish SDK) → C (formalize Views) → D (compatibility) → E (one flagship).
+2. Inspected repo state: pond-core/pond_minimal.py (~140 LOC, 3 primitives), existing RFCs 0001-0006, validation/vector_report.md (DX 5/10, finding F: "impossible to delete a name"), engineering/02_gc.py (existing PondGC), docs/NON_GOALS.md (already lists GC as Lens-level utility).
 3. Drafted RFC-0007: View Algebra. Supersedes RFC-0001's draft definition. Formal 5-tuple V = (Σ, A, E, D, M) with 6 laws (round-trip, purity, encoding preservation, materialization determinism, composition, kernel independence). Verified all 8 existing Views satisfy the algebra. Proved Views compose via ⊕ (parallel) and ∘ (sequential). Settled the Semantic-adapter question: OssieView, CubeView, DbtView are Views, not adapters-as-afterthought.
 4. Drafted RFC-0008: Deletion as Data. Addresses external validation finding F. Conclusion: do NOT add a fourth primitive. Deletion is expressible as data via Reference(name, TOMBSTONE_HASH) — a Layer 1 convention. Physical name-row reclamation is a Layer 0.5 maintenance op (compact_tombstones), analogous to VACUUM/git gc. Privacy-mandated deletion handled by prompt compaction + SQLite VACUUM; Layer 0 names should not contain sensitive data (usage guideline).
 5. Reconciled RFC-0008 with existing engineering/02_gc.py PondGC implementation. PondGC handles blob reclamation via heuristic reachability walk (regex [0-9a-f]{64}); tombstones complement it by handling name-row reclamation. No conflict: tombstones operate on names, PondGC operates on blobs. The existing PondGC works unchanged with tombstones (the tombstone blob is tiny and shared; the previously-pointed-to blob becomes unreachable and gets swept).
 6. Drafted RFC-0009: Architecture Metrics. Measurement framework for the six design goals. 12 metrics (A1-A3, B1-B3, C1-C3, D1-D2, E1-E2), split into hard constraints (C1, C2, D1, D2, E1: must be zero/100%) and trend metrics (A1-A3, B1-B3, C3, E2: tracked over time). Cadence: hard constraints every commit (CI), trend metrics every release, external DX validation every major release.
-7. Updated RFC-0005: renamed "Derived Structure" → "Materialization" throughout (per the database-literature term the user proposed). Added terminology note explaining the rename. Updated laws, API, and admission rule to use "materialization" consistently. RFC-0007 references materialization as the M component of the View 5-tuple.
-8. Created top-level DESIGN_GOALS.md: the canonical entry-point document for any agent (human or AI, local or remote) joining Pond. Captures: what Pond is, the main goal, the six design principles (Simple, Powerful, Performant, Scalable, Efficient, Beautiful), the weekly question, the repo map, the outcome vocabulary, the six-goal checklist, the current Phase A-E roadmap, and explicit guidance for future AI agents (kernel is FROZEN, do not add kernel features to solve View-level problems, use outcome vocabulary, append to worklog).
+7. Updated RFC-0005: renamed "Derived Structure" → "Materialization" throughout (per the database-literature term the user proposed). Added terminology note explaining the rename. Updated laws, API, and admission rule to use "materialization" consistently. RFC-0007 references materialization as the M component of the Lens 5-tuple.
+8. Created top-level DESIGN_GOALS.md: the canonical entry-point document for any agent (human or AI, local or remote) joining Pond. Captures: what Pond is, the main goal, the six design principles (Simple, Powerful, Performant, Scalable, Efficient, Beautiful), the weekly question, the repo map, the outcome vocabulary, the six-goal checklist, the current Phase A-E roadmap, and explicit guidance for future AI agents (kernel is FROZEN, do not add kernel features to solve Lens-level problems, use outcome vocabulary, append to worklog).
 9. Updated PACKAGES.md: added §3 Removability Discipline (every package must be removable without changing any lower layer — operationalizes Design Goal 3.4 and metric C2 from RFC-0009), §4 Adding a new package (6-step checklist including View algebra specification), §5 Removing a package. Updated package list to include pond-vector. Updated RFC list to include RFC-0007, 0008, 0009.
 10. Updated rfcs/README.md: RFC-0001 marked as superseded by RFC-0007; RFC-0005 marked as renamed to Materialization Calculus; RFC-0007, 0008, 0009 added to active RFCs table. DESIGN_GOALS.md added to reference documents list with "read this first" annotation.
-11. Did NOT modify pond-core (kernel stays FROZEN at ~140 LOC, 3 primitives). Did NOT add a fourth primitive. Did NOT modify any View code. This session was Phase A (freeze) + Phase C (formalize) only — no feature additions, no code changes, only RFCs and foundational documents.
+11. Did NOT modify pond-core (kernel stays FROZEN at ~140 LOC, 3 primitives). Did NOT add a fourth primitive. Did NOT modify any Lens code. This session was Phase A (freeze) + Phase C (formalize) only — no feature additions, no code changes, only RFCs and foundational documents.
 12. Appended this worklog entry.
 
 ## Stage Summary
 
-Three new RFCs drafted (0007 View Algebra, 0008 Deletion as Data, 0009 Architecture Metrics), one RFC updated (0005 → Materialization), one new top-level doc created (DESIGN_GOALS.md), two docs updated (PACKAGES.md, rfcs/README.md). The deletion question is settled: no fourth primitive, tombstones at Layer 1, compact_tombstones at Layer 0.5, existing PondGC unchanged. The View formalization question is settled: V = (Σ, A, E, D, M) with 6 laws, all existing Views satisfy the algebra, Views compose via ⊕ and ∘, Semantic adapters are Views. The architecture metrics question is settled: 12 metrics split into hard constraints (5) and trend metrics (7), with measurement cadence defined. The repo now has a canonical entry-point document (DESIGN_GOALS.md) that any future agent — including the user's local AI agents — can read first to understand context. Phase A (freeze) is in effect; Phase B (SDK polish) is the next work, with the vector_report.md findings as the backlog. Phase C (formalize Views) is drafted in RFC-0007 but needs the view_laws.py property-test harness to move to Accepted. Phase D (compatibility: Arrow/DuckDB/Polars/DataFusion/Lance adapters) and Phase E (one flagship) are not started. No kernel changes; no View code changes; no new packages. Architecture discipline preserved.
+Three new RFCs drafted (0007 View Algebra, 0008 Deletion as Data, 0009 Architecture Metrics), one RFC updated (0005 → Materialization), one new top-level doc created (DESIGN_GOALS.md), two docs updated (PACKAGES.md, rfcs/README.md). The deletion question is settled: no fourth primitive, tombstones at Layer 1, compact_tombstones at Layer 0.5, existing PondGC unchanged. The View formalization question is settled: V = (Σ, A, E, D, M) with 6 laws, all existing Views satisfy the algebra, Views compose via ⊕ and ∘, Semantic adapters are Views. The architecture metrics question is settled: 12 metrics split into hard constraints (5) and trend metrics (7), with measurement cadence defined. The repo now has a canonical entry-point document (DESIGN_GOALS.md) that any future agent — including the user's local AI agents — can read first to understand context. Phase A (freeze) is in effect; Phase B (SDK polish) is the next work, with the vector_report.md findings as the backlog. Phase C (formalize Views) is drafted in RFC-0007 but needs the lens_laws.py property-test harness to move to Accepted. Phase D (compatibility: Arrow/DuckDB/Polars/DataFusion/Lance adapters) and Phase E (one flagship) are not started. No kernel changes; no Lens code changes; no new packages. Architecture discipline preserved.
 
 ---
 Task ID: 11
 Agent: main (Super Z, web-a5961fe6 session)
-Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_report.md (A–J), build view_laws.py property-test harness (RFC-0007)
+Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_report.md (A–J), build lens_laws.py property-test harness (RFC-0007)
 
 ## Work Log
 
-1. Read validation/vector_report.md findings A–J in full. Read current SDK code: pond-sdk/view_sdk.py (542 LOC), pond-sdk/prolly_view.py (612 LOC), pond-sdk/auto_index.py (513 LOC), pond-sdk/binary_encoding.py (binary commit format). Inspected existing PondGC at engineering/02_gc.py.
+1. Read validation/vector_report.md findings A–J in full. Read current SDK code: pond-sdk/lens_sdk.py (542 LOC), pond-sdk/prolly_view.py (612 LOC), pond-sdk/auto_index.py (513 LOC), pond-sdk/binary_encoding.py (binary commit format). Inspected existing PondGC at engineering/02_gc.py.
 2. Created pond-sdk/maintenance.py (RFC-0008 tombstone helpers):
    - TOMBSTONE_HASH constant (SHA-256 of b"__pond_tombstone__")
    - drop_name(kernel, name): logically delete a name (rebind to TOMBSTONE_HASH)
@@ -280,7 +280,7 @@ Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_r
    - resolve_active(kernel, name): resolve returning None for unbound OR tombstoned
    - compact_tombstones(kernel): Layer 0.5 maintenance, removes tombstoned name rows
    - 3 tests: round-trip, drop isolation, tombstone+PondGC composition — ALL PASS
-3. Updated pond-sdk/view_sdk.py:
+3. Updated pond-sdk/lens_sdk.py:
    - Imported tombstone helpers from maintenance.py
    - Rewrote drop_index to use drop_name (tombstone pattern, per RFC-0008) instead of "empty tree" workaround
    - Updated lookup_by_index to use resolve_active (returns None for tombstoned indexes immediately)
@@ -291,7 +291,7 @@ Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_r
    - Rewrote unregister_index to use drop_name (tombstone pattern)
    - Added is_index_registered() helper (True iff registered AND not tombstoned)
    - Updated find_by() to return None immediately for tombstoned indexes
-5. Ran existing tests: pond-sdk/view_sdk.py index test PASSES (drop_index returns None immediately). pond-sdk/auto_index.py full test suite PASSES (lazy/eager/incremental, 98.5x speedup preserved). Pre-existing OssieSemanticView NameError is unchanged (not introduced by this session).
+5. Ran existing tests: pond-sdk/lens_sdk.py index test PASSES (drop_index returns None immediately). pond-sdk/auto_index.py full test suite PASSES (lazy/eager/incremental, 98.5x speedup preserved). Pre-existing OssieSemanticView NameError is unchanged (not introduced by this session).
 6. Created SDK_SPEC.md (top-level, ~430 lines): authoritative SDK contract settling all 10 ambiguities:
    - A (§1.1): PondMinimal(base_dir) IS the kernel, not a factory
    - B (§4.2): extractor receives decoded data only, returns str
@@ -303,8 +303,8 @@ Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_r
    - H (§6.2): history() returns list of dicts with exactly {commit, message, timestamp, index, type}
    - I (§2.3): put_raw stages existing blob_hash, no encode, no kernel.write
    - J (§7): full binary commit format documented (1B type + 32B parent + 32B snapshot + deltas + msg + ts + index)
-7. Created pond-sdk/view_laws.py (property-test harness for RFC-0007's 6 laws):
-   - ViewContract dataclass: adapter mapping a View's API to the harness
+7. Created pond-sdk/lens_laws.py (property-test harness for RFC-0007's 6 laws):
+   - ViewContract dataclass: adapter mapping a Lens's API to the harness
    - ViewLaws class with check_all() running all 6 law checks
    - Law 1: round-trip (decode(encode(d)) == d)
    - Law 2: purity (encode and kernel.write deterministic)
@@ -313,15 +313,15 @@ Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_r
    - Law 5: composition (structural — data persists in kernel)
    - Law 6: kernel independence (blobs opaque, content-addressing verified)
    - LawReport and LawResult dataclasses for structured output
-8. Ran view_laws.py against default View class: ALL 6 LAWS PASS.
-9. Ran view_laws.py against IndexedView class (with eager index as materialization): ALL 6 LAWS PASS.
-10. Updated DESIGN_GOALS.md: added SDK_SPEC.md to top-level docs list, updated pond-sdk entry to mention maintenance.py and view_laws.py.
-11. Updated PACKAGES.md: added SDK_SPEC.md to top-level file list, added maintenance.py and view_laws.py to pond-sdk structure.
+8. Ran lens_laws.py against default View class: ALL 6 LAWS PASS.
+9. Ran lens_laws.py against IndexedView class (with eager index as materialization): ALL 6 LAWS PASS.
+10. Updated DESIGN_GOALS.md: added SDK_SPEC.md to top-level docs list, updated pond-sdk entry to mention maintenance.py and lens_laws.py.
+11. Updated PACKAGES.md: added SDK_SPEC.md to top-level file list, added maintenance.py and lens_laws.py to pond-sdk structure.
 12. Appended this worklog entry.
 
 ## Stage Summary
 
-Phase B (SDK polish) complete: all 10 validation ambiguities (A–J) are settled in SDK_SPEC.md with concrete contracts. Tombstones (RFC-0008) are implemented in pond-sdk/maintenance.py and wired into drop_index/unregister_index. The view_laws.py harness verifies RFC-0007's 6 algebra laws; both default View and IndexedView pass all 6. Existing tests still pass (index ops work correctly with tombstones; auto-index lazy/eager/incremental all work; tombstones compose cleanly with existing PondGC — tombstoned blobs get swept on next collection). No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). No new packages — maintenance.py and view_laws.py live inside pond-sdk, preserving the removability discipline. Phase B success criterion (a second external implementation scoring 9/10 DX) is now ready to be measured: re-run validation/vector_challenge_prompt.md with a fresh agent using SDK_SPEC.md as the spec. Phase C (formalize Views) is also unblocked: RFC-0007 can move from Draft to Accepted once view_laws.py runs as CI on every commit.
+Phase B (SDK polish) complete: all 10 validation ambiguities (A–J) are settled in SDK_SPEC.md with concrete contracts. Tombstones (RFC-0008) are implemented in pond-sdk/maintenance.py and wired into drop_index/unregister_index. The lens_laws.py harness verifies RFC-0007's 6 algebra laws; both default View and IndexedView pass all 6. Existing tests still pass (index ops work correctly with tombstones; auto-index lazy/eager/incremental all work; tombstones compose cleanly with existing PondGC — tombstoned blobs get swept on next collection). No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). No new packages — maintenance.py and lens_laws.py live inside pond-sdk, preserving the removability discipline. Phase B success criterion (a second external implementation scoring 9/10 DX) is now ready to be measured: re-run validation/vector_challenge_prompt.md with a fresh agent using SDK_SPEC.md as the spec. Phase C (formalize Views) is also unblocked: RFC-0007 can move from Draft to Accepted once lens_laws.py runs as CI on every commit.
 
 ---
 Task ID: 12
@@ -329,7 +329,7 @@ Agent: general-purpose (external validation)
 Task: Build GraphView from SDK_SPEC.md (external validation #2 — Phase B success criterion)
 
 Work Log:
-- Read worklog (324 lines, ended at Task 11 Phase B SDK polish). Read SDK_SPEC.md (611 lines, settles A–J), pond-core/pond_minimal.py (200 LOC, the 3 primitives), RFC-0003 (kernel laws), RFC-0007 (View algebra 5-tuple + 6 laws), RFC-0008 (tombstones), DESIGN_GOALS.md head. Did NOT read pond-sdk/, pond-vector/, vector_report.md, or any other View code — task constraints honored.
+- Read worklog (324 lines, ended at Task 11 Phase B SDK polish). Read SDK_SPEC.md (611 lines, settles A–J), pond-core/pond_minimal.py (200 LOC, the 3 primitives), RFC-0003 (kernel laws), RFC-0007 (View algebra 5-tuple + 6 laws), RFC-0008 (tombstones), DESIGN_GOALS.md head. Did NOT read pond-sdk/, pond-vector/, vector_report.md, or any other Lens code — task constraints honored.
 - Built /home/z/my-project/pond_repo/validation/graph_view_external.py (~600 LOC). Chose option (b): build directly on the kernel primitives rather than re-implementing ProllyViewBase/IndexedView, because (i) spec §7 says "Views do NOT need to know this format" for the binary commit format, (ii) the Prolly tree structure is referenced but never defined in the spec, (iii) building directly lets me follow the spec's described BEHAVIOR without guessing Prolly internals. Used JSON for commits and indexes (spec-permitted per §7/§9). Implemented all required ops: add_node, add_edge, get_node, get_neighbors (with edge_type filter), find_nodes_by_type, find_edges_by_type (both use indexes), delete_node (cascades to edges both directions), delete_edge, count_nodes, count_edges, commit, branch, checkout, merge, history. Plus diff (per §6.3) and drop_index (per §4.5 tombstone pattern). Eager index rebuild on every commit (§4.3 "eager" mode). COMPACTION_THRESHOLD=4 (§7) with first-commit-is-snapshot rule (had to invent — spec doesn't say but a delta with no parent is nonsensical).
 - Built /home/z/my-project/pond_repo/validation/graph_view_external_test.py (12 test sections, 64 assertions). First run: 53/64 pass. Two failures, both spec gaps not my bugs: (1) tombstone marker blob must exist on disk before kernel.reference(name, TOMBSTONE_HASH) succeeds — kernel's reference() validates blob existence (pond_minimal.py:155-156) but SDK_SPEC §4.5 / RFC-0008 §6 example code doesn't write the marker first; on a fresh kernel the example crashes. Invented _ensure_tombstone_blob(kernel) workaround. (2) First commit must be a snapshot (no parent to delta against); spec §7 only says "after every 4 deltas, next is snapshot" without specifying the parent=None case. Fixed by `is_snapshot = (parent is None) OR (deltas_since_last_snapshot >= 4)`.
 - Second run: 64/64 pass. All A–J contracts verified by tests: history shape (5 keys, 12-char commit, float timestamp, int index, str type), merge union+merged-branch-wins (test #5 confirms merged branch's value silently wins on conflict), diff hash-prefix parameters (test #6), put_raw zero-copy (test #9 confirms blob hash shared not re-encoded), tombstone-based drop_index (test #7 — idempotent, revivable, falls back to linear scan), branching/checkout staging-clear (test #12), empty-commit raises ValueError (test #10), branch-before-commit raises ValueError (test #11), get() correctness across the snapshot/delta compaction boundary (test #8 — 6 commits, snapshot at c0, deltas c1-c4, snapshot at c5).
@@ -342,7 +342,7 @@ Phase B success criterion (a second external implementation scoring 9/10 DX) is 
 ---
 Task ID: 13
 Agent: main (Super Z, web-a5961fe6 session)
-Task: Phase B.2 — apply SDK_SPEC.md fixes from graph_challenge_report (Task 12), build CI harness for view_laws.py, promote RFC-0007 to Accepted.
+Task: Phase B.2 — apply SDK_SPEC.md fixes from graph_challenge_report (Task 12), build CI harness for lens_laws.py, promote RFC-0007 to Accepted.
 
 ## Work Log
 
@@ -351,26 +351,26 @@ Task: Phase B.2 — apply SDK_SPEC.md fixes from graph_challenge_report (Task 12
    - §1.2: documented that kernel.reference() validates blob existence; added warning about TOMBSTONE_HASH direct use
    - §1.3 (new): documented View constructor signature View(kernel, name); explained name appears in HEAD/Branch/Index References; name must not contain __
    - §1.4 (renumbered): lifetime
-   - §2.5 (new): key naming conventions — reserved _ prefix, no __ in keys, View authors choose their own
+   - §2.5 (new): key naming conventions — reserved _ prefix, no __ in keys, Lens authors choose their own
    - §3.3 (new): find_by() return shape — single value or None; find_all_by() returns list (possibly empty)
    - §4.4: relaxed "Prolly trees" to "kernel blobs in any deterministic format"; added §4.4.1 multi-valued indexes (list-at-leaf recommended, multi-entry alternative)
    - §5.2: documented current-branch tracking is IN-MEMORY, lost on restart
    - §6.1: documented merge commit has 1 parent (not git-style 2); history() walks single-parent chain
    - §6.2: clarified history() index is per-branch count, not global DAG topological order
-   - §7: clarified who needs to know the commit format (View authors extending View/IndexedView: no; alternative implementations: any format is fine); added first-commit-is-snapshot rule
+   - §7: clarified who needs to know the commit format (Lens authors extending View/IndexedView: no; alternative implementations: any format is fine); added first-commit-is-snapshot rule
    - §8: documented import path (add pond-sdk/ to PYTHONPATH, then `from maintenance import ...`); documented that drop_name handles marker-blob pre-write internally
    - §11: relaxed compliance checklist to allow kernel-direct Views per §7; clarified index format flexibility; clarified tombstone usage via drop_name (not direct kernel.reference)
-3. Created pond-sdk/run_view_laws_ci.py: CI entry point that runs view_laws.py against Default View, IndexedView, and SemanticView. Exits 0 if all pass, 1 if any fail, 2 on harness error. All 3 Views pass all 6 laws.
-4. Created validation/run_graph_view_laws.py: runs view_laws.py against the externally-built GraphView (from Task 12). The external GraphView PASSES all 6 laws — confirming the algebra is a real specification, not just a description of pond-sdk's own Views. This is the strongest possible test of RFC-0007's generality.
+3. Created pond-sdk/run_lens_laws_ci.py: CI entry point that runs lens_laws.py against Default View, IndexedView, and SemanticView. Exits 0 if all pass, 1 if any fail, 2 on harness error. All 3 Views pass all 6 laws.
+4. Created validation/run_graph_lens_laws.py: runs lens_laws.py against the externally-built GraphView (from Task 12). The external GraphView PASSES all 6 laws — confirming the algebra is a real specification, not just a description of pond-sdk's own Views. This is the strongest possible test of RFC-0007's generality.
 5. Promoted RFC-0007 from Draft to Accepted:
-   - Updated Status section: documented acceptance evidence (view_laws.py harness + CI runner + external GraphView compliance)
+   - Updated Status section: documented acceptance evidence (lens_laws.py harness + CI runner + external GraphView compliance)
    - Updated §12 (Status of this RFC): documented that the 6 laws are now verified by automated property tests, not just inspection; the harness is metric E1 (RFC-0009) with target 0 violations
    - Updated rfcs/README.md index: RFC-0007 marked Accepted with verification note
 6. Appended this worklog entry.
 
 ## Stage Summary
 
-Phase B.2 complete. The external validation (Task 12) measured DX at 7/10 (up from 5/10 baseline — +2 points, all 10 A-J ambiguities settled). The validator's 7 most actionable NEW findings are now fixed in SDK_SPEC.md. The view_laws.py harness is now CI-runnable (pond-sdk/run_view_laws_ci.py) and passes for all 3 SDK Views AND for the externally-built GraphView — confirming RFC-0007's algebra is a real specification, not a tautology. RFC-0007 promoted from Draft to Accepted; the 6 View algebra laws are now release-blocking constraints (metric E1 of RFC-0009, target 0). Remaining NEW ambiguities from the validator's report are lower-severity (mostly "behavior described but implementation unspecified" — fixable in a future spec revision). The next Phase B iteration would target DX 9/10 by addressing those; the next major step is Phase D (compatibility: Arrow/DuckDB/Polars/Lance adapter Views) or Phase E (one flagship productionized). No kernel changes; no new packages; pond-core still FROZEN at ~140 LOC.
+Phase B.2 complete. The external validation (Task 12) measured DX at 7/10 (up from 5/10 baseline — +2 points, all 10 A-J ambiguities settled). The validator's 7 most actionable NEW findings are now fixed in SDK_SPEC.md. The lens_laws.py harness is now CI-runnable (pond-sdk/run_lens_laws_ci.py) and passes for all 3 SDK Views AND for the externally-built GraphView — confirming RFC-0007's algebra is a real specification, not a tautology. RFC-0007 promoted from Draft to Accepted; the 6 View algebra laws are now release-blocking constraints (metric E1 of RFC-0009, target 0). Remaining NEW ambiguities from the validator's report are lower-severity (mostly "behavior described but implementation unspecified" — fixable in a future spec revision). The next Phase B iteration would target DX 9/10 by addressing those; the next major step is Phase D (compatibility: Arrow/DuckDB/Polars/Lance adapter Views) or Phase E (one flagship productionized). No kernel changes; no new packages; pond-core still FROZEN at ~140 LOC.
 
 ---
 Task ID: 14
@@ -382,17 +382,17 @@ Task: Answer three user questions (multikey indexes, no-PK views, Liquid Cluster
 1. Inspected pond-sdk for Q1 (multikey indexes) and Q2 (no-PK views). Found: register_index takes extractor: Callable[[Any], str] (single-key only, no multi-valued support); put(key, data) requires a key (no auto-key mode). Documented both findings with recommendations.
 2. Researched Databricks Liquid Clustering via web_search (8 results) + page_reader (Databricks official docs + Medium deep-dive). Key findings: (1) Hilbert curves instead of Z-order (better data locality), (2) incremental clustering via stable/unstable Z-cubes (low write amplification), (3) mutable cluster keys (metadata-only ALTER TABLE).
 3. Wrote docs/LIQUID_CLUSTERING_COMPARISON.md (~350 lines): full comparison of Pond vs Liquid Clustering. Conclusion: they solve DIFFERENT problems (Pond = storage algebra for multi-workload composition; LC = single-table layout optimizer for multi-column range queries). Pond is better at: multi-workload, point lookups, versioning, content addressing, backend independence. LC is better at: multi-column range queries, layout mutability without rewrite, incremental layout optimization, PB-scale production maturity. Pond can learn 3 lessons: (1) Hilbert-curve multi-dimensional clustering as a Layer 2 materialization, (2) "stable chunk" concept to reduce write amplification, (3) mutable cluster keys as commit-metadata. Pond should NOT learn: UUID file IDs (Pond's content-addressing is strictly better), tight runtime coupling (would break backend independence).
-4. Started Phase D: built pond-arrow/arrow_view.py (~540 LOC including tests). ArrowView extends View, encodes pyarrow.Table as Arrow IPC bytes, decodes back. Provides put_row/get_row/scan/to_arrow/to_duckdb/to_polars/to_pandas. Index integration via create_arrow_index/find_by_arrow (simplified: O(N) for now, future work for O(log N)).
+4. Started Phase D: built pond-arrow/arrow_view.py (~540 LOC including tests). ArrowLens extends View, encodes pyarrow.Table as Arrow IPC bytes, decodes back. Provides put_row/get_row/scan/to_arrow/to_duckdb/to_polars/to_pandas. Index integration via create_arrow_index/find_by_arrow (simplified: O(N) for now, future work for O(log N)).
 5. Fixed two bugs during ArrowView testing: (1) schema was inferred before _pk was added to row (reordered put_row to add _pk first); (2) pa.field("region") requires a type — switched to pc.field("region") from pyarrow.compute for filter expressions.
 6. All 6 ArrowView tests pass: basic round-trip, DuckDB interop (SELECT/GROUP BY/WHERE on Pond data), Polars interop (filter/sum), versioning (branch + history), delete/update, index integration (create/find/drop with tombstone pattern).
-7. Created pond-arrow/run_arrow_view_laws.py: runs view_laws.py against ArrowView. Initial failure: 3 laws failed because the contract used dict sample data but ArrowView's decode returns pa.Table. Fixed by making the contract return pa.Table samples (ArrowView's Sigma IS pa.Table, not dict). After fix: ALL 6 LAWS PASS. This is a meaningful generalization — proves the algebra admits Views whose state is not dict.
-8. Wrote RFC-0010: ArrowView (Phase D Compatibility Adapter). Status: Accepted (verified by tests + view_laws harness). Documents the View algebra for ArrowView, storage layout, interop shims, test results, and 5 future-work items (chunked storage, O(log N) indexes, schema enforcement, streaming reads, multi-dimensional clustering per LC comparison).
+7. Created pond-arrow/run_arrow_lens_laws.py: runs lens_laws.py against ArrowView. Initial failure: 3 laws failed because the contract used dict sample data but ArrowView's decode returns pa.Table. Fixed by making the contract return pa.Table samples (ArrowView's Sigma IS pa.Table, not dict). After fix: ALL 6 LAWS PASS. This is a meaningful generalization — proves the algebra admits Views whose state is not dict.
+8. Wrote RFC-0010: ArrowView (Phase D Compatibility Adapter). Status: Accepted (verified by tests + lens_laws harness). Documents the Lens algebra for ArrowView, storage layout, interop shims, test results, and 5 future-work items (chunked storage, O(log N) indexes, schema enforcement, streaming reads, multi-dimensional clustering per LC comparison).
 9. Updated rfcs/README.md (RFC-0010 added as Accepted), PACKAGES.md (pond-arrow package added with files; RFC list updated; LIQUID_CLUSTERING_COMPARISON.md noted in docs).
 10. Appended this worklog entry.
 
 ## Stage Summary
 
-Three user questions answered: (Q1) multikey indexes not supported but design extension proposed (extractor returns str|list[str]); (Q2) Views require keys but auto-key mode is a viable SDK addition; (Q3) full Liquid Clustering comparison written — Pond and LC solve different problems, Pond can absorb LC's Hilbert-curve innovation as a Layer 2 materialization without inheriting LC's limitations. Phase D started: ArrowView built, 6/6 tests pass (including DuckDB + Polars interop on Pond data), all 6 RFC-0007 algebra laws pass via view_laws.py harness. RFC-0010 Accepted. Pond now interoperates with the entire Arrow ecosystem (DuckDB, Polars, pandas, DataFusion, Lance) without those systems knowing Pond exists. This is the LTAP vision made concrete. No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). pond-arrow is removable (depends only on pond-sdk; lower layers unaffected). Next: Phase D continued (Lance, DuckDB-native, Polars-native adapters) or Phase E (one flagship productionized).
+Three user questions answered: (Q1) multikey indexes not supported but design extension proposed (extractor returns str|list[str]); (Q2) Views require keys but auto-key mode is a viable SDK addition; (Q3) full Liquid Clustering comparison written — Pond and LC solve different problems, Pond can absorb LC's Hilbert-curve innovation as a Layer 2 materialization without inheriting LC's limitations. Phase D started: ArrowView built, 6/6 tests pass (including DuckDB + Polars interop on Pond data), all 6 RFC-0007 algebra laws pass via lens_laws.py harness. RFC-0010 Accepted. Pond now interoperates with the entire Arrow ecosystem (DuckDB, Polars, pandas, DataFusion, Lance) without those systems knowing Pond exists. This is the LTAP vision made concrete. No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). pond-arrow is removable (depends only on pond-sdk; lower layers unaffected). Next: Phase D continued (Lance, DuckDB-native, Polars-native adapters) or Phase E (one flagship productionized).
 
 ---
 Task ID: 15
@@ -404,14 +404,14 @@ Task: Phase B.3 SDK polish — multikey indexes, auto-key mode, primary-keyless 
 1. Read user's architecture review guidance: (1) finish Phase D carefully by tightening SDK contract around multikey / auto-key / primary-keyless Views + cross-View semantics; (2) keep ArrowView as compatibility anchor, add only one more adapter if it teaches something new; (3) make CI/property-test story mandatory; (4) choose one flagship and push to production-quality. Strongest advice: do NOT let Liquid Clustering pull Pond into layout-tuning as a core concern; borrow the incremental adaptive-materialization idea but keep at View layer.
 2. Multikey indexes: extended `register_index` extractor signature in `pond-sdk/auto_index.py` from `Callable[[Any], str]` to `Callable[[Any], Union[str, list[str]]]`. Added `AutoIndex.extract_keys` static method that normalizes extractor return to `list[str]` (handles str, list, None, other). Updated `put` and `_rebuild_index` to call `extract_keys` and index the row under each returned key. Backward-compatible: single-string extractors still work unchanged. Verified with new multikey test: indexing docs by tags list, find_by returns correct row for each tag.
 3. Fixed pre-existing bug in `find_by`: for EAGER indexes registered AFTER data was already committed, `tree_root` was None and `find_by` didn't trigger a rebuild (only LAZY mode did). Refactored: `if idx.tree_root is None: self._rebuild_index(idx)` runs for ALL modes now, then LAZY staleness check is layered on top. This also fixes the case where the user calls find_by before any commit.
-4. Auto-key mode: added `put_auto(data) -> str` to both `View` (view_sdk.py) and `IndexedView` (auto_index.py). Generates a UUID4 hex key (32 chars, no dashes), calls `put(key, data)` internally, returns the key so caller can retrieve later. Imported `uuid` module. Documented collision probability (~10^-37 for 10^12 records).
-5. Primary-keyless Views: added `KeylessView` class to view_sdk.py. Subclass of View that overrides `put` to require `key=None` (raises TypeError otherwise). Adds `put_many(rows)` for batch inserts. The class makes primary-keyless a first-class design choice, not a per-call decision.
+4. Auto-key mode: added `put_auto(data) -> str` to both `View` (lens_sdk.py) and `IndexedView` (auto_index.py). Generates a UUID4 hex key (32 chars, no dashes), calls `put(key, data)` internally, returns the key so caller can retrieve later. Imported `uuid` module. Documented collision probability (~10^-37 for 10^12 records).
+5. Primary-keyless Views: added `KeylessView` class to lens_sdk.py. Subclass of View that overrides `put` to require `key=None` (raises TypeError otherwise). Adds `put_many(rows)` for batch inserts. The class makes primary-keyless a first-class design choice, not a per-call decision.
 6. CrossView semantics: rewrote `CrossView` class with explicit class docstring documenting 5 rules: (1) source = HEAD of currently-checked-out branch, (2) tombstoned indexes are skipped, (3) zero-copy sharing (copies HASH not CONTENT), (4) no cross-View atomicity, (5) pipe is non-transactional (caller must commit). Added per-method docstrings.
 7. Updated SDK_SPEC.md: added 3 new entries to ambiguity table (K: multikey indexes §4.2.1, L: auto-key + primary-keyless §2.6, M: CrossView semantics §8.1). Wrote full sections for each: §2.6 has 4 subsections (put_auto, KeylessView, indexed lookups on keyless data, when-to-use table); §4.2.1 documents extractor return semantics with a 4-row table; §8.1 has 5 explicit semantics rules with code example.
-8. Updated `pond-sdk/view_laws.py` Law 3 and Law 5 checks: now capture the key returned by `contract.put(key, data)` and use it for the subsequent `get`, falling back to the original key if returned_key is None or doesn't retrieve. This makes the harness work with auto-key Views (KeylessView) where the caller-supplied key is ignored.
-9. Added 2 new contracts to `pond-sdk/run_view_laws_ci.py`: `make_multikey_view_contract` (IndexedView with list-returning extractor for tags + single-key extractor for id; sample data has tags list field) and `make_keyless_view_contract` (KeylessView with `keyless_put` adapter that calls `view.put(None, data)`). CI now runs 5 View contracts: Default, Indexed, Semantic, Multikey, Keyless.
-10. Verified ALL 5 View contracts pass all 6 RFC-0007 algebra laws. Verified ArrowView and external GraphView still pass (no regressions from view_laws.py changes). Verified maintenance.py tombstone tests still pass. Verified auto_index.py and view_sdk.py existing tests still pass.
-11. Created `.github/workflows/view-laws.yml`: GitHub Actions workflow that runs on every push/PR to main. Installs pyarrow/duckdb/polars. Runs 6 test commands: run_view_laws_ci.py (5 SDK Views), run_arrow_view_laws.py (ArrowView), run_graph_view_laws.py (external GraphView), arrow_view.py (functional tests), maintenance.py (tombstone tests). Makes RFC-0007 compliance MANDATORY — any violation blocks merge.
+8. Updated `pond-sdk/lens_laws.py` Law 3 and Law 5 checks: now capture the key returned by `contract.put(key, data)` and use it for the subsequent `get`, falling back to the original key if returned_key is None or doesn't retrieve. This makes the harness work with auto-key Views (KeylessView) where the caller-supplied key is ignored.
+9. Added 2 new contracts to `pond-sdk/run_lens_laws_ci.py`: `make_multikey_view_contract` (IndexedView with list-returning extractor for tags + single-key extractor for id; sample data has tags list field) and `make_keyless_view_contract` (KeylessView with `keyless_put` adapter that calls `view.put(None, data)`). CI now runs 5 View contracts: Default, Indexed, Semantic, Multikey, Keyless.
+10. Verified ALL 5 View contracts pass all 6 RFC-0007 algebra laws. Verified ArrowView and external GraphView still pass (no regressions from lens_laws.py changes). Verified maintenance.py tombstone tests still pass. Verified auto_index.py and lens_sdk.py existing tests still pass.
+11. Created `.github/workflows/view-laws.yml`: GitHub Actions workflow that runs on every push/PR to main. Installs pyarrow/duckdb/polars. Runs 6 test commands: run_lens_laws_ci.py (5 SDK Views), run_arrow_lens_laws.py (ArrowView), run_graph_lens_laws.py (external GraphView), arrow_view.py (functional tests), maintenance.py (tombstone tests). Makes RFC-0007 compliance MANDATORY — any violation blocks merge.
 12. Appended this worklog entry.
 
 ## Stage Summary
@@ -443,8 +443,8 @@ Task: Phase B.4 SDK hardening + Phase E flagship (Feature Store to production qu
    - In-memory staged-features cache: _staged_features dict allows write_feature_value to validate against features defined in the same session but not yet committed.
 6. Wrote test_production_features() with 7 test sections: schema validation (4 assertions), feature versioning (5 assertions), entity registry (3 assertions), point-in-time JOIN (8 assertions — the key test), batch online serving (6 assertions), O(1) freshness (2 assertions), persistence (5 assertions — close kernel, reopen, verify all data survived).
 7. All tests pass. Original test_feature_store() also still passes (backward compatible).
-8. Verified view_laws.py CI still passes (5/5 Views, all 6 algebra laws) — no regressions from SDK changes.
-9. Wrote RFC-0011: Feature Store (Phase E Flagship). Status: Accepted. Documents the View algebra for FeatureStore, storage model, versioning rules, schema validation table, point-in-time JOIN algorithm and complexity, batch serving complexity, O(1) freshness cache, persistence, cross-View ingestion, and 6 future-work items (streaming ingestion, transformations, materialized tables, distributed coordination, tiered storage, liquid-clustering materialization).
+8. Verified lens_laws.py CI still passes (5/5 Views, all 6 algebra laws) — no regressions from SDK changes.
+9. Wrote RFC-0011: Feature Store (Phase E Flagship). Status: Accepted. Documents the Lens algebra for FeatureStore, storage model, versioning rules, schema validation table, point-in-time JOIN algorithm and complexity, batch serving complexity, O(1) freshness cache, persistence, cross-View ingestion, and 6 future-work items (streaming ingestion, transformations, materialized tables, distributed coordination, tiered storage, liquid-clustering materialization).
 10. Updated rfcs/README.md (RFC-0011 added as Accepted) and PACKAGES.md (pond-feature-store updated with feature_store.py description and cli.py; RFC list updated).
 11. Appended this worklog entry.
 
@@ -475,7 +475,7 @@ Task: Feature Store as polished, measurable, end-to-end reference product. Run i
    - Step 12: Schema validation (3 bad writes rejected: string->float, 3.7->int, undefined feature)
 3. Ran the workflow. All 12 steps pass. Pseudo-model output shows sensible fraud signals: customer_total_spent ratio (fraud/clean) = 1.52, customer_order_count ratio = 1.32. Label leakage check: 0/5 first-ever orders have leaked features (expected 0). Persistence: 5 features + 800 entries survived restart, versioning [1,2] survived, entity types survived, point-in-time JOIN still works after restart.
 4. Wrote docs/FEATURE_STORE_USE_CASE.md (~350 lines): compact reference use case document. NOT an RFC. Covers: scenario (e-commerce fraud detection), input data, feature definitions, batch compute, versioning, point-in-time training set creation (with the label leakage check), online serving (with measured latency), batch serving (with measured latency), freshness monitoring, cross-view reads (ArrowView -> DuckDB), lineage, persistence, schema validation. Includes a measurements summary table and a "what this use case does NOT cover" section (streaming, transformations, materialized tables, distributed coordination, liquid-clustering materialization).
-5. Added e2e_workflow.py and feature_store.py to the CI workflow (.github/workflows/view-laws.yml) as mandatory test steps. CI now runs 8 test commands: view_laws CI (5 Views), ArrowView view_laws, GraphView view_laws, ArrowView functional, tombstone tests, Feature Store production tests, Feature Store e2e workflow.
+5. Added e2e_workflow.py and feature_store.py to the CI workflow (.github/workflows/view-laws.yml) as mandatory test steps. CI now runs 8 test commands: lens_laws CI (5 Views), ArrowView lens_laws, GraphView lens_laws, ArrowView functional, tombstone tests, Feature Store production tests, Feature Store e2e workflow.
 6. Appended this worklog entry.
 
 ## Stage Summary
@@ -489,7 +489,7 @@ Task: External user validation of the Pond Feature Store — built a Customer An
 
 Work Log:
 - Read DESIGN_GOALS.md, SDK_SPEC.md (1096 lines), pond-core/pond_minimal.py (~140 LOC), pond-feature-store/feature_store.py (~1047 LOC incl. tests), docs/FEATURE_STORE_USE_CASE.md, and the worklog's last ~200 lines for context. Did NOT read e2e_workflow.py, cli.py, other Layer 3 Views, or Task 12 validation reports (per the task constraints — avoiding bias).
-- Read pond-sdk/view_sdk.py (View, KeylessView, CrossView, SemanticView — ~726 LOC) and pond-sdk/auto_index.py (IndexedView, AutoIndex — ~605 LOC) to understand the API surface the FeatureStore inherits. Read pond-arrow/arrow_view.py (ArrowView — ~642 LOC) for the DuckDB integration path.
+- Read pond-sdk/lens_sdk.py (View, KeylessView, CrossView, SemanticView — ~726 LOC) and pond-sdk/auto_index.py (IndexedView, AutoIndex — ~605 LOC) to understand the API surface the FeatureStore inherits. Read pond-arrow/arrow_view.py (ArrowView — ~642 LOC) for the DuckDB integration path.
 - Built /home/z/my-project/pond_repo/validation/customer_analytics_app.py (~440 LOC) from scratch using only Pond kernel + SDK + FeatureStore + ArrowView + stdlib. The app: (1) generates 200 synthetic customers with customer_id/signup_date/region/plan/lifetime_value/churn_risk_score; (2) ingests them as a source View; (3) defines 8 features (5 raw: customer_ltv, customer_churn_risk, customer_region, customer_plan_tier, customer_tenure_days; 3 derived: is_high_value, is_at_risk, region_avg_ltv); (4) writes 1600 feature values in one batch commit; (5) builds a 50-row churn training set via get_training_dataset (point-in-time JOIN, no label leakage — verified); (6) does online lookup for one customer; (7) builds a 200x8 batch dashboard via get_feature_matrix; (8) loads the matrix into ArrowView and runs 3 DuckDB SQL queries (region GROUP BY, at-risk high-value filter, plan tier distribution); (9) closes the kernel, reopens, verifies all 8 features + entity type + point-in-time JOIN survive restart.
 - Ran the app end-to-end successfully. All 8 sections complete. Restart test PASS. Region GROUP BY returns correct averages (NA=$604.73, EU=$444.78, APAC=$619.95, LATAM=$663.04). Point-in-time JOIN returns 50 rows with 0 missing features. Pseudo-model signal: avg churn_risk for churned=0.553 vs clean=0.357 (correct direction).
 - Probed the by_entity index behavior with a dedicated perf script: 1 feature/entity = 0.194 ms/lookup; 8 features/entity looking up first-written feature = 1.483 ms/lookup (8x slower); 8 features/entity looking up last-written feature = 0.759 ms/lookup. Confirmed the by_entity index returns LAST-WRITTEN record per entity_id (per SDK_SPEC §4.2.1 hardening note 3), so any multi-feature workload falls through to O(N) scan in get_feature_value. This contradicts the documented 4.5ms / O(log N) claim in FEATURE_STORE_USE_CASE.md §6.
@@ -525,13 +525,13 @@ Task: External user validation of Feature Store + apply fixes + GETTING_STARTED.
    - Fix #4 (has_staged): exposed FeatureStore.has_staged() as a public method. Callers no longer need to reach into fs.base.has_staged(). Simplified the persistence test to use fs.has_staged() directly.
    - Fix #5 (transformation parameter): rewrote define_feature docstring to explicitly state "descriptive only — NOT executed; you must compute the value yourself." References docs/FEATURE_STORE_USE_CASE.md §"What this does NOT cover."
    - Fix #6 (get_freshness semantics): rewrote docstring to clarify it returns event-timestamp age (not wall-clock write age). Explained the semantic and how to get wall-clock freshness (pass time.time() as timestamp argument).
-5. Verified all tests still pass: feature_store.py production tests (7 sections), e2e_workflow.py (12 steps), validation/customer_analytics_app.py (the external validator's own app — still works with my fixes), view_laws CI (5 Views, 6 algebra laws), ArrowView tests (7 tests including pandas/DuckDB/Polars interop).
+5. Verified all tests still pass: feature_store.py production tests (7 sections), e2e_workflow.py (12 steps), validation/customer_analytics_app.py (the external validator's own app — still works with my fixes), lens_laws CI (5 Views, 6 algebra laws), ArrowView tests (7 tests including pandas/DuckDB/Polars interop).
 6. Wrote docs/GETTING_STARTED.md (~250 lines): compact 5-minute onboarding path. Covers: what the Feature Store is, prerequisites, first feature store (60-line example), point-in-time training sets (the killer feature), feature versioning, cross-view reads (ArrowView→DuckDB), persistence, the mental model (4-layer composition + storage model + indexes), common pitfalls (5 items including the transformation-is-descriptive-only and get_freshness-event-timestamp clarifications), where to go next, what's NOT in the Feature Store (deferred items).
 7. Appended this worklog entry.
 
 ## Stage Summary
 
-External user validation complete (DX 6/10). The validator confirmed the architecture is sound and the workflow runs end-to-end, but found 3 real bugs (by_entity index broken for multi-feature, get_feature_matrix complexity claim wrong, put_row mutates caller's dict) and 3 documentation gaps (has_staged not exposed, transformation misleading, get_freshness semantics unclear). All 6 findings fixed. The by_entity index fix is the highest-impact: get_feature_value is now genuinely O(log N) for the normal multi-feature case (was O(N) due to last-writer-wins collisions). The get_feature_matrix fix makes it genuinely O(N+E·M) instead of O(M·N). All existing tests pass (feature_store, e2e_workflow, view_laws CI, ArrowView). The external validator's own app still works with my fixes. GETTING_STARTED.md written as the canonical onboarding path. Per user's guidance: did NOT add new platform surface, did NOT go to Raft, kept layout optimizations at materialization layer. The Feature Store is now soaking as the polished canonical reference implementation with honest external validation confirming it's usable (6/10, up from the SDK's 5/10 baseline, with a clear path to 8-9/10 if transformation engine, materialized online tables, and streaming ingestion are added).
+External user validation complete (DX 6/10). The validator confirmed the architecture is sound and the workflow runs end-to-end, but found 3 real bugs (by_entity index broken for multi-feature, get_feature_matrix complexity claim wrong, put_row mutates caller's dict) and 3 documentation gaps (has_staged not exposed, transformation misleading, get_freshness semantics unclear). All 6 findings fixed. The by_entity index fix is the highest-impact: get_feature_value is now genuinely O(log N) for the normal multi-feature case (was O(N) due to last-writer-wins collisions). The get_feature_matrix fix makes it genuinely O(N+E·M) instead of O(M·N). All existing tests pass (feature_store, e2e_workflow, lens_laws CI, ArrowView). The external validator's own app still works with my fixes. GETTING_STARTED.md written as the canonical onboarding path. Per user's guidance: did NOT add new platform surface, did NOT go to Raft, kept layout optimizations at materialization layer. The Feature Store is now soaking as the polished canonical reference implementation with honest external validation confirming it's usable (6/10, up from the SDK's 5/10 baseline, with a clear path to 8-9/10 if transformation engine, materialized online tables, and streaming ingestion are added).
 
 ---
 Task ID: 20
@@ -542,7 +542,7 @@ Task: Acknowledge Phase F roadmap shift (features -> evidence) + implement elega
 
 1. Read user's extensive architecture review. Key message: the project has shifted from "can Pond do this?" to "does Pond still feel elegant doing this?" The next phase is EVIDENCE, not features. Six evidence gaps identified: scale, long-lived history, multiple simultaneous materializations, failure modes, independent implementations, Derived Structure calculus. Concrete ask: "more direct, easy, simple and elegant way of reading data from other views" so future execution engines can access data seamlessly.
 2. Updated DESIGN_GOALS.md §8 with Phase F (Evidence, not features) as the CURRENT phase. Documented the 6 evidence gaps and what's explicitly NOT in Phase F (no new domain packages, no new SDK surface unless validation exposes a gap, no Raft). Marked Phase E (Feature Store) as COMPLETE.
-3. Built pond-sdk/view_query.py (~200 LOC): ViewQuery class — a lazy, composable query API for Views. Makes a View feel like a collection:
+3. Built pond-sdk/lens_query.py (~200 LOC): ViewQuery class — a lazy, composable query API for Lenses. Makes a Lens feel like a collection:
    - __iter__: for row in view (yields decoded rows, not keys)
    - __len__: len(view) == view.count()
    - __contains__: key in view == view.exists(key)
@@ -553,16 +553,16 @@ Task: Acknowledge Phase F roadmap shift (features -> evidence) + implement elega
    - collect(): force evaluation, return list
    - count(), first(), take(n): terminal operations
    - JoinedQuery: result of join, supports further chaining
-4. Wired ViewQuery into View class (view_sdk.py): added __iter__, __len__, __contains__, where, select, map, join methods. These are thin wrappers that return ViewQuery(self).where(...) etc. No kernel changes, no new abstractions — just making the existing View feel like a collection.
-5. Wrote pond-sdk/test_view_query.py (~300 LOC, 7 tests): basic iteration, where filter (kwargs + predicate + chain), select projection, map transform, cross-view JOIN (LEFT JOIN semantics, merge, chain), laziness (no eval until iterate, first stops early), elegant pattern (join + where + map + collect in 5 lines). All 7 tests pass.
-6. Verified all existing tests still pass: view_laws CI (5 Views, 6 algebra laws), ArrowView (7 tests), Feature Store production tests, e2e workflow (12 steps). The __iter__ addition to View doesn't break anything.
+4. Wired ViewQuery into View class (lens_sdk.py): added __iter__, __len__, __contains__, where, select, map, join methods. These are thin wrappers that return ViewQuery(self).where(...) etc. No kernel changes, no new abstractions — just making the existing View feel like a collection.
+5. Wrote pond-sdk/test_lens_query.py (~300 LOC, 7 tests): basic iteration, where filter (kwargs + predicate + chain), select projection, map transform, cross-view JOIN (LEFT JOIN semantics, merge, chain), laziness (no eval until iterate, first stops early), elegant pattern (join + where + map + collect in 5 lines). All 7 tests pass.
+6. Verified all existing tests still pass: lens_laws CI (5 Views, 6 algebra laws), ArrowView (7 tests), Feature Store production tests, e2e workflow (12 steps). The __iter__ addition to View doesn't break anything.
 7. Updated GETTING_STARTED.md with a new "Elegant cross-view reading (ViewQuery)" section showing the full pattern: iteration, len/in, where (kwargs + predicate), select, map, join, chain, collect. Explained why the laziness matters for future execution engines.
-8. Added test_view_query.py to CI workflow (.github/workflows/view-laws.yml). CI now runs 9 test commands.
+8. Added test_lens_query.py to CI workflow (.github/workflows/view-laws.yml). CI now runs 9 test commands.
 9. Appended this worklog entry.
 
 ## Stage Summary
 
-Phase F roadmap shift documented in DESIGN_GOALS.md. The elegant cross-view reading API (ViewQuery) is the concrete ask from the user's review. It makes a View feel like a collection: `for row in view`, `view.where(region="US")`, `orders.join(customers, on="customer_id")`. The query is LAZY — nothing runs until you iterate or collect — which is designed for future execution engines (SQL, Polars, DataFusion) to push down filters and projections to the kernel level. All 7 ViewQuery tests pass. All existing tests pass (no regressions from __iter__/__len__/__contains__ on View). No kernel changes (pond-core still FROZEN). No new domain packages. No new RFC. This is a polish of existing surface, not a new feature — it makes the View the user already has feel like the collection it always should have been. Per the user's roadmap: next is evidence experiments (scale, history, multi-materialization, failure modes, independent implementations, Derived Structure calculus), NOT more features.
+Phase F roadmap shift documented in DESIGN_GOALS.md. The elegant cross-view reading API (ViewQuery) is the concrete ask from the user's review. It makes a Lens feel like a collection: `for row in view`, `view.where(region="US")`, `orders.join(customers, on="customer_id")`. The query is LAZY — nothing runs until you iterate or collect — which is designed for future execution engines (SQL, Polars, DataFusion) to push down filters and projections to the kernel level. All 7 ViewQuery tests pass. All existing tests pass (no regressions from __iter__/__len__/__contains__ on View). No kernel changes (pond-core still FROZEN). No new domain packages. No new RFC. This is a polish of existing surface, not a new feature — it makes the Lens the user already has feel like the collection it always should have been. Per the user's roadmap: next is evidence experiments (scale, history, multi-materialization, failure modes, independent implementations, Derived Structure calculus), NOT more features.
 
 ---
 Task ID: 21
@@ -584,7 +584,7 @@ Task: SharedDataset + NativeView — the "data is just bytes, Views are lenses" 
    - test_manifest_persists_across_restart: manifest survives process restart.
    - test_versioning_and_history: branch, checkout, history work (inherited from View).
    - test_elegant_pattern: write once, enable 3 views (sql, olap, pandas), read via 4 readers (DuckDB, Polars, pandas, Arrow iterate). All see total_ltv=4500.0. Manifest tracks 3 enabled views.
-4. Verified no regressions: view_laws CI (5 Views, 6 laws), e2e workflow (12 steps) all pass.
+4. Verified no regressions: lens_laws CI (5 Views, 6 laws), e2e workflow (12 steps) all pass.
 5. Added shared_dataset.py to CI workflow (10 test commands now).
 6. Appended this worklog entry.
 
@@ -599,9 +599,9 @@ Task: Correct the shared-data pattern — remove SharedDataset (Arrow-specific +
 
 ## Work Log
 
-1. Read user's correction: the SharedDataset/NativeView approach was wrong. (a) It stored Arrow IPC bytes — that's format-aware storage. The kernel shouldn't know about Arrow. (b) It had a manifest with enable_view metadata — that's exactly the overhead the user said to avoid (like Apache XTable / Delta Uniform). The user wants: the existing Pond kernel already stores raw bytes. Multiple Views (Git, SQL, Notebook, FeatureStore) should share the same underlying data by reading/writing the same Prolly tree. Each View is just a translation layer (encode/decode). No metadata. No manifest. No overhead. One write → all Views see it.
+1. Read user's correction: the SharedDataset/NativeView approach was wrong. (a) It stored Arrow IPC bytes — that's format-aware storage. The kernel shouldn't know about Arrow. (b) It had a manifest with enable_view metadata — that's exactly the overhead the user said to avoid (like Apache XTable / Delta Uniform). The user wants: the existing Pond kernel already stores raw bytes. Multiple Views (Git, SQL, Notebook, FeatureStore) should share the same underlying data by reading/writing the same Prolly tree. Each View is just a translation layer (encode/decode). No metadata. No manifest. No overhead. One write → all Lenses see it.
 2. Removed pond-sdk/shared_dataset.py (the wrong approach). Updated CI workflow to replace it.
-3. Built pond-sdk/test_shared_views.py (~350 LOC, 6 tests): the correct pattern. Multiple View subclasses (JsonView, RawView, TextView, CsvView) all with the same View name "shared" — they share the same Prolly tree. Each has its own encode/decode. The bytes are format-agnostic (the kernel doesn't know what format they're in).
+3. Built pond-sdk/test_shared_views.py (~350 LOC, 6 tests): the correct pattern. Multiple View subclasses (JsonView, RawView, TextView, CsvView) all with the same Lens name "shared" — they share the same Prolly tree. Each has its own encode/decode. The bytes are format-agnostic (the kernel doesn't know what format they're in).
 4. Tests:
    - test_shared_data_one_write_all_read: THE KEY TEST. JsonView writes {"name":"Alice","age":30} as JSON bytes. RawView reads those same bytes as raw bytes. TextView reads them as UTF-8 text. JsonView reads them as a dict. All read the SAME underlying blob — just interpreted differently. Zero overhead.
    - test_write_via_different_views: JsonView, RawView, TextView each write different keys. All share the same HEAD. Any View can list all keys and read any key (via get_raw if the decoder doesn't match).
@@ -609,13 +609,13 @@ Task: Correct the shared-data pattern — remove SharedDataset (Arrow-specific +
    - test_incompatible_decoders_coexist: JsonView + CsvView on the same tree. Each writes its own format. Both coexist. Bytes are intact. Decoders are independent.
    - test_count_and_iterate_shared: both Views see the same count (10) and same keys. JsonView iterates dicts; RawView iterates bytes.
    - test_versioning_shared: branch via JsonView; RawView sees and can checkout the same branch. Same commit DAG.
-5. All 6 tests pass. All existing tests pass (view_laws CI, e2e workflow). No regressions.
+5. All 6 tests pass. All existing tests pass (lens_laws CI, e2e workflow). No regressions.
 6. Updated CI workflow: replaced shared_dataset.py with test_shared_views.py.
 7. Appended this worklog entry.
 
 ## Stage Summary
 
-Corrected the shared-data pattern. The wrong approach (SharedDataset with Arrow IPC + manifest) is removed. The right pattern is: multiple Views with the same name share the same Prolly tree. Each View has its own encode/decode. The bytes are format-agnostic (the kernel stores bytes, not Arrow/Parquet/JSON). NO manifest, NO enable_view, NO per-View metadata — just 3 blobs (data + tree + commit). This is the anti-XTable / anti-Delta-Uniform pattern: zero overhead for multi-View access. One write → all Views read the same bytes immediately. Views with compatible decoders can read each other's data; Views with incompatible decoders coexist (they just can't decode each other's blobs). The "enablement" is in the code (having a View instance with the right decoder), not in the data. This aligns with all 6 design goals and with the user's vision: "bytes itself shouldn't be aware of arrow, parquet or any other thing. They are smallest units of data from which we should be able to read them in our suitable structure."
+Corrected the shared-data pattern. The wrong approach (SharedDataset with Arrow IPC + manifest) is removed. The right pattern is: multiple Views with the same name share the same Prolly tree. Each View has its own encode/decode. The bytes are format-agnostic (the kernel stores bytes, not Arrow/Parquet/JSON). NO manifest, NO enable_view, NO per-View metadata — just 3 blobs (data + tree + commit). This is the anti-XTable / anti-Delta-Uniform pattern: zero overhead for multi-View access. One write → all Lenses read the same bytes immediately. Views with compatible decoders can read each other's data; Views with incompatible decoders coexist (they just can't decode each other's blobs). The "enablement" is in the code (having a Lens instance with the right decoder), not in the data. This aligns with all 6 design goals and with the user's vision: "bytes itself shouldn't be aware of arrow, parquet or any other thing. They are smallest units of data from which we should be able to read them in our suitable structure."
 
 ---
 Task ID: 23
@@ -628,7 +628,7 @@ Task: The Lens Architecture — rename "View" to "Lens", answer the milestone re
    (a) The kernel owns only Bytes, History, Names. Everything above is "a way of interpreting those bytes" — not owning, copying, or converting.
    (b) "View" is the wrong name — conflates with SQL VIEW, Materialized View, etc. The user's preferred rename: "Lens" — different ways of seeing the same data.
    (c) The open research question: can multiple independent domain lenses operate over the same byte graph without metadata duplication? Three options: A (each owns encoding), B (canonical IR), C (intentional overlap). User wants this answered conclusively.
-2. Added "Lens" as an alias for "View" in pond-sdk/view_sdk.py. Backward compatible: `from view_sdk import Lens` works, `from view_sdk import View` still works. Also added KeylessLens, SemanticLens aliases. Documented the rename rationale in a header comment.
+2. Added "Lens" as an alias for "View" in pond-sdk/lens_sdk.py. Backward compatible: `from lens_sdk import Lens` works, `from lens_sdk import View` still works. Also added KeylessLens, SemanticLens aliases. Documented the rename rationale in a header comment.
 3. Wrote RFC-0012: The Lens Architecture (~250 lines). Covers:
    - §1: The clarification (kernel owns Bytes/History/Names; everything else is interpretation)
    - §2: The rename ("View" → "Lens"; implementation via aliases)
@@ -638,12 +638,12 @@ Task: The Lens Architecture — rename "View" to "Lens", answer the milestone re
    - §6: Relationship to other RFCs
    - §7: What this means for the roadmap
 4. Built pond-sdk/test_lens_architecture.py (~350 LOC, 5 tests):
-   - test_three_lenses_same_byte_graph: THE MILESTONE TEST. SqlLens, GitLens, NotebookLens all share the same byte graph (same View name "workspace"). Each writes its own encoding (JSON rows, Git tree format, notebook JSON). All see the same 5 keys. Each reads its own data correctly. Can't read each other's data (different encodings). BUT raw bytes are intact (get_raw works for any lens). Emergent overlap: NotebookLens reads SQL data (both use JSON — not designed, just emergent).
+   - test_three_lenses_same_byte_graph: THE MILESTONE TEST. SqlLens, GitLens, NotebookLens all share the same byte graph (same Lens name "workspace"). Each writes its own encoding (JSON rows, Git tree format, notebook JSON). All see the same 5 keys. Each reads its own data correctly. Can't read each other's data (different encodings). BUT raw bytes are intact (get_raw works for any lens). Emergent overlap: NotebookLens reads SQL data (both use JSON — not designed, just emergent).
    - test_no_metadata_duplication: 7 blobs total. NO manifest, NO enable_view, NO sidecar. The anti-XTable / anti-Delta-Uniform property.
    - test_shared_history_and_branching: SQL branch visible to Git. Git commit visible to SQL. Same commit DAG.
    - test_lenses_are_independent: SQL writes JSON, Git writes tree format. Each reads its own correctly. Bytes are different.
    - test_lens_alias_works: Lens is View (backward compatible).
-5. All 5 tests pass. All existing tests pass (view_laws CI, e2e workflow). No regressions.
+5. All 5 tests pass. All existing tests pass (lens_laws CI, e2e workflow). No regressions.
 6. Updated rfcs/README.md (RFC-0012 added), CI workflow (test_lens_architecture.py added as mandatory step).
 7. Appended this worklog entry.
 
@@ -672,8 +672,8 @@ Task: TypedBlob middle layer — any lens can read any blob, cross-lens indexing
    - test_bidirectional_branching: SQL creates branch, Git and Notebook see it. Git commits on branch, SQL sees it. SQL commits on branch, Notebook sees it. All share same commit DAG.
    - test_envelope_overhead: 5 bytes per blob. No manifest, no enable_view, no sidecar. The anti-XTable property.
    - test_transform_later: Git lens reads SQL blob (decoded via registry), extracts 'files' list, transforms into Git tree, writes back. SQL lens can also read the Git tree (decoded via registry).
-5. Fixed IndexedLens alias (was None — circular import issue). Now imports IndexedView at end of view_sdk.py.
-6. All existing tests pass (view_laws CI, e2e workflow, lens architecture). No regressions.
+5. Fixed IndexedLens alias (was None — circular import issue). Now imports IndexedView at end of lens_sdk.py.
+6. All existing tests pass (lens_laws CI, e2e workflow, lens architecture). No regressions.
 7. Added test_typed_blob.py to CI workflow (12 test commands now).
 8. Appended this worklog entry.
 
@@ -746,10 +746,10 @@ Task: Implement LogLens from the Lens Interpretation Contract alone — no acces
 
 Work Log:
 - Read worklog tail (~100 lines) for context. Read the 4 permitted documents: RFC-0013 (Lens Interpretation Contract), RFC-0012 (Lens Architecture), pond-core/pond_minimal.py (the 3-primitive kernel), DESIGN_GOALS.md.
-- Consulted pond-sdk/view_sdk.py ONLY to locate the `Lens` base class (alias for `View` at line 832). Did NOT read any domain Lens implementation (sql_view.py, arrow_view.py, feature_store.py, pond_git.py, notebook.py, etc.), did NOT read falsification_context.py, did NOT read typed_blob.py, did NOT read any test file.
+- Consulted pond-sdk/lens_sdk.py ONLY to locate the `Lens` base class (alias for `View` at line 832). Did NOT read any domain Lens implementation (sql_view.py, arrow_view.py, feature_store.py, pond_git.py, notebook.py, etc.), did NOT read falsification_context.py, did NOT read typed_blob.py, did NOT read any test file.
 - Implemented in validation/log_lens_external.py (~336 non-blank LOC including tests):
   - ContextResolver (37 LOC): implements RFC-0013 §8 interface (register, encode_for_key, decode_for_key). Longest-prefix match. Fallback to raw bytes on decode (§5).
-  - ContextLens (30 LOC): the generic Resolver-backed Lens. Overrides put/get/get_raw to delegate encode/decode to the resolver, keyed by the FULL key (caller supplies prefix). Inherits branch/checkout/list_branches/undo/commit/history from the View base class.
+  - ContextLens (30 LOC): the generic Resolver-backed Lens. Overrides put/get/get_raw to delegate encode/decode to the resolver, keyed by the FULL key (caller supplies prefix). Inherits branch/checkout/list_branches/undo/commit/history from the Lens base class.
   - LogLens (48 LOC): domain Lens for structured logs. JSON codec, "log/" prefix, fields {timestamp, level, message, service, trace_id}. Registers codec with the resolver at construction (§8).
   - SqlLens (13 LOC): minimal sibling Lens ("sql/" prefix, JSON codec) used to demonstrate cross-Lens reading and shared branching.
 - Wrote a 7-requirement test in the same file (test_1 through test_7). All pass.
@@ -813,7 +813,7 @@ Task: Phase G Correctness — fix the two scale bugs (data loss + index rebuild 
    - Invariant 7: Index rebuild at scale (10K records, lookup succeeds).
    All 7 invariants pass.
 
-7. Verified no regressions: view_laws CI (5 Views, 6 laws), e2e workflow (12 steps), TypedBlob tests (5 tests) all pass.
+7. Verified no regressions: lens_laws CI (5 Views, 6 laws), e2e workflow (12 steps), TypedBlob tests (5 tests) all pass.
 
 8. Added invariants to CI workflow (.github/workflows/view-laws.yml). CI now runs 14 test commands.
 
@@ -862,17 +862,17 @@ Task: Full repo reorganization — one-page POND.md, rename view_* to lens_*, mo
 1. Wrote POND.md — the one-page "What is Pond?" document. Covers: the kernel (Bytes/History/Names), the Lens (interprets bytes, never owns), Physical Structures (accelerate access, never own data), what is NOT in the kernel, the 10 Architecture Laws, the layer hierarchy, and design goals. One sentence summary: "Pond stores immutable bytes with universal history; every higher-level capability is simply a different Lens over that substrate."
 
 2. Full repo audit. Identified:
-   - 20 files importing from view_sdk (needs rename to lens_sdk)
+   - 20 files importing from lens_sdk (needs rename to lens_sdk)
    - Deprecated typed_blob.py + test_typed_blob.py in pond-sdk/ (should move to experiments/)
    - Docs using VIEW_ prefix (should be LENS_)
    - Stale directories (prototype/, libraries/, destruction/, engineering/, applications/)
 
 3. File renames (git mv):
-   - pond-sdk/view_sdk.py → pond-sdk/lens_sdk.py
-   - pond-sdk/view_laws.py → pond-sdk/lens_laws.py
-   - pond-sdk/view_query.py → pond-sdk/lens_query.py
-   - pond-sdk/run_view_laws_ci.py → pond-sdk/run_lens_laws_ci.py
-   - pond-sdk/test_view_query.py → pond-sdk/test_lens_query.py
+   - pond-sdk/lens_sdk.py → pond-sdk/lens_sdk.py
+   - pond-sdk/lens_laws.py → pond-sdk/lens_laws.py
+   - pond-sdk/lens_query.py → pond-sdk/lens_query.py
+   - pond-sdk/run_lens_laws_ci.py → pond-sdk/run_lens_laws_ci.py
+   - pond-sdk/test_lens_query.py → pond-sdk/test_lens_query.py
    - pond-sdk/test_shared_views.py → pond-sdk/test_shared_lenses.py
 
 4. Moved deprecated files:
@@ -883,7 +883,7 @@ Task: Full repo reorganization — one-page POND.md, rename view_* to lens_*, mo
    - docs/VIEW_AUTHORS_GUIDE.md → docs/LENS_AUTHORS_GUIDE.md
    - docs/VIEW_INTEROP_SPEC.md → docs/LENS_INTEROP_SPEC.md
 
-6. Updated ALL imports across 20+ files: from view_sdk → from lens_sdk, from view_laws → from lens_laws, from view_query → from lens_query. Used sed for bulk replacement.
+6. Updated ALL imports across 20+ files: from lens_sdk → from lens_sdk, from lens_laws → from lens_laws, from lens_query → from lens_query. Used sed for bulk replacement.
 
 7. Updated CI workflow (.github/workflows/view-laws.yml): all test command references updated to new file names.
 
@@ -903,7 +903,7 @@ Task: Full repo reorganization — one-page POND.md, rename view_* to lens_*, mo
 
 ## Stage Summary
 
-Full repo reorganization complete. The one-page POND.md is the canonical "What is Pond?" document. All SDK files renamed from view_* to lens_* (view_sdk.py → lens_sdk.py, etc.). Deprecated TypedBlob moved to experiments/. Docs renamed from VIEW_* to LENS_*. All 20+ import references updated. All tests pass (8 test suites, 50+ individual tests). The codebase now consistently uses "Lens" terminology throughout — no more "View" in file names (only as backward-compatible class aliases). The repo is cleaner, the naming is consistent, and the one-pager gives anyone the elevator pitch in 60 seconds.
+Full repo reorganization complete. The one-page POND.md is the canonical "What is Pond?" document. All SDK files renamed from view_* to lens_* (lens_sdk.py → lens_sdk.py, etc.). Deprecated TypedBlob moved to experiments/. Docs renamed from VIEW_* to LENS_*. All 20+ import references updated. All tests pass (8 test suites, 50+ individual tests). The codebase now consistently uses "Lens" terminology throughout — no more "View" in file names (only as backward-compatible class aliases). The repo is cleaner, the naming is consistent, and the one-pager gives anyone the elevator pitch in 60 seconds.
 
 ---
 Task ID: 32

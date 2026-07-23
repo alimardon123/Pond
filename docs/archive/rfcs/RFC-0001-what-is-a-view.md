@@ -1,4 +1,4 @@
-# RFC-0001: What Is a View?
+# RFC-0001: What Is a Lens?
 
 ## Status
 
@@ -12,7 +12,7 @@ implementations, an independent implementation challenge, and a
 View Author's Guide. But "View" itself remains intuitive — never
 formally defined.
 
-This RFC attempts to define what a View IS, mathematically. If we
+This RFC attempts to define what a Lens IS, mathematically. If we
 can define it, we've discovered something more valuable than another
 backend: a formal interface between the substrate and the
 interpretation layer.
@@ -27,7 +27,7 @@ like saying "a program is something that runs on a CPU" — true but
 unhelpful.
 
 The question: can we define View as an algebraic structure? Can we
-specify the View interface so precisely that two independently-written
+specify the Lens interface so precisely that two independently-written
 Views that satisfy the same specification are guaranteed to produce
 the same observable behavior?
 
@@ -45,7 +45,7 @@ where:
 
 ### State
 The View's internal state (in-memory, not kernel state). This is
-what the View tracks between kernel calls — staging areas, caches,
+what the Lens tracks between kernel calls — staging areas, caches,
 schema metadata, pending writes, etc.
 
 ```
@@ -53,7 +53,7 @@ State = View-specific type
 ```
 
 ### Encode: ViewData → Bytes
-Transforms View-level data (rows, vectors, files, graph nodes, etc.)
+Transforms Lens-level data (rows, vectors, files, graph nodes, etc.)
 into bytes suitable for `kernel.Write`. The View chooses the format
 (Parquet, JSON, raw floats, length-prefixed records, etc.).
 
@@ -65,7 +65,7 @@ This is a pure function. Same ViewData always produces the same Bytes.
 
 ### Decode: Bytes → ViewData
 Inverse of Encode. Transforms bytes from `kernel.Read` back into
-View-level data.
+Lens-level data.
 
 ```
 Decode : Bytes → ViewData
@@ -93,7 +93,7 @@ However, it IS deterministic given the same kernel state and inputs
 Takes the current View state and a query (read by name, read by hash,
 list, search, traverse, etc.), resolves the name/hash via the kernel,
 reads the relevant blobs via `kernel.Read`, decodes them via Decode,
-and returns View-level results.
+and returns Lens-level results.
 
 ```
 Resolve : State × Query → ViewResult
@@ -120,7 +120,7 @@ The View's serialization is lossless.
 ```
 Resolve does not call Write or Reference.
 ```
-Reading from a View does not mutate kernel state.
+Reading from a Lens does not mutate kernel state.
 
 ### View Law 3: Commit is deterministic
 ```
@@ -229,7 +229,7 @@ to ask; the answer requires further research.
 
 2. **Is the 5-tuple complete?** Are there View operations that don't
    fit into Encode/Decode/Commit/Resolve? (E.g., GC, compaction,
-   schema migration — are these part of the View or external?)
+   schema migration — are these part of the Lens or external?)
 
 3. **Can Views compose?** Is there an algebra of View composition?
 

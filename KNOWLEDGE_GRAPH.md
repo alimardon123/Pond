@@ -75,7 +75,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
-| `pond-sdk/lens_sdk.py` | 846 | `View`, `Lens`, `KeylessView`, `CrossView`, `SemanticView`, `OssieAdapter` | Lens base class with index management. `Lens = View` alias. |
+| `pond-sdk/lens_sdk.py` | 846 | `Lens`, `View` (alias), `KeylessLens`, `CrossLens`, `SemanticLens` | Lens base class with index management. `View = Lens` alias. |
 | `pond-sdk/prolly_view.py` | 761 | `ProllyTree`, `ProllyViewBase` | Prolly tree storage + tiered commits (delta + snapshot) + branching + merge + history. |
 | `pond-sdk/auto_index.py` | 604 | `AutoIndex`, `IndexedView` | Physical Structure for secondary indexes. Auto-indexing (lazy/eager/incremental). |
 | `pond-sdk/collection.py` | 517 | `Collection` | Named collection with namespace, type, source metadata. |
@@ -99,7 +99,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `lenses/vector/vector_view.py` | 198 | `VectorView` | Vector DB with ANN search. Extends `IndexedView`. |
 | `lenses/vector/auto_index.py` | 329 | (mock) | Mock auto-index for testing. |
 | `lenses/vector/mock_kernel.py` | 46 | `PondMinimal` (mock) | In-memory mock kernel for tests. |
-| `lenses/vector/view_sdk.py` | 39 | `CrossView` (mock) | Mock CrossView helpers. |
+| `lenses/vector/view_sdk.py` | 39 | `CrossLens` (mock) | Mock CrossLens helpers. |
 | `lenses/vector/test_vector.py` | 175 | (tests) | VectorView tests. |
 | `lenses/README.md` | — | — | Folder purpose, how to add a Lens. |
 
@@ -474,7 +474,7 @@ python pond-sdk/lens_laws.py
 | Looking for... | Go to... |
 |---|---|
 | The kernel | `pond-core/pond_minimal.py` |
-| Lens base class | `pond-sdk/lens_sdk.py` → `View` / `Lens` |
+| Lens base class | `pond-sdk/lens_sdk.py` → `Lens` (`View` alias) |
 | Prolly tree | `pond-sdk/prolly_view.py` → `ProllyTree` |
 | Indexes | `pond-sdk/auto_index.py` → `IndexedView` |
 | Lakehouse (flagship) | `lenses/lakehouse/lakehouse.py` → `PondLakehouse` |

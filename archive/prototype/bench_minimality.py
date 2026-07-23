@@ -9,7 +9,7 @@ The minimal kernel (pond_minimal.py) has ONLY:
 NO Tree. NO Commit. NO OPEN/SEALED. NO lifecycle.
 
 If all 8 Views work, then Tree/Commit/OPEN-SEALED were never primitive —
-they were View-level patterns. That's the finding.
+they were Lens-level patterns. That's the finding.
 
 Run:  python3 bench_minimality.py
 """
@@ -23,7 +23,7 @@ import struct
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pond_minimal import PondMinimal
 from views_minimal import (
-    SQLView, VectorView, StreamView, GitView,
+    SQLLens, VectorLens, StreamView, GitLens,
     GraphView, MLView, TimeSeriesView, OCIView,
 )
 
@@ -39,7 +39,7 @@ def main():
     print("    3. Reference(name, hash)")
     print()
     print("  NO Tree. NO Commit. NO OPEN/SEALED. NO lifecycle.")
-    print("  Tree/Commit/Tag are View-level patterns built from these 3.")
+    print("  Tree/Commit/Tag are Lens-level patterns built from these 3.")
     print()
     print("  If all 8 Views work, those concepts were never primitive.")
     print()
@@ -55,10 +55,10 @@ def main():
     # ------------------------------------------------------------------
     # View 1: SQL
     # ------------------------------------------------------------------
-    print("  [1] SQLView on minimal kernel...")
+    print("  [1] SQLLens on minimal kernel...")
     try:
         import pyarrow as pa
-        sql = SQLView(kernel, "users")
+        sql = SQLLens(kernel, "users")
         schema = pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())])
         sql.create(schema)
         batch = pa.RecordBatch.from_arrays([
@@ -70,27 +70,27 @@ def main():
         t = sql.read()
         assert t.num_rows == 3
         assert t.column("name").to_pylist() == ["alice", "bob", "carol"]
-        print(f"      ✓ SQLView works (3 rows)")
+        print(f"      ✓ SQLLens works (3 rows)")
     except Exception as e:
-        print(f"      ✗ SQLView failed: {e}")
-        failures.append(("SQLView", str(e)))
+        print(f"      ✗ SQLLens failed: {e}")
+        failures.append(("SQLLens", str(e)))
 
     # ------------------------------------------------------------------
     # View 2: Vector
     # ------------------------------------------------------------------
-    print("  [2] VectorView on minimal kernel...")
+    print("  [2] VectorLens on minimal kernel...")
     try:
-        vec = VectorView(kernel, "embeddings", dim=4)
+        vec = VectorLens(kernel, "embeddings", dim=4)
         vec.insert([0.1, 0.2, 0.3, 0.4])
         vec.insert([0.5, 0.6, 0.7, 0.8])
         vec.commit()
         results = vec.search([0.1, 0.2, 0.3, 0.4], k=1)
         assert len(results) == 1
         assert results[0][1] == 0
-        print(f"      ✓ VectorView works (search found nearest)")
+        print(f"      ✓ VectorLens works (search found nearest)")
     except Exception as e:
-        print(f"      ✗ VectorView failed: {e}")
-        failures.append(("VectorView", str(e)))
+        print(f"      ✗ VectorLens failed: {e}")
+        failures.append(("VectorLens", str(e)))
 
     # ------------------------------------------------------------------
     # View 3: Stream
@@ -113,9 +113,9 @@ def main():
     # ------------------------------------------------------------------
     # View 4: Git
     # ------------------------------------------------------------------
-    print("  [4] GitView on minimal kernel...")
+    print("  [4] GitLens on minimal kernel...")
     try:
-        g = GitView(kernel, "repo")
+        g = GitLens(kernel, "repo")
         g.add("README.md", b"# Hello\n")
         g.add("main.py", b"print('hi')\n")
         g.commit("initial")
@@ -124,10 +124,10 @@ def main():
         assert g.read_file("README.md") == b"# Hello world\n"
         assert g.read_file("main.py") == b"print('hi')\n"
         assert len(g.log()) == 2
-        print(f"      ✓ GitView works (2 commits, file inheritance works)")
+        print(f"      ✓ GitLens works (2 commits, file inheritance works)")
     except Exception as e:
-        print(f"      ✗ GitView failed: {e}")
-        failures.append(("GitView", str(e)))
+        print(f"      ✗ GitLens failed: {e}")
+        failures.append(("GitLens", str(e)))
 
     # ------------------------------------------------------------------
     # View 5: Graph
@@ -230,13 +230,13 @@ def main():
         print("    2. Read(hash_or_name) -> bytes (fetch blob by hash or name)")
         print("    3. Reference(name, hash)      (mutable name -> hash mapping)")
         print()
-        print("  What was REMOVED (and the Views still work):")
-        print("    - Tree          (now a View pattern: blob with serialized {name -> hash})")
-        print("    - Commit        (now a View pattern: blob with serialized metadata)")
+        print("  What was REMOVED (and the Lenss still work):")
+        print("    - Tree          (now a Lens pattern: blob with serialized {name -> hash})")
+        print("    - Commit        (now a Lens pattern: blob with serialized metadata)")
         print("    - Tag           (now just Reference(name, commit_hash))")
         print("    - Branch        (now just Reference(name, commit_hash))")
-        print("    - OPEN/SEALED   (now a View-level buffer optimization)")
-        print("    - Lifecycle     (OPEN/SEALED/COMPACTED/ARCHIVED/GC — all View-level)")
+        print("    - OPEN/SEALED   (now a Lens-level buffer optimization)")
+        print("    - Lifecycle     (OPEN/SEALED/COMPACTED/ARCHIVED/GC — all Lens-level)")
         print("    - write_tree    (View helper, not kernel)")
         print("    - read_tree     (View helper, not kernel)")
         print("    - write_commit  (View helper, not kernel)")
@@ -244,16 +244,16 @@ def main():
         print("    - walk_tree     (View helper, not kernel)")
         print()
         print("  FINDING: Tree, Commit, OPEN/SEALED, and the lifecycle were NEVER")
-        print("  primitive. They were View-level patterns. The kernel only needs")
+        print("  primitive. They were Lens-level patterns. The kernel only needs")
         print("  Write + Read + Reference.")
         print()
         print("  This is the minimal basis. Pond's storage algebra is 3 primitives.")
         print()
         print("  What this means:")
-        print("    - Git's blob/tree/commit model is a View, not the architecture")
-        print("    - Iceberg's manifest/snapshot model would be a View")
-        print("    - Delta's transaction log would be a View")
-        print("    - OCI's manifest/layer model is a View")
+        print("    - Git's blob/tree/commit model is a Lens, not the architecture")
+        print("    - Iceberg's manifest/snapshot model would be a Lens")
+        print("    - Delta's transaction log would be a Lens")
+        print("    - OCI's manifest/layer model is a Lens")
         print("    - The kernel has zero opinion about object structure")
         print()
         print("  Architectural implications:")
@@ -272,7 +272,7 @@ def main():
         print()
         print("  This means the removed primitive was actually necessary.")
         print("  Investigate whether to admit it to the kernel (via the 5-criterion")
-        print("  Admission Rule) or fix the View.")
+        print("  Admission Rule) or fix the Lens.")
 
     kernel.close()
 

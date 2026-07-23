@@ -39,7 +39,7 @@ been found in 14 tested (8 standard + 6 alien).
 first-class kernel objects.
 
 **Why rejected:** Same as Tree. A Commit is just a blob containing
-serialized metadata. The `parent_hash` field is a View convention, not
+serialized metadata. The `parent_hash` field is a Lens convention, not
 a kernel requirement. Multi-parent commits (CRDTs, merges) work
 because the kernel doesn't enforce single-parent — it just stores bytes.
 
@@ -57,10 +57,10 @@ require them to be kernel-level.
 **What:** Objects had a lifecycle: OPEN (mutable, appendable) → SEALED
 (immutable) → COMPACTED → ARCHIVED → GC. The kernel tracked object state.
 
-**Why rejected:** The lifecycle is a View-level buffer optimization.
+**Why rejected:** The lifecycle is a Lens-level buffer optimization.
 Views can buffer in memory and call `Write` when ready. The kernel
 doesn't need to track "OPEN" vs "SEALED" — once bytes are Written,
-they're immutable, period. Compaction, archival, and GC are View-level
+they're immutable, period. Compaction, archival, and GC are Lens-level
 policies.
 
 **Could be revisited:** No, unless a workload requires kernel-enforced
@@ -111,7 +111,7 @@ re-couple the kernel to the data ecosystem.
 **What:** The kernel had a `.sql(query)` method that executed SQL via
 DuckDB over sealed Parquet files.
 
-**Why rejected:** SQL is a View concern. Putting `.sql()` on the kernel
+**Why rejected:** SQL is a Lens concern. Putting `.sql()` on the kernel
 class makes SQL privileged — it suggests the kernel "knows" SQL. The
 kernel should be query-language-agnostic. SQL belongs in SQLView, not
 on the kernel.
@@ -127,11 +127,11 @@ on the kernel.
 **What:** The kernel tracked `pa.Schema` (Arrow schema) per table.
 
 **Why rejected:** Arrow type system leak. The kernel should not know
-about schemas — schemas are View-level concepts (SQL tables have
+about schemas — schemas are Lens-level concepts (SQL tables have
 schemas; OCI images don't; Git files don't). Views track their own
 schemas if they need them.
 
-**Could be revisited:** No. Schema is a View concern by the Universality
+**Could be revisited:** No. Schema is a Lens concern by the Universality
 criterion of the Admission Rule.
 
 ---
@@ -147,7 +147,7 @@ travel instead of O(N).
 **Why rejected:** Fails the Universality criterion of the Admission
 Rule. Only SQL and Git Views need time travel. Vector, Streaming,
 Graph, ML, TimeSeries, OCI Views don't. Skip pointers should be a
-View-level pattern (each View that needs time travel implements its own).
+Lens-level pattern (each View that needs time travel implements its own).
 
 **Could be revisited:** Yes, if 3+ structurally different Views need
 skip pointers. Currently only 2 do. If a third emerges (e.g., a
@@ -169,11 +169,11 @@ have different GC policies:
 - OCI: keep all manifests tagged in the last 30 days
 - ML: keep all checkpoints unless explicitly deleted
 
-A kernel-level GC would impose one policy. View-level GC lets each
+A kernel-level GC would impose one policy. Lens-level GC lets each
 View choose. The kernel provides the primitives (Write, Read,
 Reference, list-blobs); Views implement reachability walks.
 
-**Could be revisited:** Yes, if all Views converge on the same GC
+**Could be revisited:** Yes, if all Lenses converge on the same GC
 policy. Currently they don't.
 
 ---
@@ -187,7 +187,7 @@ deployments.
 
 **Why rejected (deferred):** Not rejected — deferred. The kernel
 should support replication, but the question is whether Raft is the
-right mechanism or whether it should be a View/infrastructure concern.
+right mechanism or whether it should be a Lens/infrastructure concern.
 
 The destruction phase (Stage 3) found that content-addressing handles
 idempotent writes and dedup, but does NOT handle: lost updates,
@@ -197,7 +197,7 @@ visibility, causal consistency. These need a coordination layer.
 Open question: is the coordination layer part of the kernel, or a
 separate infrastructure component? The laws-vs-APIs experiment
 (Experiment 3) suggests the kernel is laws, and coordination is one
-realization. Raft might be a View/infrastructure concern, not a
+realization. Raft might be a Lens/infrastructure concern, not a
 kernel primitive.
 
 **Could be revisited:** Yes — this is an active research question.

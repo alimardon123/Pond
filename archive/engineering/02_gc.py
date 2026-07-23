@@ -3,12 +3,12 @@ Garbage Collection — implementing reachability walk + sweep.
 
 Finding 6 (from the prototype phase): orphaned objects accumulate after
 crashes and reference overwrites. The kernel has no GC. This file
-implements a View-level GC that:
+implements a Lens-level GC that:
   1. Walks reachability from all root References
-  2. Marks all reachable objects (transitively, via View-defined chains)
+  2. Marks all reachable objects (transitively, via Lens-defined chains)
   3. Sweeps unreferenced objects from the object store
 
-This is NOT a kernel feature. It's a View-level utility that any View
+This is NOT a kernel feature. It's a Lens-level utility that any View
 can use. Different Views can have different GC policies (Git keeps all
 commits reachable from any branch; OCI keeps all manifests tagged in
 the last 30 days).
@@ -46,7 +46,7 @@ HASH_PATTERN = re.compile(r'[0-9a-f]{64}')  # 64-char hex string = SHA-256 hash
 
 class PondGC:
     """
-    View-level garbage collector for Pond.
+    Lens-level garbage collector for Pond.
 
     Algorithm:
       1. MARK: walk all names in the root namespace. For each name,
@@ -379,8 +379,8 @@ def main():
     print("  4. GC at scale (1000 objects)            | SUPPORTED")
     print("  5. GC idempotent                         | SUPPORTED")
     print()
-    print("  Finding 6 is now FIXED at the View level.")
-    print("  GC is a View-level utility, not a kernel primitive.")
+    print("  Finding 6 is now FIXED at the Lens level.")
+    print("  GC is a Lens-level utility, not a kernel primitive.")
     print("  Different Views can have different GC policies.")
     print()
     print("  Next: real backend portability (S3 or KV backend).")

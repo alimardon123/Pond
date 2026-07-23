@@ -131,11 +131,11 @@ If you need a second sentence, the kernel has grown too complex.
 
 The kernel does as little as possible. Everything else — Trees,
 Commits, Branches, Tags, OPEN/SEALED, indexes, materializations,
-schedules, schemas — is a **View-level pattern** built by composing
+schedules, schemas — is a **Lens-level pattern** built by composing
 the 3 primitives. Rich behavior must *emerge* from composition, not
 be *added* as kernel features.
 
-**Test:** Can the proposed capability be expressed as data + a View?
+**Test:** Can the proposed capability be expressed as data + a Lens?
 If yes, it does not belong in the kernel. (See RFC-0008 for the
 deletion case study: deletion is data, not a fourth primitive.)
 
@@ -149,14 +149,14 @@ not preventing Views from being fast.
 
 **Test:** Is the proposed optimization measurable at the kernel
 level, or does it only show up in a specific View? If the latter,
-it lives in the View, not the kernel.
+it lives in the Lens, not the kernel.
 
 ### 3.4 Scalable — derived structures, adapters, and domain packages
 evolve independently
 
-Views are independent. Adding a new View (e.g., `VectorView`,
+Views are independent. Adding a new Lens (e.g., `VectorView`,
 `SemanticView`, `OssieView`) must not require modifying any existing
-View or the kernel. Removing a View must not break any lower layer.
+View or the kernel. Removing a Lens must not break any lower layer.
 
 **Test (the removability test):** If package X is deleted entirely,
 does any lower-layer package break? If yes, the dependency is wrong.
@@ -248,7 +248,7 @@ only makes sense with `pond-feature-store` or `pond-semantic` present
 |---|---|---|
 | `README.md` | Project overview, hypothesis, status | You are new to Pond |
 | `DESIGN_GOALS.md` (this file) | Six design principles + repo map | You are starting any work on Pond |
-| `SDK_SPEC.md` | Authoritative SDK contract (settles all 10 validation ambiguities) | You are building a View or modifying the SDK |
+| `SDK_SPEC.md` | Authoritative SDK contract (settles all 10 validation ambiguities) | You are building a Lens or modifying the SDK |
 | `PACKAGES.md` | Package boundaries and removability discipline | You are adding or modifying a package |
 | `worklog.md` | Append-only research log | You need to know what previous agents did |
 
@@ -260,7 +260,7 @@ RFCs decide.
 
 | RFC | Title | Status | What it specifies |
 |---|---|---|---|
-| RFC-0001 | What Is a View? | Draft (superseded by RFC-0007) | The original draft definition of a View |
+| RFC-0001 | What Is a Lens? | Draft (superseded by RFC-0007) | The original draft definition of a Lens |
 | RFC-0002 | Elegance Metrics | Draft | How to measure architectural elegance |
 | RFC-0003 | Kernel Specification | **Accepted (FROZEN)** | The 3 primitives, 5 storage laws, 7 composition laws |
 | RFC-0004 | View Composition | Draft | How Views compose (parallel and sequential) |
@@ -281,7 +281,7 @@ frozen.
 |---|---|
 | `FORMAL_SPEC.md` | 5 storage laws + 7 composition laws + preconditions/postconditions |
 | `FORMAL_ALGEBRA.md` | Mathematical definition + 8 theorems + lower-bound proof |
-| `LENS_AUTHORS_GUIDE.md` | 6 guarantees + 7 conventions + 12 unspecified (the View boundary) |
+| `LENS_AUTHORS_GUIDE.md` | 6 guarantees + 7 conventions + 12 unspecified (the Lens boundary) |
 | `LENS_INTEROP_SPEC.md` | 10 ambiguities from independent implementation, classified |
 | `REJECTED_DESIGNS.md` | 15+ rejected architectural decisions with reasons |
 | `NON_GOALS.md` | 15 things Pond deliberately does NOT solve |
@@ -293,7 +293,7 @@ frozen.
 | Package | Layer | LOC | Responsibility |
 |---|---|---|---|
 | `pond-core` | 0 | ~140 | The 3 primitives. FROZEN. Do not modify without an Accepted RFC. |
-| `pond-sdk` | 1–2 | (see repo) | `View` base class, `IndexedView`, common View patterns, `maintenance.py` (tombstones per RFC-0008), `view_laws.py` (algebra property tests per RFC-0007) |
+| `pond-sdk` | 1–2 | (see repo) | `View` base class, `IndexedView`, common View patterns, `maintenance.py` (tombstones per RFC-0008), `lens_laws.py` (algebra property tests per RFC-0007) |
 | `pond-sql` | 3 | (see repo) | SQL View (CREATE/INSERT/SELECT/UPDATE/DELETE/ALTER + indexes + time travel) |
 | `pond-streaming` | 3 | (see repo) | Streaming View (topics, consumer groups, offsets) |
 | `pond-git` | 3 | (see repo) | Git View (init/add/commit/branch/checkout/merge/diff) |
@@ -311,7 +311,7 @@ changing `pond-sdk`, something is wrong.
 | File | Purpose |
 |---|---|
 | `01_concurrency.py` | Thread-safety for the root namespace (Finding 7 fix) |
-| `02_gc.py` | `PondGC` — View-level reachability walk + sweep (Finding 6 fix) |
+| `02_gc.py` | `PondGC` — Lens-level reachability walk + sweep (Finding 6 fix) |
 | `03_s3_backend.py` | S3 backend adapter for the kernel |
 
 ### 5.6 Validation (`validation/`)
@@ -389,7 +389,7 @@ second external implementation scores 9/10 for developer confidence.
 
 ### Phase C — Formalize Views
 
-Produce a mathematically clean definition of what a View is, what
+Produce a mathematically clean definition of what a Lens is, what
 laws it satisfies, and how Views compose. **Status:** RFC-0007
 drafted. Needs automated property tests to move to Accepted.
 
@@ -978,7 +978,7 @@ If you are an agent picking up Pond work, do this in order:
    SDK. The validator's findings are the SDK polish backlog.
 6. **Check `docs/NON_GOALS.md`** before proposing any feature. If
    your feature is on the Non-Goals list, it does not belong in the
-   kernel; it may belong in a View.
+   kernel; it may belong in a Lens.
 7. **Run the weekly question** (§4 above). If your work makes the
    answer "no," stop and reconsider.
 8. **Append to `worklog.md`** when you finish. Use the format in
@@ -990,9 +990,9 @@ If you are an agent picking up Pond work, do this in order:
 - The kernel is FROZEN. Do not modify `pond-core/pond_minimal.py`
   without an Accepted RFC that passes the Admission Rule
   (`rfcs/README.md`).
-- Do not add features to the kernel to solve View-level problems.
+- Do not add features to the kernel to solve Lens-level problems.
   The answer to "the kernel can't do X" is almost always "X is a
-  View-level pattern, not a kernel primitive." See RFC-0008 for
+  Lens-level pattern, not a kernel primitive." See RFC-0008 for
   the deletion case study.
 - Prefer editing existing files over creating new ones. New RFCs
   are fine; new packages need explicit justification against the

@@ -269,7 +269,7 @@ All tests pass.
    `pond-feature-store` does not affect any lower layer. The SDK and
    kernel are unaware that the Feature Store exists.
 
-5. **The view_laws.py harness still passes.** The Feature Store is
+5. **The lens_laws.py harness still passes.** The Feature Store is
    a Layer 3 subclass of `IndexedView`; the existing CI (which tests
    `View`, `IndexedView`, `SemanticView`, `Multikey`, `KeylessView`)
    continues to pass. The algebra is preserved.
@@ -319,5 +319,5 @@ These are candidates for future RFCs, not part of RFC-0011:
   ingestion), §4.2.1 (multikey, for tag-based feature indexing),
   §8.1 (CrossView, for ingestion).
 - **Does not modify:** any kernel code, any SDK code, any existing
-  View code, any RFC. FeatureStore is purely additive — a Layer 3
+  Lens code, any RFC. FeatureStore is purely additive — a Layer 3
   application consuming the SDK.

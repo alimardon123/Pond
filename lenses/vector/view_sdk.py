@@ -1,24 +1,24 @@
 """
-Mock implementation of CrossView, built ONLY from the SDK specification.
+Mock implementation of CrossLens, built ONLY from the SDK specification.
 
 NOT the real SDK.  Used for testing.
 """
 
 
-class CrossView:
+class CrossLens:
     """Static helpers for cross-view data access."""
 
     @staticmethod
-    def read_from(view, key: str):
-        return view.get(key)
+    def read_from(lens, key: str):
+        return lens.get(key)
 
     @staticmethod
-    def read_all_from(view) -> dict:
-        return view.get_all()
+    def read_all_from(lens) -> dict:
+        return lens.get_all()
 
     @staticmethod
-    def write_to(view, key: str, data) -> str:
-        return view.put(key, data)
+    def write_to(lens, key: str, data) -> str:
+        return lens.put(key, data)
 
     @staticmethod
     def share_blob(from_view, from_key: str, to_view, to_key: str) -> bool:

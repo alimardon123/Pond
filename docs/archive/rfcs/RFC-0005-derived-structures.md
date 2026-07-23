@@ -23,7 +23,7 @@ database-literature term "materialization" — the same concept used by
 > "materialization."
 >
 > In RFC-0007 (View Algebra), materializations are the `M` component
-> of the View 5-tuple `V = (Σ, A, E, D, M)`.
+> of the Lens 5-tuple `V = (Σ, A, E, D, M)`.
 
 ---
 
@@ -47,7 +47,7 @@ all share the same fundamental structure:
 derived = f(snapshot)
 ```
 
-A snapshot is a point-in-time view of a View's state (a commit hash).
+A snapshot is a point-in-time view of a Lens's state (a commit hash).
 A materialization is any object computed from that snapshot.
 
 ---
@@ -81,7 +81,7 @@ where:
 ### Storage: where the derived data lives
 - Usually: a Prolly tree (content-addressed, like indexes)
 - Could be: a raw blob (e.g., a single statistics JSON)
-- Could be: a separate View (e.g., a materialized view IS a View)
+- Could be: a separate View (e.g., a materialized view IS a Lens)
 
 ---
 
@@ -231,7 +231,7 @@ A new concept enters the Materialization layer if and only if:
 3. It can be rebuilt from the source (lossless re-derivation)
 
 If a concept fails any criterion, it's NOT a materialization — it's
-either source data (canonical) or a View (has its own commit history).
+either source data (canonical) or a Lens (has its own commit history).
 
 ---
 
@@ -243,7 +243,7 @@ nothing about them. The kernel provides:
 - Read (to retrieve derived data)
 - Reference (to name derived data)
 
-The Materialization layer sits between the kernel and the View layer:
+The Materialization layer sits between the kernel and the Lens layer:
 ```
 Kernel (3 primitives)
   → Materialization Layer (f(snapshot) → stored result)

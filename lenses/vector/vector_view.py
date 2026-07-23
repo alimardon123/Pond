@@ -11,7 +11,7 @@ Implements:
 
 Design notes
 ------------
-* Extends ``IndexedView`` and registers an ``"by_id"`` index (eager mode)
+* Extends ``IndexedLens`` and registers an ``"by_id"`` index (eager mode)
   so that ID lookups go through the indexing layer as required.
 * Vectors are stored as packed binary (``struct.pack``) — NOT JSON — for
   efficiency.  The overridden ``encode`` / ``decode`` methods handle the
@@ -44,12 +44,12 @@ import math
 import struct
 from typing import Any
 
-from auto_index import IndexedView          # Layer 2
-from lens_sdk import CrossView               # cross-view helpers (available)
+from auto_index import IndexedLens          # Layer 2
+from lens_sdk import CrossLens               # cross-view helpers (available)
 
 
-class VectorView(IndexedView):
-    """A simple vector database on Pond's IndexedView."""
+class VectorLens(IndexedLens):
+    """A simple vector database on Pond's IndexedLens."""
 
     # ---- lifecycle --------------------------------------------------
 
@@ -184,7 +184,7 @@ class VectorView(IndexedView):
     def get_history(self, limit: int = 20) -> list[dict]:
         return self.history(limit)
 
-    # ---- index-backed lookup (demonstrates IndexedView usage) -------
+    # ---- index-backed lookup (demonstrates IndexedLens usage) -------
 
     def find_by_id(self, id: str) -> dict | None:
         """O(log N) lookup via the registered by_id index."""

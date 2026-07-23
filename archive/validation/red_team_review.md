@@ -263,7 +263,7 @@ contradiction on a load-bearing concept.
 
 But the class is still `class View` (`lens_sdk.py`), the file is `lens_sdk.py`
 which imports `ProllyViewBase`, the algebra is `RFC-0007: The View Algebra`,
-and the laws file is `view_laws.py`. The paper uses "Lens" exclusively and
+and the laws file is `lens_laws.py`. The paper uses "Lens" exclusively and
 never mentions "View." A reader cross-referencing the paper to the code must
 mentally translate on every line.
 

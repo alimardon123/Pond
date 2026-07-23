@@ -92,7 +92,7 @@ compose — they're inherited.
 
 ```
 pond-core/           Layer 0: pond_minimal.py (3 primitives, ~140 LOC)
-pond-sdk/            Layer 1+2: prolly_view.py, binary_encoding.py, auto_index.py, view_sdk.py
+pond-sdk/            Layer 1+2: prolly_view.py, binary_encoding.py, auto_index.py, lens_sdk.py
 pond-semantic/       Layer 3: semantic adapters (Ossie, Cube, dbt)
 pond-feature-store/  Layer 3: feature_store.py
 pond-sql/            Layer 3: sql_view.py

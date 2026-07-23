@@ -38,7 +38,7 @@ pond_repo/
 │       ├── vector_view.py       # VectorView (ANN search)
 │       ├── auto_index.py        # Mock auto-index for testing
 │       ├── mock_kernel.py       # In-memory mock kernel for tests
-│       ├── view_sdk.py          # Mock CrossView helpers
+│       ├── lens_sdk.py          # Mock CrossView helpers
 │       └── test_vector.py       # Tests
 │
 ├── services/                    # Cross-cutting services (on the kernel)

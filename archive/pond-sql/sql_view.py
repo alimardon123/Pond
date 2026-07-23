@@ -1,14 +1,14 @@
 """
-Reworked SQL View on ProllyViewBase.
+Reworked SQL View on ProllyLensBase.
 
 Uses Prolly trees for O(log N) point lookups, bounded delta journal
-for O(1) commits, and View-level indexes for fast secondary lookups.
+for O(1) commits, and Lens-level indexes for fast secondary lookups.
 
 Features:
   - CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, ALTER TABLE
   - Point lookups via ProllyTree.lookup() — O(log N)
   - Full scans via ProllyTree.read_all() — O(N/chunk_size)
-  - Secondary indexes via ProllyViewBase.build_index()
+  - Secondary indexes via ProllyLensBase.build_index()
   - Time travel, branching, merge, history
   - All on the 3-primitive kernel (Write/Read/Reference)
 """
@@ -19,16 +19,16 @@ from typing import Optional, Any
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-sdk"))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase
+from prolly_view import ProllyLensBase
 
 
-class SQLView:
-    """SQL database on Pond. Uses ProllyViewBase for all storage."""
+class SQLLens:
+    """SQL database on Pond. Uses ProllyLensBase for all storage."""
 
     def __init__(self, kernel: PondMinimal, db_name: str = "db"):
         self.kernel = kernel
         self.db_name = db_name
-        self.base = ProllyViewBase(kernel, db_name)
+        self.base = ProllyLensBase(kernel, db_name)
 
     def create_table(self, table_name: str, columns: dict, primary_key: str = "id"):
         schema = {"table": table_name, "columns": columns, "primary_key": primary_key}

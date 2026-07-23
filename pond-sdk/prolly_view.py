@@ -1,5 +1,5 @@
 """
-ProllyViewBase — Prolly trees + bounded delta journal.
+ProllyLensBase — Prolly trees + bounded delta journal.
 
 The optimal data structure for content-addressed versioned storage:
   - Prolly tree: content-addressed B-tree with O(log N) lookups,
@@ -233,10 +233,10 @@ class ProllyTree:
 
 
 # ---------------------------------------------------------------------------
-# ProllyViewBase — Prolly tree + bounded delta journal
+# ProllyLensBase — Prolly tree + bounded delta journal
 # ---------------------------------------------------------------------------
 
-class ProllyViewBase:
+class ProllyLensBase:
     """
     Base class for all Pond Lenses. Uses Prolly trees + Tiered Commit Model.
 
@@ -637,7 +637,7 @@ class ProllyViewBase:
         return {"added": added, "removed": removed, "modified": modified}
 
     # ------------------------------------------------------------------
-    # Index support (View-level, not kernel)
+    # Index support (Lens-level, not kernel)
     # ------------------------------------------------------------------
 
     def build_index(self, index_name: str, key_extractor) -> str:
@@ -759,3 +759,6 @@ class ProllyViewBase:
 
     def decode(self, data: bytes) -> Any:
         return json.loads(data)
+
+# Backward-compatible aliases
+ProllyViewBase = ProllyLensBase  # backward-compatible alias

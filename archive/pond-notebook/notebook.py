@@ -1,8 +1,8 @@
 """
-Reworked Notebook View on ProllyViewBase.
+Reworked Notebook View on ProllyLensBase.
 
 Uses Prolly trees for O(log N) page lookups, bounded delta journal
-for O(1) commits, and View-level search index.
+for O(1) commits, and Lens-level search index.
 """
 
 import json, time, sys, os
@@ -12,7 +12,7 @@ from typing import Optional
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-sdk"))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase, ProllyTree
+from prolly_view import ProllyLensBase, ProllyTree
 
 
 @dataclass
@@ -28,13 +28,13 @@ class Page:
     def from_bytes(data): return Page(**json.loads(data))
 
 
-class NotebookView:
-    """Personal notebook on Pond. Uses ProllyViewBase."""
+class NotebookLens:
+    """Personal notebook on Pond. Uses ProllyLensBase."""
 
     def __init__(self, kernel, name="notebook"):
         self.kernel = kernel
         self.name = name
-        self.base = ProllyViewBase(kernel, name)
+        self.base = ProllyLensBase(kernel, name)
 
     def create_page(self, path, title, body="", tags=None):
         page = Page(title, body, tags or [], time.time(), time.time())

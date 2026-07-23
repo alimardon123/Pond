@@ -2,16 +2,16 @@
 Views layer — built ON TOP of the kernel, using only the 4 syscalls.
 
 Each View interprets the same immutable objects differently. The kernel
-knows nothing about formats; the View knows everything.
+knows nothing about formats; the Lens knows everything.
 
 Views implemented here:
-  - SQLView      (writes/reads Parquet bytes; tabular interpretation)
-  - VectorView   (writes/reads Arrow IPC bytes of float arrays; vector interpretation)
+  - SQLLens      (writes/reads Parquet bytes; tabular interpretation)
+  - VectorLens   (writes/reads Arrow IPC bytes of float arrays; vector interpretation)
   - StreamView   (writes/reads Arrow IPC bytes; append-only log interpretation)
-  - GitView      (stores files + directories as blobs/trees; version control)
+  - GitLens      (stores files + directories as blobs/trees; version control)
 
 The point: the kernel is bytes-only. Each View is a thin adapter that
-knows one format. Adding a new View (e.g., LanceView, IcebergView)
+knows one format. Adding a new Lens (e.g., LanceView, IcebergView)
 requires NO changes to the kernel.
 """
 
@@ -35,12 +35,12 @@ from pond_kernel import PondKernel, Tree, Commit, hash_bytes
 # SQL View — tabular data via Parquet
 # ===========================================================================
 
-class SQLView:
+class SQLLens:
     """
     A SQL view of immutable objects. Writes Arrow RecordBatches, seals them
     as Parquet bytes. Reads Parquet bytes and returns Arrow Tables.
 
-    The kernel stores the Parquet bytes; the View interprets them.
+    The kernel stores the Parquet bytes; the Lens interprets them.
     """
 
     def __init__(self, kernel: PondKernel, table_name: str):
@@ -80,7 +80,7 @@ class SQLView:
         self._open_writer.close()
         arrow_bytes = self._open_sink.getvalue()
 
-        # Convert Arrow IPC -> Parquet (this is a View decision, not kernel)
+        # Convert Arrow IPC -> Parquet (this is a Lens decision, not kernel)
         reader = ipc.open_stream(pa.BufferReader(arrow_bytes))
         table = pa.Table.from_batches(reader, self._schema)
         parquet_buf = io.BytesIO()
@@ -175,13 +175,13 @@ class SQLView:
 # Vector View — embedding collections via raw float bytes
 # ===========================================================================
 
-class VectorView:
+class VectorLens:
     """
     A vector view. Stores embeddings as raw float32 bytes (no Parquet —
     vectors don't need columnar format). Each "insert" appends a vector;
     "search" scans all vectors and computes distances.
 
-    Demonstrates: a View that uses a DIFFERENT format than SQLView, but
+    Demonstrates: a Lens that uses a DIFFERENT format than SQLLens, but
     the same kernel. The kernel doesn't care that these bytes are floats.
     """
 
@@ -212,7 +212,7 @@ class VectorView:
         # Write to kernel (single-shot blob)
         blob_hash = self.kernel.write_blob(buf)
 
-        # Build the DAG (similar to SQLView but with vector naming)
+        # Build the DAG (similar to SQLLens but with vector naming)
         parent_hash = self.kernel._resolve_name(self.collection_name)
         parent_subtrees = []
         parent_unsealed_leaves = []
@@ -294,7 +294,7 @@ class StreamView:
     A streaming log view. Each commit is a batch of records. Reading the
     log walks the commit DAG in order, returning records from each blob.
 
-    Demonstrates: a View that interprets bytes as a sequence of records,
+    Demonstrates: a Lens that interprets bytes as a sequence of records,
     not as a table or vectors. Same kernel, different interpretation.
     """
 
@@ -402,12 +402,12 @@ class StreamView:
 # Git View — files + directories, version control
 # ===========================================================================
 
-class GitView:
+class GitLens:
     """
     A Git-style view. Stores files as blobs, directories as trees, commits
     as commit objects, branches as named references.
 
-    Demonstrates: a View that interprets objects as a filesystem, not as
+    Demonstrates: a Lens that interprets objects as a filesystem, not as
     a database. Same kernel, different interpretation. This is the
     "implement Git on top of Pond" experiment.
     """

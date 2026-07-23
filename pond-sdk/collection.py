@@ -213,7 +213,7 @@ class Collection:
 
     @property
     def source(self) -> Optional[str]:
-        """The source Collection name (if this is a materialized view).
+        """The source Collection name (if this is a materialized lens).
         None for base Collections."""
         return self._meta.get("source")
 
@@ -321,7 +321,7 @@ class Collection:
         views = [v for v in Collection.list(kernel) if v.get("source") is not None]
         if source:
             views = [v for v in views if v.get("source") == source]
-        return views
+        return lenss
 
     @staticmethod
     def list_base(kernel: PondMinimal) -> list[dict]:

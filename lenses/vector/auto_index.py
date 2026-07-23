@@ -1,8 +1,8 @@
 """
-Mock implementation of View (Layer 1) and IndexedView (Layer 2),
+Mock implementation of View (Layer 1) and IndexedLens (Layer 2),
 built ONLY from the SDK specification.
 
-NOT the real SDK.  Used for testing VectorView.
+NOT the real SDK.  Used for testing VectorLens.
 """
 
 import json
@@ -14,7 +14,7 @@ from mock_kernel import PondMinimal  # noqa: F401  (re-exported for convenience)
 # Layer 1: View
 # ---------------------------------------------------------------------------
 
-class View:
+class Lens:
     """
     A versioned, content-addressed key/value view on top of the kernel.
 
@@ -169,7 +169,7 @@ class View:
         }
         return {"added": added, "removed": removed, "modified": modified}
 
-    # ---- Indexing (basic, overridden by IndexedView) ----
+    # ---- Indexing (basic, overridden by IndexedLens) ----
 
     def create_index(self, name: str, extractor) -> str:
         snapshot = self._get_snapshot()
@@ -215,12 +215,12 @@ class View:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: IndexedView
+# Layer 2: IndexedLens
 # ---------------------------------------------------------------------------
 
-class IndexedView(View):
+class IndexedLens(Lens):
     """
-    View with automatic, registered indexes.
+    Lens with automatic, registered indexes.
 
     Modes:
       "lazy"  — index rebuilt on read when staleness >= budget.
@@ -327,3 +327,7 @@ class IndexedView(View):
 
     def get_index_staleness(self, index_name: str) -> int:
         return self._staleness(index_name)
+
+# Backward-compatible alias
+View = Lens  # backward-compatible alias
+IndexedView = IndexedLens  # backward-compatible alias

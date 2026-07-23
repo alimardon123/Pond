@@ -27,7 +27,7 @@ import os
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from notebook import NotebookView
+from notebook import NotebookLens
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prototype"))
 from pond_minimal import PondMinimal
@@ -36,7 +36,7 @@ from pond_minimal import PondMinimal
 def get_kernel_and_notebook(notebook_dir=None):
     notebook_dir = notebook_dir or os.environ.get("POND_NOTEBOOK_DIR", ".pond_notebook")
     kernel = PondMinimal(notebook_dir)
-    nb = NotebookView(kernel, "notebook")
+    nb = NotebookLens(kernel, "notebook")
     return kernel, nb
 
 

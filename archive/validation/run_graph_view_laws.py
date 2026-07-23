@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Run view_laws.py against the externally-built GraphView.
+Run view_laws.py against the externally-built GraphLens.
 
 This is the strongest possible test of RFC-0007's generality:
-a View built from spec alone (no access to pond-sdk internals)
+a Lens built from spec alone (no access to pond-sdk internals)
 should still satisfy all 6 View algebra laws.
 
-If this passes, it confirms that the View algebra is a real
+If this passes, it confirms that the Lens algebra is a real
 specification, not just a description of pond-sdk's own Views.
 """
 
@@ -23,14 +23,14 @@ sys.path.insert(0, os.path.join(POND_ROOT, "pond-sdk"))
 sys.path.insert(0, os.path.join(POND_ROOT, "validation"))
 
 from pond_minimal import PondMinimal
-from lens_laws import ViewLaws, ViewContract
+from lens_laws import LensLaws, LensContract
 from graph_view_external import GraphView
 
 
 def make_graph_view_contract(kernel) -> tuple:
-    """Contract for the externally-built GraphView."""
+    """Contract for the externally-built GraphLens."""
     view = GraphView(kernel, "ci_graph_external")
-    return view, ViewContract(
+    return view, LensContract(
         name="ci_graph_external",
         encode=view.encode,
         decode=view.decode,
@@ -62,7 +62,7 @@ def main() -> int:
     try:
         kernel = PondMinimal(bench_dir)
         view, contract = make_graph_view_contract(kernel)
-        laws = ViewLaws(kernel)
+        laws = LensLaws(kernel)
         report = laws.check_all(contract, num_samples=10)
         print(report)
         print()

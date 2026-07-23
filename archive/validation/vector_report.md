@@ -39,7 +39,7 @@ to code against.
 
 However, "sufficient" implies I could ship with confidence.  I could not.
 To actually *test* my implementation I had to write three mock SDK modules
-(`pond_minimal.py`, `auto_index.py`, `view_sdk.py`) — totalling ~250 lines —
+(`pond_minimal.py`, `auto_index.py`, `lens_sdk.py`) — totalling ~250 lines —
 because the spec does not describe internal behavior, only signatures.
 If I had been handed a real SDK binary with no source, at least six of my
 guesses could have been wrong and my code would have silently failed or
@@ -193,7 +193,7 @@ documenting why it's intentionally absent).
 | `pond-vector/vector_view.py` | The VectorView implementation (spec-only) |
 | `pond-vector/pond_minimal.py` | Mock kernel (for testing) |
 | `pond-vector/auto_index.py` | Mock View + IndexedView (for testing) |
-| `pond-vector/view_sdk.py` | Mock CrossView (for testing) |
+| `pond-vector/lens_sdk.py` | Mock CrossView (for testing) |
 | `pond-vector/test_vector.py` | Test harness — all 22 checks pass |
 | `validation/vector_report.md` | This report |
 

@@ -4,7 +4,7 @@ Identity experiments — trying to falsify each primitive assumption.
 Per the architecture review: stop optimizing the hypothesis, start trying
 to destroy it. Each experiment ends in one of three outcomes:
   - SURVIVED: the kernel remains unchanged (hypothesis holds)
-  - DERIVED:  the feature moves into a View/cache (kernel shrinks)
+  - DERIVED:  the feature moves into a Lens/cache (kernel shrinks)
   - BROKEN:   a fundamental flaw is found; core abstraction needs revisiting
 
 10 experiments total. Run them in order.
@@ -112,12 +112,12 @@ def exp1_remove_content_addressing():
     print(f"  Dedup: NO. Same bytes stored multiple times.")
     print()
 
-    # Could we build a View that does its own hashing?
-    # Yes — a View could write hash(bytes) into a side index. But that's
-    # the View re-implementing content-addressing, not the kernel providing it.
-    print(f"  Could a View implement content-addressing on top of ID addressing?")
-    print(f"    Yes — a View could maintain hash -> id mapping in a side blob.")
-    print(f"    But this is the View re-implementing what content-addressing gives for free.")
+    # Could we build a Lens that does its own hashing?
+    # Yes — a Lens could write hash(bytes) into a side index. But that's
+    # the Lens re-implementing content-addressing, not the kernel providing it.
+    print(f"  Could a Lens implement content-addressing on top of ID addressing?")
+    print(f"    Yes — a Lens could maintain hash -> id mapping in a side blob.")
+    print(f"    But this is the Lens re-implementing what content-addressing gives for free.")
     print()
 
     print(f"  VERDICT: ⚠ DERIVED")
@@ -126,7 +126,7 @@ def exp1_remove_content_addressing():
     print(f"    - Dedup (same bytes -> different IDs)")
     print(f"    - Integrity (cannot re-verify bytes match address)")
     print(f"    - Immutability (no enforced 'bytes at hash H never change')")
-    print(f"  The 'immutable' in 'immutable object runtime' becomes a View convention,")
+    print(f"  The 'immutable' in 'immutable object runtime' becomes a Lens convention,")
     print(f"  not a kernel guarantee. This is a significant weakening of the contract.")
     print()
     print(f"  Decision: KEEP content-addressing as primitive. It's what makes the")
@@ -178,7 +178,7 @@ def exp2_remove_immutability():
     print("     lock-free reads (the bytes won't change mid-read).")
     print()
     print("  Could Views compensate? A View could keep its own version chain")
-    print("  (write_new, never overwrite). But this is the View re-implementing")
+    print("  (write_new, never overwrite). But this is the Lens re-implementing")
     print("  what immutability gives for free — and the kernel couldn't enforce it.")
     print()
     print("  VERDICT: ✗ BROKEN (without immutability)")
@@ -207,7 +207,7 @@ def exp3_replace_reference_with_lookup():
     print("  Test: replace with Lookup (find blobs by predicate). No mutations.")
     print()
 
-    print("  Without Reference, how does a View find its current data?")
+    print("  Without Reference, how does a Lens find its current data?")
     print()
     print("  Option A: Views hardcode hashes (like IPFS without IPNS).")
     print("    -> A database needs stable names. Every restart must re-resolve.")
@@ -331,16 +331,16 @@ def exp5_postgres_backend():
     print(f"  Names in namespace: {kernel.list_names()}")
     print()
 
-    # Now run a real View (SQLView from views_minimal) on the Postgres kernel
-    print("  Testing: can SQLView run on the Postgres kernel?")
+    # Now run a real View (SQLLens from views_minimal) on the Postgres kernel
+    print("  Testing: can SQLLens run on the Postgres kernel?")
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-    # SQLView expects kernel.write, kernel.read, kernel.read_blob, kernel.resolve, kernel.reference
+    # SQLLens expects kernel.write, kernel.read, kernel.read_blob, kernel.resolve, kernel.reference
     # PostgresKernel has all of these. Should work.
     try:
-        from views_minimal import SQLView
+        from views_minimal import SQLLens
         import pyarrow as pa
-        sql = SQLView(kernel, "pg_users")
+        sql = SQLLens(kernel, "pg_users")
         schema = pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())])
         sql.create(schema)
         batch = pa.RecordBatch.from_arrays([
@@ -351,9 +351,9 @@ def exp5_postgres_backend():
         sql.commit()
         t = sql.read()
         assert t.num_rows == 2
-        print(f"  ✓ SQLView works on Postgres kernel (2 rows)")
+        print(f"  ✓ SQLLens works on Postgres kernel (2 rows)")
     except Exception as e:
-        print(f"  ✗ SQLView failed on Postgres kernel: {e}")
+        print(f"  ✗ SQLLens failed on Postgres kernel: {e}")
 
     print()
     print("  VERDICT: ✓ SURVIVED")
@@ -402,26 +402,26 @@ def exp7_anti_iceberg():
     print("  The kernel itself would survive. It has zero dependencies on any")
     print("  of the technologies that 'disappeared.'")
     print()
-    print("  What about the Views?")
-    print("    - SQLView imports pyarrow + parquet -> WOULD BREAK")
-    print("    - VectorView imports struct -> survives (uses raw float bytes)")
+    print("  What about the Lenss?")
+    print("    - SQLLens imports pyarrow + parquet -> WOULD BREAK")
+    print("    - VectorLens imports struct -> survives (uses raw float bytes)")
     print("    - StreamView imports struct -> survives")
-    print("    - GitView imports json -> survives")
+    print("    - GitLens imports json -> survives")
     print("    - GraphView imports json -> survives")
     print("    - MLView imports json -> survives")
     print("    - TimeSeriesView imports struct -> survives")
     print("    - OCIView imports json -> survives")
     print()
-    print("  7 of 8 Views survive. SQLView breaks because it specifically chose")
+    print("  7 of 8 Views survive. SQLLens breaks because it specifically chose")
     print("  Parquet as its serialization format — but that's a VIEW choice,")
-    print("  not a kernel requirement. A future SQLView could use ORC, Arrow IPC,")
+    print("  not a kernel requirement. A future SQLLens could use ORC, Arrow IPC,")
     print("  CSV, JSON, or a custom format. The kernel doesn't care.")
     print()
     print("  VERDICT: ✓ SURVIVED")
     print()
     print("  The kernel has zero coupling to today's data ecosystem. If Parquet,")
     print("  Arrow, DuckDB, Iceberg, and Spark all disappeared tomorrow, Pond's")
-    print("  kernel would continue to function unchanged. Only SQLView (which")
+    print("  kernel would continue to function unchanged. Only SQLLens (which")
     print("  chose Parquet) would need to be rewritten to use a different format.")
     print()
     print("  This is the strongest evidence that Pond is not 'another Iceberg.'")
@@ -597,7 +597,7 @@ def exp8_alien_workloads():
     print("  VERDICT: ✓ SURVIVED")
     print()
     print("  6 alien workloads (Minecraft, Blender, CAD, Genome, PACS, Photoshop)")
-    print("  all built on Pond with ZERO kernel changes. Each is a View using")
+    print("  all built on Pond with ZERO kernel changes. Each is a Lens using")
     print("  only Write + Read + Reference + Tree/Commit patterns.")
     print()
     print("  The kernel genuinely doesn't care what the bytes represent. Voxel")
@@ -665,7 +665,7 @@ def exp10_databricks_without_sql():
     print()
     print("  Can someone build Databricks-level capabilities (data warehouse,")
     print("  ML platform, streaming, governance) on Pond WITHOUT ever implementing")
-    print("  SQLView?")
+    print("  SQLLens?")
     print()
     print("  Databricks provides:")
     print("    1. Data warehouse (SQL queries on lakehouse)")
@@ -674,25 +674,25 @@ def exp10_databricks_without_sql():
     print("    4. Governance (Unity Catalog)")
     print("    5. Dashboards/BI")
     print()
-    print("  On Pond, WITHOUT SQLView:")
+    print("  On Pond, WITHOUT SQLLens:")
     print("    1. Data warehouse -> could use a different query View")
     print("       (e.g., a NoSQL document View, a graph View, a tensor View)")
     print("       The KERNEL doesn't require SQL. A user who never wants SQL")
-    print("       can build a data warehouse using a different View.")
+    print("       can build a data warehouse using a different Lens.")
     print("    2. ML platform -> MLView (already implemented) provides checkpoint")
     print("       tracking, lineage, artifact registry. No SQL needed.")
     print("    3. Streaming -> StreamView (already implemented) provides")
     print("       Kafka-like logs. No SQL needed.")
     print("    4. Governance -> root namespace (Reference) provides naming +")
-    print("       access control could be a View layer on top.")
+    print("       access control could be a Lens layer on top.")
     print("    5. Dashboards -> could be built on any View that returns data.")
     print()
     print("  A user who wants video analytics, AI tensor pipelines, robotics")
     print("  data, simulation logs, or document management could build all of")
-    print("  these on Pond using VectorView, MLView, StreamView, DocumentView,")
-    print("  etc. — without ever touching SQLView.")
+    print("  these on Pond using VectorLens, MLView, StreamView, DocumentView,")
+    print("  etc. — without ever touching SQLLens.")
     print()
-    print("  SQLView is ONE View among many. It's not privileged. A user who")
+    print("  SQLLens is ONE View among many. It's not privileged. A user who")
     print("  doesn't want SQL doesn't have to install it.")
     print()
     print("  VERDICT: ✓ SURVIVED")

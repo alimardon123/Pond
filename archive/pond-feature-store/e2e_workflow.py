@@ -6,7 +6,7 @@ This script runs the Feature Store through a complete, realistic ML
 workflow to validate that Pond's "platform" story is actually pleasant
 to use. It exercises every production feature in a single narrative:
 
-  1. Source data ingestion (orders as a source View)
+  1. Source data ingestion (orders as a source Lens)
   2. Feature definitions (with types, sources, transformations)
   3. Feature value writing (batch + incremental, at multiple timestamps)
   4. Feature versioning (redefine a feature to fix a bug; v1 -> v2)
@@ -14,8 +14,8 @@ to use. It exercises every production feature in a single narrative:
   6. Online serving (single-entity inference)
   7. Batch serving (multi-entity scoring via get_feature_matrix)
   8. Freshness monitoring (across all features)
-  9. Cross-View reads (ingest from ArrowView; serve to DuckDB via Arrow)
-  10. Lineage (source View -> feature -> transformation)
+  9. Cross-Lens reads (ingest from ArrowLens; serve to DuckDB via Arrow)
+  10. Lineage (source Lens -> feature -> transformation)
   11. Persistence (close kernel, reopen, verify model still works)
   12. Schema validation (reject a bad write; verify data integrity)
 
@@ -53,7 +53,7 @@ sys.path.insert(0, _HERE)
 
 from pond_minimal import PondMinimal
 from feature_store import FeatureStore
-from lens_sdk import View, CrossView
+from lens_sdk import View, CrossLens
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +127,12 @@ def run_e2e_workflow():
 
     banner("Pond Feature Store — End-to-End Reference ML Workflow")
     print("  Scenario: e-commerce fraud detection")
-    print("  Stack: Kernel -> ProllyViewBase -> IndexedView -> FeatureStore")
+    print("  Stack: Kernel -> ProllyLensBase -> IndexedLens -> FeatureStore")
 
     # ====================================================================
     # Step 1: Source data ingestion
     # ====================================================================
-    step(1, "Source data ingestion (orders as a source View)")
+    step(1, "Source data ingestion (orders as a source Lens)")
 
     orders_data = generate_orders(n=1000)
     print(f"  Generated {len(orders_data)} synthetic orders across "
@@ -437,18 +437,18 @@ def run_e2e_workflow():
     print(f"  not O(N) scanning all values.")
 
     # ====================================================================
-    # Step 9: Cross-View reads (ingest from ArrowView; serve to DuckDB)
+    # Step 9: Cross-Lens reads (ingest from ArrowLens; serve to DuckDB)
     # ====================================================================
-    step(9, "Cross-View reads (ArrowView interop for analytics)")
+    step(9, "Cross-Lens reads (ArrowLens interop for analytics)")
 
-    # Build an ArrowView from the feature matrix and serve to DuckDB
+    # Build an ArrowLens from the feature matrix and serve to DuckDB
     # for ad-hoc SQL analytics.
     try:
         import pyarrow as pa
-        from arrow_view import ArrowView
+        from arrow_view import ArrowLens
 
-        # Convert the feature matrix to an ArrowView
-        analytics = ArrowView(kernel, "feature_analytics")
+        # Convert the feature matrix to an ArrowLens
+        analytics = ArrowLens(kernel, "feature_analytics")
         for row in matrix:
             analytics.put_row(row["entity_id"], {
                 "customer_id": row["entity_id"],
@@ -458,10 +458,10 @@ def run_e2e_workflow():
                 "distinct_products": row.get("customer_distinct_products") or 0,
                 "is_high_value": row.get("is_high_value_customer") or False,
             })
-        analytics.commit("load feature matrix into ArrowView")
+        analytics.commit("load feature matrix into ArrowLens")
 
         table = analytics.to_arrow()
-        print(f"  ArrowView 'feature_analytics': {table.num_rows} rows, "
+        print(f"  ArrowLens 'feature_analytics': {table.num_rows} rows, "
               f"{table.num_columns} columns")
 
         # Serve to DuckDB for SQL analytics
@@ -495,16 +495,16 @@ def run_e2e_workflow():
             for row in q3:
                 print(f"    {row[0]}: ${row[1]:.2f} ({row[2]} products)")
             con.close()
-            print(f"  -> PASS: Feature data served to DuckDB via ArrowView")
+            print(f"  -> PASS: Feature data served to DuckDB via ArrowLens")
         except ImportError:
             print(f"  SKIP: DuckDB not installed; skipping SQL analytics demo")
     except ImportError:
-        print(f"  SKIP: pyarrow not installed; skipping ArrowView interop demo")
+        print(f"  SKIP: pyarrow not installed; skipping ArrowLens interop demo")
 
     # ====================================================================
-    # Step 10: Lineage (source View -> feature -> transformation)
+    # Step 10: Lineage (source Lens -> feature -> transformation)
     # ====================================================================
-    step(10, "Lineage (source View -> feature -> transformation)")
+    step(10, "Lineage (source Lens -> feature -> transformation)")
 
     print(f"  {'feature':<32} {'source':>10} {'values':>8}  transformation")
     print(f"  {'-'*32} {'-'*10} {'-'*8}  {'-'*40}")
@@ -609,7 +609,7 @@ def run_e2e_workflow():
     print("    - Online serving (single-entity inference)")
     print("    - Batch serving (50 customers x 5 features)")
     print("    - Freshness monitoring (O(1) per feature)")
-    print("    - Cross-View reads (ArrowView -> DuckDB SQL analytics)")
+    print("    - Cross-Lens reads (ArrowLens -> DuckDB SQL analytics)")
     print("    - Lineage (source -> feature -> transformation)")
     print("    - Persistence (full state survived process restart)")
     print("    - Schema validation (3 bad writes rejected)")

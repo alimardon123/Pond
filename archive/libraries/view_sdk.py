@@ -1,8 +1,8 @@
 """
-Enhanced View SDK with:
+Enhanced Lens SDK with:
   - Index management (create/drop/refresh — metadata only, NO data rewrite)
-  - Ossie-aligned SemanticView (Apache Ossie open semantic interchange spec)
-  - Recursive View composition (Phase D)
+  - Ossie-aligned SemanticLens (Apache Ossie open semantic interchange spec)
+  - Recursive Lens composition (Phase D)
 
 Answers the user's question:
   Q: If I want to drop/create/refresh indexes, do I have to rewrite data or metadata?
@@ -24,17 +24,17 @@ from typing import Optional, Any, Callable
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase, ProllyTree
+from prolly_view import ProllyLensBase, ProllyTree
 from binary_encoding import BinaryProllyTree
 
 
 # ===========================================================================
-# Enhanced View with full index management
+# Enhanced Lens with full index management
 # ===========================================================================
 
 class View:
     """
-    Abstract base class for all Pond Views.
+    Abstract base class for all Pond Lenses.
 
     Index management:
       - create_index(name, extractor): builds a Prolly tree mapping
@@ -43,7 +43,7 @@ class View:
         Data blobs are untouched.
       - refresh_index(name, extractor): rebuilds the index from current data.
         Does NOT touch data blobs.
-      - list_indexes(): lists all indexes for this View.
+      - list_indexes(): lists all indexes for this Lens.
 
     All index operations work on METADATA only (Prolly trees of key→hash).
     Data blobs are immutable and never rewritten.
@@ -52,7 +52,7 @@ class View:
     def __init__(self, kernel: PondMinimal, name: str):
         self.kernel = kernel
         self.name = name
-        self.base = ProllyViewBase(kernel, name)
+        self.base = ProllyLensBase(kernel, name)
 
     # --- Write path ---
     def put(self, key: str, data: Any) -> str:
@@ -158,7 +158,7 @@ class View:
         return self.create_index(index_name, key_extractor)
 
     def list_indexes(self) -> list[str]:
-        """List all indexes for this View."""
+        """List all indexes for this Lens."""
         prefix = f"{self.name}__index__"
         return [n[len(prefix):] for n in self.kernel.list_names() if n.startswith(prefix)]
 
@@ -179,27 +179,27 @@ class View:
 
 
 # ===========================================================================
-# CrossView — read/write across Views
+# CrossLens — read/write across Views
 # ===========================================================================
 
-class CrossView:
+class CrossLens:
     @staticmethod
-    def read_from(view: View, key: str) -> Optional[Any]:
+    def read_from(view: Lens, key: str) -> Optional[Any]:
         return view.get(key)
     @staticmethod
-    def read_all_from(view: View) -> dict[str, Any]:
+    def read_all_from(view: Lens) -> dict[str, Any]:
         return view.get_all()
     @staticmethod
-    def write_to(view: View, key: str, data: Any) -> str:
+    def write_to(view: Lens, key: str, data: Any) -> str:
         return view.put(key, data)
     @staticmethod
-    def share_blob(from_view: View, from_key: str, to_view: View, to_key: str) -> bool:
+    def share_blob(from_view: Lens, from_key: str, to_view: Lens, to_key: str) -> bool:
         h = from_view.base.lookup(from_key)
         if h is None: return False
         to_view.put_raw(to_key, h)
         return True
     @staticmethod
-    def pipe(from_view: View, to_view: View,
+    def pipe(from_view: Lens, to_view: Lens,
              transformer: Optional[Callable] = None) -> int:
         state = from_view.base.read_all()
         count = 0
@@ -216,13 +216,13 @@ class CrossView:
 
 
 # ===========================================================================
-# OssieSemanticView — aligned with Apache Ossie open semantic interchange spec
+# OssieSemanticLens — aligned with Apache Ossie open semantic interchange spec
 # ===========================================================================
 
 class SemanticModelAdapter:
     """Abstract interface for semantic model formats.
     Pond supports multiple semantic model standards (Ossie, Cube, dbt, etc.)
-    via adapters. The kernel and View SDK are NOT coupled to any specific format."""
+    via adapters. The kernel and Lens SDK are NOT coupled to any specific format."""
     def export_model(self, view: 'View') -> dict:
         raise NotImplementedError
     def import_model(self, view: 'View', model: dict) -> None:
@@ -244,14 +244,14 @@ class OssieAdapter(SemanticModelAdapter):
         return model
 
     def import_model(self, view: 'View', model: dict) -> None:
-        """Import an Ossie-format model into the View."""
+        """Import an Ossie-format model into the Lens."""
         for metric in model.get("metrics", []):
             view.put(f"_semantic/metrics/{metric['name']}", metric)
         for rel in model.get("relationships", []):
             view.put(f"_semantic/relationships/{rel['name']}", rel)
 
 
-class SemanticView(View):
+class SemanticLens(Lens):
     """
     A View that manages semantic models (metrics, dimensions, relationships).
 
@@ -348,9 +348,9 @@ class SemanticView(View):
     def get_metric(self, name: str) -> Optional[dict]:
         return self.get(f"_semantic/metrics/{name}")
 
-    def execute_metric(self, metric_name: str, source_view: View,
+    def execute_metric(self, metric_name: str, source_view: Lens,
                        group_by: list[str] = None) -> list[dict]:
-        """Execute a metric query against a source View."""
+        """Execute a metric query against a source Lens."""
         metric = self.get_metric(metric_name)
         if not metric:
             raise ValueError(f"Metric '{metric_name}' not found")
@@ -395,7 +395,7 @@ class SemanticView(View):
 
 
 # ===========================================================================
-# Test: Index management + Ossie SemanticView
+# Test: Index management + Ossie SemanticLens
 # ===========================================================================
 
 def test_all():
@@ -407,7 +407,7 @@ def test_all():
 
     print("=== INDEX MANAGEMENT TEST ===\n")
 
-    # Create a View with data
+    # Create a Lens with data
     db = View(kernel, "db")
     db.put("user:1", {"name": "Alice", "age": 30, "region": "US"})
     db.put("user:2", {"name": "Bob", "age": 25, "region": "EU"})
@@ -449,7 +449,7 @@ def test_all():
     print("\n=== OSSIE SEMANTIC VIEW TEST ===\n")
 
     # Create Ossie semantic model
-    semantic = OssieSemanticView(kernel, "semantic")
+    semantic = OssieSemanticLens(kernel, "semantic")
 
     # Define metrics with multi-dialect expressions (Ossie pattern)
     semantic.define_metric_ossie(

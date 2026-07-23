@@ -128,12 +128,12 @@ def exp_memory():
     assert kernel.read("test") == b"hello"
     print(f"  Reference + Read: ✓")
 
-    # Run a real View (SQLView expects the 3 primitives)
+    # Run a real View (SQLLens expects the 3 primitives)
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
     try:
-        from views_minimal import SQLView
+        from views_minimal import SQLLens
         import pyarrow as pa
-        sql = SQLView(kernel, "mem_users")
+        sql = SQLLens(kernel, "mem_users")
         schema = pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())])
         sql.create(schema)
         batch = pa.RecordBatch.from_arrays([
@@ -144,9 +144,9 @@ def exp_memory():
         sql.commit()
         t = sql.read()
         assert t.num_rows == 2
-        print(f"  SQLView on memory kernel: ✓ (2 rows)")
+        print(f"  SQLLens on memory kernel: ✓ (2 rows)")
     except Exception as e:
-        print(f"  SQLView on memory kernel FAILED: {e}")
+        print(f"  SQLLens on memory kernel FAILED: {e}")
         return False
 
     print()
@@ -231,11 +231,11 @@ def exp_sqlite():
     assert kernel.read("test") == b"hello"
     print(f"  Reference + Read: ✓")
 
-    # Run SQLView
+    # Run SQLLens
     try:
-        from views_minimal import SQLView
+        from views_minimal import SQLLens
         import pyarrow as pa
-        sql = SQLView(kernel, "sqlite_users")
+        sql = SQLLens(kernel, "sqlite_users")
         schema = pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())])
         sql.create(schema)
         batch = pa.RecordBatch.from_arrays([
@@ -246,9 +246,9 @@ def exp_sqlite():
         sql.commit()
         t = sql.read()
         assert t.num_rows == 3
-        print(f"  SQLView on SQLite kernel: ✓ (3 rows)")
+        print(f"  SQLLens on SQLite kernel: ✓ (3 rows)")
     except Exception as e:
-        print(f"  SQLView on SQLite kernel FAILED: {e}")
+        print(f"  SQLLens on SQLite kernel FAILED: {e}")
         return False
 
     kernel.close()
@@ -327,11 +327,11 @@ def exp_redis():
     assert kernel.read("test") == b"redis data"
     print(f"  Reference + Read: ✓")
 
-    # Run SQLView
+    # Run SQLLens
     try:
-        from views_minimal import SQLView
+        from views_minimal import SQLLens
         import pyarrow as pa
-        sql = SQLView(kernel, "redis_users")
+        sql = SQLLens(kernel, "redis_users")
         schema = pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())])
         sql.create(schema)
         batch = pa.RecordBatch.from_arrays([
@@ -342,9 +342,9 @@ def exp_redis():
         sql.commit()
         t = sql.read()
         assert t.num_rows == 2
-        print(f"  SQLView on Redis-like kernel: ✓ (2 rows)")
+        print(f"  SQLLens on Redis-like kernel: ✓ (2 rows)")
     except Exception as e:
-        print(f"  SQLView on Redis-like kernel FAILED: {e}")
+        print(f"  SQLLens on Redis-like kernel FAILED: {e}")
         return False
 
     print()
@@ -438,11 +438,11 @@ def exp_s3():
     assert kernel.read("test") == b"s3 data"
     print(f"  Reference + Read: ✓")
 
-    # Run SQLView
+    # Run SQLLens
     try:
-        from views_minimal import SQLView
+        from views_minimal import SQLLens
         import pyarrow as pa
-        sql = SQLView(kernel, "s3_users")
+        sql = SQLLens(kernel, "s3_users")
         schema = pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())])
         sql.create(schema)
         batch = pa.RecordBatch.from_arrays([
@@ -453,9 +453,9 @@ def exp_s3():
         sql.commit()
         t = sql.read()
         assert t.num_rows == 4
-        print(f"  SQLView on S3-like kernel: ✓ (4 rows)")
+        print(f"  SQLLens on S3-like kernel: ✓ (4 rows)")
     except Exception as e:
-        print(f"  SQLView on S3-like kernel FAILED: {e}")
+        print(f"  SQLLens on S3-like kernel FAILED: {e}")
         return False
 
     print()

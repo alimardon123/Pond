@@ -11,7 +11,7 @@ This module implements the maintenance operations defined in RFC-0008
     is the Layer 1 "delete" operation. Idempotent.
   - is_dropped(kernel, name): True iff name is bound to TOMBSTONE_HASH.
   - resolve_active(kernel, name): resolve a name, returning None for
-    unbound OR tombstoned names. This is what View code should call
+    unbound OR tombstoned names. This is what Lens code should call
     instead of kernel.resolve() when it wants "active names only."
   - compact_tombstones(kernel): physical maintenance — remove rows
     from the kernel's root namespace whose current binding is
@@ -99,7 +99,7 @@ def resolve_active(kernel, name: str) -> Optional[str]:
     """Resolve a name to its hash, returning None for unbound OR
     tombstoned names.
 
-    This is the function View code should call when it wants "active
+    This is the function Lens code should call when it wants "active
     names only." Use kernel.resolve() directly only when you need to
     distinguish "unbound" from "tombstoned" (rare).
     """

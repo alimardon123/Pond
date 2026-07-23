@@ -2,7 +2,7 @@
 Pond Kernel Admission Rule (architectural law, not implementation).
 
 A feature enters the storage kernel ONLY if it satisfies ALL five criteria.
-If any criterion fails, the feature belongs in a View, not the kernel.
+If any criterion fails, the feature belongs in a Lens, not the kernel.
 
 This file is documentation, not code. It exists to be referenced in code
 review: every PR that touches pond_kernel.py must answer "which criterion
@@ -17,29 +17,29 @@ The five criteria:
      If only one View needs it, it doesn't belong in the kernel.
 
   2. IMPOSSIBLE OUTSIDE THE KERNEL
-     If a View can implement the feature using existing kernel syscalls,
+     If a Lens can implement the feature using existing kernel syscalls,
      the feature stays out of the kernel.
      Test: can I implement this as a Tree pattern, a Commit convention,
-     or a View-level cache? If yes, it's a View concern.
+     or a Lens-level cache? If yes, it's a Lens concern.
 
   3. IMMUTABLE
      The kernel never owns mutable semantics. Mutable state (name -> hash
      mappings in the root namespace) is the only exception, and it's the
      smallest possible mutable surface.
      Test: does this feature require the kernel to track changing state
-     beyond name -> hash? If yes, it's a View concern.
+     beyond name -> hash? If yes, it's a Lens concern.
 
   4. STORAGE-INDEPENDENT
      The kernel cannot know about: Arrow, Parquet, Delta, Iceberg, JSON,
      protobuf, SQL, vectors, rows, columns, events, tables, schemas,
      images, audio, video, model weights, edges, nodes, layers, segments.
      Test: does this feature reference any format or workload type? If
-     yes, it's a View concern.
+     yes, it's a Lens concern.
 
   5. DECADES-STABLE
      Could Linux keep this syscall for 30 years? If not, it doesn't belong.
      Test: is this feature likely to be obsoleted by hardware, format, or
-     workload evolution in the next decade? If yes, it's a View concern.
+     workload evolution in the next decade? If yes, it's a Lens concern.
 
 ---
 
@@ -70,8 +70,8 @@ Applying the rule to current kernel features:
 
 The two close calls:
 
-  * Hierarchical trees (subtree compaction): Could arguably be a View
-    concern (a View could implement its own tree-walk caching). But every
+  * Hierarchical trees (subtree compaction): Could arguably be a Lens
+    concern (a Lens could implement its own tree-walk caching). But every
     View that builds a Tree benefits from hierarchy, so it's universal.
     Admitted to kernel — but watch for drift.
 
@@ -84,7 +84,7 @@ The two close calls:
 
 The rule in one sentence:
 
-  > If a View can do it, a View must do it.
+  > If a Lens can do it, a Lens must do it.
 """
 
 

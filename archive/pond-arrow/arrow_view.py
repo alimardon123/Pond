@@ -1,5 +1,5 @@
 """
-ArrowView — a Pond View that stores tabular data as Apache Arrow IPC
+ArrowLens — a Pond Lens that stores tabular data as Apache Arrow IPC
 streams, exposing the data to external Arrow-compatible systems
 (DuckDB, Polars, DataFusion, Lance, pandas) without those systems
 needing to know Pond exists.
@@ -98,11 +98,11 @@ def rows_to_table(rows: list[dict], schema: Optional[pa.Schema] = None) -> pa.Ta
 
 
 # ---------------------------------------------------------------------------
-# ArrowView — the Phase D compatibility adapter
+# ArrowLens — the Phase D compatibility adapter
 # ---------------------------------------------------------------------------
 
-class ArrowView(View):
-    """A Pond View that stores tabular data as Apache Arrow IPC.
+class ArrowLens(Lens):
+    """A Pond Lens that stores tabular data as Apache Arrow IPC.
 
     Compatibility:
       - DuckDB: `con.from_arrow(view.to_arrow())`
@@ -117,11 +117,11 @@ class ArrowView(View):
 
     def __init__(self, kernel: PondMinimal, name: str,
                  schema: Optional[pa.Schema] = None):
-        """Construct an ArrowView.
+        """Construct an ArrowLens.
 
         Args:
             kernel: the Pond kernel.
-            name: the View name (used in kernel References).
+            name: the Lens name (used in kernel References).
             schema: optional pyarrow.Schema. If provided, all put_row
                 calls must conform to this schema. If None, schema is
                 inferred from the first put_row call.
@@ -133,13 +133,13 @@ class ArrowView(View):
         self._pk_field: str = "_pk"  # primary-key field name in rows
 
     # ------------------------------------------------------------------
-    # Encode/Decode override (the View Algebra E/D pair)
+    # Encode/Decode override (the Lens Algebra E/D pair)
     # ------------------------------------------------------------------
 
     def encode(self, data: Any) -> bytes:
         """Encode data as bytes for kernel storage.
 
-        For ArrowView, `data` can be:
+        For ArrowLens, `data` can be:
           - a pyarrow.Table -> encoded as Arrow IPC
           - a list[dict] -> converted to Table then encoded as Arrow IPC
           - a dict (single row) -> wrapped in a list, converted, encoded
@@ -165,7 +165,7 @@ class ArrowView(View):
                 return data
 
     # ------------------------------------------------------------------
-    # Row-level API (the View Algebra A operations)
+    # Row-level API (the Lens Algebra A operations)
     # ------------------------------------------------------------------
 
     def put_row(self, primary_key: str, row: dict) -> str:
@@ -174,7 +174,7 @@ class ArrowView(View):
         Args:
             primary_key: the row's primary key (used for `get_row`,
                 `delete_row`, and the by_pk index).
-            row: the row data as a dict. Keys must match the View's
+            row: the row data as a dict. Keys must match the Lens's
                 schema (or the first row's keys, if no schema was set).
                 **This method does NOT mutate `row`** — it copies the
                 dict before adding the internal `_pk` field, so the
@@ -281,7 +281,7 @@ class ArrowView(View):
                 NOT pyarrow.field which requires a type).
 
         Returns:
-            A pyarrow.Table (possibly empty). None if the View is empty.
+            A pyarrow.Table (possibly empty). None if the Lens is empty.
         """
         table = self.to_arrow()
         if table is None:
@@ -302,11 +302,11 @@ class ArrowView(View):
     # ------------------------------------------------------------------
 
     def to_duckdb(self, con, table_name: Optional[str] = None) -> str:
-        """Register this View's data as a DuckDB table.
+        """Register this Lens's data as a DuckDB table.
 
         Args:
             con: a DuckDB connection (duckdb.connect()).
-            table_name: optional name; defaults to the View's name.
+            table_name: optional name; defaults to the Lens's name.
 
         Returns:
             The table name used. Query with: SELECT * FROM <name>.
@@ -340,10 +340,10 @@ class ArrowView(View):
 
     def create_arrow_index(self, index_name: str,
                             key_extractor: Callable[[dict], str]) -> str:
-        """Create a secondary index on the ArrowView.
+        """Create a secondary index on the ArrowLens.
 
         Internally uses the SDK's create_index (Prolly tree), but with
-        an Arrow-aware wrapper: the View's data is stored as Arrow IPC
+        an Arrow-aware wrapper: the Lens's data is stored as Arrow IPC
         blobs, so we decode each blob to a Table then convert to row
         dicts before passing to the extractor.
 
@@ -364,9 +364,9 @@ class ArrowView(View):
         for pk, bh in state.items():
             if pk.startswith("_"):
                 continue
-            # Decode the blob — for ArrowView, data blobs are Arrow IPC
+            # Decode the blob — for ArrowLens, data blobs are Arrow IPC
             # but the index references the per-row blob hash. Actually,
-            # ArrowView stores the FULL TABLE as one blob under
+            # ArrowLens stores the FULL TABLE as one blob under
             # "_arrow/snapshot", not per-row. So per-row indexing
             # requires a different approach: index the rows of the
             # full table, with each row's blob hash being the snapshot
@@ -450,7 +450,7 @@ class ArrowView(View):
 # ---------------------------------------------------------------------------
 
 def _test_basic_roundtrip():
-    """Verify ArrowView can put rows, commit, and read back as Arrow."""
+    """Verify ArrowLens can put rows, commit, and read back as Arrow."""
     import shutil
     bench_dir = "/tmp/pond_arrow_basic"
     if os.path.exists(bench_dir):
@@ -458,7 +458,7 @@ def _test_basic_roundtrip():
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
 
-    view = ArrowView(kernel, "users")
+    view = ArrowLens(kernel, "users")
     view.put_row("u1", {"name": "Alice", "age": 30, "region": "US"})
     view.put_row("u2", {"name": "Bob", "age": 25, "region": "EU"})
     view.put_row("u3", {"name": "Carol", "age": 35, "region": "US"})
@@ -486,11 +486,11 @@ def _test_basic_roundtrip():
 
     kernel.close()
     shutil.rmtree(bench_dir, ignore_errors=True)
-    print("PASS: ArrowView basic round-trip (put_row, commit, to_arrow, get_row, scan)")
+    print("PASS: ArrowLens basic round-trip (put_row, commit, to_arrow, get_row, scan)")
 
 
 def _test_arrow_interop():
-    """Verify ArrowView data interoperates with external Arrow consumers."""
+    """Verify ArrowLens data interoperates with external Arrow consumers."""
     import shutil
     bench_dir = "/tmp/pond_arrow_interop"
     if os.path.exists(bench_dir):
@@ -498,7 +498,7 @@ def _test_arrow_interop():
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
 
-    view = ArrowView(kernel, "orders")
+    view = ArrowLens(kernel, "orders")
     view.put_row("o1", {"product": "Widget", "amount": 100, "region": "US"})
     view.put_row("o2", {"product": "Gadget", "amount": 200, "region": "EU"})
     view.put_row("o3", {"product": "Widget", "amount": 50, "region": "US"})
@@ -512,7 +512,7 @@ def _test_arrow_interop():
         assert len(df) == 3
         assert "product" in df.columns
         assert (df["product"] == "Widget").sum() == 2
-        print("PASS: ArrowView interoperates with pandas (DataFrame conversion)")
+        print("PASS: ArrowLens interoperates with pandas (DataFrame conversion)")
     except ImportError:
         print("SKIP: pandas not installed; skipping pandas interop test")
 
@@ -525,7 +525,7 @@ def _test_arrow_interop():
         result2 = con.execute(f"SELECT COUNT(*) FROM {name} WHERE region = 'US'").fetchone()
         assert result2[0] == 2, f"Expected 2 US orders, got {result2}"
         con.close()
-        print("PASS: ArrowView interoperates with DuckDB (SELECT, GROUP BY, WHERE)")
+        print("PASS: ArrowLens interoperates with DuckDB (SELECT, GROUP BY, WHERE)")
     except ImportError:
         print("SKIP: DuckDB not installed; skipping DuckDB interop test")
 
@@ -535,13 +535,13 @@ def _test_arrow_interop():
         assert "product" in df_pl.columns
         widget_total = df_pl.filter(df_pl["product"] == "Widget")["amount"].sum()
         assert widget_total == 150, f"Expected Widget total 150, got {widget_total}"
-        print("PASS: ArrowView interoperates with Polars (filter, sum)")
+        print("PASS: ArrowLens interoperates with Polars (filter, sum)")
     except ImportError:
         print("SKIP: Polars not installed; skipping Polars interop test")
 
 
 def _test_versioning_with_arrow():
-    """Verify ArrowView supports branching and history (via base View)."""
+    """Verify ArrowLens supports branching and history (via base View)."""
     import shutil
     bench_dir = "/tmp/pond_arrow_versioning"
     if os.path.exists(bench_dir):
@@ -549,7 +549,7 @@ def _test_versioning_with_arrow():
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
 
-    view = ArrowView(kernel, "events")
+    view = ArrowLens(kernel, "events")
     view.put_row("e1", {"type": "click", "user": "u1"})
     view.put_row("e2", {"type": "view", "user": "u2"})
     view.commit("initial events")
@@ -568,11 +568,11 @@ def _test_versioning_with_arrow():
 
     kernel.close()
     shutil.rmtree(bench_dir, ignore_errors=True)
-    print("PASS: ArrowView supports branching and history")
+    print("PASS: ArrowLens supports branching and history")
 
 
 def _test_delete_and_update():
-    """Verify ArrowView supports delete and update (via put_row overwrite)."""
+    """Verify ArrowLens supports delete and update (via put_row overwrite)."""
     import shutil
     bench_dir = "/tmp/pond_arrow_delete"
     if os.path.exists(bench_dir):
@@ -580,7 +580,7 @@ def _test_delete_and_update():
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
 
-    view = ArrowView(kernel, "items")
+    view = ArrowLens(kernel, "items")
     view.put_row("i1", {"name": "first", "val": 10})
     view.put_row("i2", {"name": "second", "val": 20})
     view.commit("insert 2")
@@ -602,11 +602,11 @@ def _test_delete_and_update():
 
     kernel.close()
     shutil.rmtree(bench_dir, ignore_errors=True)
-    print("PASS: ArrowView supports update (overwrite) and delete")
+    print("PASS: ArrowLens supports update (overwrite) and delete")
 
 
 def _test_index_integration():
-    """Verify ArrowView can use the SDK's index infrastructure."""
+    """Verify ArrowLens can use the SDK's index infrastructure."""
     import shutil
     bench_dir = "/tmp/pond_arrow_index"
     if os.path.exists(bench_dir):
@@ -614,7 +614,7 @@ def _test_index_integration():
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
 
-    view = ArrowView(kernel, "products")
+    view = ArrowLens(kernel, "products")
     view.put_row("p1", {"name": "Widget", "category": "hardware"})
     view.put_row("p2", {"name": "Gadget", "category": "hardware"})
     view.put_row("p3", {"name": "Book", "category": "software"})
@@ -633,11 +633,11 @@ def _test_index_integration():
 
     kernel.close()
     shutil.rmtree(bench_dir, ignore_errors=True)
-    print("PASS: ArrowView integrates with SDK index infrastructure (create, find, drop)")
+    print("PASS: ArrowLens integrates with SDK index infrastructure (create, find, drop)")
 
 
 def _run_all_tests():
-    print("=== ArrowView — Phase D Compatibility Adapter Tests ===\n")
+    print("=== ArrowLens — Phase D Compatibility Adapter Tests ===\n")
     _test_basic_roundtrip()
     _test_arrow_interop()
     _test_versioning_with_arrow()

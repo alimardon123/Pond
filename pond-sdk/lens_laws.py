@@ -1,23 +1,23 @@
 """
 View algebra property-test harness (RFC-0007).
 
-Verifies that any Pond View satisfies the six laws of the View
+Verifies that any Pond Lens satisfies the six laws of the Lens
 algebra V = (Sigma, A, E, D, M):
 
   Law 1: Round-trip       — D(E(s)) = s
   Law 2: Purity           — operations are deterministic functions of state
   Law 3: Encoding preservation — every reachable state is persistable
   Law 4: Materialization determinism — materializations are pure functions of state
-  Law 5: Composition      — V1 + V2 is itself a View (verified structurally)
+  Law 5: Composition      — V1 + V2 is itself a Lens (verified structurally)
   Law 6: Kernel independence — the kernel never inspects blob contents
 
 Usage:
-    from lens_laws import ViewLaws, ViewContract
-    laws = ViewLaws(kernel)
+    from lens_laws import LensLaws, LensContract
+    laws = LensLaws(kernel)
     result = laws.check_all(my_view)
 
-The harness is designed to be View-agnostic. A View author
-provides a small `ViewContract` adapter that maps the View's
+The harness is designed to be View-agnostic. A Lens author
+provides a small `LensContract` adapter that maps the Lens's
 API to the harness's expectations, then runs `check_all`.
 
 See RFC-0007 for the formal statement of each law.
@@ -44,15 +44,15 @@ from pond_minimal import PondMinimal
 
 
 # ---------------------------------------------------------------------------
-# ViewContract — adapter that maps a View's API to the harness's expectations
+# LensContract — adapter that maps a Lens's API to the harness's expectations
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ViewContract:
-    """Adapter that exposes a View's algebra to the property-test harness.
+class LensContract:
+    """Adapter that exposes a Lens's algebra to the property-test harness.
 
-    A View author instantiates this with references to the View's
-    methods, then passes it to ViewLaws.check_all().
+    A Lens author instantiates this with references to the Lens's
+    methods, then passes it to LensLaws.check_all().
 
     All callables should be bound methods of a single View instance.
     The harness will call them with the documented arguments and
@@ -121,16 +121,16 @@ class LawReport:
 
 
 # ---------------------------------------------------------------------------
-# ViewLaws — the harness
+# LensLaws — the harness
 # ---------------------------------------------------------------------------
 
-class ViewLaws:
+class LensLaws:
     """Property-test harness for RFC-0007's six View algebra laws."""
 
     def __init__(self, kernel: PondMinimal):
         self.kernel = kernel
 
-    def check_all(self, contract: ViewContract, num_samples: int = 10) -> LawReport:
+    def check_all(self, contract: LensContract, num_samples: int = 10) -> LawReport:
         """Run all six law checks against the given View contract."""
         report = LawReport()
         report.add(self.check_law1_round_trip(contract, num_samples))
@@ -145,7 +145,7 @@ class ViewLaws:
     # Law 1: Round-trip — D(E(s)) = s
     # ------------------------------------------------------------------
 
-    def check_law1_round_trip(self, contract: ViewContract, num_samples: int) -> LawResult:
+    def check_law1_round_trip(self, contract: LensContract, num_samples: int) -> LawResult:
         """Verify that decode(encode(data)) == data for sample data."""
         failures = []
         for i in range(num_samples):
@@ -177,7 +177,7 @@ class ViewLaws:
     # Law 2: Purity — operations are deterministic functions of state
     # ------------------------------------------------------------------
 
-    def check_law2_purity(self, contract: ViewContract, num_samples: int) -> LawResult:
+    def check_law2_purity(self, contract: LensContract, num_samples: int) -> LawResult:
         """Verify that putting the same data twice produces the same state.
 
         We test purity by:
@@ -230,14 +230,14 @@ class ViewLaws:
     # Law 3: Encoding preservation — every reachable state is persistable
     # ------------------------------------------------------------------
 
-    def check_law3_encoding_preservation(self, contract: ViewContract, num_samples: int) -> LawResult:
+    def check_law3_encoding_preservation(self, contract: LensContract, num_samples: int) -> LawResult:
         """Verify that put + commit + get round-trips for sample data.
 
         This is the integrated form of Law 1 + Law 3: not only must
         encode/decode round-trip in isolation, but the full put→commit→get
         cycle must preserve the data.
 
-        For Views that auto-generate keys (e.g., KeylessView), the
+        For Views that auto-generate keys (e.g., KeylessLens), the
         harness uses the key returned by `put` for the subsequent
         `get`. For Views that use caller-supplied keys, the returned
         key may be the blob hash (not the lookup key); in that case
@@ -281,7 +281,7 @@ class ViewLaws:
     # Law 4: Materialization determinism
     # ------------------------------------------------------------------
 
-    def check_law4_materialization_determinism(self, contract: ViewContract) -> LawResult:
+    def check_law4_materialization_determinism(self, contract: LensContract) -> LawResult:
         """Verify that materializations (if any) are deterministic functions of state.
 
         For each materialization M:
@@ -331,10 +331,10 @@ class ViewLaws:
         )
 
     # ------------------------------------------------------------------
-    # Law 5: Composition — V1 + V2 is itself a View
+    # Law 5: Composition — V1 + V2 is itself a Lens
     # ------------------------------------------------------------------
 
-    def check_law5_composition(self, contract: ViewContract) -> LawResult:
+    def check_law5_composition(self, contract: LensContract) -> LawResult:
         """Verify the structural properties required for composition.
 
         Full composition testing requires two Views; this check verifies
@@ -364,9 +364,9 @@ class ViewLaws:
             # We can't easily create a fresh View here without the
             # View's constructor, so we verify the kernel has the data.
 
-            # Find the View's head commit
+            # Find the Lens's head commit
             head = self.kernel.resolve(contract.name) if hasattr(contract, 'name') else None
-            # Note: contract.name is the View's name, which may not be
+            # Note: contract.name is the Lens's name, which may not be
             # the same as the kernel reference name. This is a known
             # limitation; the harness assumes contract.name matches the
             # kernel reference name (the standard convention).
@@ -377,7 +377,7 @@ class ViewLaws:
                 return LawResult(
                     "Law 5: Composition (structural)",
                     passed=True,
-                    detail="View name not bound in kernel; cannot verify recoverability from fresh instance (skipped)",
+                    detail="Lens name not bound in kernel; cannot verify recoverability from fresh instance (skipped)",
                 )
 
             # Verify the data is recoverable via the contract's get().
@@ -412,8 +412,8 @@ class ViewLaws:
     # Law 6: Kernel independence — the kernel never inspects blob contents
     # ------------------------------------------------------------------
 
-    def check_law6_kernel_independence(self, contract: ViewContract) -> LawResult:
-        """Verify that the View's blobs are opaque to the kernel.
+    def check_law6_kernel_independence(self, contract: LensContract) -> LawResult:
+        """Verify that the Lens's blobs are opaque to the kernel.
 
         We test this by:
           1. Write a blob via the contract's encode path.
@@ -423,7 +423,7 @@ class ViewLaws:
              of any other View state (content-addressing property).
 
         This is largely a kernel property, but we verify it through
-        the View's encode path to ensure the View is not relying on
+        the Lens's encode path to ensure the Lens is not relying on
         the kernel to interpret its blobs.
         """
         failures = []
@@ -483,34 +483,34 @@ def _test_default_view_passes_laws():
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
 
-    view = View(kernel, "lawtest")
+    lens = Lens(kernel, "lawtest")
 
-    contract = ViewContract(
+    contract = LensContract(
         name="lawtest",
-        encode=view.encode,
-        decode=view.decode,
-        put=view.put,
-        get=view.get,
-        delete=view.delete,
-        commit=view.commit,
-        keys=view.keys,
-        get_all=view.get_all,
+        encode=lens.encode,
+        decode=lens.decode,
+        put=lens.put,
+        get=lens.get,
+        delete=lens.delete,
+        commit=lens.commit,
+        keys=lens.keys,
+        get_all=lens.get_all,
         # Default View has no materializations
         list_materializations=lambda: [],
         build_materialization=None,
         sample_data=lambda i: {"id": i, "name": f"item-{i}", "value": i * 10},
     )
 
-    laws = ViewLaws(kernel)
+    laws = LensLaws(kernel)
     report = laws.check_all(contract, num_samples=10)
 
     print(report)
     print()
 
     # Cleanup
-    for key in view.keys():
-        view.delete(key)
-    view.commit("cleanup")
+    for key in lens.keys():
+        lens.delete(key)
+    lens.commit("cleanup")
     kernel.close()
     shutil.rmtree(bench_dir, ignore_errors=True)
 
@@ -519,9 +519,9 @@ def _test_default_view_passes_laws():
 
 
 def _test_indexed_view_passes_laws():
-    """Smoke test: the IndexedView class should also pass all 6 laws."""
+    """Smoke test: the IndexedLens class should also pass all 6 laws."""
     import shutil
-    from auto_index import IndexedView
+    from auto_index import IndexedLens
 
     bench_dir = "/tmp/pond_view_laws_indexed_test"
     if os.path.exists(bench_dir):
@@ -529,37 +529,37 @@ def _test_indexed_view_passes_laws():
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
 
-    view = IndexedView(kernel, "lawtest_idx")
+    lens = IndexedLens(kernel, "lawtest_idx")
     # Register an index to exercise the materialization path
-    view.register_index("by_value", lambda d: str(d.get("value", 0)), mode="eager")
+    lens.register_index("by_value", lambda d: str(d.get("value", 0)), mode="eager")
 
     # For Law 4: treat the index as a materialization
     def build_mat(name: str) -> bytes:
         if name == "by_value":
             # Force a rebuild and return the tree root hash bytes
-            idx = view._auto_indexes.get("by_value")
+            idx = lens._auto_indexes.get("by_value")
             if idx is None:
                 return b""
-            view._rebuild_index(idx)
+            lens._rebuild_index(idx)
             return (idx.tree_root or "").encode()
         return b""
 
-    contract = ViewContract(
+    contract = LensContract(
         name="lawtest_idx",
-        encode=view.encode,
-        decode=view.decode,
-        put=view.put,
-        get=view.get,
-        delete=view.delete,
-        commit=view.commit,
-        keys=view.keys,
-        get_all=view.get_all,
+        encode=lens.encode,
+        decode=lens.decode,
+        put=lens.put,
+        get=lens.get,
+        delete=lens.delete,
+        commit=lens.commit,
+        keys=lens.keys,
+        get_all=lens.get_all,
         list_materializations=lambda: ["by_value"],
         build_materialization=build_mat,
         sample_data=lambda i: {"id": i, "name": f"item-{i}", "value": i * 10},
     )
 
-    laws = ViewLaws(kernel)
+    laws = LensLaws(kernel)
     report = laws.check_all(contract, num_samples=10)
 
     print(report)
@@ -568,8 +568,8 @@ def _test_indexed_view_passes_laws():
     kernel.close()
     shutil.rmtree(bench_dir, ignore_errors=True)
 
-    assert report.all_passed, "IndexedView should pass all 6 laws"
-    print("PASS: IndexedView satisfies all 6 View algebra laws")
+    assert report.all_passed, "IndexedLens should pass all 6 laws"
+    print("PASS: IndexedLens satisfies all 6 View algebra laws")
 
 
 def _run_all_tests():
@@ -577,7 +577,7 @@ def _run_all_tests():
     print("--- Test 1: Default View class ---\n")
     _test_default_view_passes_laws()
     print()
-    print("--- Test 2: IndexedView class ---\n")
+    print("--- Test 2: IndexedLens class ---\n")
     _test_indexed_view_passes_laws()
     print()
     print("=== ALL HARNESS TESTS PASSED ===")
@@ -585,3 +585,7 @@ def _run_all_tests():
 
 if __name__ == "__main__":
     _run_all_tests()
+
+# Backward-compatible aliases
+ViewLaws = LensLaws  # backward-compatible alias
+ViewContract = LensContract  # backward-compatible alias

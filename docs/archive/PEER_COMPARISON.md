@@ -39,7 +39,7 @@ source code).
   compressed archives). Pond's Views could use a similar pattern.
 - Reflog for recovery (Git tracks ref changes for undo). Pond's
   namespace could benefit from a reflog.
-- Shallow clones for partial replication. Pond Views could support
+- Shallow clones for partial replication. Pond Lenss could support
   fetching only the blobs reachable from a specific commit.
 
 ---
@@ -63,19 +63,19 @@ Based on Git's model but programmable.
 - Irmin is designed for MirageOS unikernels. Pond is designed for
   general-purpose data infrastructure.
 - Irmin exposes a tree abstraction (Irmin tree = Pond's Tree pattern).
-  Pond's kernel has no tree abstraction; it's View-level.
+  Pond's kernel has no tree abstraction; it's Lens-level.
 
 **What Pond is rediscovering:** The "content-addressable store as
 universal data structure" idea. Irmin had it. Pond's contribution
-(if any) is separating the kernel (laws) from the View (patterns)
+(if any) is separating the kernel (laws) from the Lens (patterns)
 more strictly than Irmin does.
 
 **Where Pond could learn from Irmin:**
 - Merge semantics. Irmin has a well-defined 3-way merge. Pond has
   none. Views that need merge (Git-like, LakeFS-like) would benefit
-  from a View-level merge library.
+  from a Lens-level merge library.
 - Atomic snapshots across multiple keys. Irmin supports this. Pond's
-  Reference is single-key; multi-key atomicity is a View concern.
+  Reference is single-key; multi-key atomicity is a Lens concern.
 
 ---
 
@@ -102,7 +102,7 @@ IPNS is its mutable naming layer (one mutable pointer per node key).
   interpret bytes (SQL, vectors, streaming, Git, etc.).
 
 **What Pond is rediscovering:** Content-addressing + mutable naming.
-IPFS had it. Pond's contribution (if any) is the View layer — IPFS
+IPFS had it. Pond's contribution (if any) is the Lens layer — IPFS
 objects are opaque files; Pond objects are interpreted by Views that
 give them structure (tables, vectors, graphs, etc.).
 
@@ -148,7 +148,7 @@ vectors, streaming, OCI — none of which LakeFS supports natively.
 - Branch-as-first-class. LakeFS's branch model (copy-on-write,
   branch-specific commits) is more developed than Pond's
   "Reference is a branch" convention.
-- Hook system. LakeFS has pre/post hooks on commits. Pond Views
+- Hook system. LakeFS has pre/post hooks on commits. Pond Lenss
   could benefit from a similar hook mechanism.
 - Garbage collection policies. LakeFS has well-defined GC rules
   (keep reachable from any branch). Pond's GC is undefined.
@@ -162,7 +162,7 @@ architecture: minimal core (ordered KV) + layers (SQL, document, graph).
 
 **What Pond shares:**
 - Minimal substrate philosophy (FDB's core is tiny; Pond's kernel is tiny)
-- Layered architecture (FDB layers = Pond Views)
+- Layered architecture (FDB layers = Pond Lenss)
 - Backend independence (FDB runs on shared-nothing clusters; Pond runs
   on FS/S3/Redis/FDB)
 - "The kernel coordinates; layers interpret" separation
@@ -183,13 +183,13 @@ integrity, and immutability for free — properties FDB doesn't have.
 
 **Where Pond could learn from FDB:**
 - Transactional layer. FDB's layers (Record Layer, Document Layer)
-  build transactions on the KV substrate. Pond Views that need
+  build transactions on the KV substrate. Pond Lenss that need
   transactions could use a similar approach.
 - Deterministic simulation testing. FDB's `simulation.fdb` runs
   thousands of randomized tests. Pond needs a similar testing
   discipline for distributed scenarios.
 - Layer composition. FDB layers compose (Document Layer on Record
-  Layer on KV). Pond Views don't yet compose (each View is standalone).
+  Layer on KV). Pond Lenss don't yet compose (each View is standalone).
 
 ---
 
@@ -220,12 +220,12 @@ host non-SQL versioned workloads (Git, OCI, ML).
 
 **Where Pond could learn from Dolt:**
 - Prolly trees. Dolt's content-addressed B-trees are more efficient
-  than Pond's flat blobs + View-level Trees. A Pond View could use
+  than Pond's flat blobs + Lens-level Trees. A Pond Lens could use
   Prolly trees for structured data.
 - Diff algorithm. Dolt can diff two database versions efficiently.
-  Pond Views that need diff would benefit from a similar algorithm.
+  Pond Lenss that need diff would benefit from a similar algorithm.
 - Merge semantics for structured data. Dolt's 3-way merge for SQL
-  tables is well-developed. Pond Views could reuse it.
+  tables is well-developed. Pond Lenss could reuse it.
 
 ---
 
@@ -262,12 +262,12 @@ consistency.
 **Where Pond could learn from WarpStream:**
 - Batching strategy. WarpStream batches writes to amortize S3 PUT cost.
   Pond's Views should batch similarly (the OPEN object pattern from
-  earlier prototypes, or a View-level buffer).
+  earlier prototypes, or a Lens-level buffer).
 - Offset-based addressing for streaming. Pond's StreamView uses
   commit-hash-based addressing, which is correct but requires walking
   the commit chain. WarpStream's offset-based addressing is O(1) for
   random access. A Pond StreamView could use offset-based addressing
-  as a View-level optimization.
+  as a Lens-level optimization.
 - No-local-state design. WarpStream's "no local disk" is a strong
   operational property. Pond's S3 backend (engineering/03_s3_backend.py)
   achieves the same, but the root namespace still uses SQLite. An
@@ -316,7 +316,7 @@ manager, or a 500MB runtime to build a serious data system.
   Pond's production implementation should too.
 - Kafka wire protocol compatibility. Redpanda's success comes partly
   from being a drop-in Kafka replacement. Pond's StreamView could
-  expose a Kafka-compatible wire protocol as a View-level feature,
+  expose a Kafka-compatible wire protocol as a Lens-level feature,
   enabling migration from Kafka/Redpanda to Pond without code changes.
 
 ---
@@ -341,7 +341,7 @@ and random access, designed for ML/AI workloads.
 - Lance format is columnar (like Parquet but with random access and
   versioning). Pond stores raw bytes; Views choose format.
 - LanceDB has built-in ANN indexes (IVF, HNSW). Pond's VectorView does
-  linear scan; indexes are View-level.
+  linear scan; indexes are Lens-level.
 - LanceDB is Rust-native with Arrow columnar. Pond is language-agnostic
   and format-agnostic.
 
@@ -352,14 +352,14 @@ search; Pond generalizes it to all workloads.
 **Where Pond could learn from LanceDB:**
 - Lance format's random access. Lance supports O(1) random row access
   within a columnar file. Pond's Views currently read entire blobs. A
-  View-level columnar format (like Lance) would enable efficient
+  Lens-level columnar format (like Lance) would enable efficient
   partial reads.
 - Lance's fragment-based versioning. Lance versions datasets as a
   sequence of fragments (data files) + a manifest (metadata). This is
   similar to Pond's delta + snapshot approach, but Lance's fragments
   are columnar (better for analytical scans).
 - LanceDB's ANN index as a first-class feature. Pond's VectorView
-  could adopt Lance's index format as a View-level library.
+  could adopt Lance's index format as a Lens-level library.
 - LanceDB's embedded serverless model. LanceDB on S3 with no server
   is exactly what Pond's S3 backend achieves.
 
@@ -385,7 +385,7 @@ After comparing to 8 peers, Pond's potential contributions are:
 
 4. **Multiple workload types on one substrate.** Git does source code.
    LakeFS does object storage. Dolt does SQL. FDB does KV. Pond does
-   all of these (via Views) on one substrate. Whether this is a
+   all of these (via Lenss) on one substrate. Whether this is a
    feature or a "jack of all trades, master of none" remains to be seen.
 
 5. **WarpStream-inspired: direct-to-object-storage without local state.**

@@ -5,7 +5,7 @@ Per the architecture review: 'the next value is in testing the parts
 that most likely become Iceberg-like: namespace semantics, concurrent
 ref updates, and whether one shared mutable surface becomes the bottleneck.'
 
-This is NOT a new View. It's a stress test of the mutable surface itself.
+This is NOT a new Lens. It's a stress test of the mutable surface itself.
 
 Scenarios:
   1. Ref storm: 100 threads racing on 10 shared names. Lost updates?
@@ -406,7 +406,7 @@ def main():
     print("=" * 76)
     print("  Namespace Contention Hostile Test")
     print("  Goal: stress the mutable ref surface. Find where it breaks.")
-    print("  NOT a new View — a stress test of Reference() itself.")
+    print("  NOT a new Lens — a stress test of Reference() itself.")
     print("=" * 76)
 
     test_ref_storm()

@@ -11,16 +11,16 @@ Features:
   - Retention (delete old segments)
 
 Design:
-  - Each topic is a ProllyViewBase instance
+  - Each topic is a ProllyLensBase instance
   - Records are stored as key: "records/<offset>" → blob_hash
   - Consumer offsets stored as key: "_offsets/<consumer_group>" → last_read_offset
-  - Partitions are separate ProllyViewBase instances per partition
+  - Partitions are separate ProllyLensBase instances per partition
 
   This is NOT a streaming engine (no watermarks, no exactly-once, no
   stateful processing). It's a streaming STORAGE layer — the log itself.
-  Processing semantics are a View/infrastructure concern.
+  Processing semantics are a Lens/infrastructure concern.
 
-  Uses the 3-primitive kernel (Write/Read/Reference) + ProllyViewBase.
+  Uses the 3-primitive kernel (Write/Read/Reference) + ProllyLensBase.
 """
 
 import json, time, sys, os, struct, hashlib
@@ -29,10 +29,10 @@ from typing import Optional, Iterator
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-sdk"))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase, ProllyTree
+from prolly_view import ProllyLensBase, ProllyTree
 
 
-class StreamingView:
+class StreamingLens:
     """
     Kafka-like streaming on Pond.
 
@@ -43,7 +43,7 @@ class StreamingView:
     def __init__(self, kernel: PondMinimal, topic_name: str):
         self.kernel = kernel
         self.topic_name = topic_name
-        self.base = ProllyViewBase(kernel, topic_name)
+        self.base = ProllyLensBase(kernel, topic_name)
         self._next_offset = self._compute_next_offset()
 
     def _compute_next_offset(self) -> int:
@@ -199,11 +199,11 @@ class StreamingClient:
 
     def __init__(self, kernel: PondMinimal):
         self.kernel = kernel
-        self._topics: dict[str, StreamingView] = {}
+        self._topics: dict[str, StreamingLens] = {}
 
-    def create_topic(self, name: str) -> StreamingView:
+    def create_topic(self, name: str) -> StreamingLens:
         """Create or open a topic."""
-        topic = StreamingView(self.kernel, name)
+        topic = StreamingLens(self.kernel, name)
         self._topics[name] = topic
         return topic
 

@@ -11,7 +11,7 @@ This is the proof that answers the milestone question:
 Answer: YES. This test demonstrates:
 
   1. SQL Lens, Git Lens, and Notebook Lens all share the same byte
-     graph (same View name → same Prolly tree).
+     graph (same Lens name → same Prolly tree).
   2. Each lens writes its own encoding (JSON rows, Git tree format,
      notebook JSON).
   3. No metadata is written for "enablement." The kernel stores only
@@ -138,7 +138,7 @@ def test_three_lenses_same_byte_graph():
     """THE MILESTONE TEST: SQL, Git, and Notebook lenses share the same bytes.
 
     Each lens writes its own encoding. All share the same Prolly tree
-    (same View name "workspace"). No metadata. No translation. No
+    (same Lens name "workspace"). No metadata. No translation. No
     duplication.
     """
     bench = "/tmp/pond_lens_milestone"
@@ -381,7 +381,7 @@ def test_lenses_are_independent():
 def test_lens_alias_works():
     """Verify: Lens is an alias for View (backward compatible)."""
     from lens_sdk import Lens, View
-    assert Lens is View
+    assert Lens is View  # backward compat: View = Lens
 
     # Can construct via either name
     bench = "/tmp/pond_lens_alias"
@@ -391,20 +391,20 @@ def test_lens_alias_works():
     kernel = PondMinimal(bench)
 
     lens = Lens(kernel, "test")  # Using new name
-    view = View(kernel, "test2")  # Using old name
+    lens = Lens(kernel, "test2")  # Using old name
 
     # Both work identically
     lens.put("k1", {"v": 1})
     lens.commit("via Lens")
-    view.put("k1", {"v": 1})
-    view.commit("via View")
+    lens.put("k1", {"v": 1})
+    lens.commit("via Lens")
 
     assert lens.get("k1") == {"v": 1}
-    assert view.get("k1") == {"v": 1}
+    assert lens.get("k1") == {"v": 1}
 
     kernel.close()
     shutil.rmtree(bench, ignore_errors=True)
-    print("PASS: Lens alias works (Lens is View; both names construct lenses)")
+    print("PASS: Lens alias works (View = Lens; both names construct lenses)")
 
 
 def _run_all_tests():

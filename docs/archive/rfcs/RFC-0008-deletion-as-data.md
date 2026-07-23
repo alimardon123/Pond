@@ -86,7 +86,7 @@ def resolve_or_none(kernel, name):
 - `resolve(name)` continues to return a hash; readers check for
   `TOMBSTONE_HASH` and interpret it as "deleted."
 - The convention lives at Layer 1 (State Calculus), not Layer 0
-  (Storage Calculus). It is a View-level pattern, not a kernel
+  (Storage Calculus). It is a Lens-level pattern, not a kernel
   feature.
 
 ### Why this is the *correct* answer
@@ -200,7 +200,7 @@ This is a usage guideline, not a kernel constraint.
 A related question: can you delete a *blob* (not just a name)?
 
 **This is already implemented.** `engineering/02_gc.py` ships a
-`PondGC` class — a View-level garbage collector that:
+`PondGC` class — a Lens-level garbage collector that:
 
 1. Walks all names in the root namespace.
 2. For each name, resolves to its hash, reads the blob, finds all
@@ -210,7 +210,7 @@ A related question: can you delete a *blob* (not just a name)?
 
 This is documented as Composition Law 3 in `FORMAL_SPEC.md` and as
 a Non-Goal in `NON_GOALS.md` ("Pond's kernel has no GC. Orphaned
-objects accumulate. GC is a View-level utility (`PondGC` in
+objects accumulate. GC is a Lens-level utility (`PondGC` in
 `engineering/02_gc.py`)").
 
 ### How tombstones compose with existing PondGC
@@ -261,7 +261,7 @@ to `PondGC.collect()` is required for tombstone support. The only
 new code is `compact_tombstones` for the (separate, much smaller)
 name-row storage concern.
 
-### What if a View wants precise (non-heuristic) GC?
+### What if a Lens wants precise (non-heuristic) GC?
 
 Views that want precise reachability — e.g., a `SQLView` that tracks
 exactly which blobs are in its tree, no false positives — can
@@ -429,8 +429,8 @@ at Layer 0 (kernel calculus).
   reachability) — unchanged. Tombstones just make some names point
   to a fixed marker; the reachability walk still works.
 - **Reconciles with:** `NON_GOALS.md` ("Pond's kernel has no GC.
-  Orphaned objects accumulate. GC is a View-level utility") —
-  unchanged. `compact_tombstones` is also a View/maintenance-level
+  Orphaned objects accumulate. GC is a Lens-level utility") —
+  unchanged. `compact_tombstones` is also a Lens/maintenance-level
   utility, not a kernel primitive.
 - **Informs:** RFC-0007 §9 (the algebra does not need a deletion
   axis; tombstones are just data).

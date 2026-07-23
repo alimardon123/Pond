@@ -4,7 +4,7 @@ This is NOT a tutorial. It is a **contract** that specifies the boundary
 between the kernel and Views: what the kernel guarantees, what is convention,
 and what is intentionally left unspecified.
 
-If you are writing a View, read this before writing any code. If you find
+If you are writing a Lens, read this before writing any code. If you find
 yourself assuming something not listed here as a guarantee, your View is
 depending on behavior the kernel does not promise.
 
@@ -70,7 +70,7 @@ include a `"type"` field in their JSON:
 {"type": "tree", "entries": {"file.txt": "abc123..."}}
 {"type": "commit", "tree": "def456...", "parents": ["ghi789..."], ...}
 ```
-This lets a View distinguish object kinds when reading by hash. Views
+This lets a Lens distinguish object kinds when reading by hash. Views
 MAY use a different discriminator or none at all.
 
 ### C3: Flat tree (path → blob hash)
@@ -134,22 +134,22 @@ The kernel stores bytes. It does not know if those bytes are JSON,
 protobuf, Parquet, raw floats, or anything else. Two Views using
 different formats cannot read each other's objects.
 
-**View author's responsibility:** choose a format, document it, and
-handle serialization/deserialization in the View.
+**Lens author's responsibility:** choose a format, document it, and
+handle serialization/deserialization in the Lens.
 
 ### U2: Tree structure
-The kernel has no tree concept. "Tree" is a View-level pattern. A
+The kernel has no tree concept. "Tree" is a Lens-level pattern. A
 View could use flat trees, nested trees, prolly trees, B-trees, or
 no trees at all (just name → blob directly).
 
-**View author's responsibility:** define how the View organizes
+**Lens author's responsibility:** define how the Lens organizes
 multiple blobs into a coherent structure.
 
 ### U3: Staging area / index
-The kernel has no staging concept. Staging is View-level state
+The kernel has no staging concept. Staging is Lens-level state
 (typically in-memory). The kernel does not persist staging state.
 
-**View author's responsibility:** decide how to buffer writes before
+**Lens author's responsibility:** decide how to buffer writes before
 committing. Typically an in-memory dict, cleared on commit.
 
 ### U4: Error representation
@@ -157,8 +157,8 @@ The kernel names error conditions (`NOT_FOUND`, `HASH_NOT_FOUND`)
 but does not specify how they're delivered (exceptions, result types,
 error codes). Views must handle errors from kernel calls.
 
-**View author's responsibility:** wrap kernel calls in error handling
-appropriate for the View's language and conventions.
+**Lens author's responsibility:** wrap kernel calls in error handling
+appropriate for the Lens's language and conventions.
 
 ### U5: Multi-writer coordination
 The kernel provides no CAS, no transactions, no MVCC. Concurrent
@@ -166,7 +166,7 @@ The kernel provides no CAS, no transactions, no MVCC. Concurrent
 need multi-writer safety must implement their own coordination
 (branches + merges, external locks, Raft).
 
-**View author's responsibility:** decide on a concurrency model.
+**Lens author's responsibility:** decide on a concurrency model.
 For single-writer: no special handling needed. For multi-writer:
 use branches (CRDT pattern) or external coordination.
 
@@ -175,17 +175,17 @@ The kernel does not GC. Orphaned objects (Write without Reference,
 or Reference overwritten) accumulate forever. Views define their own
 reachability and implement GC as a periodic walk.
 
-**View author's responsibility:** decide if/when to GC. Define
+**Lens author's responsibility:** decide if/when to GC. Define
 reachability (which names are roots, how to walk transitive
 references). Implement sweep.
 
 ### U7: Merge semantics
 The kernel allows multi-parent commits (parents is a list in the
-commit blob) but does not define merge. Merge is a View-level
+commit blob) but does not define merge. Merge is a Lens-level
 operation: read both parent trees, resolve conflicts, write a new
 merged tree + commit.
 
-**View author's responsibility:** define conflict resolution rules.
+**Lens author's responsibility:** define conflict resolution rules.
 Git uses 3-way merge. CRDTs use commutative merge. SQL might use
 UNION. There is no universal merge.
 
@@ -194,14 +194,14 @@ The kernel has no HEAD, no working tree, no "current state" beyond
 what names point to. Views track "current branch" however they want
 (typically HEAD-as-object, convention C6).
 
-**View author's responsibility:** define how the View tracks its
+**Lens author's responsibility:** define how the Lens tracks its
 current position in the commit DAG.
 
 ### U9: Timestamps and identity
 The kernel does not track author, timestamp, or identity on objects.
 Views add these fields to their commit blobs as needed.
 
-**View author's responsibility:** decide what metadata to attach
+**Lens author's responsibility:** decide what metadata to attach
 to commits. The kernel stores it opaquely as bytes.
 
 ### U10: Checkout semantics
@@ -209,18 +209,18 @@ The kernel has no "checkout" concept. A View's checkout is typically:
 1. Resolve the branch name to a commit hash
 2. Read the commit's tree
 3. Update HEAD (via HEAD-as-object or in-memory)
-4. The "working tree" is whatever the View presents to the user
+4. The "working tree" is whatever the Lens presents to the user
 
-**View author's responsibility:** define what checkout means for
-the View. The kernel provides no working tree abstraction.
+**Lens author's responsibility:** define what checkout means for
+the Lens. The kernel provides no working tree abstraction.
 
 ### U11: Time travel performance
 Walking the commit parent chain is O(N) in history depth. The kernel
 provides no skip pointers, no history index, no logarithmic time
 travel. Views that need fast time travel implement skip pointers
-as a View-level pattern (every Kth commit stores a back-pointer).
+as a Lens-level pattern (every Kth commit stores a back-pointer).
 
-**View author's responsibility:** decide if time travel is needed
+**Lens author's responsibility:** decide if time travel is needed
 and at what performance level. Implement skip pointers if needed.
 
 ### U12: Cross-View compatibility
@@ -228,7 +228,7 @@ Two Views using the same kernel CANNOT read each other's objects
 unless they agree on format, tree structure, and ref naming. The
 kernel provides no interop layer.
 
-**View author's responsibility:** if cross-View compatibility is
+**Lens author's responsibility:** if cross-View compatibility is
 needed, Views must agree on conventions (Part 2). The kernel does
 not enforce or verify compatibility.
 
@@ -254,20 +254,20 @@ not enforce or verify compatibility.
 │   time travel, cross-View compat)        │
 ├─────────────────────────────────────────┤
 │              VIEW CODE                   │
-│  (everything the View author writes)     │
+│  (everything the Lens author writes)     │
 └─────────────────────────────────────────┘
 ```
 
 **The boundary is sharp:** the kernel guarantees G1-G6. Everything
-else is the View's responsibility. Conventions (C1-C7) are
+else is the Lens's responsibility. Conventions (C1-C7) are
 recommended but not enforced. Unspecified items (U1-U12) are
-explicitly the View's choice.
+explicitly the Lens's choice.
 
 ---
 
 ## Part 5: Checklist for View Authors
 
-Before writing a View, answer these questions:
+Before writing a Lens, answer these questions:
 
 - [ ] What format will I serialize objects in? (U1)
 - [ ] How will I structure trees? Flat, nested, or something else? (U2)

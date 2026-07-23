@@ -6,11 +6,11 @@ Does NOT import pond-sdk (built from spec, not copied).
 
 Design choice (per task instructions, option (b)):
   Build GraphView directly on the kernel primitives, following the
-  spec's described behavior. We do NOT re-implement ProllyViewBase
-  or IndexedView from the spec because:
+  spec's described behavior. We do NOT re-implement ProllyLensBase
+  or IndexedLens from the spec because:
     1. Spec §7 explicitly says "Views do NOT need to know this format"
        (the binary commit format is an internal detail of
-       ProllyViewBase; the spec authorizes Views to use their own).
+       ProllyLensBase; the spec authorizes Views to use their own).
     2. The Prolly tree structure is referenced as known but never
        defined in SDK_SPEC.md — re-implementing it would require
        inventing unspecified internals.
@@ -146,9 +146,9 @@ class GraphView:
 
     def __init__(self, kernel: PondMinimal, name: str):
         """
-        Construct a GraphView.
+        Construct a GraphLens.
 
-        Note: SDK_SPEC.md does not specify the View constructor signature.
+        Note: SDK_SPEC.md does not specify the Lens constructor signature.
         §1.1 shows kernel construction but not View construction. We
         invent: `GraphView(kernel, name)` — kernel is the PondMinimal
         instance per §1.1, name is the view_name used in §4.4/§5.1.

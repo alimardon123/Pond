@@ -1,8 +1,8 @@
 """
-Cross-View data sharing proof.
+Cross-Lens data sharing proof.
 
-Demonstrates: data written by SQLView is readable by StreamingView,
-and vice versa. Data written by NotebookView is readable by GitView.
+Demonstrates: data written by SQLLens is readable by StreamingLens,
+and vice versa. Data written by NotebookLens is readable by GitLens.
 All Views share the same kernel, and content-addressing means any
 blob is accessible by any View via its hash.
 
@@ -18,9 +18,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sql_database"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "streaming"))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase, ProllyTree
-from sql_view_v2 import SQLView
-from streaming_view import StreamingView
+from prolly_view import ProllyLensBase, ProllyTree
+from sql_view_v2 import SQLLens
+from streaming_view import StreamingLens
 
 
 def test_cross_view():
@@ -35,18 +35,18 @@ def test_cross_view():
     # ==================================================================
     print("=== Test 1: SQL writes, Streaming reads ===")
 
-    sql = SQLView(kernel, "sql_db")
+    sql = SQLLens(kernel, "sql_db")
     sql.create_table("events", {"id": "INT", "event": "TEXT", "ts": "TEXT"}, "id")
     sql.insert("events", {"id": 1, "event": "login", "ts": "2024-01-01"})
     sql.insert("events", {"id": 2, "event": "purchase", "ts": "2024-01-02"})
     sql.insert("events", {"id": 3, "event": "logout", "ts": "2024-01-03"})
     sql.commit("insert events")
 
-    # Now StreamingView wants to read these events as a stream
+    # Now StreamingLens wants to read these events as a stream
     # The SQL data is stored as blobs keyed by "events/1", "events/2", "events/3"
-    # under the "sql_db" ProllyViewBase. StreamingView can read them directly.
+    # under the "sql_db" ProllyLensBase. StreamingLens can read them directly.
 
-    stream = StreamingView(kernel, "stream_from_sql")
+    stream = StreamingLens(kernel, "stream_from_sql")
 
     # Read SQL's state and produce to stream
     sql_state = sql.base.read_all()

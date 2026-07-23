@@ -40,7 +40,7 @@ SKIP_INTERVAL = 64        # skip pointer every 64 commits (same as compaction)
 
 class DeltaViewBase:
     """
-    Base class for all Pond Views. Provides:
+    Base class for all Pond Lenses. Provides:
     - O(1) commits via delta commits (only changed entries written)
     - O(1) point lookups via embedded snapshots
     - O(log N) history via skip pointers

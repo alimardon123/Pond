@@ -3,9 +3,9 @@ Push minimality further: try to remove each of the 3 remaining primitives.
 
 For each primitive:
   1. Try to remove it
-  2. Rebuild at least one View without it
-  3. If the View works, the primitive wasn't fundamental
-  4. If the View fails, the primitive IS fundamental
+  2. Rebuild at least one Lens without it
+  3. If the Lens works, the primitive wasn't fundamental
+  4. If the Lens fails, the primitive IS fundamental
 
 The 3 candidates:
   - Write(bytes) -> hash     (can Views create data without this?)
@@ -37,7 +37,7 @@ def test_remove_reference():
     print("  [Test] Can we remove Reference (mutable names)?")
     print()
     print("    Thought experiment: if there's no name -> hash mapping,")
-    print("    how does a View find its data?")
+    print("    how does a Lens find its data?")
     print()
     print("    Option A: Views hardcode hashes (like IPFS without IPNS).")
     print("      -> A database needs stable names. Hardcoding hashes means")
@@ -140,7 +140,7 @@ def test_remove_content_addressing():
             row = cur.fetchone()
             return f"id:{row[0]:08d}" if row else None
 
-    # Try to build a SQLView-like View on the location-addressed kernel
+    # Try to build a SQLLens-like View on the location-addressed kernel
     kernel = LocationAddressedKernel(bench_dir)
     try:
         # Write a "blob" (just some bytes)
@@ -213,7 +213,7 @@ def test_multi_parent_commit():
     Or does the kernel force single-parent history?"""
     print("  [Test] Can a Commit have multiple parents (CRDT / merge)?")
     print()
-    print("    In the minimal kernel, Commit is a View pattern:")
+    print("    In the minimal kernel, Commit is a Lens pattern:")
     print("      write_commit(tree, parent, msg)")
     print("    The 'parent' field is just bytes in a blob. The kernel")
     print("    doesn't enforce single-parent. A View could write:")
@@ -236,15 +236,15 @@ def test_no_parent_commit():
     print("    part of a history chain. The Commit pattern allows")
     print("    parent=None. The kernel doesn't require history.")
     print()
-    print("    Verdict: parentless commits work. History is a View choice,")
+    print("    Verdict: parentless commits work. History is a Lens choice,")
     print("    not a kernel requirement.")
     print()
     return True
 
 
 def test_view_ignore_history():
-    """Can a View completely ignore history?"""
-    print("  [Test] Can a View completely ignore history?")
+    """Can a Lens completely ignore history?"""
+    print("  [Test] Can a Lens completely ignore history?")
     print()
     print("    Yes — OCIView does. It writes manifests as blobs and")
     print("    references them by name. No parent tracking, no history walk.")
@@ -307,8 +307,8 @@ def main():
     print("    - Commit     (View pattern: blob with metadata)")
     print("    - Tag        (Reference)")
     print("    - Branch     (Reference)")
-    print("    - OPEN/SEALED (View-level buffer)")
-    print("    - Lifecycle  (View-level)")
+    print("    - OPEN/SEALED (Lens-level buffer)")
+    print("    - Lifecycle  (Lens-level)")
     print("    - Single-parent (View choice; multi-parent works)")
     print("    - History    (View choice; stateless Views work)")
     print()

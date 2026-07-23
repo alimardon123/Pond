@@ -1,5 +1,5 @@
 """
-Pond View Helpers — shared library eliminating boilerplate across Views.
+Pond Lens Helpers — shared library eliminating boilerplate across Views.
 
 Fixes friction points 1, 2, and 4 from the notebook friction diary:
   - Friction 1: Tree/Commit boilerplate (no more copy-paste)
@@ -135,7 +135,7 @@ class SkipPointerHistory:
     Total: O(D / SKIP_INTERVAL + SKIP_INTERVAL) = O(D/64 + 64)
 
     The skip pointer is stored IN the commit blob (as an extra field),
-    NOT in the kernel. This is a View-level pattern.
+    NOT in the kernel. This is a Lens-level pattern.
     """
 
     @staticmethod
@@ -206,7 +206,7 @@ class SkipPointerHistory:
 
 class ViewBase:
     """
-    Base class for Views. Eliminates ALL boilerplate.
+    Base class for Lenses. Eliminates ALL boilerplate.
 
     Subclasses get:
     - Sharded trees (O(1) commits, O(1) key reads)

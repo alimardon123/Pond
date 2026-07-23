@@ -49,8 +49,8 @@ def measure_compression():
          "Kafka-like topics, consumer groups, retention"),
         ("SDK", None,
          "libraries/view_sdk.py",
-         "View SDK (View + CrossView + SemanticView)"),
-        ("ProllyViewBase", None,
+         "Lens SDK (View + CrossLens + SemanticLens)"),
+        ("ProllyLensBase", None,
          "libraries/prolly_view.py",
          "Prolly tree + delta journal + binary encoding"),
         ("BinaryEncoding", None,
@@ -94,7 +94,7 @@ def measure_compression():
     shared_loc += count_loc(os.path.join(base_dir, "libraries/binary_encoding.py"))
 
     print()
-    print(f"  Shared library LOC (SDK + ProllyViewBase + BinaryEncoding): {shared_loc}")
+    print(f"  Shared library LOC (SDK + ProllyLensBase + BinaryEncoding): {shared_loc}")
     print(f"  Total View LOC (v2, using SDK): {total_v2}")
     print(f"  Total View LOC (v1, from scratch): {total_v1}")
     if total_v1 > 0:

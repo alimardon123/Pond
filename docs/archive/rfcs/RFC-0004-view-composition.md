@@ -106,7 +106,7 @@ in cross_view_proof.py.
 
 ### Pattern 3: Derived Views (materialized views)
 
-A derived View is a View whose state is computed from another View's state.
+A derived View is a Lens whose state is computed from another View's state.
 
 ```python
 # SQLView has a "users" table
@@ -133,7 +133,7 @@ class UserCountByRegionView:
 ```
 
 Derived Views are just Views that read from other Views. No kernel
-support needed. The "refresh" operation is View-level (triggered by
+support needed. The "refresh" operation is Lens-level (triggered by
 the application, not the kernel).
 
 ### Pattern 4: View chaining (output → input → output)
@@ -191,7 +191,7 @@ unless they agree on a format.
 ### Composition Law 4: Schema independence
 The kernel does not enforce schema compatibility between Views.
 Views that want schema-level sharing (Level 3) must agree on a
-schema convention. The kernel stores bytes; schemas are View-level.
+schema convention. The kernel stores bytes; schemas are Lens-level.
 
 ### Composition Law 5: Derived View consistency
 A derived View's state is a function of its source View's state.
@@ -214,14 +214,14 @@ Views manage their own refresh logic.
 
 3. **Format conversion.** If View A writes JSON and View B needs
    Arrow, the kernel doesn't convert. Views must either agree on
-   format or implement conversion at the View level.
+   format or implement conversion at the Lens level.
 
 4. **Schema enforcement.** The kernel doesn't validate that View B's
    data matches View A's schema. Views must validate their own inputs.
 
 ---
 
-## 5. Implications for the View ecosystem
+## 5. Implications for the Lens ecosystem
 
 ### View composition is free (no kernel cost)
 Any View can read any other View's data. No kernel changes, no

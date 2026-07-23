@@ -1,16 +1,16 @@
-"""Quick test of ProllyViewBase — Prolly trees + bounded delta journal."""
+"""Quick test of ProllyLensBase — Prolly trees + bounded delta journal."""
 import sys, os, shutil, time, json
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase, ProllyTree
+from prolly_view import ProllyLensBase, ProllyTree
 
 def test():
     bench_dir = "/tmp/pond_prolly_test"
     if os.path.exists(bench_dir): shutil.rmtree(bench_dir)
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
-    base = ProllyViewBase(kernel, "test")
+    base = ProllyLensBase(kernel, "test")
 
     print("=== INSERT 100 keys ===")
     for i in range(100):
@@ -60,7 +60,7 @@ def test():
 
     # Switch back to main
     kernel.reference("test", main_commit)
-    base2 = ProllyViewBase(kernel, "test")
+    base2 = ProllyLensBase(kernel, "test")
     print(f"  On main: {len(base2.read_all())} entries")
     print(f"  feature key on main: {base2.lookup('key-feat')}")
 

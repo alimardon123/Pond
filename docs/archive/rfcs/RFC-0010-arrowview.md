@@ -6,8 +6,8 @@
 implementation (`pond-arrow/arrow_view.py`) passes:
 1. Its own test suite (6/6 tests: basic round-trip, DuckDB interop,
    Polars interop, versioning, delete/update, index integration).
-2. The `view_laws.py` property-test harness (all 6 RFC-0007 laws pass,
-   run via `python pond-arrow/run_arrow_view_laws.py`).
+2. The `lens_laws.py` property-test harness (all 6 RFC-0007 laws pass,
+   run via `python pond-arrow/run_arrow_lens_laws.py`).
 
 This proves Pond can be the storage layer underneath the Arrow
 ecosystem without modifying DuckDB, Polars, pandas, or DataFusion.
@@ -29,7 +29,7 @@ Apache Arrow is the natural first target because:
   write Arrow natively.
 - Arrow's columnar format is content-agnostic — it doesn't impose a
   schema or workload model. This makes it compatible with Pond's
-  "store bytes, interpret in the View" philosophy.
+  "store bytes, interpret in the Lens" philosophy.
 - Arrow IPC streams are self-describing bytes — perfect for storage
   in Pond's content-addressed object store.
 
@@ -127,7 +127,7 @@ passing:
    returns a Table with 3 rows and 4 columns (including the
    auto-added `_pk` field). Verify `get_row` returns the right row.
    Verify `scan(filter=...)` and `scan(columns=...)` work.
-2. **Arrow interop** — register the View's data with DuckDB, run
+2. **Arrow interop** — register the Lens's data with DuckDB, run
    `SELECT product, SUM(amount) FROM orders GROUP BY product`, verify
    the result. Same for Polars (`filter + sum`). This proves Pond
    data is usable by external systems without copying.
@@ -143,7 +143,7 @@ passing:
 
 ### 3.1. View algebra compliance
 
-Run `python pond-arrow/run_arrow_view_laws.py` to verify ArrowView
+Run `python pond-arrow/run_arrow_lens_laws.py` to verify ArrowView
 satisfies all 6 RFC-0007 laws:
 
 ```
@@ -250,5 +250,5 @@ a kernel feature.
   with the Arrow ecosystem).
 - **Informs:** a future RFC for `ClusteredArrowView` (per
   `docs/LIQUID_CLUSTERING_COMPARISON.md` §3.3 Lesson 1).
-- **Does not modify:** any kernel code, any existing View code, any
+- **Does not modify:** any kernel code, any existing Lens code, any
   RFC. ArrowView is purely additive.

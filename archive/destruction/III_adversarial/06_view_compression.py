@@ -2,7 +2,7 @@
 View Compression Study — strip each View to its irreducible translation layer.
 
 Per the architecture review:
-  > Take every View. Delete everything possible. How many lines remain?
+  > Take every Lens. Delete everything possible. How many lines remain?
   > If every View bottoms out around 100-200 lines: good.
   > If one View bottoms out at 2500 lines: you found friction. That is a kernel finding.
 
@@ -69,7 +69,7 @@ def count_meaningful_lines(filepath: str) -> dict:
 
 
 def analyze_view(name: str, filepath: str, responsibilities: list[str]) -> dict:
-    """Analyze a View's size and complexity."""
+    """Analyze a Lens's size and complexity."""
     counts = count_meaningful_lines(filepath)
     return {
         "name": name,
@@ -91,7 +91,7 @@ def main():
 
     views = [
         analyze_view(
-            "SQLView",
+            "SQLLens",
             os.path.join(VIEWS_DIR, "views_minimal.py"),
             [
                 "Schema tracking (pa.Schema)",
@@ -103,7 +103,7 @@ def main():
             ],
         ),
         analyze_view(
-            "VectorView",
+            "VectorLens",
             os.path.join(VIEWS_DIR, "views_minimal.py"),
             [
                 "Vector buffering (list of floats)",
@@ -126,7 +126,7 @@ def main():
             ],
         ),
         analyze_view(
-            "GitView",
+            "GitLens",
             os.path.join(VIEWS_DIR, "views_minimal.py"),
             [
                 "File staging (dict path -> bytes)",
@@ -143,7 +143,7 @@ def main():
                 "Node/edge buffering",
                 "Node serialization (JSON)",
                 "Edge serialization (JSON)",
-                "Adjacency index construction (View-level!)",
+                "Adjacency index construction (Lens-level!)",
                 "Tree pattern (inherit parent)",
                 "Commit pattern",
                 "Read node by ID",
@@ -229,13 +229,13 @@ def main():
             elif "Adjacency index" in r:
                 kernel_issues.append((r, "GraphView builds its own adjacency index because the kernel has no index primitive. This is the biggest friction point."))
             elif "Linear scan" in r:
-                kernel_issues.append((r, "VectorView does linear scan for ANN because the kernel has no index. Real vector DBs need HNSW/IVF."))
+                kernel_issues.append((r, "VectorLens does linear scan for ANN because the kernel has no index. Real vector DBs need HNSW/IVF."))
             elif "Read: walk tree" in r:
                 view_issues.append((r, "View must walk the tree to find blobs. Could be a kernel helper, but Views want different walk semantics."))
             elif "History" in r or "walk" in r:
-                kernel_issues.append((r, "O(N) history walk. Known issue (Finding 5a). Needs View-level skip pointers."))
+                kernel_issues.append((r, "O(N) history walk. Known issue (Finding 5a). Needs Lens-level skip pointers."))
             elif "Retention" in r:
-                view_issues.append((r, "View rebuilds tree without old segments. Awkward but necessary — GC is a View concern."))
+                view_issues.append((r, "View rebuilds tree without old segments. Awkward but necessary — GC is a Lens concern."))
             elif "parent is irrelevant" in r:
                 acceptable.append((r, "OCI manifests don't need history. The Commit pattern allows parent=None, so this works."))
             else:
@@ -299,7 +299,7 @@ def main():
         print()
         print("  These are candidates for kernel admission (must pass the 5-criterion rule).")
     else:
-        print("  No kernel findings — all friction is View-level or acceptable.")
+        print("  No kernel findings — all friction is Lens-level or acceptable.")
 
 
 if __name__ == "__main__":

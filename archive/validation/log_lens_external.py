@@ -148,7 +148,7 @@ def _decode_json(raw: bytes) -> Any:
 class ContextLens(Lens):
     """A Lens that delegates encode/decode to a ContextResolver.
 
-    Multiple ContextLenses over the same kernel + same View name share:
+    Multiple ContextLenses over the same kernel + same Lens name share:
       - the same Prolly tree (so they see each other's keys)
       - the same commit DAG (so branches are shared)                  (§3.4)
     They differ only in which key prefix they "own" — but any Lens can
@@ -493,7 +493,7 @@ def main() -> int:
 
     kernel = _make_kernel(tmpdir)
     resolver = ContextResolver()
-    name = "workspace"  # shared View name — both Lenses see the same DAG (§3.4)
+    name = "workspace"  # shared Lens name — both Lenses see the same DAG (§3.4)
 
     log_lens = LogLens(kernel, name, resolver)
     sql_lens = SqlLens(kernel, name, resolver)

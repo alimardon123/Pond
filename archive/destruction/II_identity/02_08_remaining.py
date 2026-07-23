@@ -77,7 +77,7 @@ def exp2_namespace_model():
         ("Graph edge",
          "Reference(src, edge_label, dst_hash)",
          "Graph-structured namespace. Names are (src, label) pairs. Useful"
-         " for graph databases. But: this is a View concern (GraphView"
+         " for graph databases. But: this is a Lens concern (GraphView"
          " already builds this on top of flat namespace)."),
 
         ("Content query",
@@ -160,9 +160,9 @@ def exp4_name_deletion():
     print(f"  Workaround 2: leave it (namespace pollution)")
     print(f"    'temp_table' still exists, just points to tombstone")
 
-    # Workaround 3: View-level namespace store with delete
+    # Workaround 3: Lens-level namespace store with delete
     # (Views that need deletion maintain their own namespace)
-    print(f"  Workaround 3: View-level namespace with delete")
+    print(f"  Workaround 3: Lens-level namespace with delete")
     print(f"    Views that need deletion use their own namespace store,")
     print(f"    not the kernel's root namespace.")
 
@@ -225,7 +225,7 @@ def exp5_crdt_references():
 
         ("Multi-Value (MV-Register)",
          "Concurrent writes produce multiple values; View resolves.",
-         "Like DynamoDB. The namespace returns a set of hashes; the View"
+         "Like DynamoDB. The namespace returns a set of hashes; the Lens"
          " picks one (or merges). Requires vector clocks."),
 
         ("Grow-Only Set (G-Set)",
@@ -254,17 +254,17 @@ def exp5_crdt_references():
     print("     This is a CRDT — the simplest one.")
     print()
     print("  2. Richer CRDTs (MV-Register, OR-Set) could be implemented as")
-    print("     View-level namespace stores. The kernel's Reference stays LWW;")
+    print("     Lens-level namespace stores. The kernel's Reference stays LWW;")
     print("     Views that need richer CRDT semantics build them on top.")
     print()
     print("  3. CRDTs require metadata (vector clocks, version vectors) that")
-    print("     the kernel doesn't provide. A View-level CRDT namespace would")
-    print("     store this metadata in blobs, interpreted by the View.")
+    print("     the kernel doesn't provide. A Lens-level CRDT namespace would")
+    print("     store this metadata in blobs, interpreted by the Lens.")
     print()
     print("  4. The kernel's LWW Reference is sufficient for single-writer")
     print("     scenarios (the current scope). Multi-writer requires either:")
     print("     - A coordination layer (Raft) on the root namespace, OR")
-    print("     - A CRDT namespace implemented as a View")
+    print("     - A CRDT namespace implemented as a Lens")
     print()
     print("  5. Neither requires kernel changes. The kernel's LWW Reference is")
     print("     the minimal mutable surface; richer coordination is layered on top.")
@@ -276,7 +276,7 @@ def exp5_crdt_references():
     print()
     print("  This is consistent with the destruction phase's finding that")
     print("  content-addressing handles idempotent writes but NOT concurrent")
-    print("  reference races. CRDTs are the fix — and they're a View concern.")
+    print("  reference races. CRDTs are the fix — and they're a Lens concern.")
 
 
 # ---------------------------------------------------------------------------
@@ -340,19 +340,19 @@ def exp6_namespace_composition():
     print("  3. Name collisions are resolved last-writer-wins. This is a KNOWN")
     print("     limitation for multi-View scenarios. Mitigations:")
     print("     - Naming conventions (prefix per View: 'sql:*', 'git:*')")
-    print("     - View-level namespace stores (each View has its own namespace)")
+    print("     - Lens-level namespace stores (each View has its own namespace)")
     print("     - Coordination layer (Raft) for multi-View consistency")
     print()
     print("  4. Namespace COMPOSITION (merging two namespaces) is not a kernel")
     print("     operation. Views that need composition (e.g., merge two Git repos)")
-    print("     implement it at the View level (read both namespaces, write a merged one).")
+    print("     implement it at the Lens level (read both namespaces, write a merged one).")
     print()
     print("  VERDICT: SUPPORTED — namespaces can overlap and coexist.")
     print("  Name collisions are resolved LWW (known limitation, mitigations exist).")
-    print("  Namespace composition is a View concern, not a kernel primitive.")
+    print("  Namespace composition is a Lens concern, not a kernel primitive.")
     print()
     print("  This is consistent with the Admission Rule: namespace composition")
-    print("  fails 'Universal' (not all Views need it) and 'Impossible outside")
+    print("  fails 'Universal' (not all Lenses need it) and 'Impossible outside")
     print("  kernel' (Views CAN implement it by reading and writing names).")
 
     kernel.close()
@@ -398,13 +398,13 @@ def exp7_hash_alternatives():
          "id = (hash, location_hint)",
          "Content-addressing for identity + location hint for performance."
          " This is what IPFS CIDs + provider records do. Pond could adopt it"
-         " as a View-level optimization without changing the kernel."),
+         " as a Lens-level optimization without changing the kernel."),
 
         ("Multi-hash (IPFS CID)",
          "id = (hash_algo, hash)",
          "Supports multiple hash algorithms. Future-proofs against SHA-256 break."
          " Pond hardcodes SHA-256; CID is more flexible. Could be a kernel change"
-         " OR a View-level convention (prefix hash with algo identifier)."),
+         " OR a Lens-level convention (prefix hash with algo identifier)."),
     ]
 
     for name, model, analysis in alternatives:
@@ -424,7 +424,7 @@ def exp7_hash_alternatives():
     print("     BLAKE3, SHA-3, or a post-quantum hash without changing the laws.")
     print()
     print("  3. Multi-hash (IPFS CID style) is a candidate for kernel admission:")
-    print("     - Universal? Yes — all Views benefit from hash agility.")
+    print("     - Universal? Yes — all Lenses benefit from hash agility.")
     print("     - Impossible outside kernel? Yes — Views can't change the hash")
     print("       function the kernel uses.")
     print("     - Immutable? Yes.")
@@ -452,7 +452,7 @@ def exp7_hash_alternatives():
 def exp8_immutability_spectrum():
     section("Experiment 8: Is immutability binary?")
     print()
-    print("  Current: objects are EITHER mutable (OPEN, View-level buffer) OR")
+    print("  Current: objects are EITHER mutable (OPEN, Lens-level buffer) OR")
     print("  immutable (Written to kernel). Binary. Once Written, never changes.")
     print()
     print("  Question: could there be tiered immutability?")
@@ -461,7 +461,7 @@ def exp8_immutability_spectrum():
 
     tiers = [
         ("Binary (current)",
-         "OPEN (mutable, View-level) -> Written (immutable, kernel-level)",
+         "OPEN (mutable, Lens-level) -> Written (immutable, kernel-level)",
          "Simple. Clear invariant. Matches Git's model."),
 
         ("Time-bounded mutability",
@@ -479,13 +479,13 @@ def exp8_immutability_spectrum():
         ("Tiered storage",
          "Objects immutable but move between storage tiers (hot -> warm -> cold).",
          "This is placement, not mutability. The object doesn't change;"
-         " it just lives on different backends. Already a View concern"
+         " it just lives on different backends. Already a Lens concern"
          " (placement capability in RFC 4)."),
 
         ("Copy-on-write mutability",
          "Objects are mutable; writes create new versions (CoW).",
          "This is what mutable databases (Postgres) do. Pond's model is"
-         " already CoW at the View level (new commit = new tree + new blobs)."
+         " already CoW at the Lens level (new commit = new tree + new blobs)."
          " The kernel doesn't need to know about CoW."),
     ]
 
@@ -508,17 +508,17 @@ def exp8_immutability_spectrum():
     print("     Views can buffer in memory; the kernel doesn't need to track OPEN vs SEALED.")
     print()
     print("  4. Tiered storage (hot/warm/cold) is placement, not mutability.")
-    print("     Already a View concern. No kernel change needed.")
+    print("     Already a Lens concern. No kernel change needed.")
     print()
     print("  5. Copy-on-write is already how Views work. No kernel change needed.")
     print()
     print("  VERDICT: SUPPORTED — immutability is binary.")
     print("  Tiered immutability either violates Law 1 (time-bounded) or is already")
-    print("  handled at the View level (CoW, placement). The kernel's binary")
+    print("  handled at the Lens level (CoW, placement). The kernel's binary")
     print("  immutability is the minimal model that satisfies the laws.")
     print()
     print("  No kernel change needed. Views that need 'mutable-then-immutable'")
-    print("  semantics (e.g., streaming buffers) implement them at the View level")
+    print("  semantics (e.g., streaming buffers) implement them at the Lens level")
     print("  using in-memory state + Write when ready.")
 
 

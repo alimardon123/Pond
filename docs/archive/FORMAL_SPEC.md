@@ -142,13 +142,13 @@ indexes, materialized views) are derived and rebuildable.
 An object is "reachable" if it's referenced by a name in the root
 namespace, directly or transitively (via Trees, Commits, etc. that
 are themselves reachable). Unreachable objects are orphans and may
-be garbage-collected (GC is a View concern, not a kernel guarantee).
+be garbage-collected (GC is a Lens concern, not a kernel guarantee).
 
 ### Invariant 3: Deterministic apply
 Given the same sequence of (Write, Reference) operations applied in
 the same order, any two implementations produce the same state.
 Non-determinism (timestamps, randomness) must be resolved BEFORE
-calling Write (at the View/adapter layer), not inside the kernel.
+calling Write (at the Lens/adapter layer), not inside the kernel.
 
 ### Invariant 4: Snapshot consistency
 A Read at a hash always returns the same bytes (Law 1). A Read at a
@@ -177,22 +177,22 @@ by Views or infrastructure:
    If writer A writes blob X then references name "foo" to X, and
    writer B reads "foo" and gets X, writer B has no way to know
    whether X was written before or after some other operation.
-   Causal consistency is a View/infrastructure concern.
+   Causal consistency is a Lens/infrastructure concern.
 
 3. **Transactional visibility.** The kernel has no transactions.
    A View that writes blob X, then writes blob Y, then references
    "foo" to Y — readers might see X but not Y (if they read between
-   the writes). Transactions are a View concern.
+   the writes). Transactions are a Lens concern.
 
 4. **Cross-region linearizability.** The kernel is single-region.
    Cross-region replication (async, read-your-writes) is an
    infrastructure concern, not a kernel law.
 
 5. **Garbage collection.** Orphaned objects (Write without Reference,
-   or Reference overwritten) accumulate. GC is a View concern.
+   or Reference overwritten) accumulate. GC is a Lens concern.
 
 6. **Time travel performance.** Walking the commit parent chain is
-   O(N). Skip pointers (for O(log N)) are a View-level pattern.
+   O(N). Skip pointers (for O(log N)) are a Lens-level pattern.
 
 These gaps are NOT kernel bugs. They are explicitly out of scope for
 the kernel. Views and infrastructure provide them as needed.
@@ -230,14 +230,14 @@ composition laws fill that gap.
 If name `N1` resolves to hash `H1`, and the bytes at `H1` contain a
 reference to hash `H2`, then reading `H1` gives bytes that mention `H2`,
 but the kernel does NOT automatically resolve `H2`. Reference chains
-are View-level walks, not kernel-level traversals.
+are Lens-level walks, not kernel-level traversals.
 
 **Implication:** the kernel provides one level of indirection
-(name → hash → bytes). Deeper indirection is a View concern. This is
+(name → hash → bytes). Deeper indirection is a Lens concern. This is
 intentional — it keeps the kernel minimal.
 
-**Corollary:** "Reachability" is a View-defined concept. The kernel
-does not track transitive reachability. GC (a View concern) defines
+**Corollary:** "Reachability" is a Lens-defined concept. The kernel
+does not track transitive reachability. GC (a Lens concern) defines
 reachability for its own purposes.
 
 ### Composition Law 2: Reference moves
@@ -253,10 +253,10 @@ pointers in blobs).
 
 ### Composition Law 3: GC reachability
 The kernel does NOT guarantee GC. Orphaned objects (hashes not
-reachable from any name) accumulate. GC is a View concern.
+reachable from any name) accumulate. GC is a Lens concern.
 
-**Definition (for Views implementing GC):** an object `H` is reachable
-if some name resolves (transitively, via View-defined reference chains)
+**Definition (for Lenses implementing GC):** an object `H` is reachable
+if some name resolves (transitively, via Lens-defined reference chains)
 to `H`. Views implementing GC walk their own reference chains from all
 names to determine reachability.
 
@@ -297,7 +297,7 @@ reachable from `commit_hash` with its parent (copy-on-write semantics
 for free, because objects are immutable).
 
 **Implication:** branches are O(1) to create (just a Reference). Merging
-branches is a View concern (the kernel doesn't define merge semantics).
+branches is a Lens concern (the kernel doesn't define merge semantics).
 
 ### Composition Law 7: Cross-View isolation
 If two Views use disjoint name prefixes (e.g., `sql:*` and `git:*`),
@@ -324,7 +324,7 @@ must coordinate their naming.
 3. **Causal consistency across Views.** If View A writes blob X and
    View B reads it, View B has no way to know whether X was written
    before or after some other operation. Causal consistency requires
-   View-level coordination.
+   Lens-level coordination.
 
 4. **Distributed snapshot.** The kernel's snapshot is single-node.
    Distributed snapshots (across nodes) require a coordination protocol

@@ -1,7 +1,7 @@
 """
 Pond Git — a real Git replacement built on Pond.
 
-This is NOT a toy View. It's a functional Git-like version control
+This is NOT a toy Lens. It's a functional Git-like version control
 system that stores files, commits, branches, and history in the Pond
 kernel. It demonstrates that Pond can replace Git's storage layer.
 
@@ -17,7 +17,7 @@ Supported operations:
   - cat: read a file at the current commit
   - ls: list files at the current commit
 
-Uses the ViewBase library (sharded trees + skip pointers) to avoid
+Uses the LensBase library (sharded trees + skip pointers) to avoid
 boilerplate and get O(1) commits and O(log N) history.
 """
 
@@ -97,7 +97,7 @@ class PondGit:
         for path in self._deleted:
             entries.pop(path, None)
 
-        # Commit via ViewBase (sharded tree + skip pointer)
+        # Commit via LensBase (sharded tree + skip pointer)
         commit_hash = self.base.commit(message, entries)
 
         # Update HEAD

@@ -7,7 +7,7 @@ Design tension:
   - Solution: LAZY indexing
 
 How it works:
-  - When a View registers an auto-index, it specifies a "staleness budget"
+  - When a Lens registers an auto-index, it specifies a "staleness budget"
     (e.g., "index can be up to 5 commits stale")
   - On commit: indexes are NOT updated (O(1) write, fast)
   - On lookup: check if index is stale (commit count exceeded budget)
@@ -38,7 +38,7 @@ from typing import Optional, Any, Callable
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase, ProllyTree
+from prolly_view import ProllyLensBase, ProllyTree
 from binary_encoding import BinaryProllyTree
 
 
@@ -60,9 +60,9 @@ class AutoIndex:
         self._cached_entries: Optional[dict[str, str]] = None  # in-memory cache of index entries
 
 
-class IndexedView:
+class IndexedLens:
     """
-    A View with automatic indexing.
+    A Lens with automatic indexing.
 
     Indexes can be:
       - EAGER: updated on every commit (slow writes, always-fresh reads)
@@ -79,7 +79,7 @@ class IndexedView:
     def __init__(self, kernel: PondMinimal, name: str):
         self.kernel = kernel
         self.name = name
-        self.base = ProllyViewBase(kernel, name)
+        self.base = ProllyLensBase(kernel, name)
         self._auto_indexes: dict[str, AutoIndex] = {}
         self._commit_count = 0
 
@@ -338,8 +338,8 @@ def test_auto_indexing():
 
     print("=== AUTOMATIC INDEXING TEST ===\n")
 
-    # Create IndexedView with LAZY index (default — fast writes)
-    db = IndexedView(kernel, "db")
+    # Create IndexedLens with LAZY index (default — fast writes)
+    db = IndexedLens(kernel, "db")
     db.register_index("by_region", lambda d: d.get("region", ""), mode="lazy", staleness_budget=3)
     db.register_index("by_age", lambda d: str(d.get("age", 0)), mode="lazy", staleness_budget=3)
 
@@ -388,7 +388,7 @@ def test_auto_indexing():
 
     # Test EAGER mode (slow writes, always-fresh reads)
     print(f"\n=== EAGER MODE TEST ===\n")
-    eager_db = IndexedView(kernel, "eager_db")
+    eager_db = IndexedLens(kernel, "eager_db")
     eager_db.register_index("by_status", lambda d: d.get("status", ""), mode="eager")
 
     eager_db.put("order:1", {"amount": 100, "status": "pending"})
@@ -415,7 +415,7 @@ def test_auto_indexing():
     import time
 
     # Lazy writes (no index update)
-    lazy_db = IndexedView(kernel, "lazy_perf")
+    lazy_db = IndexedLens(kernel, "lazy_perf")
     lazy_db.register_index("by_val", lambda d: str(d.get("val", 0)), mode="lazy")
 
     t0 = time.perf_counter()
@@ -426,7 +426,7 @@ def test_auto_indexing():
     lazy_time = t1 - t0
 
     # Eager writes (index update on every commit)
-    eager_db2 = IndexedView(kernel, "eager_perf")
+    eager_db2 = IndexedLens(kernel, "eager_perf")
     eager_db2.register_index("by_val", lambda d: str(d.get("val", 0)), mode="eager")
 
     t0 = time.perf_counter()
@@ -452,8 +452,8 @@ def test_auto_indexing():
 
     import time
 
-    # Build a View with 1000 entries
-    big_db = IndexedView(kernel, "big_db")
+    # Build a Lens with 1000 entries
+    big_db = IndexedLens(kernel, "big_db")
     for i in range(1000):
         big_db.put(f"k{i:04d}", {"val": i, "region": ["US", "EU", "ASIA"][i % 3]})
     big_db.commit("insert 1000 entries")

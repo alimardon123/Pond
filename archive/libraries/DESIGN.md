@@ -1,4 +1,4 @@
-# Pond View Ecosystem — Design for Elegance, Performance, and Minimal Round Trips
+# Pond Lens Ecosystem — Design for Elegance, Performance, and Minimal Round Trips
 
 ## Problem Statement
 

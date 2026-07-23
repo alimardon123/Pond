@@ -222,7 +222,7 @@ translation layer (e.g., `lens.to_arrow()`).
 **Yes.** The proof is in `pond-sdk/test_lens_architecture.py`:
 
 1. SQL Lens, Git Lens, and Notebook Lens all share the same byte
-   graph (same View name → same Prolly tree).
+   graph (same Lens name → same Prolly tree).
 2. Each lens writes its own encoding (JSON, Git tree format,
    notebook JSON).
 3. No metadata is written for "enablement." The kernel stores only

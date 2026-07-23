@@ -107,7 +107,7 @@ TIER1_DELTA_THRESHOLD = 16  # after this many deltas, compact to a snapshot
 class TieredCommitModel:
     """Tiered commit model: fast writes (delta) + fast reads (snapshot).
 
-    This is a drop-in replacement for ProllyViewBase's commit/lookup logic.
+    This is a drop-in replacement for ProllyLensBase's commit/lookup logic.
     It maintains a snapshot pointer alongside HEAD, so lookups always go
     directly to the latest snapshot without walking the delta chain.
     """

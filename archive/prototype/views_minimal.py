@@ -6,7 +6,7 @@ Each View builds its own Tree/Commit/Tag patterns using only:
   - kernel.read(hash_or_name) -> bytes
   - kernel.reference(name, hash)
 
-Tree, Commit, Tag, Branch, OPEN/SEALED — all are View-level patterns
+Tree, Commit, Tag, Branch, OPEN/SEALED — all are Lens-level patterns
 built from these 3 primitives. The kernel has zero knowledge of them.
 
 If all 8 Views work on the minimal kernel, then Tree/Commit/OPEN-SEALED
@@ -30,7 +30,7 @@ from pond_minimal import PondMinimal, hash_bytes
 
 
 # ===========================================================================
-# View-level pattern helpers — built ONLY from Write/Read/Reference
+# Lens-level pattern helpers — built ONLY from Write/Read/Reference
 # ===========================================================================
 #
 # These are NOT kernel primitives. They're conventions that Views use to
@@ -38,7 +38,7 @@ from pond_minimal import PondMinimal, hash_bytes
 
 def write_tree(kernel: PondMinimal, entries: dict[str, str]) -> str:
     """A Tree is just a blob containing serialized {name -> hash} mappings.
-    This is a View-level pattern, not a kernel primitive."""
+    This is a Lens-level pattern, not a kernel primitive."""
     data = json.dumps({"type": "tree", "entries": entries}, sort_keys=True).encode()
     return kernel.write(data)
 
@@ -52,7 +52,7 @@ def write_commit(kernel: PondMinimal, tree_hash: str,
                  parent_hash: Optional[str], message: str,
                  extra: Optional[dict] = None) -> str:
     """A Commit is just a blob containing serialized metadata.
-    This is a View-level pattern, not a kernel primitive."""
+    This is a Lens-level pattern, not a kernel primitive."""
     obj = {
         "type": "commit",
         "tree": tree_hash,
@@ -80,10 +80,10 @@ def make_branch(kernel: PondMinimal, name: str, commit_hash: str) -> None:
 
 
 # ===========================================================================
-# SQLView — tabular data via Parquet
+# SQLLens — tabular data via Parquet
 # ===========================================================================
 
-class SQLView:
+class SQLLens:
     def __init__(self, kernel: PondMinimal, table_name: str):
         self.kernel = kernel
         self.table_name = table_name
@@ -148,10 +148,10 @@ class SQLView:
 
 
 # ===========================================================================
-# VectorView — embeddings via raw float bytes
+# VectorLens — embeddings via raw float bytes
 # ===========================================================================
 
-class VectorView:
+class VectorLens:
     def __init__(self, kernel: PondMinimal, collection_name: str, dim: int = 4):
         self.kernel = kernel
         self.collection_name = collection_name
@@ -269,10 +269,10 @@ class StreamView:
 
 
 # ===========================================================================
-# GitView — files + directories + commits
+# GitLens — files + directories + commits
 # ===========================================================================
 
-class GitView:
+class GitLens:
     def __init__(self, kernel: PondMinimal, repo_name: str):
         self.kernel = kernel
         self.repo_name = repo_name

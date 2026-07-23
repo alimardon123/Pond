@@ -5,9 +5,9 @@ Feature Store.
 This script is written by a developer who has NEVER seen the Pond project
 before. It uses only:
   - PondMinimal kernel (3 primitives)
-  - pond-sdk (View, IndexedView, CrossView)
+  - pond-sdk (View, IndexedLens, CrossLens)
   - pond-feature-store (FeatureStore)
-  - pond-arrow (ArrowView)
+  - pond-arrow (ArrowLens)
   - standard library
 
 Goal: build a real customer analytics application that exercises the
@@ -19,7 +19,7 @@ Feature Store end-to-end:
   4. Build a churn-prediction training set via point-in-time JOIN
   5. Online lookup (single customer feature vector)
   6. Batch dashboard (feature matrix for all 200 customers)
-  7. Region analytics via ArrowView -> DuckDB SQL
+  7. Region analytics via ArrowLens -> DuckDB SQL
   8. Restart test (close kernel, reopen, verify dashboard works)
 
 Run:
@@ -47,9 +47,9 @@ for _pkg in ("pond-core", "pond-sdk", "pond-feature-store", "pond-arrow"):
     sys.path.insert(0, os.path.join(_REPO_ROOT, _pkg))
 
 from pond_minimal import PondMinimal
-from lens_sdk import View, CrossView
+from lens_sdk import View, CrossLens
 from feature_store import FeatureStore
-from arrow_view import ArrowView
+from arrow_view import ArrowLens
 
 # Try to import duckdb for the SQL analytics section. If it isn't available,
 # we'll skip that section gracefully.
@@ -113,13 +113,13 @@ def generate_customers(n: int = 200) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Section 1: ingest customers into a source View
+# Section 1: ingest customers into a source Lens
 # ---------------------------------------------------------------------------
 
 def ingest_customers(kernel: PondMinimal, customers: list[dict]) -> View:
-    """Ingest the customer records as a regular Pond View.
+    """Ingest the customer records as a regular Pond Lens.
 
-    I'm using a plain View here (not an IndexedView) because the source
+    I'm using a plain View here (not an IndexedLens) because the source
     data is just a snapshot — I don't need auto-indexing on it.
     """
     src = View(kernel, "customers_src")
@@ -387,18 +387,18 @@ def batch_dashboard_demo(fs: FeatureStore, customers: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Section 7: region analytics via ArrowView -> DuckDB
+# Section 7: region analytics via ArrowLens -> DuckDB
 # ---------------------------------------------------------------------------
 
 def region_analytics_demo(kernel: PondMinimal, matrix: list[dict]) -> None:
-    print("\n--- 7. Region analytics via ArrowView -> DuckDB ---")
+    print("\n--- 7. Region analytics via ArrowLens -> DuckDB ---")
     if not _HAVE_DUCKDB:
         print("  (duckdb not installed — skipping)")
         return
 
-    av = ArrowView(kernel, "customer_analytics")
+    av = ArrowLens(kernel, "customer_analytics")
     # Each row in the matrix is the feature vector for one customer.
-    # ArrowView.put_row wants (primary_key, row_dict). The matrix row
+    # ArrowLens.put_row wants (primary_key, row_dict). The matrix row
     # already has entity_id; I'll use it as the primary key too.
     for row in matrix:
         pk = row["entity_id"]
@@ -528,12 +528,12 @@ def main():
 
     kernel = PondMinimal(bench_dir)
 
-    # --- Section 1: synthetic data + source View ---
-    print("\n--- 1. Synthetic customer data + source View ---")
+    # --- Section 1: synthetic data + source Lens ---
+    print("\n--- 1. Synthetic customer data + source Lens ---")
     customers = generate_customers(200)
     print(f"  generated {len(customers)} synthetic customers")
     src = ingest_customers(kernel, customers)
-    print(f"  source View 'customers_src' count: {src.count()}")
+    print(f"  source Lens 'customers_src' count: {src.count()}")
 
     # --- Section 2 + 3: FeatureStore + feature definitions ---
     print("\n--- 2 + 3. FeatureStore: define 8 features + write values ---")

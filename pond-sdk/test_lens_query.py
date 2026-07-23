@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test: elegant cross-view reading via ViewQuery.
+Test: elegant cross-view reading via LensQuery.
 
 Demonstrates the "direct, easy, simple and elegant way of reading
 data from other Views" that the architecture review asked for.
@@ -32,20 +32,20 @@ def test_basic_iteration():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    view = View(kernel, "users")
-    view.put("u1", {"name": "Alice", "age": 30, "region": "US"})
-    view.put("u2", {"name": "Bob", "age": 25, "region": "EU"})
-    view.put("u3", {"name": "Carol", "age": 35, "region": "US"})
-    view.commit("insert 3 users")
+    lens = Lens(kernel, "users")
+    lens.put("u1", {"name": "Alice", "age": 30, "region": "US"})
+    lens.put("u2", {"name": "Bob", "age": 25, "region": "EU"})
+    lens.put("u3", {"name": "Carol", "age": 35, "region": "US"})
+    lens.commit("insert 3 users")
 
     # Direct iteration
-    rows = list(view)
+    rows = list(lens)
     assert len(rows) == 3
     names = {r["name"] for r in rows}
     assert names == {"Alice", "Bob", "Carol"}
 
     # len() works
-    assert len(view) == 3
+    assert len(lens) == 3
 
     # `in` works (checks key existence)
     assert "u1" in view
@@ -53,50 +53,50 @@ def test_basic_iteration():
 
     kernel.close()
     shutil.rmtree(bench, ignore_errors=True)
-    print("PASS: basic iteration (for row in view, len(view), key in view)")
+    print("PASS: basic iteration (for row in lens, len(lens), key in lens)")
 
 
 def test_where_filter():
-    """view.where(region='US') filters by field value."""
+    """lens.where(region='US') filters by field value."""
     bench = "/tmp/pond_vq_where"
     if os.path.exists(bench):
         shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    view = View(kernel, "users")
-    view.put("u1", {"name": "Alice", "age": 30, "region": "US"})
-    view.put("u2", {"name": "Bob", "age": 25, "region": "EU"})
-    view.put("u3", {"name": "Carol", "age": 35, "region": "US"})
-    view.put("u4", {"name": "Dave", "age": 28, "region": "EU"})
-    view.commit("insert 4 users")
+    lens = Lens(kernel, "users")
+    lens.put("u1", {"name": "Alice", "age": 30, "region": "US"})
+    lens.put("u2", {"name": "Bob", "age": 25, "region": "EU"})
+    lens.put("u3", {"name": "Carol", "age": 35, "region": "US"})
+    lens.put("u4", {"name": "Dave", "age": 28, "region": "EU"})
+    lens.commit("insert 4 users")
 
     # Filter with kwargs
-    us_users = list(view.where(region="US"))
+    us_users = list(lens.where(region="US"))
     assert len(us_users) == 2
     assert {r["name"] for r in us_users} == {"Alice", "Carol"}
 
     # Filter with a predicate
-    over_30 = list(view.where(lambda r: r["age"] > 30))
+    over_30 = list(lens.where(lambda r: r["age"] > 30))
     assert len(over_30) == 1
     assert over_30[0]["name"] == "Carol"
 
     # Chain multiple .where() calls (ANDed)
-    eu_over_26 = list(view.where(region="EU").where(lambda r: r["age"] > 26))
+    eu_over_26 = list(lens.where(region="EU").where(lambda r: r["age"] > 26))
     assert len(eu_over_26) == 1
     assert eu_over_26[0]["name"] == "Dave"
 
     # .first() returns the first match
-    first_us = view.where(region="US").first()
+    first_us = lens.where(region="US").first()
     assert first_us is not None
     assert first_us["region"] == "US"
 
     # .count() counts matches
-    assert view.where(region="US").count() == 2
-    assert view.where(region="ASIA").count() == 0
+    assert lens.where(region="US").count() == 2
+    assert lens.where(region="ASIA").count() == 0
 
-    # .take(n) limits (on a ViewQuery, not directly on View)
-    first_2 = view.where().take(2)
+    # .take(n) limits (on a LensQuery, not directly on View)
+    first_2 = lens.where().take(2)
     assert len(first_2) == 2
 
     kernel.close()
@@ -105,20 +105,20 @@ def test_where_filter():
 
 
 def test_select_projection():
-    """view.select('name', 'age') projects rows to only those fields."""
+    """lens.select('name', 'age') projects rows to only those fields."""
     bench = "/tmp/pond_vq_select"
     if os.path.exists(bench):
         shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    view = View(kernel, "users")
-    view.put("u1", {"name": "Alice", "age": 30, "region": "US", "email": "a@x.com"})
-    view.put("u2", {"name": "Bob", "age": 25, "region": "EU", "email": "b@x.com"})
-    view.commit("insert 2 users")
+    lens = Lens(kernel, "users")
+    lens.put("u1", {"name": "Alice", "age": 30, "region": "US", "email": "a@x.com"})
+    lens.put("u2", {"name": "Bob", "age": 25, "region": "EU", "email": "b@x.com"})
+    lens.commit("insert 2 users")
 
     # Project
-    projected = list(view.select("name", "age"))
+    projected = list(lens.select("name", "age"))
     assert len(projected) == 2
     for row in projected:
         assert set(row.keys()) == {"name", "age"}
@@ -126,7 +126,7 @@ def test_select_projection():
         assert "email" not in row
 
     # Chain where + select
-    us_names = list(view.where(region="US").select("name"))
+    us_names = list(lens.where(region="US").select("name"))
     assert len(us_names) == 1
     assert us_names[0] == {"name": "Alice"}
 
@@ -136,20 +136,20 @@ def test_select_projection():
 
 
 def test_map_transform():
-    """view.map(fn) transforms each row."""
+    """lens.map(fn) transforms each row."""
     bench = "/tmp/pond_vq_map"
     if os.path.exists(bench):
         shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    view = View(kernel, "orders")
-    view.put("o1", {"order_id": 1, "amount": 100.0, "currency": "EUR"})
-    view.put("o2", {"order_id": 2, "amount": 200.0, "currency": "EUR"})
-    view.commit("insert 2 orders")
+    lens = Lens(kernel, "orders")
+    lens.put("o1", {"order_id": 1, "amount": 100.0, "currency": "EUR"})
+    lens.put("o2", {"order_id": 2, "amount": 200.0, "currency": "EUR"})
+    lens.commit("insert 2 orders")
 
     # Map: convert EUR to USD
-    usd_orders = list(view.map(lambda r: {**r, "amount_usd": r["amount"] * 1.1}))
+    usd_orders = list(lens.map(lambda r: {**r, "amount_usd": r["amount"] * 1.1}))
 
     assert len(usd_orders) == 2
     for row in usd_orders:
@@ -171,7 +171,7 @@ def test_map_transform():
 
 
 def test_cross_view_join():
-    """view.join(other_view, on='field') joins two Views."""
+    """lens.join(other_view, on='field') joins two Views."""
     bench = "/tmp/pond_vq_join"
     if os.path.exists(bench):
         shutil.rmtree(bench)
@@ -225,20 +225,20 @@ def test_cross_view_join():
 
 
 def test_laziness():
-    """ViewQuery is lazy: nothing runs until you iterate or collect."""
+    """LensQuery is lazy: nothing runs until you iterate or collect."""
     bench = "/tmp/pond_vq_lazy"
     if os.path.exists(bench):
         shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    view = View(kernel, "data")
+    lens = Lens(kernel, "data")
     for i in range(100):
-        view.put(f"k{i:03d}", {"id": i, "val": i * 10})
-    view.commit("insert 100 items")
+        lens.put(f"k{i:03d}", {"id": i, "val": i * 10})
+    lens.commit("insert 100 items")
 
     # Build a query — should NOT read any data yet
-    q = view.where(lambda r: r["val"] > 500).select("id", "val")
+    q = lens.where(lambda r: r["val"] > 500).select("id", "val")
 
     # Now iterate — this is where evaluation happens
     results = q.collect()
@@ -247,7 +247,7 @@ def test_laziness():
     assert all(set(r.keys()) == {"id", "val"} for r in results)
 
     # .first() stops early (doesn't evaluate all 100)
-    first = view.where(lambda r: r["val"] > 500).first()
+    first = lens.where(lambda r: r["val"] > 500).first()
     assert first is not None
     assert first["val"] > 500
 
@@ -257,7 +257,7 @@ def test_laziness():
 
 
 def test_elegant_pattern():
-    """The full elegant pattern: read from one view, transform, join."""
+    """The full elegant pattern: read from one lens, transform, join."""
     bench = "/tmp/pond_vq_elegant"
     if os.path.exists(bench):
         shutil.rmtree(bench)
@@ -292,10 +292,10 @@ def test_elegant_pattern():
         assert "region" not in row  # projected out by map
         assert "customer_id" not in row
 
-    # Compare to the OLD pattern (what you'd have to write without ViewQuery):
+    # Compare to the OLD pattern (what you'd have to write without LensQuery):
     # old_result = []
-    # orders_data = CrossView.read_all_from(orders)
-    # customers_data = CrossView.read_all_from(customers)
+    # orders_data = CrossLens.read_all_from(orders)
+    # customers_data = CrossLens.read_all_from(customers)
     # for key, order in orders_data.items():
     #     customer = customers_data.get(order["customer_id"])
     #     if customer and customer.get("region") == "US":
@@ -312,7 +312,7 @@ def test_elegant_pattern():
 
 
 def _run_all_tests():
-    print("=== ViewQuery — Elegant Cross-View Reading Tests ===\n")
+    print("=== LensQuery — Elegant Cross-View Reading Tests ===\n")
     test_basic_iteration()
     test_where_filter()
     test_select_projection()

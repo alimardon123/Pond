@@ -8,7 +8,7 @@ This is a faithful interpretation of:
     kernel.resolve(name: str) -> str | None   # resolve name to hash
     kernel.list_names() -> list[str]          # list all names
 
-Used for testing VectorView.  NOT the real SDK.
+Used for testing VectorLens.  NOT the real SDK.
 """
 
 import hashlib

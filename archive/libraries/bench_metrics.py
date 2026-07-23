@@ -1,5 +1,5 @@
 """
-Performance, scale, and metadata metrics for ProllyViewBase.
+Performance, scale, and metadata metrics for ProllyLensBase.
 
 Measures:
   1. Write throughput (rows/sec, MB/sec)
@@ -15,7 +15,7 @@ import sys, os, shutil, json, time, statistics
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "libraries"))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase, ProllyTree
+from prolly_view import ProllyLensBase, ProllyTree
 
 
 def fmt_bytes(n):
@@ -37,7 +37,7 @@ def bench_scale(n_entries):
     if os.path.exists(bench_dir): shutil.rmtree(bench_dir)
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
-    base = ProllyViewBase(kernel, "bench")
+    base = ProllyLensBase(kernel, "bench")
 
     # Write N entries
     data_size = 0
@@ -139,7 +139,7 @@ def bench_scale(n_entries):
 
 def main():
     print("=" * 76)
-    print("  Performance, Scale, and Metadata Metrics for ProllyViewBase")
+    print("  Performance, Scale, and Metadata Metrics for ProllyLensBase")
     print("=" * 76)
 
     scales = [100, 1000, 10000]

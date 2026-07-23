@@ -15,7 +15,7 @@ import struct
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pond_kernel import PondKernel, hash_bytes
-from views import SQLView, VectorView, StreamView, GitView
+from views import SQLLens, VectorLens, StreamView, GitLens
 
 
 def main():
@@ -24,7 +24,7 @@ def main():
     print("=" * 76)
     print()
     print("  Thesis: the storage kernel is bytes-only. SQL, Vector, Streaming,")
-    print("  and Git are all Views that interpret the same immutable objects.")
+    print("  and Git are all Lenses that interpret the same immutable objects.")
     print()
     print("  Each View uses ONLY the kernel's 4 syscalls (Read/Write/Seal/")
     print("  Reference) + DAG patterns (Tree/Commit). The kernel never calls")
@@ -48,7 +48,7 @@ def main():
         pa.field("id", pa.int64()),
         pa.field("name", pa.string()),
     ])
-    sql = SQLView(kernel, "users")
+    sql = SQLLens(kernel, "users")
     sql.create(schema)
     batch = pa.RecordBatch.from_arrays([
         pa.array([1, 2, 3], type=pa.int64()),
@@ -66,7 +66,7 @@ def main():
     # View 2: Vector — embeddings via raw float bytes
     # ------------------------------------------------------------------
     print("  [2] Vector View: embeddings via raw float bytes")
-    vec = VectorView(kernel, "embeddings", dim=4)
+    vec = VectorLens(kernel, "embeddings", dim=4)
     vec.insert([0.1, 0.2, 0.3, 0.4])
     vec.insert([0.5, 0.6, 0.7, 0.8])
     vec.insert([0.9, 1.0, 1.1, 1.2])
@@ -97,7 +97,7 @@ def main():
     # View 4: Git — files + directories + commits
     # ------------------------------------------------------------------
     print("  [4] Git View: files + directories + commits")
-    git = GitView(kernel, "my_repo")
+    git = GitLens(kernel, "my_repo")
     git.add("README.md", b"# My Repo\n\nHello world.\n")
     git.add("main.py", b"print('hello')\n")
     git.commit(message="initial commit")
@@ -128,8 +128,8 @@ def main():
     print()
 
     print("  [6] Experiment 2: Delete SQL capability — does storage still work?")
-    print("      (PondKernel has no SQL. SQLView is a separate file. Removing")
-    print("       SQLView doesn't affect the kernel or other Views.)")
+    print("      (PondKernel has no SQL. SQLLens is a separate file. Removing")
+    print("       SQLLens doesn't affect the kernel or other Views.)")
     # Demonstrate by using only the kernel directly
     blob_hash = kernel.write_blob(b"raw bytes, no View needed")
     # Build a tree + commit + reference manually
@@ -143,11 +143,11 @@ def main():
     kernel.reference("raw_object", ch)
     data = kernel.read("raw_object")
     print(f"      Wrote raw bytes via kernel only: {data!r}")
-    print(f"      ✓ Storage works without any View.")
+    print(f"      ✓ Storage works without any Lens.")
     print()
 
     print("  [7] Experiment 3: Implement Git on top of Pond")
-    print("      (Done above in View 4. GitView uses only kernel syscalls.)")
+    print("      (Done above in View 4. GitLens uses only kernel syscalls.)")
     print(f"      ✓ Git's blob/tree/commit/tag model = Pond's DAG pattern.")
     print()
 
@@ -162,8 +162,8 @@ def main():
     print("  What this proves:")
     print("    - The 4 syscalls (Read/Write/Seal/Reference) are sufficient")
     print("    - The DAG pattern (Tree/Commit) is sufficient")
-    print("    - Adding a new View (e.g., LanceView, IcebergView) requires")
-    print("      NO changes to the kernel — only a new View file")
+    print("    - Adding a new Lens (e.g., LanceView, IcebergView) requires")
+    print("      NO changes to the kernel — only a new Lens file")
     print("    - The kernel has zero knowledge of formats, SQL, vectors,")
     print("      streaming, or Git semantics")
     print()
@@ -175,7 +175,7 @@ def main():
     print()
     print("  The fix (now done):")
     print("    - pond_kernel.py: bytes-only, universal (this file)")
-    print("    - views.py: SQLView, VectorView, StreamView, GitView (separate)")
+    print("    - views.py: SQLLens, VectorLens, StreamView, GitLens (separate)")
     print("    - The kernel has NO imports of pyarrow, parquet, or any format")
     print()
     print("  Architectural lesson:")

@@ -152,7 +152,7 @@ def exp_storage_amplification():
 def exp_write_amplification():
     section("Test 2: Write amplification")
     print()
-    print("  Question: when a View writes N logical bytes, how many bytes go to S3?")
+    print("  Question: when a Lens writes N logical bytes, how many bytes go to S3?")
     print()
 
     # A View writes:
@@ -194,7 +194,7 @@ def exp_write_amplification():
 def exp_read_amplification():
     section("Test 3: Read amplification")
     print()
-    print("  Question: when a View reads N logical bytes, how many bytes come from S3?")
+    print("  Question: when a Lens reads N logical bytes, how many bytes come from S3?")
     print()
 
     # To read the latest data of a table:
@@ -265,7 +265,7 @@ def exp_metadata_amplification():
     print()
     print("  VERDICT: SUPPORTED for the kernel's metadata model.")
     print("  CAVEAT: Without GC (Finding 6), metadata grows unbounded.")
-    print("  GC is a View-level concern, not a kernel issue.")
+    print("  GC is a Lens-level concern, not a kernel issue.")
     return 0.001
 
 

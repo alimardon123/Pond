@@ -490,7 +490,7 @@ def define_concurrency_contract():
     print()
     print("  This contract is SUFFICIENT for the 14 tested workloads (8 standard + 6 alien).")
     print("  Views that need stronger guarantees (CAS, transactions, causal consistency)")
-    print("  implement them at the View/infrastructure level, not the kernel level.")
+    print("  implement them at the Lens/infrastructure level, not the kernel level.")
 
 
 # ---------------------------------------------------------------------------

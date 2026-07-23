@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "libraries"))
 from pond_minimal import PondMinimal
 from delta_view import DeltaViewBase
-from sql_view import SQLView
+from sql_view import SQLLens
 
 def test_sql():
     bench_dir = "/tmp/pond_sql_test"
@@ -15,7 +15,7 @@ def test_sql():
     os.makedirs(bench_dir)
 
     kernel = PondMinimal(bench_dir)
-    db = SQLView(kernel, "test_db")
+    db = SQLLens(kernel, "test_db")
 
     print("=== CREATE TABLE ===")
     db.create_table("users", {"id": "INT", "name": "TEXT", "email": "TEXT"}, "id")

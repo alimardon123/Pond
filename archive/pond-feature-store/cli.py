@@ -36,7 +36,7 @@ sys.path.insert(0, SCRIPT_DIR)  # for feature_store.py
 
 from pond_minimal import PondMinimal
 from feature_store import FeatureStore
-from lens_sdk import View, SemanticView
+from lens_sdk import View, SemanticLens
 
 
 def get_store():
@@ -73,7 +73,7 @@ def cmd_ingest(args):
         sys.exit(1)
     source_name, feature, entity_field, value_field = args[0], args[1], args[2], args[3]
     kernel, fs = get_store()
-    # Create a source View and read from it
+    # Create a source Lens and read from it
     source = View(kernel, source_name)
     count = fs.ingest_from_view(source, feature, entity_field, value_field)
     fs.commit(f"ingest {count} values for '{feature}' from '{source_name}'")
@@ -228,7 +228,7 @@ def cmd_semantic(args):
         print("Usage: semantic <semantic_view_name>")
         sys.exit(1)
     kernel, fs = get_store()
-    semantic = SemanticView(kernel, args[0])
+    semantic = SemanticLens(kernel, args[0])
     fs.register_with_semantic_view(semantic)
     semantic.commit("register features")
     print(f"Registered {len(fs.list_features())} features with semantic view '{args[0]}'")

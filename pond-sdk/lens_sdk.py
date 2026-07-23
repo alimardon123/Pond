@@ -1,8 +1,8 @@
 """
-Enhanced View SDK with:
+Enhanced Lens SDK:
   - Index management (create/drop/refresh — metadata only, NO data rewrite)
-  - Ossie-aligned SemanticView (Apache Ossie open semantic interchange spec)
-  - Recursive View composition (Phase D)
+  - Ossie-aligned SemanticLens (Apache Ossie open semantic interchange spec)
+  - Recursive Lens composition (Phase D)
 
 Answers the user's question:
   Q: If I want to drop/create/refresh indexes, do I have to rewrite data or metadata?
@@ -25,15 +25,15 @@ from typing import Optional, Any, Callable, Union
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase, ProllyTree
+from prolly_view import ProllyLensBase, ProllyTree
 from binary_encoding import BinaryProllyTree
 from maintenance import (drop_name, is_dropped, resolve_active,
                          TOMBSTONE_HASH)
-from lens_query import ViewQuery
+from lens_query import LensQuery
 
 
 # ===========================================================================
-# Naming: "Lens" is the preferred term for what was called "View".
+# Naming: "Lens" is the preferred term for what was called "View" (now "Lens").
 #
 # A Pond Lens is an interpretation layer over immutable bytes — like a
 # lens that focuses light differently without changing the light itself.
@@ -44,18 +44,18 @@ from lens_query import ViewQuery
 # Both names work. `View` is kept for backward compatibility. New code
 # should use `Lens`. See RFC-0012 for the full rationale.
 #
-# The aliases (Lens = View, etc.) are defined at the END of this file,
+# The backward-compatible aliases (View = Lens, etc.) are defined at the END of this file,
 # after all classes are declared.
 # ===========================================================================
 
 
 # ===========================================================================
-# Enhanced View with full index management
+# Enhanced Lens with full index management
 # ===========================================================================
 
-class View:
+class Lens:
     """
-    Abstract base class for all Pond Views.
+    Abstract base class for all Pond Lenses.
 
     Index management:
       - create_index(name, extractor): builds a Prolly tree mapping
@@ -64,7 +64,7 @@ class View:
         Data blobs are untouched.
       - refresh_index(name, extractor): rebuilds the index from current data.
         Does NOT touch data blobs.
-      - list_indexes(): lists all indexes for this View.
+      - list_indexes(): lists all indexes for this Lens.
 
     All index operations work on METADATA only (Prolly trees of key→hash).
     Data blobs are immutable and never rewritten.
@@ -73,7 +73,7 @@ class View:
     def __init__(self, kernel: PondMinimal, name: str):
         self.kernel = kernel
         self.name = name
-        self.base = ProllyViewBase(kernel, name)
+        self.base = ProllyLensBase(kernel, name)
 
     # --- Write path ---
     def put(self, key: str, data: Any) -> str:
@@ -134,7 +134,7 @@ class View:
         return sum(1 for k in self.base.read_all() if not k.startswith("_"))
 
     # ------------------------------------------------------------------
-    # Collection-like API — make View feel like an iterable of rows.
+    # Collection-like API — make Lens feel like an iterable of rows.
     # This is the "direct, easy, simple and elegant way of reading
     # data" per the architecture review. See view_query.py for the
     # lazy query API (.where, .select, .map, .join).
@@ -147,8 +147,8 @@ class View:
                 print(row)
 
         Equivalent to:
-            for key in view.keys():
-                row = view.get(key)
+            for key in lens.keys():
+                row = lens.get(key)
                 if row is not None:
                     yield row
         """
@@ -158,46 +158,46 @@ class View:
                 yield row
 
     def __len__(self) -> int:
-        """len(view) == view.count()."""
+        """len(lens) == lens.count()."""
         return self.count()
 
     def __contains__(self, key: str) -> bool:
-        """key in view == view.exists(key)."""
+        """key in view == lens.exists(key)."""
         return self.exists(key)
 
-    def where(self, predicate=None, **kwargs) -> ViewQuery:
+    def where(self, predicate=None, **kwargs) -> LensQuery:
         """Start a lazy query that filters rows.
 
             # Filter with kwargs
-            for row in view.where(region="US"):
+            for row in lens.where(region="US"):
                 ...
 
             # Filter with a predicate
-            for row in view.where(lambda r: r["amount"] > 100):
+            for row in lens.where(lambda r: r["amount"] > 100):
                 ...
 
-        See ViewQuery for full chaining: .where().select().map().join().
+        See LensQuery for full chaining: .where().select().map().join().
         """
-        return ViewQuery(self).where(predicate, **kwargs)
+        return LensQuery(self).where(predicate, **kwargs)
 
-    def select(self, *fields: str) -> ViewQuery:
+    def select(self, *fields: str) -> LensQuery:
         """Start a lazy query that projects rows to only these fields.
 
-            for row in view.select("order_id", "amount"):
+            for row in lens.select("order_id", "amount"):
                 ...
         """
-        return ViewQuery(self).select(*fields)
+        return LensQuery(self).select(*fields)
 
-    def map(self, fn: Callable) -> ViewQuery:
+    def map(self, fn: Callable) -> LensQuery:
         """Start a lazy query that transforms each row via fn(row).
 
-            for row in view.map(lambda r: {**r, "amount_usd": r["amount"] * 1.1}):
+            for row in lens.map(lambda r: {**r, "amount_usd": r["amount"] * 1.1}):
                 ...
         """
-        return ViewQuery(self).map(fn)
+        return LensQuery(self).map(fn)
 
     def join(self, other, on: str):
-        """JOIN with another View.
+        """JOIN with another Lens.
 
             for row in orders.join(customers, on="customer_id"):
                 print(row["order_id"], row["customer_name"])
@@ -205,7 +205,7 @@ class View:
         LEFT JOIN semantics: left rows with no match are yielded as-is.
         Right side wins on field conflicts.
         """
-        return ViewQuery(self).join(other, on)
+        return LensQuery(self).join(other, on)
 
     # --- Version control ---
     def branch(self, name: str) -> str: return self.base.branch(name)
@@ -281,7 +281,7 @@ class View:
         return self.create_index(index_name, key_extractor)
 
     def list_indexes(self) -> list[str]:
-        """List all ACTIVE (non-tombstoned) indexes for this View.
+        """List all ACTIVE (non-tombstoned) indexes for this Lens.
 
         Per RFC-0008, tombstoned indexes are excluded. Use
         list_all_indexes() to include tombstoned indexes.
@@ -320,28 +320,28 @@ class View:
 
 
 # ===========================================================================
-# KeylessView — primary-keyless View as a first-class mode
+# KeylessLens — primary-keyless Lens as a first-class mode
 # ===========================================================================
 
-class KeylessView(View):
-    """A View where primary keys are auto-generated, not user-supplied.
+class KeylessLens(Lens):
+    """A Lens where primary keys are auto-generated, not user-supplied.
 
     Use this when your data does not have a natural primary key:
     event logs, time-series, metrics, append-only streams, audit
-    trails. The View generates a UUID4 for each row; the caller
+    trails. The Lens generates a UUID4 for each row; the caller
     receives the key from put() and can use it for later retrieval.
 
     This is the first-class version of the auto-key pattern. Instead
-    of calling `view.put_auto(data)` on a regular View, you construct
-    a KeylessView and call `view.put(data)` — the key generation is
+    of calling `lens.put_auto(data)` on a regular Lens, you construct
+    a KeylessLens and call `lens.put(data)` — the key generation is
     built into the put path.
 
-    Internally, KeylessView just overrides put() to delegate to
-    put_auto(). All other View operations (get, delete, branch, merge,
-    history, indexes) work unchanged. The View's state space is the
-    same as a regular View; the only difference is the put() signature.
+    Internally, KeylessLens just overrides put() to delegate to
+    put_auto(). All other Lens operations (get, delete, branch, merge,
+    history, indexes) work unchanged. The Lens's state space is the
+    same as a regular Lens; the only difference is the put() signature.
 
-    For indexed lookups on KeylessView data, register indexes on
+    For indexed lookups on KeylessLens data, register indexes on
     fields WITHIN the data (e.g., a timestamp, a user_id). Use
     find_by / find_all_by to query without knowing the primary key.
     """
@@ -350,9 +350,9 @@ class KeylessView(View):
         """Stage data with an auto-generated key. Returns the key.
 
         Args:
-            key: MUST be None for KeylessView. Passing a non-None key
+            key: MUST be None for KeylessLens. Passing a non-None key
                 raises TypeError — if you want to supply your own
-                keys, use the regular `View` class instead.
+                keys, use the regular `Lens` class instead.
             data: the data to store.
 
         Returns:
@@ -361,8 +361,8 @@ class KeylessView(View):
         """
         if key is not None:
             raise TypeError(
-                "KeylessView.put() does not accept a key. "
-                "Pass key=None, or use the regular View class if you "
+                "KeylessLens.put() does not accept a key. "
+                "Pass key=None, or use the regular Lens class if you "
                 "want to supply your own keys."
             )
         return self.put_auto(data)
@@ -380,67 +380,67 @@ class KeylessView(View):
 
 
 # ===========================================================================
-# CrossView — read/write across Views
+# CrossLens — read/write across Views
 # ===========================================================================
 
-class CrossView:
-    """Cross-View read/write operations.
+class CrossLens:
+    """Cross-Lens read/write operations.
 
     Semantics (settled per Phase B.3 SDK polish):
 
-    - **Source = HEAD commit of the source View's currently-checked-out
-      branch.** CrossView does NOT take a commit-hash argument; it
-      always reads from the source View's current HEAD. To read from
+    - **Source = HEAD commit of the source Lens's currently-checked-out
+      branch.** CrossLens does NOT take a commit-hash argument; it
+      always reads from the source Lens's current HEAD. To read from
       a specific historical commit, check out that commit's branch
-      first, then call CrossView.
-    - **Tombstoned indexes are skipped.** If `from_view` has tombstoned
+      first, then call CrossLens.
+    - **Tombstoned indexes are skipped.** If `from_lens` has tombstoned
       indexes (per RFC-0008), `read_all_from` returns only non-internal
       user keys; tombstoned index References are excluded (they start
       with `{view_name}__index__` and resolve to TOMBSTONE_HASH).
     - **Zero-copy sharing.** `share_blob` copies the blob HASH, not
       the blob CONTENT. The two Views now reference the same kernel
       blob (content-addressed dedup for free).
-    - **No cross-View atomicity.** A `write_to` followed by a `commit`
-      on the target View is atomic for the target, but there is no
-      cross-View atomic commit. If you need atomic multi-View commits,
+    - **No cross-Lens atomicity.** A `write_to` followed by a `commit`
+      on the target Lens is atomic for the target, but there is no
+      cross-Lens atomic commit. If you need atomic multi-Lens commits,
       use a higher-level coordinator (future RFC).
     - **Pipe is non-transactional.** `pipe` reads the source's current
       state at call time and writes to the target's staging area. The
-      target is NOT committed; the caller must call `to_view.commit()`
+      target is NOT committed; the caller must call `to_lens.commit()`
       after `pipe` returns.
     """
     @staticmethod
-    def read_from(view: View, key: str) -> Optional[Any]:
+    def read_from(view: Lens, key: str) -> Optional[Any]:
         """Read a single key from the view's current HEAD.
 
         Returns None if the key does not exist or was deleted.
         """
-        return view.get(key)
+        return lens.get(key)
 
     @staticmethod
-    def read_all_from(view: View) -> dict[str, Any]:
+    def read_all_from(view: Lens) -> dict[str, Any]:
         """Read all non-internal keys from the view's current HEAD.
 
         Keys starting with `_` (internal: schema, index metadata,
         semantic definitions) are excluded. Tombstoned names are
-        excluded (they are not in `view.get_all()` because `get_all`
-        walks the View state, not the root namespace).
+        excluded (they are not in `lens.get_all()` because `get_all`
+        walks the Lens state, not the root namespace).
         """
-        return view.get_all()
+        return lens.get_all()
 
     @staticmethod
-    def write_to(view: View, key: str, data: Any) -> str:
-        """Stage a write on the target view. Does NOT commit.
+    def write_to(view: Lens, key: str, data: Any) -> str:
+        """Stage a write on the target lens. Does NOT commit.
 
-        The caller must call `view.commit(message)` after one or more
+        The caller must call `lens.commit(message)` after one or more
         `write_to` calls to make the changes durable.
         """
-        return view.put(key, data)
+        return lens.put(key, data)
 
     @staticmethod
-    def share_blob(from_view: View, from_key: str,
-                    to_view: View, to_key: str) -> bool:
-        """Zero-copy: share a blob's HASH from one View to another.
+    def share_blob(from_lens: Lens, from_key: str,
+                    to_lens: Lens, to_key: str) -> bool:
+        """Zero-copy: share a blob's HASH from one Lens to another.
 
         The blob's CONTENT is not copied. Both Views now reference
         the same kernel blob (content-addressed dedup for free).
@@ -448,93 +448,93 @@ class CrossView:
         Returns True if the source key existed and the share succeeded,
         False if the source key was not found.
 
-        The target View's staging area is updated; the caller must
-        call `to_view.commit(message)` to make the share durable.
+        The target Lens's staging area is updated; the caller must
+        call `to_lens.commit(message)` to make the share durable.
         """
-        h = from_view.base.lookup(from_key)
+        h = from_lens.base.lookup(from_key)
         if h is None:
             return False
-        to_view.put_raw(to_key, h)
+        to_lens.put_raw(to_key, h)
         return True
 
     @staticmethod
-    def pipe(from_view: View, to_view: View,
+    def pipe(from_lens: Lens, to_lens: Lens,
              transformer: Optional[Callable] = None) -> int:
-        """Copy all non-internal keys from `from_view` to `to_view`.
+        """Copy all non-internal keys from `from_lens` to `to_lens`.
 
         If `transformer` is None: zero-copy share (each blob hash is
         staged directly via `put_raw`, no re-encoding).
 
         If `transformer` is provided: re-encode path. The transformer
         receives `(key, decoded_data)` and returns `(new_key, new_data)`.
-        The new_data is re-encoded via `to_view.encode` and written as
+        The new_data is re-encoded via `to_lens.encode` and written as
         a new blob.
 
-        The target View's staging area is updated; the caller must
-        call `to_view.commit(message)` to make the pipe durable.
+        The target Lens's staging area is updated; the caller must
+        call `to_lens.commit(message)` to make the pipe durable.
 
         Returns the number of keys copied.
         """
-        state = from_view.base.read_all()
+        state = from_lens.base.read_all()
         count = 0
         for key, h in state.items():
             if key.startswith("_"):
                 continue
             if transformer:
-                data = from_view.decode(from_view.kernel.read_blob(h))
+                data = from_lens.decode(from_lens.kernel.read_blob(h))
                 to_key, to_data = transformer(key, data)
-                to_view.put(to_key, to_data)
+                to_lens.put(to_key, to_data)
             else:
-                to_view.put_raw(key, h)
+                to_lens.put_raw(key, h)
             count += 1
         return count
 
 
 # ===========================================================================
-# OssieSemanticView — aligned with Apache Ossie open semantic interchange spec
+# OssieSemanticLens — aligned with Apache Ossie open semantic interchange spec
 # ===========================================================================
 
 class SemanticModelAdapter:
     """Abstract interface for semantic model formats.
     Pond supports multiple semantic model standards (Ossie, Cube, dbt, etc.)
-    via adapters. The kernel and View SDK are NOT coupled to any specific format."""
-    def export_model(self, view: 'View') -> dict:
+    via adapters. The kernel and Lens SDK are NOT coupled to any specific format."""
+    def export_model(self, lens: 'Lens') -> dict:
         raise NotImplementedError
-    def import_model(self, view: 'View', model: dict) -> None:
+    def import_model(self, lens: 'Lens', model: dict) -> None:
         raise NotImplementedError
 
 
 class OssieAdapter(SemanticModelAdapter):
     """Apache Ossie adapter — one implementation of the semantic model interface."""
 
-    def export_model(self, view: 'View') -> dict:
+    def export_model(self, lens: 'Lens') -> dict:
         """Export semantic definitions in Ossie format."""
-        state = view.base.read_all()
-        model = {"name": view.name, "datasets": [], "metrics": [], "relationships": []}
+        state = lens.base.read_all()
+        model = {"name": lens.name, "datasets": [], "metrics": [], "relationships": []}
         for key in state:
             if key.startswith("_semantic/metrics/"):
-                model["metrics"].append(view.decode(view.kernel.read_blob(state[key])))
+                model["metrics"].append(lens.decode(lens.kernel.read_blob(state[key])))
             elif key.startswith("_semantic/relationships/"):
-                model["relationships"].append(view.decode(view.kernel.read_blob(state[key])))
+                model["relationships"].append(lens.decode(lens.kernel.read_blob(state[key])))
         return model
 
-    def import_model(self, view: 'View', model: dict) -> None:
-        """Import an Ossie-format model into the View."""
+    def import_model(self, lens: 'Lens', model: dict) -> None:
+        """Import an Ossie-format model into the Lens."""
         for metric in model.get("metrics", []):
-            view.put(f"_semantic/metrics/{metric['name']}", metric)
+            lens.put(f"_semantic/metrics/{metric['name']}", metric)
         for rel in model.get("relationships", []):
-            view.put(f"_semantic/relationships/{rel['name']}", rel)
+            lens.put(f"_semantic/relationships/{rel['name']}", rel)
 
 
-class SemanticView(View):
+class SemanticLens(Lens):
     """
-    A View that manages semantic models (metrics, dimensions, relationships).
+    A Lens that manages semantic models (metrics, dimensions, relationships).
 
     NOT coupled to any specific semantic model standard. Uses adapters:
       - OssieAdapter for Apache Ossie format
       - Future: CubeAdapter, DbtAdapter, etc.
 
-    The View stores metric/dimension/relationship definitions as blobs.
+    The Lens stores metric/dimension/relationship definitions as blobs.
     Adapters translate between the internal format and external standards.
     """
 
@@ -623,9 +623,9 @@ class SemanticView(View):
     def get_metric(self, name: str) -> Optional[dict]:
         return self.get(f"_semantic/metrics/{name}")
 
-    def execute_metric(self, metric_name: str, source_view: View,
+    def execute_metric(self, metric_name: str, source_view: Lens,
                        group_by: list[str] = None) -> list[dict]:
-        """Execute a metric query against a source View."""
+        """Execute a metric query against a source Lens."""
         metric = self.get_metric(metric_name)
         if not metric:
             raise ValueError(f"Metric '{metric_name}' not found")
@@ -670,7 +670,7 @@ class SemanticView(View):
 
 
 # ===========================================================================
-# Test: Index management + Ossie SemanticView
+# Test: Index management + Ossie SemanticLens
 # ===========================================================================
 
 def test_all():
@@ -682,7 +682,7 @@ def test_all():
 
     print("=== INDEX MANAGEMENT TEST ===\n")
 
-    # Create a View with data
+    # Create a Lens with data
     db = View(kernel, "db")
     db.put("user:1", {"name": "Alice", "age": 30, "region": "US"})
     db.put("user:2", {"name": "Bob", "age": 25, "region": "EU"})
@@ -724,7 +724,7 @@ def test_all():
     print("\n=== OSSIE SEMANTIC VIEW TEST ===\n")
 
     # Create Ossie semantic model
-    semantic = OssieSemanticView(kernel, "semantic")
+    semantic = OssieSemanticLens(kernel, "semantic")
 
     # Define metrics with multi-dialect expressions (Ossie pattern)
     semantic.define_metric_ossie(
@@ -818,8 +818,7 @@ if __name__ == "__main__":
 
 
 # ===========================================================================
-# Lens aliases — the preferred names going forward.
-# See RFC-0012 for the rename rationale.
+# Backward-compatible aliases (Lens is the primary name; View = Lens)
 #
 # "View" is kept for backward compatibility. New code should use "Lens":
 #   from lens_sdk import Lens, IndexedLens, KeylessLens, SemanticLens
@@ -829,18 +828,20 @@ if __name__ == "__main__":
 # that focuses light differently without changing the light itself.
 # ===========================================================================
 
-Lens = View
-KeylessLens = KeylessView
-SemanticLens = SemanticView
-OssieLens = SemanticView  # backward compat for old name
+View = Lens  # backward-compatible alias
+KeylessView = KeylessLens  # backward-compatible alias
+SemanticView = SemanticLens  # backward-compatible alias
+CrossView = CrossLens  # backward-compatible alias
+OssieLens = SemanticLens  # backward compat for old name
+OssieSemanticLens = SemanticLens  # backward compat
 
-# IndexedLens needs to reference IndexedView from auto_index.py.
+# IndexedLens needs to reference IndexedLens from auto_index.py.
 # Import it lazily to avoid circular imports.
 def _get_indexed_lens():
-    from auto_index import IndexedView
-    return IndexedView
+    from auto_index import IndexedLens
+    return IndexedLens
 
 # Use a property-like approach so `IndexedLens` works as a class.
-# Since IndexedView is in a different module, we import it here.
-from auto_index import IndexedView as _IndexedView
-IndexedLens = _IndexedView
+# Since IndexedLens is in a different module, we import it here.
+from auto_index import IndexedLens as _IndexedLens
+IndexedLens = _IndexedLens

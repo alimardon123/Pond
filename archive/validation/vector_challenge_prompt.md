@@ -133,7 +133,7 @@ available as imports:
 ```python
 from pond_minimal import PondMinimal
 from auto_index import IndexedView
-from view_sdk import CrossView
+from lens_sdk import CrossView
 ```
 
 Write the implementation to /home/z/my-project/pond_repo/pond-vector/vector_view.py

@@ -3,22 +3,22 @@
 ## Status
 
 **Accepted** — promoted from Draft after the property-test harness
-(`pond-sdk/view_laws.py`) was built and verified against:
+(`pond-sdk/lens_laws.py`) was built and verified against:
 
 1. The SDK's own `View`, `IndexedView`, and `SemanticView` classes
    (all pass all 6 laws; run via
-   `python pond-sdk/run_view_laws_ci.py`).
+   `python pond-sdk/run_lens_laws_ci.py`).
 2. An externally-built `GraphView` constructed from `SDK_SPEC.md`
    alone (no access to pond-sdk internals; passes all 6 laws; run via
-   `python validation/run_graph_view_laws.py`).
+   `python validation/run_graph_lens_laws.py`).
 
-This RFC is now the authoritative specification of what a Pond View
+This RFC is now the authoritative specification of what a Pond Lens
 IS, mathematically. Violations are release-blocking bugs (RFC-0009
 metric E1, target 0).
 
 ## Abstract
 
-RFC-0001 asked the question: *what is a View, mathematically?* It
+RFC-0001 asked the question: *what is a Lens, mathematically?* It
 proposed `V = (State, Encode, Decode, Commit, Resolve)` as a draft
 answer and listed composition as an open question.
 
@@ -27,18 +27,18 @@ prove that Views compose, prove that all existing Views satisfy the
 algebra, and use the algebra to settle the Semantic-adapter question
 (OssieView, CubeView, dbtView are Views, not adapters-as-afterthought).
 
-The shift from RFC-0001 is: stop conflating "what a View IS" with
-"what a View DOES." `Commit` and `Resolve` are operations; picking
+The shift from RFC-0001 is: stop conflating "what a Lens IS" with
+"what a Lens DOES." `Commit` and `Resolve` are operations; picking
 two of them and freezing them into the definition was arbitrary.
 The algebra admits the full operation set; the definition admits
 only the structural skeleton.
 
-> **Acceptance evidence:** the `view_laws.py` harness in
+> **Acceptance evidence:** the `lens_laws.py` harness in
 > `pond-sdk/` implements all 6 law checks as property tests. It
 > passes for all 3 SDK View classes AND for an external GraphView
 > built from `SDK_SPEC.md` alone (validation/graph_view_external.py,
 > from Task 12 external validation). The harness is CI-runnable via
-> `python pond-sdk/run_view_laws_ci.py`.
+> `python pond-sdk/run_lens_laws_ci.py`.
 
 ---
 
@@ -50,15 +50,15 @@ spec, but reported friction: ambiguity in contracts, missing
 defaults, invented conventions. The friction was not architectural
 (architecture: 9/10). It was specification friction.
 
-The root cause: we never specified what a View IS. The SDK
-documentation describes how to *use* a View, not what a View *is*.
+The root cause: we never specified what a Lens IS. The SDK
+documentation describes how to *use* a Lens, not what a Lens *is*.
 A formal definition would:
 
-1. Give View authors a checkable contract (does my code satisfy the
+1. Give Lens authors a checkable contract (does my code satisfy the
    algebra?).
 2. Make composition principled (when do two Views compose? what is
    the composite?).
-3. Settle questions like "is a Semantic adapter a View?" by reducing
+3. Settle questions like "is a Semantic adapter a Lens?" by reducing
    them to "does it satisfy the algebra?"
 4. Enable automated View testing (algebraic laws are checkable
    invariants).
@@ -78,9 +78,9 @@ where:
 ### Σ — state space
 
 The set of all possible view states. A view state is the complete
-information the View needs to answer any query. It is not "in-memory
+information the Lens needs to answer any query. It is not "in-memory
 buffer state" (RFC-0001's `State` was ambiguous about this); it is
-the *logical* state — the snapshot the View presents to its users.
+the *logical* state — the snapshot the Lens presents to its users.
 
 For versioned Views, Σ includes the commit DAG: a state is a node
 in the DAG, plus the snapshot it carries. `Σ = CommitDAG × Snapshot`.
@@ -110,7 +110,7 @@ produce new states; accessors are pure functions of state.
 Critically, **`A` is not fixed by the algebra**. Different Views have
 different algebras. SQLView has `CREATE_TABLE`, `INSERT`, `SELECT`;
 VectorView has `INSERT`, `SEARCH`, `DELETE`. The algebra is what
-makes a View a View-of-something-specific.
+makes a Lens a Lens-of-something-specific.
 
 ### E : Σ → Blob — encode
 
@@ -155,7 +155,7 @@ not part of the algebra.
 
 ## 3. Laws
 
-A 5-tuple `(Σ, A, E, D, M)` is a View iff it satisfies the following
+A 5-tuple `(Σ, A, E, D, M)` is a Lens iff it satisfies the following
 six laws.
 
 ### Law 1: Round-trip
@@ -164,7 +164,7 @@ six laws.
 
 Encoding is lossless. The View can persist any state and recover it
 exactly. This is the contract that makes the kernel trustworthy as
-a View backend.
+a Lens backend.
 
 ### Law 2: Purity of operations
 
@@ -209,7 +209,7 @@ Views over the same kernel, then their composite
 V1 ⊕ V2 = (Σ1 × Σ2, A1 ⊕ A2, E1 ⊕ E2, D1 ⊕ D2, M1 ⊕ M2)
 ```
 
-is also a View, where:
+is also a Lens, where:
 
 - `A1 ⊕ A2` is the disjoint union of operations (an operation in V1
   acts on the first component; an operation in V2 acts on the second).
@@ -221,17 +221,17 @@ is also a View, where:
 This law is what makes layered architecture work: a higher-layer
 View (e.g., FeatureStoreView) is a composite of lower-layer Views
 (e.g., IndexedView ⊕ ProllyViewBase), and the composite is itself
-a View satisfying the same algebra.
+a Lens satisfying the same algebra.
 
 ### Law 6: Kernel independence
 
 For any view state `s ∈ Σ`, `E(s)` is a finite byte string. The
-kernel can store and retrieve it without any knowledge of the View's
+kernel can store and retrieve it without any knowledge of the Lens's
 structure. The kernel never needs to inspect blob contents to
 satisfy its own laws.
 
 This is the downward-only-dependency rule, formalized. The View
-depends on the kernel; the kernel never depends on the View.
+depends on the kernel; the kernel never depends on the Lens.
 
 ---
 
@@ -258,7 +258,7 @@ of state. Verified by replay tests: same operation sequence on same
 initial state produces same final state.
 
 **Law 3 (encoding preservation):** Every operation produces a state
-that the View can encode. (If it couldn't, the View couldn't commit
+that the Lens can encode. (If it couldn't, the Lens couldn't commit
 — and every View's commit operation works.)
 
 **Law 4 (materialization determinism):** All materializations are
@@ -271,7 +271,7 @@ materialization, rebuild, verify identical output.
 - `SemanticView ⊕ FeatureStoreView` = the Semantic adapter stack
 
 **Law 6 (kernel independence):** Verified by backend substitution.
-The same View code runs unchanged on 6 backends (FS, memory, SQLite,
+The same Lens code runs unchanged on 6 backends (FS, memory, SQLite,
 Redis, S3, FDB). The kernel never inspects blob contents.
 
 ---
@@ -288,7 +288,7 @@ We also define `∘` (sequential composition):
 
 If V1's state space can be *interpreted* as V2's state space — i.e.,
 there exist pure functions `f : Σ1 → Σ2` and `g : Σ2 → Σ1` with
-`f ∘ g = id_Σ2` — then V1 ∘ V2 is a View with state space Σ2 and
+`f ∘ g = id_Σ2` — then V1 ∘ V2 is a Lens with state space Σ2 and
 algebra `A2` lifted through `g`.
 
 Concretely: V1 ∘ V2 is "V2, but stored using V1's encoding." This is
@@ -299,7 +299,7 @@ how a `LakeFSView` can be a GitView-with-extra-metadata, or how an
 
 This settles the Semantic-adapter question (Section 6) and the
 Layered Architecture (RFC-0006) on a single formal foundation.
-Each layer is a View; each layer composes with the layer below via
+Each layer is a Lens; each layer composes with the layer below via
 `⊕` or `∘`. There is no special-case "adapter" concept — adapters
 are Views, and Views compose.
 
@@ -326,7 +326,7 @@ through `E`/`D`. All three can be layered over `FeatureStoreView`
 through `⊕` to give "semantic layer over feature store."
 
 **Architectural consequence:** the `pond-semantic` package is not
-an adapter layer; it is a View family. The kernel does not know
+an adapter layer; it is a Lens family. The kernel does not know
 Semantic exists. The SDK does not need a special Semantic API. The
 algebra admits all three uniformly.
 
@@ -364,7 +364,7 @@ Each law is checkable by a property test:
 | 5. Composition | `assert (V1 ⊕ V2) satisfies laws 1–4` |
 | 6. Kernel independence | `assert kernel_backend_substitution(V) works` |
 
-A `view_laws.py` test harness can verify any View implementation
+A `lens_laws.py` test harness can verify any View implementation
 against the algebra. This is the SDK polish work proposed for Phase B
 of the roadmap.
 
@@ -376,7 +376,7 @@ of the roadmap.
 The user's review proposed `View = State + Translation + Derived
 Structures + Policies`. We omit policies from the algebra because
 policies (retention, GC, access control, replication) constrain
-*which transitions are permitted* — they do not change *what a View
+*which transitions are permitted* — they do not change *what a Lens
 is*. A SQLView with a 30-day retention policy and a SQLView with a
 7-year retention policy are the same View with different policies.
 
@@ -392,9 +392,9 @@ of `Σ` for versioned Views.
 
 ### Concurrency
 The algebra is sequential. Concurrency (locking, MVCC, isolation
-levels) is a Layer 4 concern, not a View-definition concern. The
-algebra describes what a View IS; concurrency describes how
-multiple actors interact over a View.
+levels) is a Layer 4 concern, not a Lens-definition concern. The
+algebra describes what a Lens IS; concurrency describes how
+multiple actors interact over a Lens.
 
 ---
 
@@ -443,7 +443,7 @@ special cases.
   Law 5).
 - **Refines:** RFC-0005 (Derived Structures — now `M`, the
   materialization set; renamed per database literature).
-- **Settles:** RFC-0006 (Layered Architecture — each layer is a View
+- **Settles:** RFC-0006 (Layered Architecture — each layer is a Lens
   composite per Law 5).
 
 ---
@@ -453,12 +453,12 @@ special cases.
 This RFC is **Accepted**. The six laws have been verified against
 the eight reference Views by inspection AND against the SDK's three
 View classes (View, IndexedView, SemanticView) plus an externally-
-built GraphView via the automated `view_laws.py` property-test
+built GraphView via the automated `lens_laws.py` property-test
 harness. The harness is CI-runnable
-(`python pond-sdk/run_view_laws_ci.py`) and is now metric E1
+(`python pond-sdk/run_lens_laws_ci.py`) and is now metric E1
 (RFC-0009): a hard constraint with target 0 violations.
 
 Future work: extend the harness to cover all Layer 3 domain Views
 (SQLView, StreamingView, GitView, NotebookView, FeatureStoreView)
 once each has a `ViewContract` adapter. The harness is View-agnostic;
-adding a new View requires only writing its contract.
+adding a new Lens requires only writing its contract.

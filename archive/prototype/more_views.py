@@ -2,7 +2,7 @@
 More Views — testing whether the kernel is truly universal.
 
 Each View must be implemented using ONLY the kernel's 4 syscalls
-(Read/Write/Seal/Reference) + DAG patterns (Tree/Commit). If a View
+(Read/Write/Seal/Reference) + DAG patterns (Tree/Commit). If a Lens
 needs a kernel change, that's a finding — it means the kernel leaked
 or is missing a universal primitive.
 
@@ -46,7 +46,7 @@ from pond_kernel import PondKernel, Tree, Commit, hash_bytes
 
 class GraphView:
     """
-    A graph database View. Stores nodes and edges as immutable blobs;
+    A graph database Lens. Stores nodes and edges as immutable blobs;
     builds adjacency index as Trees.
 
     Design:
@@ -208,12 +208,12 @@ class GraphView:
 
 class MLView:
     """
-    An ML artifact registry View. Stores:
+    An ML artifact registry Lens. Stores:
       - model_weights/<name>/<step> -> raw weight bytes (large blob)
       - metadata/<name>/<step> -> JSON metadata (loss, hyperparams, lineage)
       - lineage/<name> -> JSON lineage tree (parent step, derived artifacts)
 
-    The kernel stores the weight bytes opaquely; the View interprets them.
+    The kernel stores the weight bytes opaquely; the Lens interprets them.
     Large blobs are deduplicated by content hash (good for ML, where the
     same checkpoint might be referenced by multiple experiments).
     """
@@ -312,7 +312,7 @@ class MLView:
 
 class TimeSeriesView:
     """
-    A time-series View. Each series is a sequence of (timestamp, value) pairs.
+    A time-series Lens. Each series is a sequence of (timestamp, value) pairs.
     Segments are batches of points compressed as raw float bytes.
 
     Layout:
@@ -457,7 +457,7 @@ class TimeSeriesView:
 
 class OCIView:
     """
-    An OCI container registry View. Stores:
+    An OCI container registry Lens. Stores:
       - blobs/<sha256> -> raw layer/config bytes (content-addressed, dedup'd)
       - manifests/<image>/<tag> -> JSON manifest referencing config + layers
 

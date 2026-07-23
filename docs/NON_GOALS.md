@@ -14,14 +14,14 @@ The kernel stores and retrieves bytes; it does not plan execution.
 
 ### Distributed consensus protocol
 Pond's kernel has no Raft, no Paxos, no leader election.
-Multi-writer coordination is a View/infrastructure concern.
+Multi-writer coordination is a Lens/infrastructure concern.
 The kernel provides last-writer-wins; Views build stronger coordination
 on top (branches, CRDTs, external Raft).
 
 ### Vector search engine
 Pond's kernel has no HNSW, no IVF, no ANN algorithm.
 VectorView does linear scan. Production vector search requires a
-View-level index library. The kernel stores vectors as bytes.
+Lens-level index library. The kernel stores vectors as bytes.
 
 ### Query planner / IR
 Pond's kernel has no intermediate representation, no logical/physical
@@ -38,23 +38,23 @@ Pond's kernel has no schema concept. Views track their own schemas.
 The kernel stores bytes; it does not validate structure.
 
 ### Cache
-Pond's kernel has no cache layer. Caching is a View/infrastructure
+Pond's kernel has no cache layer. Caching is a Lens/infrastructure
 concern. The kernel reads from the backend on every Read; Views
 cache if they want to.
 
 ### Index
 Pond's kernel has no index primitive. Views build indexes as Tree
-patterns. A shared index library (View-level) may emerge, but it's
+patterns. A shared index library (Lens-level) may emerge, but it's
 not part of the kernel.
 
 ### Scheduler
 Pond's kernel has no job scheduler, no pipeline executor, no morsel
-driver. Execution scheduling is a View/backend concern.
+driver. Execution scheduling is a Lens/backend concern.
 
 ### Authorization system
 Pond's kernel has no auth, no RBAC, no capability enforcement.
 Multi-tenancy is solved via separate kernel instances or capability
-tokens (View-level naming conventions).
+tokens (Lens-level naming conventions).
 
 ### Compression engine
 Pond's kernel does not compress. Views compress their blobs before
@@ -71,7 +71,7 @@ StreamView provides append-only log semantics; full streaming
 
 ### Garbage collector
 Pond's kernel has no GC. Orphaned objects accumulate.
-GC is a View-level utility (PondGC in engineering/02_gc.py).
+GC is a Lens-level utility (PondGC in engineering/02_gc.py).
 
 ### Time-travel accelerator
 Pond's kernel has no skip pointers, no history index.
@@ -81,7 +81,7 @@ pointers if they need O(log N) time travel.
 ### Merge engine
 Pond's kernel has no merge semantics. Multi-parent commits are
 allowed (parents is a list in the commit blob), but conflict
-resolution is a View concern.
+resolution is a Lens concern.
 
 ### Working tree
 Pond's kernel has no working tree, no checkout, no staging area.
@@ -97,12 +97,12 @@ The kernel is a library. Networking is an infrastructure layer.
 
 Each of the above is either:
 1. **Workload-specific** (SQL optimizer, vector search, schema registry) —
-   not all Views need it. Adding it to the kernel would violate the
+   not all Lenses need it. Adding it to the kernel would violate the
    Universality criterion of the Admission Rule.
 2. **Infrastructure-specific** (replication, consensus, networking) —
    these are deployment concerns, not storage concerns. The kernel
    works the same whether single-node or distributed.
-3. **View-level** (cache, index, GC, merge, time-travel) — Views can
+3. **Lens-level** (cache, index, GC, merge, time-travel) — Views can
    implement these using the 3 kernel primitives. Adding them to the
    kernel would violate the "Impossible outside kernel" criterion.
 

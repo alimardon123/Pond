@@ -144,7 +144,7 @@ to call `fs.base.has_staged()` directly. Either expose it on
 
 Every Pond package does its own `sys.path.insert(0, ...)` dance in
 its module header (see `feature_store.py:49-54`, `arrow_view.py:50-53`,
-`view_sdk.py:25-26`). To import them I had to copy the same 4-line
+`lens_sdk.py:25-26`). To import them I had to copy the same 4-line
 incantation. There's no `pyproject.toml`, no `pip install -e .`, no
 namespace package. This is fine for a research prototype but would
 be the first thing a real user trips on.

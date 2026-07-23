@@ -8,16 +8,16 @@ authoritative source for its topic.
 
 | RFC | Title | Status |
 |---|---|---|
-| RFC-0001 | What Is a View? | Draft (superseded by RFC-0007) |
+| RFC-0001 | What Is a Lens? | Draft (superseded by RFC-0007) |
 | RFC-0002 | Elegance Metrics | Draft |
 | RFC-0003 | Kernel Specification (Frozen) | **Accepted** |
 | RFC-0004 | View Composition and Interoperability | Draft |
 | RFC-0005 | Materialization Calculus (renamed from Derived Structures) | Draft |
 | RFC-0006 | Layered Architecture | Draft |
-| RFC-0007 | View Algebra | **Accepted** (verified by `view_laws.py` CI harness) |
+| RFC-0007 | View Algebra | **Accepted** (verified by `lens_laws.py` CI harness) |
 | RFC-0008 | Deletion as Data | Draft |
 | RFC-0009 | Architecture Metrics | Draft |
-| RFC-0010 | ArrowView (Phase D Compatibility Adapter) | **Accepted** (verified by `pond-arrow/run_arrow_view_laws.py`) |
+| RFC-0010 | ArrowView (Phase D Compatibility Adapter) | **Accepted** (verified by `pond-arrow/run_arrow_lens_laws.py`) |
 | RFC-0011 | Feature Store (Phase E Flagship) | **Accepted** (verified by `pond-feature-store/feature_store.py` production tests) |
 | RFC-0012 | The Lens Architecture | **Accepted** (context-based interpretation; verified by falsification test) |
 | RFC-0013 | The Lens Interpretation Contract | **Accepted** (formal contract; verified by falsification test) |
@@ -29,7 +29,7 @@ authoritative source for its topic.
 | `DESIGN_GOALS.md` (top-level) | Six design principles + repo map; **read this first** |
 | `FORMAL_SPEC.md` | 5 storage laws + 7 composition laws + preconditions/postconditions |
 | `FORMAL_ALGEBRA.md` | Mathematical definition + 8 theorems + lower-bound proof + equivalence analysis |
-| `LENS_AUTHORS_GUIDE.md` | 6 guarantees + 7 conventions + 12 unspecified (the View boundary) |
+| `LENS_AUTHORS_GUIDE.md` | 6 guarantees + 7 conventions + 12 unspecified (the Lens boundary) |
 | `LENS_INTEROP_SPEC.md` | 10 ambiguities from independent implementation, classified |
 | `REJECTED_DESIGNS.md` | 15+ rejected architectural decisions with reasons |
 | `NON_GOALS.md` | 15 things Pond deliberately does NOT solve |

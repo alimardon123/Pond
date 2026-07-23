@@ -2,11 +2,11 @@
 Adversarial Semantic Tests — the remaining hostile tests.
 
 Per the architecture review, the next tests should attack:
-  - cross-View consistency (one View mutates refs while another reads snapshots)
+  - cross-Lens consistency (one View mutates refs while another reads snapshots)
   - time-travel / rollback semantics under heavy churn
   - multi-parent merge behavior under contention
 
-These are NOT new Views. They're stress tests of the kernel/View boundary
+These are NOT new Lenss. They're stress tests of the kernel/View boundary
 under adversarial semantics.
 
 If any test reveals a fundamental problem (not just a SQLite limitation),
@@ -34,11 +34,11 @@ def section(title):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Cross-View consistency — one View mutates while another reads
+# Test 1: Cross-Lens consistency — one View mutates while another reads
 # ---------------------------------------------------------------------------
 
 def test_cross_view_consistency():
-    section("Test 1: Cross-View consistency — concurrent read and write")
+    section("Test 1: Cross-Lens consistency — concurrent read and write")
     print()
     print("  Scenario: View A is writing commits (updating 'table_A').")
     print("  View B is reading 'table_A' snapshots repeatedly.")
@@ -111,13 +111,13 @@ def test_cross_view_consistency():
     print()
 
     if torn_count[0] == 0 and error_count[0] == 0:
-        print(f"  ✓ No torn reads, no errors. Cross-View consistency holds.")
+        print(f"  ✓ No torn reads, no errors. Cross-Lens consistency holds.")
         print(f"  VERDICT: SUPPORTED — readers see consistent snapshots even")
         print(f"  while writers are mutating references. Content-addressing")
         print(f"  + immutability guarantees snapshot consistency.")
     elif torn_count[0] > 0:
         print(f"  ✗ TORN READS detected — the kernel returned inconsistent state")
-        print(f"  VERDICT: FALSIFIED — cross-View consistency broken")
+        print(f"  VERDICT: FALSIFIED — cross-Lens consistency broken")
     else:
         print(f"  Read errors (but no torn reads) — likely race on resolve+read")
         print(f"  VERDICT: INCONCLUSIVE — errors may be benign (name not yet bound)")
@@ -202,7 +202,7 @@ def test_time_travel_under_churn():
         print(f"  VERDICT: SUPPORTED for correctness.")
         print(f"  VERDICT: NEEDS VALIDATION for performance — O(N) walk is slow")
         print(f"  at 1000 commits (~{med_tt*1000:.0f}ms). At 1M commits, ~1000s.")
-        print(f"  This is the known Finding 5a (needs View-level skip pointers).")
+        print(f"  This is the known Finding 5a (needs Lens-level skip pointers).")
     else:
         print(f"  VERDICT: FALSIFIED — time-travel returned wrong data")
 
@@ -455,7 +455,7 @@ def test_rollback():
 def main():
     print("=" * 76)
     print("  Adversarial Semantic Tests")
-    print("  Attacking cross-View consistency, time-travel, merge, snapshot, rollback.")
+    print("  Attacking cross-Lens consistency, time-travel, merge, snapshot, rollback.")
     print("=" * 76)
 
     test_cross_view_consistency()
@@ -468,7 +468,7 @@ def main():
     print()
     print("  Test                              | Verdict")
     print("  ----------------------------------|------------------------------------------")
-    print("  1. Cross-View consistency         | SUPPORTED (immutability guarantees snapshots)")
+    print("  1. Cross-Lens consistency         | SUPPORTED (immutability guarantees snapshots)")
     print("  2. Time-travel under churn        | SUPPORTED (correctness); NEEDS VALIDATION (perf)")
     print("  3. Multi-parent merge (3-way)     | SUPPORTED (300 commits, no data loss)")
     print("  4. Snapshot isolation             | SUPPORTED (hash = snapshot, by construction)")
@@ -476,13 +476,13 @@ def main():
     print()
     print("  FINDINGS:")
     print()
-    print("  1. Cross-View consistency holds. Immutability guarantees that readers")
+    print("  1. Cross-Lens consistency holds. Immutability guarantees that readers")
     print(f"     see consistent snapshots even while writers mutate references.")
     print(f"     Content-addressing is the mechanism: once you have a hash, you")
     print(f"     have a snapshot that can't be invalidated.")
     print()
     print("  2. Time-travel is correct but O(N). At 1000 commits, ~10ms. At 1M, ~10s.")
-    print(f"     Known issue (Finding 5a). View-level skip pointers fix it.")
+    print(f"     Known issue (Finding 5a). Lens-level skip pointers fix it.")
     print()
     print("  3. Multi-parent merge works. 3 branches × 100 commits, all 300 keys")
     print(f"     preserved after 3-way merge. Multi-parent commits are supported")

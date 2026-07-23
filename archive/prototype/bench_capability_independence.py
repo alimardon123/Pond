@@ -4,15 +4,15 @@ Capability Independence Test.
 Per the architecture review:
   > Imagine a CI pipeline. Disable SQL. Run. Everything passes.
   > Disable Streaming. Run. Everything passes.
-  > If removing a View breaks another View, you have coupling.
+  > If removing a Lens breaks another View, you have coupling.
 
 This test:
   1. For each View, instantiate it in isolation (no other Views loaded)
   2. Run a basic write/read cycle
-  3. Verify the View works without any other View present
+  3. Verify the Lens works without any other View present
 
 If any View fails when run in isolation, there's hidden coupling —
-the View depends on another View's side effects, and the kernel
+the Lens depends on another View's side effects, and the kernel
 isn't truly View-agnostic.
 
 This is the test that should run in CI on every PR.
@@ -54,9 +54,9 @@ def test_view_in_isolation(view_name: str, test_fn) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def test_sql(kernel: PondKernel):
-    from views import SQLView
+    from views import SQLLens
     import pyarrow as pa
-    sql = SQLView(kernel, "users")
+    sql = SQLLens(kernel, "users")
     schema = pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())])
     sql.create(schema)
     batch = pa.RecordBatch.from_arrays([
@@ -70,8 +70,8 @@ def test_sql(kernel: PondKernel):
 
 
 def test_vector(kernel: PondKernel):
-    from views import VectorView
-    vec = VectorView(kernel, "emb", dim=4)
+    from views import VectorLens
+    vec = VectorLens(kernel, "emb", dim=4)
     vec.insert([0.1, 0.2, 0.3, 0.4])
     vec.commit()
     results = vec.search([0.1, 0.2, 0.3, 0.4], k=1)
@@ -90,8 +90,8 @@ def test_stream(kernel: PondKernel):
 
 
 def test_git(kernel: PondKernel):
-    from views import GitView
-    g = GitView(kernel, "repo")
+    from views import GitLens
+    g = GitLens(kernel, "repo")
     g.add("file.txt", b"content")
     g.commit("initial")
     assert g.read_file("file.txt") == b"content"
@@ -157,10 +157,10 @@ def main():
     print()
 
     views = [
-        ("SQLView",        test_sql),
-        ("VectorView",     test_vector),
+        ("SQLLens",        test_sql),
+        ("VectorLens",     test_vector),
         ("StreamView",     test_stream),
-        ("GitView",        test_git),
+        ("GitLens",        test_git),
         ("GraphView",      test_graph),
         ("MLView",         test_ml),
         ("TimeSeriesView", test_timeseries),
@@ -184,16 +184,16 @@ def main():
     if all_passed:
         print("  ✓ ALL VIEWS PASS IN ISOLATION")
         print()
-        print("  No View depends on another View. The kernel is truly")
-        print("  View-agnostic. Removing any View (or all Views) doesn't")
+        print("  No View depends on another Lens. The kernel is truly")
+        print("  View-agnostic. Removing any View (or all Lenses) doesn't")
         print("  affect the others.")
         print()
         print("  This means:")
-        print("    - SQLView can be deleted; Vector/Stream/Git/Graph/ML/TS/OCI still work")
+        print("    - SQLLens can be deleted; Vector/Stream/Git/Graph/ML/TS/OCI still work")
         print("    - OCIView can be deleted; SQL/Vector/Stream/Git/Graph/ML/TS still work")
         print("    - etc.")
         print()
-        print("  The kernel has zero coupling to any View. This is the test")
+        print("  The kernel has zero coupling to any Lens. This is the test")
         print("  that should run in CI on every PR.")
     else:
         print("  ✗ SOME VIEWS FAILED IN ISOLATION")

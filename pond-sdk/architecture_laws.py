@@ -49,15 +49,15 @@ def law_1_committed_keys_survive_restart():
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
-    view = Lens(kernel, "inv1")
+    lens = Lens(kernel, "inv1")
 
     # Write 1000 records
     for i in range(1000):
-        view.put(f"k{i:04d}", {"id": i, "name": f"item_{i}"})
-    view.commit("1000 records")
+        lens.put(f"k{i:04d}", {"id": i, "name": f"item_{i}"})
+    lens.commit("1000 records")
 
-    keys_before = set(view.keys())
-    count_before = view.count()
+    keys_before = set(lens.keys())
+    count_before = lens.count()
     kernel.close()
 
     # Reopen
@@ -93,27 +93,27 @@ def law_2_branch_checkout_preserves_blobs():
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
-    view = Lens(kernel, "inv2")
+    lens = Lens(kernel, "inv2")
 
-    view.put("k1", {"v": 1})
-    view.commit("main v1")
-    blob_hash_main = view.base.lookup("k1")
+    lens.put("k1", {"v": 1})
+    lens.commit("main v1")
+    blob_hash_main = lens.base.lookup("k1")
 
-    view.branch("experiment")
-    view.checkout("experiment")
-    blob_hash_exp = view.base.lookup("k1")
+    lens.branch("experiment")
+    lens.checkout("experiment")
+    blob_hash_exp = lens.base.lookup("k1")
 
     assert blob_hash_main == blob_hash_exp, \
         "LAW 2 VIOLATED: blob hash changed after checkout"
 
     # Add data on experiment branch
-    view.put("k2", {"v": 2})
-    view.commit("experiment v2")
+    lens.put("k2", {"v": 2})
+    lens.commit("experiment v2")
 
     # Checkout back to main — k1 should still have the same hash
     # (main branch's HEAD hasn't changed)
     # Note: we need to undo the checkout by switching back
-    view.checkout("experiment")  # stay on experiment for this test
+    lens.checkout("experiment")  # stay on experiment for this test
 
     kernel.close()
     shutil.rmtree(bench, ignore_errors=True)
@@ -131,20 +131,20 @@ def law_3_lens_does_not_change_stored_bytes():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    view = Lens(kernel, "inv3")
+    lens = Lens(kernel, "inv3")
     data = {"name": "Alice", "age": 30}
-    view.put("k1", data)
-    view.commit("write k1")
+    lens.put("k1", data)
+    lens.commit("write k1")
 
     # The stored bytes should be exactly encode(data)
-    expected_bytes = view.encode(data)
-    actual_bytes = view.get_raw("k1")
+    expected_bytes = lens.encode(data)
+    actual_bytes = lens.get_raw("k1")
 
     assert actual_bytes == expected_bytes, \
         "LAW 3 VIOLATED: stored bytes differ from encode(data)"
 
     # The decoded value should be exactly the original data
-    decoded = view.decode(actual_bytes)
+    decoded = lens.decode(actual_bytes)
     assert decoded == data, \
         "LAW 3 VIOLATED: decode(encode(data)) != data"
 
@@ -164,22 +164,22 @@ def law_4_derived_rebuild_produces_identical_hashes():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    view = IndexedLens(kernel, "inv4")
-    view.register_index("by_val", lambda d: str(d.get("val", 0)), mode="eager")
+    lens = IndexedLens(kernel, "inv4")
+    lens.register_index("by_val", lambda d: str(d.get("val", 0)), mode="eager")
 
     for i in range(100):
-        view.put(f"k{i:03d}", {"id": i, "val": i * 10})
-    view.commit("100 records")
+        lens.put(f"k{i:03d}", {"id": i, "val": i * 10})
+    lens.commit("100 records")
 
     # Rebuild the index twice and compare
-    idx = view._auto_indexes["by_val"]
-    view._rebuild_index(idx)
+    idx = lens._auto_indexes["by_val"]
+    lens._rebuild_index(idx)
     hash1 = idx.tree_root
 
     # Clear and rebuild again
     idx.tree_root = None
     idx._cached_entries = None
-    view._rebuild_index(idx)
+    lens._rebuild_index(idx)
     hash2 = idx.tree_root
 
     assert hash1 == hash2, \
@@ -203,16 +203,16 @@ def law_5_history_replay_equals_snapshot():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    view = Lens(kernel, "inv5")
+    lens = Lens(kernel, "inv5")
 
     # Write in multiple commits
     for batch in range(10):
         for i in range(100):
-            view.put(f"k{batch * 100 + i:04d}", {"id": batch * 100 + i})
-        view.commit(f"batch {batch}")
+            lens.put(f"k{batch * 100 + i:04d}", {"id": batch * 100 + i})
+        lens.commit(f"batch {batch}")
 
     # read_all gives the current state
-    state_head = view.base.read_all()
+    state_head = lens.base.read_all()
 
     # Find a snapshot commit in history and read its state
     from binary_encoding import BinaryProllyTree
@@ -255,27 +255,27 @@ def law_6_scale_correctness():
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
-    view = Lens(kernel, "inv6")
+    lens = Lens(kernel, "inv6")
 
     N = 10_000
     for i in range(N):
-        view.put(f"k{i:05d}", {"id": i, "name": f"user_{i}"})
-    view.commit(f"{N} records")
+        lens.put(f"k{i:05d}", {"id": i, "name": f"user_{i}"})
+    lens.commit(f"{N} records")
 
-    count = view.count()
+    count = lens.count()
     assert count == N, \
         f"LAW 6 VIOLATED: wrote {N} records, count shows {count}"
 
     # Point lookup of a key in the middle (not just HEAD)
     mid_key = f"k{N // 2:05d}"
-    result = view.get(mid_key)
+    result = lens.get(mid_key)
     assert result is not None, \
         f"LAW 6 VIOLATED: point lookup of {mid_key} returned None"
     assert result["id"] == N // 2
 
     # First and last keys
-    assert view.get("k00000") is not None
-    assert view.get(f"k{N - 1:05d}") is not None
+    assert lens.get("k00000") is not None
+    assert lens.get(f"k{N - 1:05d}") is not None
 
     kernel.close()
     shutil.rmtree(bench, ignore_errors=True)
@@ -293,16 +293,16 @@ def law_7_index_rebuild_at_scale():
     os.makedirs(bench)
     kernel = PondMinimal(bench)
 
-    view = IndexedLens(kernel, "inv7")
-    view.register_index("by_val", lambda d: str(d.get("val", 0)), mode="eager")
+    lens = IndexedLens(kernel, "inv7")
+    lens.register_index("by_val", lambda d: str(d.get("val", 0)), mode="eager")
 
     N = 10_000
     for i in range(N):
-        view.put(f"k{i:05d}", {"id": i, "val": i * 10})
-    view.commit(f"{N} records")
+        lens.put(f"k{i:05d}", {"id": i, "val": i * 10})
+    lens.commit(f"{N} records")
 
     # Index lookup should work without decode errors
-    result = view.find_by("by_val", str(50000))
+    result = lens.find_by("by_val", str(50000))
     assert result is not None, \
         "LAW 7 VIOLATED: index lookup returned None for existing key"
     assert result["id"] == 5000
@@ -346,18 +346,18 @@ def law_8_determinism():
 
     def run_ops(bench):
         kernel = PondMinimal(bench)
-        view = Lens(kernel, "det")
+        lens = Lens(kernel, "det")
         for op in operations:
             if op[0] == "put":
-                view.put(op[1], op[2])
+                lens.put(op[1], op[2])
             elif op[0] == "delete":
-                view.delete(op[1])
+                lens.delete(op[1])
             elif op[0] == "commit":
-                view.commit(op[1])
-        keys = sorted(view.keys())
-        values = {k: view.get(k) for k in keys}
+                lens.commit(op[1])
+        keys = sorted(lens.keys())
+        values = {k: lens.get(k) for k in keys}
         # Also capture blob hashes (the DATA hashes, not commit hashes)
-        blob_hashes = {k: view.base.lookup(k) for k in keys}
+        blob_hashes = {k: lens.base.lookup(k) for k in keys}
         kernel.close()
         return keys, values, blob_hashes
 
@@ -393,16 +393,16 @@ def law_9_scale():
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
-    view = Lens(kernel, "law9")
+    lens = Lens(kernel, "law9")
 
     N = 10_000
     for i in range(N):
-        view.put(f"k{i:05d}", {"id": i})
-    view.commit(f"{N} records")
+        lens.put(f"k{i:05d}", {"id": i})
+    lens.commit(f"{N} records")
 
-    assert view.count() == N, \
-        f"LAW 9 VIOLATED: wrote {N}, count={view.count()}"
-    assert view.get(f"k{N//2:05d}") is not None, \
+    assert lens.count() == N, \
+        f"LAW 9 VIOLATED: wrote {N}, count={lens.count()}"
+    assert lens.get(f"k{N//2:05d}") is not None, \
         f"LAW 9 VIOLATED: mid-range lookup returned None"
 
     kernel.close()
@@ -421,15 +421,15 @@ def law_10_index():
     if os.path.exists(bench): shutil.rmtree(bench)
     os.makedirs(bench)
     kernel = PondMinimal(bench)
-    view = IndexedLens(kernel, "law10")
-    view.register_index("by_val", lambda d: str(d.get("val", 0)), mode="eager")
+    lens = IndexedLens(kernel, "law10")
+    lens.register_index("by_val", lambda d: str(d.get("val", 0)), mode="eager")
 
     N = 10_000
     for i in range(N):
-        view.put(f"k{i:05d}", {"id": i, "val": i * 10})
-    view.commit(f"{N} records")
+        lens.put(f"k{i:05d}", {"id": i, "val": i * 10})
+    lens.commit(f"{N} records")
 
-    result = view.find_by("by_val", str(50000))
+    result = lens.find_by("by_val", str(50000))
     assert result is not None, "LAW 10 VIOLATED: index lookup failed"
 
     kernel.close()

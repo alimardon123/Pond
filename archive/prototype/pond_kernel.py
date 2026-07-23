@@ -287,7 +287,7 @@ class PondKernel:
 
     def read_blob(self, blob_hash: str) -> bytes:
         """Read a single sealed blob by content hash. Returns raw bytes.
-        The caller (View) interprets the bytes."""
+        The caller (Lens) interprets the bytes."""
         path = self._blob_path(blob_hash)
         if not os.path.exists(path):
             raise ValueError(f"Blob {blob_hash} not found on disk")
@@ -305,7 +305,7 @@ class PondKernel:
         self._set_root(name, commit_hash)
 
     # ------------------------------------------------------------------
-    # DAG pattern helpers — for Views to build trees, commits, tags
+    # DAG pattern helpers — for Lenses to build trees, commits, tags
     # ------------------------------------------------------------------
 
     def write_tree(self, tree: Tree) -> str:

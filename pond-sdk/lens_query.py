@@ -1,16 +1,16 @@
 """
-ViewQuery — a lazy, composable query API for Pond Views.
+LensQuery — a lazy, composable query API for Pond Lenses.
 
-Makes a View feel like a collection: iterable, filterable, joinable.
+Makes a Lens feel like a collection: iterable, filterable, joinable.
 This is the "direct, easy, simple and elegant way of reading data"
 that the architecture review asked for.
 
 Design:
-  - LAZY: nothing is read from the View until you iterate or .collect().
+  - LAZY: nothing is read from the Lens until you iterate or .collect().
     This allows a future execution engine (SQL, Polars, DataFusion) to
     push down filters and projections to the kernel level.
   - COMPOSABLE: .where().select().map().join() chain naturally.
-  - DICT-LIKE: View.__iter__ yields decoded rows; View.__len__ returns count().
+  - DICT-LIKE: Lens.__iter__ yields decoded rows; Lens.__len__ returns count().
 
 Usage:
     # Iterate rows directly
@@ -43,7 +43,7 @@ Usage:
     results = orders.where(region="US").collect()
 
 This module does NOT add kernel features. It is a pure SDK-layer
-convenience built on the existing View.get/View.keys API.
+convenience built on the existing Lens.get/Lens.keys API.
 """
 
 from __future__ import annotations
@@ -52,14 +52,14 @@ from typing import Any, Optional, Callable, Union, Iterable
 
 
 # ---------------------------------------------------------------------------
-# ViewQuery — lazy, composable query over a View
+# LensQuery — lazy, composable query over a Lens
 # ---------------------------------------------------------------------------
 
-class ViewQuery:
-    """A lazy query over a View (or another ViewQuery).
+class LensQuery:
+    """A lazy query over a Lens (or another LensQuery).
 
     Queries are constructed by chaining .where(), .select(), .map(),
-    .join(). Nothing is read from the View until you iterate the query
+    .join(). Nothing is read from the Lens until you iterate the query
     or call .collect().
 
     The laziness is deliberate: it allows a future execution engine to
@@ -69,11 +69,11 @@ class ViewQuery:
     future optimizer could rewrite the plan.
     """
 
-    def __init__(self, source: Union['ViewQuery', Any],
+    def __init__(self, source: Union['LensQuery', Any],
                  predicates: Optional[list] = None,
                  projection: Optional[list[str]] = None,
                  mapper: Optional[Callable] = None):
-        # source: a View (has .keys() and .get()), a ViewQuery, or any
+        # source: a Lens (has .keys() and .get()), a LensQuery, or any
         # iterable of dicts.
         self._source = source
         self._predicates = predicates or []
@@ -87,13 +87,13 @@ class ViewQuery:
     def _source_rows(self):
         """Yield raw (unfiltered, unprojected) rows from the source."""
         source = self._source
-        # Duck-typing: a View has .keys() and .get()
+        # Duck-typing: a Lens has .keys() and .get()
         if hasattr(source, 'keys') and hasattr(source, 'get'):
             for key in source.keys():
                 row = source.get(key)
                 if row is not None:
                     yield row
-        elif isinstance(source, ViewQuery):
+        elif isinstance(source, LensQuery):
             yield from source
         elif isinstance(source, JoinedQuery):
             yield from source
@@ -120,11 +120,11 @@ class ViewQuery:
             yield row
 
     # ------------------------------------------------------------------
-    # Combinators — each returns a NEW ViewQuery (lazy, no evaluation)
+    # Combinators — each returns a NEW LensQuery (lazy, no evaluation)
     # ------------------------------------------------------------------
 
     def where(self, predicate: Optional[Callable] = None,
-              **kwargs) -> 'ViewQuery':
+              **kwargs) -> 'LensQuery':
         """Filter rows.
 
         Pass either:
@@ -137,7 +137,7 @@ class ViewQuery:
         """
         if predicate is None and not kwargs:
             # No filter — return an unfiltered query (chain starter)
-            return ViewQuery(self._source, self._predicates,
+            return LensQuery(self._source, self._predicates,
                              self._projection, self._mapper)
         if predicate is not None and kwargs:
             raise TypeError("Pass either a callable or kwargs, not both")
@@ -149,26 +149,26 @@ class ViewQuery:
             pred = lambda r: all(r.get(k) == v for k, v in predicate.items())
         else:
             raise TypeError(f"where() expects a callable or kwargs, got {type(predicate)}")
-        return ViewQuery(self._source, self._predicates + [pred],
+        return LensQuery(self._source, self._predicates + [pred],
                          self._projection, self._mapper)
 
-    def select(self, *fields: str) -> 'ViewQuery':
+    def select(self, *fields: str) -> 'LensQuery':
         """Project each row to only these fields."""
-        return ViewQuery(self._source, self._predicates,
+        return LensQuery(self._source, self._predicates,
                          list(fields), self._mapper)
 
-    def map(self, fn: Callable) -> 'ViewQuery':
+    def map(self, fn: Callable) -> 'LensQuery':
         """Transform each row via fn(row) -> new_row."""
         if self._mapper is not None:
             old = self._mapper
             new_mapper = lambda r: fn(old(r))
         else:
             new_mapper = fn
-        return ViewQuery(self._source, self._predicates,
+        return LensQuery(self._source, self._predicates,
                          self._projection, new_mapper)
 
     def join(self, other, on: str) -> 'JoinedQuery':
-        """LEFT JOIN with another View or ViewQuery.
+        """LEFT JOIN with another Lens or LensQuery.
 
         For each row in this query, finds the matching row in `other`
         where other[on] == this[on]. Merges the two rows (right side
@@ -179,7 +179,7 @@ class ViewQuery:
         side is streamed (lazy).
 
         Args:
-            other: a View, ViewQuery, or any iterable of dicts.
+            other: a Lens, LensQuery, or any iterable of dicts.
             on: the field name to join on.
 
         Returns:
@@ -188,7 +188,7 @@ class ViewQuery:
         # Build lookup from right side (eager)
         lookup: dict[Any, dict] = {}
         if hasattr(other, 'keys') and hasattr(other, 'get'):
-            # It's a View — iterate its rows
+            # It's a Lens — iterate its rows
             for key in other.keys():
                 row = other.get(key)
                 if row is not None:
@@ -196,13 +196,13 @@ class ViewQuery:
                     if join_val is not None:
                         lookup[join_val] = row
         elif hasattr(other, '__iter__'):
-            # It's a ViewQuery, JoinedQuery, or iterable
+            # It's a LensQuery, JoinedQuery, or iterable
             for row in other:
                 join_val = row.get(on) if isinstance(row, dict) else None
                 if join_val is not None:
                     lookup[join_val] = row
         else:
-            raise TypeError(f"join() expects a View or iterable, got {type(other)}")
+            raise TypeError(f"join() expects a Lens or iterable, got {type(other)}")
         return JoinedQuery(self, lookup, on)
 
     # ------------------------------------------------------------------
@@ -240,12 +240,12 @@ class ViewQuery:
 class JoinedQuery:
     """Result of a JOIN. Iterates the left query, merging matching right rows.
 
-    Supports further chaining (.where, .select, .map) via ViewQuery
+    Supports further chaining (.where, .select, .map) via LensQuery
     adaptation. The join is a LEFT JOIN: left rows with no match are
     yielded as-is (no right fields added).
     """
 
-    def __init__(self, left: ViewQuery, right_lookup: dict, on: str):
+    def __init__(self, left: LensQuery, right_lookup: dict, on: str):
         self._left = left
         self._right_lookup = right_lookup
         self._on = on
@@ -272,14 +272,17 @@ class JoinedQuery:
         return None
 
     # Allow further chaining on the joined result
-    def where(self, predicate=None, **kwargs) -> ViewQuery:
-        return ViewQuery(self).where(predicate, **kwargs)
+    def where(self, predicate=None, **kwargs) -> LensQuery:
+        return LensQuery(self).where(predicate, **kwargs)
 
-    def select(self, *fields) -> ViewQuery:
-        return ViewQuery(self).select(*fields)
+    def select(self, *fields) -> LensQuery:
+        return LensQuery(self).select(*fields)
 
-    def map(self, fn: Callable) -> ViewQuery:
-        return ViewQuery(self).map(fn)
+    def map(self, fn: Callable) -> LensQuery:
+        return LensQuery(self).map(fn)
 
     def join(self, other, on: str) -> 'JoinedQuery':
-        return ViewQuery(self).join(other, on)
+        return LensQuery(self).join(other, on)
+
+# Backward-compatible aliases
+ViewQuery = LensQuery  # backward-compatible alias

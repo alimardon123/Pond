@@ -28,12 +28,12 @@ forcefully:
 > Not latency. Not throughput. Architecture.
 >
 > Metrics like:
-> * Number of concepts exposed to a View author.
+> * Number of concepts exposed to a Lens author.
 > * Number of kernel calls required for a feature.
-> * Boilerplate lines per new View.
+> * Boilerplate lines per new Lens.
 > * Number of duplicated algorithms across packages.
 > * Number of assumptions leaking between layers.
-> * Cognitive complexity of implementing a View.
+> * Cognitive complexity of implementing a Lens.
 >
 > These align much better with your original design goals than
 > microbenchmarks.
@@ -58,9 +58,9 @@ Each metric maps to one of the six design goals in `DESIGN_GOALS.md`.
 |---|---|---|---|
 | A1 | Kernel primitive count | Simple | lower is better |
 | A2 | Kernel LOC | Simple | lower is better |
-| A3 | Concepts exposed to a View author | Simple | lower is better |
+| A3 | Concepts exposed to a Lens author | Simple | lower is better |
 | B1 | Kernel calls per typical feature | Powerful | lower is better |
-| B2 | Boilerplate LOC per new View | Powerful | lower is better |
+| B2 | Boilerplate LOC per new Lens | Powerful | lower is better |
 | B3 | Duplicated algorithms across packages | Powerful | lower is better |
 | C1 | Layer-leak count (N+1 reaching past N) | Beautiful | 0 is required |
 | C2 | Removability test failures | Scalable | 0 is required |
@@ -108,9 +108,9 @@ blank lines.
 yellow flag; a 100-LOC increase is a red flag requiring RFC
 justification.
 
-### A3. Concepts exposed to a View author
+### A3. Concepts exposed to a Lens author
 
-The number of distinct concepts a View author must understand to
+The number of distinct concepts a Lens author must understand to
 build a working View.
 
 **Measurement:** enumerate the public API surface of `pond-sdk`'s
@@ -132,20 +132,20 @@ row," "commit one snapshot," "lookup by index").
 reference View's test suite; report the median calls-per-feature.
 
 **Target:** Track over time. A 2× regression is a yellow flag
-(meaning the View is doing more work than necessary); a 5×
+(meaning the Lens is doing more work than necessary); a 5×
 regression is a red flag.
 
-### B2. Boilerplate LOC per new View
+### B2. Boilerplate LOC per new Lens
 
-The number of lines a View author must write to build a minimal
-"Hello World" View (e.g., a View that stores and retrieves one kind
+The number of lines a Lens author must write to build a minimal
+"Hello World" View (e.g., a Lens that stores and retrieves one kind
 of record, with commit and branch support).
 
 **Measurement:** count lines in the smallest reference View
 implementation (currently the `VectorView` from
 `validation/vector_report.md`, ~250 LOC including binary encoding).
 
-**Target:** ≤ 100 LOC for a minimal View. ≤ 200 LOC for a View
+**Target:** ≤ 100 LOC for a minimal View. ≤ 200 LOC for a Lens
 with indexes and history.
 
 ### B3. Duplicated algorithms across packages
@@ -192,7 +192,7 @@ methods in a reference View implementation.
 `radon cc`) on the reference View's `commit` and `resolve` methods.
 
 **Target:** ≤ 10 per method. > 15 is a yellow flag; > 20 is a red
-flag (the View is doing too much in one place; refactor).
+flag (the Lens is doing too much in one place; refactor).
 
 ### D1. Materialization rebuild correctness (HARD CONSTRAINT)
 
@@ -223,7 +223,7 @@ non-deterministic — a correctness bug.
 The number of violations of the six View Algebra laws (RFC-0007) in
 the existing View implementations.
 
-**Measurement:** the `view_laws.py` property-test harness (to be
+**Measurement:** the `lens_laws.py` property-test harness (to be
 built in Phase B). Runs the six law checks against every registered
 View.
 
@@ -303,7 +303,7 @@ replace them; it complements them. The full measurement picture is:
 
 ## 7. Implementation checklist
 
-- [ ] Add `view_laws.py` property-test harness (Phase B SDK polish).
+- [ ] Add `lens_laws.py` property-test harness (Phase B SDK polish).
 - [ ] Add `arch_metrics.py` script that computes A1, A2, A3, B1, B2,
       B3, C1, C2, C3 on the current repo.
 - [ ] Add a CI job that runs the hard-constraint checks (C1, C2, D1,
@@ -327,5 +327,5 @@ replace them; it complements them. The full measurement picture is:
   Each metric in this RFC maps to a design goal.
 - **Informs:** Phase B (SDK polish) — the SDK polish work should
   move the trend metrics in the right direction.
-- **Does not modify:** any kernel or View code. This RFC is
+- **Does not modify:** any kernel or Lens code. This RFC is
   measurement only.

@@ -366,7 +366,7 @@ Walking the parent chain requires D reads of commit blobs.
 Each read is O(1) by hash.
 Total: O(D).
 
-With skip pointers (View-level): O(log D). ∎
+With skip pointers (Lens-level): O(log D). ∎
 
 ### GC (reachability walk): O(R) where R = reachable objects
 
@@ -432,7 +432,7 @@ content-addressed KV. FDB's ordered keys enable range scans; Pond's
 content-addressing enables dedup/integrity/immutability. These are
 different storage models.
 
-**Similarity:** both use a layered architecture (FDB layers = Pond Views).
+**Similarity:** both use a layered architecture (FDB layers = Pond Lenss).
 
 ### Pond ≅ Irmin (isomorphic at storage level)
 
@@ -446,7 +446,7 @@ different storage models.
 with mutable refs, same as Pond.
 
 **Difference:** Irmin has built-in merge semantics; Pond doesn't
-(merge is a View concern). Irmin is OCaml-native; Pond is
+(merge is a Lens concern). Irmin is OCaml-native; Pond is
 language-agnostic.
 
 ### Pond ≅ LakeFS (isomorphic at storage level)

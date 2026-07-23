@@ -16,14 +16,14 @@ align with those goals better than throughput or latency.
 
 ### M1: Lines of code per View (irreducible)
 
-**What:** Strip a View to its irreducible translation layer (remove
+**What:** Strip a Lens to its irreducible translation layer (remove
 convenience methods, error handling, documentation, caching). Count
 the remaining lines.
 
 **Target:** 50-200 lines for most Views. If one View is 500+ lines,
 that's an ergonomics signal.
 
-**Current:** (from the View Compression Study)
+**Current:** (from the Lens Compression Study)
 | View | Meaningful lines | Est. irreducible |
 |---|---|---|
 | SQLView | 403 | 70 |
@@ -35,7 +35,7 @@ that's an ergonomics signal.
 | TimeSeriesView | 332 | 70 |
 | OCIView | 332 | 85 |
 
-**Assessment:** all Views are within the 50-200 range (after stripping).
+**Assessment:** all Lenses are within the 50-200 range (after stripping).
 GraphView is the highest (115) due to adjacency index construction.
 
 ---
@@ -59,11 +59,11 @@ each View operation requires.
 
 ---
 
-### M3: Concepts exposed to View authors
+### M3: Concepts exposed to Lens authors
 
-**What:** How many concepts must a View author understand?
+**What:** How many concepts must a Lens author understand?
 
-**Target:** the kernel API (3 operations) + the laws (5 storage + 7 composition) + the View Author's Guide (6 guarantees + 7 conventions). That's 3 + 12 + 13 = 28 concepts.
+**Target:** the kernel API (3 operations) + the laws (5 storage + 7 composition) + the Lens Author's Guide (6 guarantees + 7 conventions). That's 3 + 12 + 13 = 28 concepts.
 
 **Current:** measured by the independent implementation challenge. The
 fresh agent needed to understand 3 primitives + 12 laws. The 10
@@ -103,23 +103,23 @@ reachability walk for GC, skip pointers for time travel), that's
 duplicate logic.
 
 **Current:**
-- GC: implemented once as PondGC (View-level utility)
+- GC: implemented once as PondGC (Lens-level utility)
 - Skip pointers: not yet implemented (any View needing time travel
   would reimplement)
 - Index patterns: 5 Views need indexes, each reimplements
 
 **Assessment:** index patterns are the biggest source of duplication.
-A shared index library (View-level) would help. Classified as
+A shared index library (Lens-level) would help. Classified as
 **Ergonomics**.
 
 ---
 
 ### M6: Cognitive complexity
 
-**What:** How hard is it to understand a View?
+**What:** How hard is it to understand a Lens?
 
-**Target:** a View author should be able to read the spec and
-implement a View in a few hours.
+**Target:** a Lens author should be able to read the spec and
+implement a Lens in a few hours.
 
 **Current:** the independent implementation challenge took one agent
 a single session to implement GitView. The 10 ambiguities required
@@ -132,7 +132,7 @@ documented) would reduce this further.
 
 ### M7: Reinvention frequency
 
-**What:** How often do View authors reinvent the same abstractions?
+**What:** How often do Lens authors reinvent the same abstractions?
 
 **Target:** low. If 3+ Views reinvent the same thing, it should be
 a shared library.

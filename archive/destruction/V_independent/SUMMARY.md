@@ -117,7 +117,7 @@ explicitly. The kernel's value is universality (any workload CAN be built),
 not interoperability (Views can share structure).
 
 If interoperability is desired later, it requires a View-level convention
-(a "Pond View Format" standard) — NOT a kernel change. This is analogous
+(a "Pond Lens Format" standard) — NOT a kernel change. This is analogous
 to how Git's object format is a convention, not a filesystem feature.
 
 ## Comparison to existing GitView

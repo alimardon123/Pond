@@ -52,7 +52,7 @@ Without a key, you cannot `put` (and therefore cannot `commit`).
 
 But this is a soft constraint, not a hard one. Three workarounds:
 
-1. **Auto-generated keys (recommended):** the View author generates
+1. **Auto-generated keys (recommended):** the Lens author generates
    keys (UUID, sequence, hash of content). The "primary key" exists
    but is invisible to the user. This is what most databases do
    internally when no PK is declared.
@@ -60,7 +60,7 @@ But this is a soft constraint, not a hard one. Three workarounds:
    This deduplicates for free but breaks if two rows have the same
    content (they'd be the same row).
 3. **Use a sequence number:** `view.put(f"row:{n}", data)`. Simple,
-   but requires the View to track `n` across commits.
+   but requires the Lens to track `n` across commits.
 
 **Recommendation:** add an `auto_key: bool = False` parameter to
 `put` that generates a UUID4 if `key is None`. This is a small,
@@ -180,7 +180,7 @@ old key still benefit from old clustering.
 | **Versioning** | Built-in (commit DAG, branches, time travel) | Separate (Delta's time travel, not a clustering property) |
 | **Content addressing** | Yes (SHA-256 of bytes; dedup for free) | No (UUIDs) |
 | **Structural sharing across versions** | Yes (same chunks → same hash) | Limited (only unchanged files shared) |
-| **Cross-table / cross-workload sharing** | Yes (CrossView; one copy serves all Views) | No (each table is isolated) |
+| **Cross-table / cross-workload sharing** | Yes (CrossView; one copy serves all Lenses) | No (each table is isolated) |
 | **Layout mutability** | New commit = new layout; old layouts preserved as history | ALTER TABLE changes cluster keys; old data keeps old layout |
 | **Write amplification on layout change** | O(N) (new Prolly tree) — but old tree preserved | O(unstable Z-cubes) — incremental, lower for new data |
 | **Incremental optimization** | Yes (delta commits; ≤K deltas between snapshots) | Yes (unstable Z-cubes; only new + unstable files re-clustered) |
@@ -202,7 +202,7 @@ old key still benefit from old clustering.
    deltas-since-snapshot (≤4 by default). Liquid Clustering doesn't
    version layouts; Delta's time travel is separate and works at
    the snapshot level, not the layout level.
-4. **Content addressing.** Two Pond Views with the same data share
+4. **Content addressing.** Two Pond Lenss with the same data share
    blobs (same hash). Two Delta tables with the same data have
    separate files. This matters for: deduplication (free in Pond),
    cross-View references (Pond's `put_raw` is zero-copy), and

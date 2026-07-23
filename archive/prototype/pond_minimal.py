@@ -4,8 +4,8 @@ Pond minimal kernel — searching for the smallest primitive basis.
 The experiment (per architecture review):
   Remove one primitive at a time. For each:
     - Remove it.
-    - Rebuild all Views.
-    - If all Views still work, the primitive is not fundamental.
+    - Rebuild all Lenses.
+    - If all Lenses still work, the primitive is not fundamental.
     - Continue until nothing else can be removed.
 
 This is searching for a minimal basis, like finding the smallest CPU
@@ -21,9 +21,9 @@ Everything else is derived:
   - Commit = blob containing serialized {tree_hash, parent_hash, ...}
   - Tag    = Reference(name, commit_hash)
   - Branch = Reference(name, commit_hash)
-  - OPEN/SEALED = View-level buffer + Write
+  - OPEN/SEALED = Lens-level buffer + Write
   - Snapshot = Read at a hash
-  - Time travel = walk parent pointers (View-level)
+  - Time travel = walk parent pointers (Lens-level)
   - GC = walk reachability from root References
 
 This file implements the minimal kernel. The Views (in views_minimal.py)
@@ -71,7 +71,7 @@ class PondMinimal:
          This is the ONLY mutable operation in the kernel.
 
     That's it. No Tree. No Commit. No OPEN/SEALED. No lifecycle.
-    Those are all View-level patterns built from these 3 primitives.
+    Those are all Lens-level patterns built from these 3 primitives.
 
     v0: single-node, local filesystem, SQLite root store, no replication.
     """

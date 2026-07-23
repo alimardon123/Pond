@@ -1,5 +1,5 @@
 """
-Truly Hostile View #1: CRDT Collaborative Editing View.
+Truly Hostile View #1: CRDT Collaborative Editing Lens.
 
 This View is designed to fight the kernel. It tests:
   - Multi-writer concurrency on the same name
@@ -11,7 +11,7 @@ Scenario: two users (Alice and Bob) collaboratively edit a document.
 Both branch from the same commit, make changes, and try to merge.
 The View must detect conflicts and resolve them.
 
-If this View requires kernel changes, that's a real falsification.
+If this Lens requires kernel changes, that's a real falsification.
 If it works with ugly workarounds, that's friction (kernel issue).
 If it works cleanly, the kernel is sufficient for CRDT workloads.
 """
@@ -315,7 +315,7 @@ def test_merge_based_collaboration():
     print(f"    1. Each writer gets their own branch (Reference to their head)")
     print(f"    2. Edits are commits on their branch (no overwriting)")
     print(f"    3. Merge creates multi-parent commits (kernel allows this)")
-    print(f"    4. Conflict resolution is a View concern (last-writer-wins here)")
+    print(f"    4. Conflict resolution is a Lens concern (last-writer-wins here)")
     print()
     print(f"  The KEY insight: the kernel's lack of CAS is NOT a blocker for CRDT.")
     print(f"  CRDT avoids the CAS problem by NEVER overwriting — always creating")
@@ -431,7 +431,7 @@ def main():
     print("  CAS would help single-branch optimistic editing (SQL MVCC style),")
     print("  but that's one workload, not universal.")
     print()
-    print("  The kernel survived its first truly hostile View. CRDT works.")
+    print("  The kernel survived its first truly hostile Lens. CRDT works.")
 
 
 if __name__ == "__main__":

@@ -4,13 +4,13 @@ Pond SDK. This is the Phase E flagship application.
 
 Architecture (recursive composition, per RFC-0006 Layered Architecture):
   Kernel (3 primitives: Write/Read/Reference)  [FROZEN, ~140 LOC]
-    -> ProllyViewBase (delta commits + Prolly trees + skip pointers)
-      -> IndexedView (auto-indexing with lazy/eager/incremental)
+    -> ProllyLensBase (delta commits + Prolly trees + skip pointers)
+      -> IndexedLens (auto-indexing with lazy/eager/incremental)
         -> FeatureStore (features + entities + point-in-time JOIN + versioning)
 
-The FeatureStore uses IndexedView for storage + auto-indexing,
-CrossView for reading from source Views (SQL, Streaming, ArrowView),
-and SemanticView for feature metadata (metrics, dimensions).
+The FeatureStore uses IndexedLens for storage + auto-indexing,
+CrossLens for reading from source Lenss (SQL, Streaming, ArrowLens),
+and SemanticLens for feature metadata (metrics, dimensions).
 
 Production features (Phase E):
   - Feature definitions WITH VERSIONING (v1, v2, ...; reproducible ML)
@@ -22,9 +22,9 @@ Production features (Phase E):
   - Point-in-time JOIN: the killer ML feature — join a training
     dataset's event timestamps against feature values as-of those
     timestamps, preventing label leakage
-  - Feature lineage (source View -> feature -> transformation)
+  - Feature lineage (source Lens -> feature -> transformation)
   - Feature freshness monitoring (O(1) via cached metadata)
-  - Cross-View ingestion (read from SQL/Streaming/Arrow Views)
+  - Cross-Lens ingestion (read from SQL/Streaming/Arrow Views)
   - Semantic model integration (features as metrics/dimensions)
   - Persistence: data survives process restart (kernel-backed)
 
@@ -54,8 +54,8 @@ for _pkg in ("pond-core", "pond-sdk", "pond-semantic"):
 sys.path.insert(0, _HERE)
 
 from pond_minimal import PondMinimal
-from auto_index import IndexedView
-from lens_sdk import CrossView, SemanticView
+from auto_index import IndexedLens
+from lens_sdk import CrossLens, SemanticLens
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ class FeatureDefinition:
     """Definition of a feature, with versioning."""
     name: str
     type: str  # int, float, string, bool, vector, any, json
-    source: str  # source View name
+    source: str  # source Lens name
     transformation: str = ""  # SQL expression or description
     description: str = ""
     tags: list = field(default_factory=list)
@@ -136,11 +136,11 @@ class EntityDefinition:
 # FeatureStore — production-quality feature store
 # ---------------------------------------------------------------------------
 
-class FeatureStore(IndexedView):
-    """A production-quality feature store built on IndexedView.
+class FeatureStore(IndexedLens):
+    """A production-quality feature store built on IndexedLens.
 
     Recursive composition (per RFC-0006):
-      FeatureStore extends IndexedView extends ProllyViewBase extends Kernel
+      FeatureStore extends IndexedLens extends ProllyLensBase extends Kernel
 
     Production features:
       - Schema validation: write_feature_value rejects type-mismatched values.
@@ -202,7 +202,7 @@ class FeatureStore(IndexedView):
             name: the feature's name (e.g., 'customer_total_spent').
             feature_type: one of {int, float, string, bool, vector, any, json}.
                 Type-checked on every write_feature_value call.
-            source: the source View name (e.g., 'orders'). Descriptive
+            source: the source Lens name (e.g., 'orders'). Descriptive
                 only — used for lineage, not for actual ingestion.
             transformation: **descriptive only** — a human-readable
                 description of how the feature is computed (e.g.,
@@ -415,14 +415,14 @@ class FeatureStore(IndexedView):
                          entity_field: str, value_field: str,
                          timestamp_field: str = "ts",
                          version: Optional[int] = None) -> int:
-        """Ingest feature values from another View (SQL, Streaming, ArrowView).
+        """Ingest feature values from another View (SQL, Streaming, ArrowLens).
 
-        Uses CrossView to read the source View's latest state. For each
+        Uses CrossLens to read the source Lens's latest state. For each
         row in the source, extracts entity_id, value, and timestamp, then
         calls write_feature_value (which validates the schema).
 
         Args:
-            source_view: the View to ingest from (must have get_all()).
+            source_view: the Lens to ingest from (must have get_all()).
             feature_name: the target feature name (must be defined).
             entity_field: the field in source rows to use as entity_id.
             value_field: the field in source rows to use as feature value.
@@ -439,7 +439,7 @@ class FeatureStore(IndexedView):
                 are staged but not committed).
         """
         count = 0
-        data = CrossView.read_all_from(source_view)
+        data = CrossLens.read_all_from(source_view)
         for key, record in data.items():
             if key.startswith("_"):
                 continue
@@ -742,10 +742,10 @@ class FeatureStore(IndexedView):
     # Semantic model integration
     # ------------------------------------------------------------------
 
-    def register_with_semantic_view(self, semantic: SemanticView) -> None:
+    def register_with_semantic_view(self, semantic: SemanticLens) -> None:
         """Register features as semantic metrics/dimensions.
 
-        For each feature, registers a metric in the SemanticView with:
+        For each feature, registers a metric in the SemanticLens with:
           - name: feature name
           - source: this FeatureStore's name
           - field: 'value'
@@ -911,7 +911,7 @@ def test_feature_store():
         print(f"    {lineage['feature']} <- {lineage['source']} ({lineage['values_count']} values)")
 
     print(f"\n  Semantic model integration:")
-    semantic = SemanticView(kernel, "semantic")
+    semantic = SemanticLens(kernel, "semantic")
     fs.register_with_semantic_view(semantic)
     semantic.commit("register features as semantic metrics")
     print(f"    Metrics: {semantic.list_metrics()}")
@@ -925,12 +925,12 @@ def test_feature_store():
 
     print(f"\n=== RECURSIVE COMPOSITION VERIFIED ===")
     print(f"  Kernel (3 primitives)")
-    print(f"    -> ProllyViewBase (delta commits + Prolly trees)")
-    print(f"      -> IndexedView (auto-indexing + incremental updates)")
+    print(f"    -> ProllyLensBase (delta commits + Prolly trees)")
+    print(f"      -> IndexedLens (auto-indexing + incremental updates)")
     print(f"        -> FeatureStore (features + lineage + semantic)")
     print(f"  4 layers of composition, each adding semantics.")
     print(f"  Each layer uses ONLY the layer below. No layer skips.")
-    print(f"  Kernel unchanged. All composition is View-level.")
+    print(f"  Kernel unchanged. All composition is Lens-level.")
 
     print(f"\n=== ALL TESTS PASSED ===")
     kernel.close()

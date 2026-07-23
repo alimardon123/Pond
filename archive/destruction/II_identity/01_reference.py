@@ -14,7 +14,7 @@ Hypothesis A: Reference IS primitive.
   every restart must re-resolve. Not a database.
 
 Hypothesis B: Reference is NOT primitive.
-  Namespace is a View concern. Different workloads need different namespace
+  Namespace is a Lens concern. Different workloads need different namespace
   models (single-writer, multi-writer CRDT, hierarchical, capability-based).
   Baking one model into the kernel is the same mistake as baking Parquet in.
 
@@ -61,7 +61,7 @@ class PondNoReference:
     """
     A kernel with ONLY Write and Read. No Reference.
 
-    Question: can we build a namespace as a View on top of this?
+    Question: can we build a namespace as a Lens on top of this?
     If yes, Reference wasn't primitive.
     """
 
@@ -96,15 +96,15 @@ class PondNoReference:
 
 
 # ---------------------------------------------------------------------------
-# Attempt 1: Build namespace as a View-side SQLite table
+# Attempt 1: Build namespace as a Lens-side SQLite table
 # ---------------------------------------------------------------------------
 
 class NamespaceView:
     """
     A View that maintains name -> hash mappings in its OWN store.
-    The kernel has no namespace; this View provides one.
+    The kernel has no namespace; this Lens provides one.
 
-    The question: where does this View store its mappings?
+    The question: where does this Lens store its mappings?
     Option A: in a separate SQLite file (View-local state)
     Option B: in a kernel blob, addressed by a fixed hash convention
 
@@ -185,7 +185,7 @@ class NamespaceViaExternalPointer:
     that maps to the current namespace blob hash.
 
     This is essentially: the kernel provides ONE Reference (POND_ROOT),
-    and everything else is a View.
+    and everything else is a Lens.
 
     Is this "Reference as primitive" or "one fixed name as primitive"?
     It's a smaller primitive than arbitrary Reference(name, hash).
@@ -204,7 +204,7 @@ class NamespaceViaExternalPointer:
 
         Is this "Reference primitive"? Partially. The kernel needs
         exactly ONE mutable name, not arbitrary names. The namespace
-        structure (how names map to hashes) is then a View concern.
+        structure (how names map to hashes) is then a Lens concern.
 
         This is the IPFS/IPNS model: IPNS provides a single mutable
         pointer per node; everything else is content-addressed.
@@ -216,7 +216,7 @@ class NamespaceViaExternalPointer:
 # ---------------------------------------------------------------------------
 
 def exp_namespace_as_view():
-    section("Test 1: Build namespace as a View-side SQLite table")
+    section("Test 1: Build namespace as a Lens-side SQLite table")
     print()
     print("  Kernel: 2 primitives (Write, Read). No Reference.")
     print(" Namespace: View-side SQLite table, separate from kernel.")
@@ -235,7 +235,7 @@ def exp_namespace_as_view():
     h = kernel.write(b"hello world")
     print(f"  Write: {h[:16]}...")
 
-    # Reference it via the View-side namespace
+    # Reference it via the Lens-side namespace
     ns.reference("my_table", h)
     print(f"  Namespace: my_table -> {h[:16]}...")
 
@@ -254,13 +254,13 @@ def exp_namespace_as_view():
     print(f"    (content-addressing, immutability, dedup).")
     print()
     print(f"  Is this a problem? It depends:")
-    print(f"  - If you want ONE shared namespace across all Views: problem.")
+    print(f"  - If you want ONE shared namespace across all Lenses: problem.")
     print(f"    (Multiple Views would each have their own namespace, conflicting.)")
-    print(f"  - If you want per-View namespaces: feature, not bug.")
+    print(f"  - If you want per-Lens namespaces: feature, not bug.")
     print(f"    (Each View manages its own naming convention.)")
     print()
     print(f"  VERDICT: INCONCLUSIVE.")
-    print(f"  Reference CAN be moved to a View, but the trade-off is:")
+    print(f"  Reference CAN be moved to a Lens, but the trade-off is:")
     print(f"  - Lose: shared namespace, kernel-guaranteed consistency")
     print(f"  - Gain: smaller kernel, namespace-model-agnostic")
     print()
@@ -291,7 +291,7 @@ def exp_single_root_pointer():
     section("Test 3: Kernel provides ONE well-known name (POND_ROOT)")
     print()
     print("  Attempt: the kernel provides exactly ONE mutable name, 'POND_ROOT',")
-    print("  which points to the current namespace blob. Everything else is a View.")
+    print("  which points to the current namespace blob. Everything else is a Lens.")
     print()
     print(NamespaceViaExternalPointer.explain())
     print()
@@ -311,12 +311,12 @@ def exp_single_root_pointer():
     print()
     print(f"  VERDICT: SUPPORTED — the kernel could be smaller.")
     print(f"  Reference(name, hash) is NOT primitive; SetRoot(hash) is.")
-    print(f"  The 'name' parameter is a View concern.")
+    print(f"  The 'name' parameter is a Lens concern.")
     print()
     print(f"  Trade-off:")
     print(f"  - Current kernel: arbitrary names, simple Views, shared namespace")
     print(f"  - Smaller kernel: one pointer, complex Views (namespace-as-blob),")
-    print(f"    per-View namespace interpretation")
+    print(f"    per-Lens namespace interpretation")
     print()
     print(f"  This is a real architectural decision. The current kernel chose")
     print(f"  'arbitrary names' for simplicity. The smaller kernel would be")
@@ -326,7 +326,7 @@ def exp_single_root_pointer():
 def exp_what_namespace_models_need():
     section("Test 4: What namespace models do workloads actually need?")
     print()
-    print("  If namespace is a View concern, different Views can use different models.")
+    print("  If namespace is a Lens concern, different Views can use different models.")
     print()
     print("  Survey of namespace models across workloads:")
     print()
@@ -352,9 +352,9 @@ def exp_what_namespace_models_need():
     print("  'model/step/100'). This works but is a convention, not a guarantee.")
     print()
     print("  If the kernel provides only SetRoot, ALL namespace structure")
-    print("  is a View concern. More flexible, more complex Views.")
+    print("  is a Lens concern. More flexible, more complex Views.")
     print()
-    print("  VERDICT: INCONCLUSIVE — depends on whether View-level namespace")
+    print("  VERDICT: INCONCLUSIVE — depends on whether Lens-level namespace")
     print("  complexity is acceptable. The current kernel (arbitrary names)")
     print("  is a pragmatic middle ground. The smaller kernel (SetRoot only)")
     print("  is more minimal but pushes complexity to Views.")
@@ -367,7 +367,7 @@ def main():
     print()
     print("  The kernel has two non-coordinating operations (Write, Read) and")
     print("  one coordinating operation (Reference). Why is the coordinator in")
-    print("  the kernel? Can it be moved to a View?")
+    print("  the kernel? Can it be moved to a Lens?")
     print()
 
     exp_namespace_as_view()
@@ -382,7 +382,7 @@ def main():
     print()
     print("  Findings:")
     print()
-    print("  1. Namespace CAN be moved to a View (Test 1). Views work with")
+    print("  1. Namespace CAN be moved to a Lens (Test 1). Views work with")
     print("     View-side namespace stores. The trade-off is losing shared")
     print("     namespace guarantees.")
     print()
@@ -390,7 +390,7 @@ def main():
     print("     You need at least ONE non-content-addressed pointer.")
     print()
     print("  3. The kernel could be smaller: SetRoot(hash) instead of")
-    print("     Reference(name, hash). The 'name' parameter is a View concern.")
+    print("     Reference(name, hash). The 'name' parameter is a Lens concern.")
     print("     This is the IPFS/IPNS model. (Test 3)")
     print()
     print("  4. Different workloads need different namespace models (Test 4).")
@@ -403,7 +403,7 @@ def main():
     print("            shared namespace. The current design.")
     print()
     print("  Option B: Reduce to SetRoot(hash) — minimal kernel, complex Views,")
-    print("            per-View namespace models. The IPFS/IPNS design.")
+    print("            per-Lens namespace models. The IPFS/IPNS design.")
     print()
     print("  Option C: Remove Reference entirely — Views maintain their own")
     print("            namespace stores outside the kernel. Smallest kernel,")

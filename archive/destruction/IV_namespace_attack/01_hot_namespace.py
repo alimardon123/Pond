@@ -14,11 +14,11 @@ The goal is NOT to confirm the kernel works. It's to find where
 the mutable surface forces unnatural patterns or breaks under load.
 
 Outcome vocabulary:
-  - Supported: the kernel handles this correctly (or it's a View concern)
+  - Supported: the kernel handles this correctly (or it's a Lens concern)
   - Falsified: the kernel corrupts, loses data, or forces horrible workarounds
   - Inconclusive: needs more infrastructure (Raft, MVCC) to test
   - Kernel issue: the kernel is missing something; admit a feature
-  - View issue: the View must work around it; acceptable tradeoff
+  - View issue: the Lens must work around it; acceptable tradeoff
 
 Run:  python3 01_hot_namespace.py
 """
@@ -276,15 +276,15 @@ def exp_tenant_isolation():
     print(f"  Apply Admission Rule:")
     print(f"  1. Universal? Maybe — multi-tenant is common but not universal.")
     print(f"  2. Impossible outside kernel? YES — Views cannot enforce isolation")
-    print(f"     without kernel support (a View can't prevent another View from")
+    print(f"     without kernel support (a Lens can't prevent another View from")
     print(f"     calling Reference on the same name).")
     print(f"  3. Immutable? Isolation is a property of the namespace, not objects.")
     print(f"  4. Storage-independent? Yes.")
     print(f"  5. Decades-stable? Yes — isolation is fundamental.")
     print()
     print(f"  VERDICT: KERNEL ISSUE (no isolation)")
-    print(f"  Tenant isolation CANNOT be implemented at the View level. The kernel")
-    print(f"  must either provide isolation OR accept that all Views share one")
+    print(f"  Tenant isolation CANNOT be implemented at the Lens level. The kernel")
+    print(f"  must either provide isolation OR accept that all Lenses share one")
     print(f"  global namespace (and use separate kernel instances per tenant).")
     print()
     print(f"  Options:")
@@ -367,7 +367,7 @@ def exp_namespace_composition():
     print(f"  Fails Admission Rule. Merge stays at View level.")
     print()
     print(f"  VERDICT: VIEW ISSUE (acceptable)")
-    print(f"  Namespace composition is a View concern. The kernel provides the")
+    print(f"  Namespace composition is a Lens concern. The kernel provides the")
     print(f"  primitives (Read, Write, Reference); Views implement merge semantics.")
     print(f"  This is correct — different workloads merge differently (Git 3-way,")
     print(f"  SQL UNION, CRDT merge). No single merge policy is universal.")
@@ -539,7 +539,7 @@ def main():
     print("     The kernel stays single-tenant; multi-tenancy = N kernel instances.")
     print("     This matches SQLite/Git/IPFS model.")
     print()
-    print("  3. Namespace composition is correctly a View concern.")
+    print("  3. Namespace composition is correctly a Lens concern.")
     print("     Different workloads merge differently. No universal merge policy.")
     print()
     print("  4. Lost updates are the fundamental mutable-surface weakness.")

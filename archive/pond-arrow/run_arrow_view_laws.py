@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Run view_laws.py against the ArrowView (Phase D compatibility adapter).
+Run view_laws.py against the ArrowLens (Phase D compatibility adapter).
 
-This verifies that a Pond View built for Arrow interoperability still
+This verifies that a Pond Lens built for Arrow interoperability still
 satisfies RFC-0007's 6 View algebra laws. If it passes, the algebra
 generalizes to Views that interoperate with external ecosystems.
 """
@@ -21,14 +21,14 @@ sys.path.insert(0, os.path.join(POND_ROOT, "pond-arrow"))
 
 import pyarrow as pa
 from pond_minimal import PondMinimal
-from lens_laws import ViewLaws, ViewContract
-from arrow_view import ArrowView
+from lens_laws import LensLaws, LensContract
+from arrow_view import ArrowLens
 
 
 def make_arrow_view_contract(kernel) -> tuple:
-    """Contract for ArrowView.
+    """Contract for ArrowLens.
 
-    ArrowView's state space Sigma is pyarrow.Table, not dict. The
+    ArrowLens's state space Sigma is pyarrow.Table, not dict. The
     encode/decode pair round-trips Tables:
         encode(Table) -> bytes (Arrow IPC)
         decode(bytes) -> Table
@@ -36,7 +36,7 @@ def make_arrow_view_contract(kernel) -> tuple:
     The put/get API of the base View class accepts Tables. The
     sample_data generator returns Tables.
     """
-    view = ArrowView(kernel, "ci_arrow")
+    view = ArrowLens(kernel, "ci_arrow")
 
     def sample_table(i: int) -> pa.Table:
         return pa.table({
@@ -45,7 +45,7 @@ def make_arrow_view_contract(kernel) -> tuple:
             "value": [i * 10],
         })
 
-    return view, ViewContract(
+    return view, LensContract(
         name="ci_arrow",
         encode=view.encode,        # encode(pa.Table) -> bytes
         decode=view.decode,        # decode(bytes) -> pa.Table
@@ -63,7 +63,7 @@ def make_arrow_view_contract(kernel) -> tuple:
 
 def main() -> int:
     print("=" * 72)
-    print("  View Algebra — ArrowView Compliance Test")
+    print("  View Algebra — ArrowLens Compliance Test")
     print("  (Phase D compatibility adapter; Pond data as Arrow IPC)")
     print("=" * 72)
     print()
@@ -76,7 +76,7 @@ def main() -> int:
     try:
         kernel = PondMinimal(bench_dir)
         view, contract = make_arrow_view_contract(kernel)
-        laws = ViewLaws(kernel)
+        laws = LensLaws(kernel)
         report = laws.check_all(contract, num_samples=10)
         print(report)
         print()

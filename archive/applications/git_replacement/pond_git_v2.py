@@ -1,5 +1,5 @@
 """
-Reworked Git View on ProllyViewBase.
+Reworked Git View on ProllyLensBase.
 
 Uses Prolly trees for O(log N) file lookups, bounded delta journal
 for O(1) commits, and content-based diff between versions.
@@ -9,16 +9,16 @@ import json, time, sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prototype"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "libraries"))
 from pond_minimal import PondMinimal
-from prolly_view import ProllyViewBase, ProllyTree
+from prolly_view import ProllyLensBase, ProllyTree
 
 
 class PondGit:
-    """Git-like VCS on Pond. Uses ProllyViewBase."""
+    """Git-like VCS on Pond. Uses ProllyLensBase."""
 
     def __init__(self, kernel, repo_name="repo"):
         self.kernel = kernel
         self.repo_name = repo_name
-        self.base = ProllyViewBase(kernel, repo_name)
+        self.base = ProllyLensBase(kernel, repo_name)
 
     def init(self):
         """Initialize with empty snapshot."""

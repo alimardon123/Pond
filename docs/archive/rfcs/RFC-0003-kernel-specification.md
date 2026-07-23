@@ -28,7 +28,7 @@ Reference(name: string, hash: string) → ()
 
 No other operations exist in the kernel. Tree, Commit, Tag, Branch,
 OPEN/SEALED, lifecycle, GC, indexes, and all other concepts are
-View-level patterns built from these 3 primitives.
+Lens-level patterns built from these 3 primitives.
 
 ### State
 
@@ -69,14 +69,14 @@ Verified on: filesystem, in-memory, SQLite, Redis (simulated), S3 (real, via mot
 
 ### Composition Law 1: Reference chains
 The kernel provides one level of indirection (name → hash → bytes).
-Deeper indirection is a View concern (walk embedded hashes in blobs).
+Deeper indirection is a Lens concern (walk embedded hashes in blobs).
 
 ### Composition Law 2: Reference moves
 Overwriting a name orphans the old hash. The kernel does not track
 reference history. Views build history via the Commit pattern.
 
 ### Composition Law 3: GC reachability
-The kernel does not GC. Orphaned objects accumulate. GC is a View
+The kernel does not GC. Orphaned objects accumulate. GC is a Lens
 concern (PondGC implements reachability walk + sweep).
 
 ### Composition Law 4: Backend substitution
@@ -178,10 +178,10 @@ Until all three are demonstrated, the kernel stays at 3 primitives.
 - Compression
 - Replication
 - Streaming (watermarks, exactly-once)
-- Garbage collection (View-level utility)
-- Time-travel acceleration (View-level skip pointers)
-- Merge (View-level conflict resolution)
+- Garbage collection (Lens-level utility)
+- Time-travel acceleration (Lens-level skip pointers)
+- Merge (Lens-level conflict resolution)
 - Working tree / staging area
 - Network protocol
 
-All of the above are View-level or infrastructure-level concerns.
+All of the above are Lens-level or infrastructure-level concerns.

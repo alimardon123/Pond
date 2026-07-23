@@ -17,7 +17,7 @@ Failure modes tested:
   8. Coordinator failure mid-commit — orphaned state?
 
 Outcome vocabulary:
-  - Supported: the kernel handles this correctly (or it's a View concern)
+  - Supported: the kernel handles this correctly (or it's a Lens concern)
   - Falsified: the kernel corrupts or loses data under this failure
   - Inconclusive: needs a real distributed implementation to test
   - Needs larger-scale validation: prototype limits prevent a conclusion
@@ -213,7 +213,7 @@ def exp_clock_skew():
     print("  2. PondMinimal.read() — NO timestamp. Just fetches by hash. Clock-independent.")
     print("  3. PondMinimal.reference() — stores `updated_at` for debugging, not for ordering.")
     print("     Clock skew would make the debug field wrong, but wouldn't corrupt data.")
-    print("  4. Commit pattern (View-level) — stores `timestamp`. Views use this for")
+    print("  4. Commit pattern (Lens-level) — stores `timestamp`. Views use this for")
     print("     display, not for ordering. The DAG uses parent_hash for ordering, not time.")
     print()
     print("  Key insight: the kernel uses CONTENT-ADDRESSING for identity, not timestamps.")
@@ -221,8 +221,8 @@ def exp_clock_skew():
     print("  Clock skew cannot corrupt the kernel's data model.")
     print()
     print("  Where clock skew WOULD matter:")
-    print("  - Snapshot isolation across nodes (View-level concern)")
-    print("  - Conflict resolution in multi-writer scenarios (View-level)")
+    print("  - Snapshot isolation across nodes (Lens-level concern)")
+    print("  - Conflict resolution in multi-writer scenarios (Lens-level)")
     print("  - These are View concerns, not kernel concerns.")
     print()
     print("  VERDICT: SUPPORTED — the kernel is clock-skew-tolerant by design.")
@@ -351,7 +351,7 @@ def exp_out_of_order_commits():
 def exp_exactly_once():
     section("Test 7: Exactly-once assumptions")
     print()
-    print("  Scenario: a View writes a blob, then crashes before updating the")
+    print("  Scenario: a Lens writes a blob, then crashes before updating the")
     print("  root namespace. On restart, it retries. Is the state correct?")
     print()
     print("  Analysis:")
@@ -395,7 +395,7 @@ def exp_exactly_once():
     print()
     print(f"  VERDICT: SUPPORTED for correctness — the root points to B, reads return B.")
     print(f"  FALSIFIED for storage — blob A is orphaned, no GC to clean it (Finding 6).")
-    print(f"  This is the known issue. Fix: View-level GC pass.")
+    print(f"  This is the known issue. Fix: Lens-level GC pass.")
 
     kernel.close()
     shutil.rmtree(bench_dir, ignore_errors=True)
@@ -408,7 +408,7 @@ def exp_exactly_once():
 def exp_coordinator_failure():
     section("Test 8: Coordinator failure mid-commit")
     print()
-    print("  Scenario: a View is building a Tree + Commit + Reference. It crashes")
+    print("  Scenario: a Lens is building a Tree + Commit + Reference. It crashes")
     print("  after writing the Tree but before writing the Commit.")
     print()
     print("  Analysis:")

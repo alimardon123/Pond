@@ -41,7 +41,7 @@ from typing import Any, Callable, Optional
 # --- Wire up imports -------------------------------------------------------
 # We import the Lens base class from the SDK. Per the task, we looked at
 # lens_sdk.py ONLY for the import path and constructor signature
-# (Lens = View; View.__init__(self, kernel, name)). Everything else here
+# (Lens = View; Lens.__init__(self, kernel, name)). Everything else here
 # is built from the contract.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _POND_SDK = os.path.normpath(os.path.join(_HERE, "..", "pond-sdk"))

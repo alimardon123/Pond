@@ -14,7 +14,7 @@
 **Partially.** I could implement LogLens from the contract alone *in spirit* —
 the philosophy, constraints, and intended behaviour were all clear enough
 that I never had to read another Lens implementation. But I did have to
-read the `View` base class source in `view_sdk.py` (which the task
+read the `View` base class source in `lens_sdk.py` (which the task
 explicitly permitted, but only to find the import path) to discover
 **five concrete API details** the contract does not specify:
 
@@ -56,7 +56,7 @@ API by reading source or by trial-and-error.
 | Phase | Estimate |
 |---|---|
 | Read the 4 documents (contract, architecture, kernel, design goals) + worklog | ~15 min |
-| Locate the `Lens` base class in `view_sdk.py` (and incidentally discover `put`/`get`/`commit`/`branch`) | ~5 min |
+| Locate the `Lens` base class in `lens_sdk.py` (and incidentally discover `put`/`get`/`commit`/`branch`) | ~5 min |
 | Implement `ContextResolver` + `ContextLens` + `LogLens` + `SqlLens` | ~20 min |
 | Write the 7-requirement test | ~15 min |
 | Debug the stage/commit split (first run returned `None` from `get_raw`) | ~10 min |
@@ -218,7 +218,7 @@ the **construction details** (the `ContextLens` class, the stage/commit
 lifecycle, the branching API, the resolver's match policy). An
 implementer following only the contract will build a correct Lens, but
 will spend ~30 minutes discovering SDK details by trial-and-error or by
-reading `view_sdk.py`. The architecture itself is genuinely elegant —
+reading `lens_sdk.py`. The architecture itself is genuinely elegant —
 the codec-in-the-key insight and the shared commit DAG make cross-Lens
 reading feel emergent rather than engineered. With five small additions
 (define `ContextLens`, state the lifecycle, name the branching API,

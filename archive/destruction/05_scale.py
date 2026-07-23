@@ -210,7 +210,7 @@ def exp_root_namespace_scale():
     print("  At 1B+ names, need a distributed KV (FoundationDB, etcd) for roots.")
     print()
     print("  This is NOT a kernel issue — the kernel treats roots as an")
-    print("  implementation detail. The View-level root store can be swapped")
+    print("  implementation detail. The Lens-level root store can be swapped")
     print("  (SQLite → FDB → etcd) without kernel changes.")
 
 
@@ -224,12 +224,12 @@ def exp_commit_history_scale():
     print("  At 1B commits: 1B × ~1us per commit read = 1000 seconds = ~17 minutes.")
     print("  This is UNUSABLE.")
     print()
-    print("  With View-level skip pointers (O(log N)):")
+    print("  With Lens-level skip pointers (O(log N)):")
     print("  At 1B commits: log2(1B) = 30 hops × ~1ms per S3 GET = 30ms. Excellent.")
     print()
     print("  VERDICT: FALSIFIED without skip pointers (known issue, Finding 5a).")
-    print("  SUPPORTED with View-level skip pointers (the fix).")
-    print("  Skip pointers are a View concern, not a kernel change.")
+    print("  SUPPORTED with Lens-level skip pointers (the fix).")
+    print("  Skip pointers are a Lens concern, not a kernel change.")
 
 
 def exp_blob_count_scale():
@@ -309,7 +309,7 @@ def main():
     print()
     print("  No NEW scale issues found beyond the known ones (Finding 5a, Finding 6).")
     print("  The architecture scales linearly to 100PB. The two known issues are")
-    print("  View-level fixes (skip pointers, GC), not kernel changes.")
+    print("  Lens-level fixes (skip pointers, GC), not kernel changes.")
     print()
     print("  Next: Stage 6 (Human destruction) — can a stranger implement Git/Iceberg/OCI?")
 

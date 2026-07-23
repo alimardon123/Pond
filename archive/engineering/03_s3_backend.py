@@ -196,12 +196,12 @@ def test_s3_backend():
             assert data == b"v2 data"
             print(f"  Overwrite reference: ✓")
 
-            # Run a real View (SQLView)
+            # Run a real View (SQLLens)
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
             try:
-                from views_minimal import SQLView
+                from views_minimal import SQLLens
                 import pyarrow as pa
-                sql = SQLView(kernel, "s3_users")
+                sql = SQLLens(kernel, "s3_users")
                 schema = pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())])
                 sql.create(schema)
                 batch = pa.RecordBatch.from_arrays([
@@ -212,9 +212,9 @@ def test_s3_backend():
                 sql.commit()
                 t = sql.read()
                 assert t.num_rows == 3
-                print(f"  SQLView on S3 backend: ✓ (3 rows)")
+                print(f"  SQLLens on S3 backend: ✓ (3 rows)")
             except Exception as e:
-                print(f"  SQLView on S3 backend FAILED: {e}")
+                print(f"  SQLLens on S3 backend FAILED: {e}")
                 return False
 
             # Verify S3 operations used
@@ -328,7 +328,7 @@ def main():
     print("  - NO rename, append, seek, directories, or filesystem semantics needed")
     print("  - Content-addressing works on S3 (hash = object key)")
     print("  - Root namespace stored as S3 objects (key prefix 'roots/')")
-    print("  - SQLView works on S3 backend (tested with 3 rows)")
+    print("  - SQLLens works on S3 backend (tested with 3 rows)")
     print("  - Same operations produce same state on S3 and filesystem")
     print()
     print("  VERDICT: SUPPORTED — the kernel is genuinely backend-independent.")

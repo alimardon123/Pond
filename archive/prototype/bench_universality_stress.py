@@ -17,7 +17,7 @@ If NO  — the kernel is universal. Pond is on the path to "universal
          immutable runtime," not "another table format."
 If YES — there's a kernel leak. Document it; decide whether to admit the
          feature (via the 5-criterion Admission Rule) or push it back
-         into the View.
+         into the Lens.
 
 Run:  python3 bench_universality_stress.py
 """
@@ -31,7 +31,7 @@ import struct
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pond_kernel import PondKernel, Tree, Commit, hash_bytes
-from views import SQLView, VectorView, StreamView, GitView
+from views import SQLLens, VectorLens, StreamView, GitLens
 from more_views import GraphView, MLView, TimeSeriesView, OCIView
 
 
@@ -212,10 +212,10 @@ def main():
         print("  ✓ THE KERNEL IS UNIVERSAL")
         print()
         print("  8 Views share one immutable object substrate:")
-        print("    1. SQLView       (Parquet, tabular)")
-        print("    2. VectorView    (raw floats, embeddings)")
+        print("    1. SQLLens       (Parquet, tabular)")
+        print("    2. VectorLens    (raw floats, embeddings)")
         print("    3. StreamView    (length-prefixed records, Kafka-like)")
-        print("    4. GitView       (files + directories + commits)")
+        print("    4. GitLens       (files + directories + commits)")
         print("    5. GraphView     (nodes + edges + adjacency)")
         print("    6. MLView        (model checkpoints + lineage)")
         print("    7. TimeSeriesView (segments + retention)")
@@ -260,7 +260,7 @@ def main():
     print("  is Git's model leaking?")
     print()
     print("  Observations from this test:")
-    print("    - SQLView, VectorView, StreamView, GitView, GraphView, MLView,")
+    print("    - SQLLens, VectorLens, StreamView, GitLens, GraphView, MLView,")
     print("      TimeSeriesView, OCIView all use Tree/Commit successfully.")
     print("    - Each View uses Trees differently (flat, hierarchical,")
     print("      per-series, per-manifest) — the kernel doesn't impose structure.")
@@ -279,7 +279,7 @@ def main():
     print("  Caveat: this is empirical, not formal. More Views and more")
     print("  extreme workloads (e.g., CRDTs, multi-parent DAGs) would test")
     print("  this further. But after 8 Views with no kernel changes, the")
-    print("  burden of proof shifts to 'show me a View that breaks it.'")
+    print("  burden of proof shifts to 'show me a Lens that breaks it.'")
 
     kernel.close()
 

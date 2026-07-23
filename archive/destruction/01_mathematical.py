@@ -299,7 +299,7 @@ def exp_time_travel_complexity():
         print(f"  Worse than O(N) — investigate.")
     print()
     print(f"  VERDICT: FALSIFIED — Time travel is O(N) in history depth.")
-    print(f"  This is the known Finding 5a. Fix: skip pointers (View-level pattern,")
+    print(f"  This is the known Finding 5a. Fix: skip pointers (Lens-level pattern,")
     print(f"  NOT a kernel change — per the Admission Rule, only SQL and Git Views")
     print(f"  need time travel, so it's not universal enough for the kernel).")
     return False  # Falsified
@@ -383,7 +383,7 @@ def exp_gc_complexity():
     print("  accumulate. This test confirms the gap.")
     print()
     print("  VERDICT: FALSIFIED — GC is not implemented. Orphans accumulate forever.")
-    print(f"  This is the known Finding 6. Fix: a View-level GC pass that walks")
+    print(f"  This is the known Finding 6. Fix: a Lens-level GC pass that walks")
     print(f"  reachability from all root References and sweeps unreferenced blobs.")
     return False
 
@@ -436,10 +436,10 @@ def main():
     print("  Findings:")
     print()
     print("  - Time travel is O(N) (Falsified) — KNOWN issue (Finding 5a).")
-    print("    Fix: View-level skip pointers (not a kernel change).")
+    print("    Fix: Lens-level skip pointers (not a kernel change).")
     print()
     print("  - GC is not implemented (Falsified) — KNOWN issue (Finding 6).")
-    print("    Fix: View-level reachability walk + sweep.")
+    print("    Fix: Lens-level reachability walk + sweep.")
     print()
     print("  - Write, Read, Reference, Resolve, Branch, Tree walk all meet targets.")
     print()

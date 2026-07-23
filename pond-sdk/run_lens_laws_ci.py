@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-CI entry point for the View Algebra property-test harness (RFC-0007).
+CI entry point for the Lens Algebra property-test harness (RFC-0007).
 
-Runs `view_laws.py` against every registered View class and exits
-non-zero if any View violates any of the 6 laws.
+Runs `lens_laws.py` against every registered Lens class and exits
+non-zero if any Lens violates any of the 6 laws.
 
 Designed for CI: no flakiness, no random data, deterministic output.
 Add to CI with:
@@ -11,8 +11,8 @@ Add to CI with:
     python pond-sdk/run_view_laws_ci.py
 
 Exit codes:
-    0 — all Views passed all 6 laws
-    1 — at least one View violated at least one law
+    0 — all Lenses passed all 6 laws
+    1 — at least one Lens violated at least one law
     2 — harness itself failed to run (import errors, etc.)
 """
 
@@ -30,27 +30,27 @@ sys.path.insert(0, os.path.join(HERE, "..", "pond-core"))
 sys.path.insert(0, HERE)
 
 from pond_minimal import PondMinimal
-from lens_laws import ViewLaws, ViewContract
+from lens_laws import LensLaws, LensContract
 
 
 # ---------------------------------------------------------------------------
-# View contracts — one per registered View class
+# Lens contracts — one per registered Lens class
 # ---------------------------------------------------------------------------
 
 def make_default_view_contract(kernel) -> tuple:
-    """Contract for the default View class."""
+    """Contract for the default Lens class."""
     from lens_sdk import View
-    view = View(kernel, "ci_default")
-    return view, ViewContract(
+    lens = Lens(kernel, "ci_default")
+    return lens, LensContract(
         name="ci_default",
-        encode=view.encode,
-        decode=view.decode,
-        put=view.put,
-        get=view.get,
-        delete=view.delete,
-        commit=view.commit,
-        keys=view.keys,
-        get_all=view.get_all,
+        encode=lens.encode,
+        decode=lens.decode,
+        put=lens.put,
+        get=lens.get,
+        delete=lens.delete,
+        commit=lens.commit,
+        keys=lens.keys,
+        get_all=lens.get_all,
         list_materializations=lambda: [],
         build_materialization=None,
         sample_data=lambda i: {"id": i, "name": f"item-{i}", "value": i * 10},
@@ -58,30 +58,30 @@ def make_default_view_contract(kernel) -> tuple:
 
 
 def make_indexed_view_contract(kernel) -> tuple:
-    """Contract for IndexedView with an eager index as materialization."""
-    from auto_index import IndexedView
-    view = IndexedView(kernel, "ci_indexed")
-    view.register_index("by_value", lambda d: str(d.get("value", 0)), mode="eager")
+    """Contract for IndexedLens with an eager index as materialization."""
+    from auto_index import IndexedLens
+    lens = IndexedLens(kernel, "ci_indexed")
+    lens.register_index("by_value", lambda d: str(d.get("value", 0)), mode="eager")
 
     def build_mat(name: str) -> bytes:
         if name == "by_value":
-            idx = view._auto_indexes.get("by_value")
+            idx = lens._auto_indexes.get("by_value")
             if idx is None:
                 return b""
-            view._rebuild_index(idx)
+            lens._rebuild_index(idx)
             return (idx.tree_root or "").encode()
         return b""
 
-    return view, ViewContract(
+    return lens, LensContract(
         name="ci_indexed",
-        encode=view.encode,
-        decode=view.decode,
-        put=view.put,
-        get=view.get,
-        delete=view.delete,
-        commit=view.commit,
-        keys=view.keys,
-        get_all=view.get_all,
+        encode=lens.encode,
+        decode=lens.decode,
+        put=lens.put,
+        get=lens.get,
+        delete=lens.delete,
+        commit=lens.commit,
+        keys=lens.keys,
+        get_all=lens.get_all,
         list_materializations=lambda: ["by_value"],
         build_materialization=build_mat,
         sample_data=lambda i: {"id": i, "name": f"item-{i}", "value": i * 10},
@@ -89,19 +89,19 @@ def make_indexed_view_contract(kernel) -> tuple:
 
 
 def make_semantic_view_contract(kernel) -> tuple:
-    """Contract for SemanticView (a subclass of View)."""
-    from lens_sdk import SemanticView
-    view = SemanticView(kernel, "ci_semantic")
-    return view, ViewContract(
+    """Contract for SemanticLens (a subclass of View)."""
+    from lens_sdk import SemanticLens
+    view = SemanticLens(kernel, "ci_semantic")
+    return lens, LensContract(
         name="ci_semantic",
-        encode=view.encode,
-        decode=view.decode,
-        put=view.put,
-        get=view.get,
-        delete=view.delete,
-        commit=view.commit,
-        keys=view.keys,
-        get_all=view.get_all,
+        encode=lens.encode,
+        decode=lens.decode,
+        put=lens.put,
+        get=lens.get,
+        delete=lens.delete,
+        commit=lens.commit,
+        keys=lens.keys,
+        get_all=lens.get_all,
         list_materializations=lambda: [],
         build_materialization=None,
         sample_data=lambda i: {"name": f"metric_{i}", "value": i * 100},
@@ -109,37 +109,37 @@ def make_semantic_view_contract(kernel) -> tuple:
 
 
 def make_multikey_view_contract(kernel) -> tuple:
-    """Contract for IndexedView with a multi-key (list-returning) extractor.
+    """Contract for IndexedLens with a multi-key (list-returning) extractor.
 
     Tests Phase B.3 multikey index support: extractor returns a list of
     tags, and the row is indexed under each tag.
     """
-    from auto_index import IndexedView
-    view = IndexedView(kernel, "ci_multikey")
-    view.register_index("by_tag",
+    from auto_index import IndexedLens
+    lens = IndexedLens(kernel, "ci_multikey")
+    lens.register_index("by_tag",
                          lambda d: d.get("tags", []),
                          mode="eager")
-    view.register_index("by_id",
+    lens.register_index("by_id",
                          lambda d: str(d.get("id", 0)),
                          mode="eager")
 
     def build_mat(name: str) -> bytes:
-        idx = view._auto_indexes.get(name)
+        idx = lens._auto_indexes.get(name)
         if idx is None:
             return b""
-        view._rebuild_index(idx)
+        lens._rebuild_index(idx)
         return (idx.tree_root or "").encode()
 
-    return view, ViewContract(
+    return lens, LensContract(
         name="ci_multikey",
-        encode=view.encode,
-        decode=view.decode,
-        put=view.put,
-        get=view.get,
-        delete=view.delete,
-        commit=view.commit,
-        keys=view.keys,
-        get_all=view.get_all,
+        encode=lens.encode,
+        decode=lens.decode,
+        put=lens.put,
+        get=lens.get,
+        delete=lens.delete,
+        commit=lens.commit,
+        keys=lens.keys,
+        get_all=lens.get_all,
         list_materializations=lambda: ["by_tag", "by_id"],
         build_materialization=build_mat,
         sample_data=lambda i: {
@@ -151,41 +151,41 @@ def make_multikey_view_contract(kernel) -> tuple:
 
 
 def make_keyless_view_contract(kernel) -> tuple:
-    """Contract for KeylessView (primary-keyless, auto-generated UUID keys).
+    """Contract for KeylessLens (primary-keyless, auto-generated UUID keys).
 
-    Tests Phase B.3 KeylessView: put(None, data) generates a UUID4 key.
+    Tests Phase B.3 KeylessLens: put(None, data) generates a UUID4 key.
     """
-    from lens_sdk import KeylessView
-    view = KeylessView(kernel, "ci_keyless")
+    from lens_sdk import KeylessLens
+    view = KeylessLens(kernel, "ci_keyless")
 
     def keyless_put(key, data):
-        # KeylessView requires key=None; the contract's put signature
-        # passes a key, so we ignore it and call view.put(None, data).
-        return view.put(None, data)
+        # KeylessLens requires key=None; the contract's put signature
+        # passes a key, so we ignore it and call lens.put(None, data).
+        return lens.put(None, data)
 
-    return view, ViewContract(
+    return lens, LensContract(
         name="ci_keyless",
-        encode=view.encode,
-        decode=view.decode,
+        encode=lens.encode,
+        decode=lens.decode,
         put=keyless_put,
-        get=view.get,
-        delete=view.delete,
-        commit=view.commit,
-        keys=view.keys,
-        get_all=view.get_all,
+        get=lens.get,
+        delete=lens.delete,
+        commit=lens.commit,
+        keys=lens.keys,
+        get_all=lens.get_all,
         list_materializations=lambda: [],
         build_materialization=None,
         sample_data=lambda i: {"event": f"event-{i}", "ts": i * 1000},
     )
 
 
-# Registry of View contracts to test
+# Registry of Lens contracts to test
 VIEW_CONTRACTS = [
     ("Default View", make_default_view_contract),
-    ("IndexedView", make_indexed_view_contract),
-    ("SemanticView", make_semantic_view_contract),
-    ("Multikey IndexedView", make_multikey_view_contract),
-    ("KeylessView", make_keyless_view_contract),
+    ("IndexedLens", make_indexed_view_contract),
+    ("SemanticLens", make_semantic_view_contract),
+    ("Multikey IndexedLens", make_multikey_view_contract),
+    ("KeylessLens", make_keyless_view_contract),
 ]
 
 
@@ -194,7 +194,7 @@ VIEW_CONTRACTS = [
 # ---------------------------------------------------------------------------
 
 def run_one(name: str, contract_factory) -> tuple[bool, str]:
-    """Run view_laws against one View. Returns (passed, output)."""
+    """Run view_laws against one Lens. Returns (passed, output)."""
     bench_dir = f"/tmp/pond_ci_{name.lower().replace(' ', '_')}"
     if os.path.exists(bench_dir):
         shutil.rmtree(bench_dir)
@@ -202,8 +202,8 @@ def run_one(name: str, contract_factory) -> tuple[bool, str]:
 
     try:
         kernel = PondMinimal(bench_dir)
-        view, contract = contract_factory(kernel)
-        laws = ViewLaws(kernel)
+        lens, contract = contract_factory(kernel)
+        laws = LensLaws(kernel)
         report = laws.check_all(contract, num_samples=10)
         output = str(report)
         passed = report.all_passed
@@ -223,7 +223,7 @@ def run_one(name: str, contract_factory) -> tuple[bool, str]:
 
 def main() -> int:
     print("=" * 72)
-    print("  View Algebra CI — RFC-0007 property tests (view_laws.py)")
+    print("  View Algebra CI — RFC-0007 property tests (lens_laws.py)")
     print("=" * 72)
     print()
 

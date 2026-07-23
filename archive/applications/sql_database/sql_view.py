@@ -6,7 +6,7 @@ sys.path.insert(0, "/home/z/my-project/pond_repo/libraries")
 from pond_minimal import PondMinimal
 from delta_view import DeltaViewBase
 
-class SQLView:
+class SQLLens:
     def __init__(self, kernel, db_name="db"):
         self.kernel = kernel
         self.db_name = db_name
