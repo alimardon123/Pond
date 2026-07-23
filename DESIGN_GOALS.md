@@ -100,12 +100,21 @@ save it.
 
 ---
 
-## 3. Design goals (the six principles)
+## 3. Design goals (the seven principles)
 
-Every architectural decision in Pond must serve these six principles.
+Every architectural decision in Pond must serve these seven principles.
 When a proposal conflicts with one of them, the proposal loses.
 When a proposal serves one at the cost of another, the tradeoff is
 made explicit and recorded in `rfcs/` or `docs/REJECTED_DESIGNS.md`.
+
+The seven principles, in priority order:
+1. **Simple** — the kernel stays intellectually small.
+2. **Powerful** — rich behavior emerges from composition.
+3. **Performant** — optimizations live above the core.
+4. **Scalable** — Lenses and Physical Structures evolve independently.
+5. **Efficient** — immutable data + rebuildable derived metadata.
+6. **Beautiful** — one responsibility per layer; dependencies flow downward.
+7. **Functional** — Pond must do everything users actually need.
 
 ### 3.1 Simple — the kernel remains intellectually small
 
@@ -176,6 +185,41 @@ independently.
 
 **Test:** Draw the dependency graph of packages. Is it a DAG with
 all edges pointing downward? If not, the architecture has leaked.
+
+### 3.7 Functional — Pond must do everything users actually need
+
+Simplicity without functionality is academic. Pond's small kernel
+is a means, not an end. The end is **covering every real workload**
+that users bring to the system — through Lenses (which interpret
+bytes) and Physical Structures (which accelerate access).
+
+The functional principle is the most demanding. It says: when a
+user wants SQL, give them SQL (via a SQL Lens). When they want
+feature stores, give them feature stores (via a Feature Store Lens).
+When they want graph queries, give them graph queries (via a Graph
+Lens). When they want OLTP, give them OLTP (via an OLTP Lens —
+which may layer a coordinator on the kernel per A7). The kernel
+stays small; the Lenses do the work.
+
+When a workload seems impossible on Pond, the functional principle
+demands we ask: **what Lens is missing?** Not "Pond can't do this."
+The answer is almost always a missing Lens or a missing Physical
+Structure, not a missing kernel primitive.
+
+**Test:** Before claiming "Pond can't do X," ask:
+1. Is there a Lens that could interpret Pond bytes as X?
+2. Is there a Physical Structure that could accelerate X?
+3. Is there a coordinator that could layer on the kernel for X's
+   consistency needs (per A7)?
+
+If the answer to all three is no, **then** Pond genuinely can't do
+X. If the answer to any is "yes, but it doesn't exist yet," the
+right statement is "Pond can do X via a Lens that hasn't been
+built yet" — not "Pond can't do X."
+
+This principle keeps Pond honest about its scope while preventing
+premature defeatism. The kernel is small; the Lens algebra is
+infinite. Most "can't" claims are missing Lenses.
 
 ---
 
