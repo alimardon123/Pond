@@ -1,337 +1,145 @@
 # Pond
 
-> *One copy. Infinite execution. Zero coordination unless necessary.*
+> *One copy of data on object storage, serving all workloads without
+> duplication, with no JVM, no Spark, no Iceberg-style metadata explosion.*
 
-Pond is a **capability-oriented immutable object runtime** — not another
-lakehouse, not another table format, not another Spark.
+Pond is a **minimal immutable object runtime** — not another lakehouse,
+not another table format, not another Spark.
 
-The core hypothesis: a tiny 3-primitive storage kernel (`Write`, `Read`,
-`Reference`) is sufficient for radically different workloads — SQL, vectors,
-streaming, Git, graphs, ML, time-series, OCI registries, and beyond — to be
-implemented as independent **Views** over a shared immutable substrate.
-
----
-
-## Outcome vocabulary (used throughout)
-
-To avoid confirmation bias, every experiment result uses this strict
-vocabulary. No "this proves" or "strongest evidence." Just:
-
-- **Supported** — evidence increased confidence in a hypothesis
-- **Falsified** — hypothesis failed
-- **Inconclusive** — experiment didn't isolate the question
-- **Needs larger-scale validation** — prototype limits prevent a conclusion
+The core hypothesis: a tiny storage kernel (3 operations on 6 substrates,
+~140 LOC) is sufficient for radically different workloads — SQL, vectors,
+streaming, Git, graphs, ML, time-series — to be implemented as
+independent **Lenses** over a shared immutable substrate.
 
 ---
 
-## Project status — what changed the architecture vs. what confirmed it
+## The Kernel
 
-One devastating experiment is worth more than fifty confirmations. This
-table tracks only experiments that *changed the architecture* or *surfaced
-a real finding*. Confirmation experiments are not listed.
+The kernel owns three operations. Nothing else.
 
-| Experiment | Result | Changed architecture? |
-|---|---|---|
-| Metadata locality (flat tree at 5K seals) | O(N²) metadata growth | Yes — hierarchical trees (Git model) |
-| Universality (Parquet hardcoded in seal) | Format leak in kernel | Yes — split kernel from Views |
-| Minimality (Tree/Commit in kernel) | Tree/Commit are patterns, not primitives | Yes — removed Tree/Commit from kernel |
-| Identity (immutability removal) | Breaks Git/OCI/ML/crash recovery | Confirmed immutability is primitive |
-| Identity (Reference removal) | IPFS without IPNS = not a database | Confirmed Reference is primitive (but see open question below) |
-| Identity (laws vs APIs) | APIs evolve; laws endure | Yes — specified as 5 laws, not 3 operations |
-| Identity (multi-hash) | SHA-256 hardcoding is fragile | Yes — multi-hash candidate for v0.8 (passes Admission Rule) |
-| Time travel (no skip pointers) | O(N) walk at 1B commits | Known issue (Finding 5a) — View-level fix, not kernel |
-| GC (none implemented) | Orphans accumulate | Known issue (Finding 6) — View-level fix, not kernel |
-| Concurrency (SQLite thread-binding) | Concurrent writers corrupt | Known issue (Finding 7) — needs thread-safe root namespace |
-| Adversarial View Design | Friction found: 5 kernel points (clustered on indexes) | **Yes** — shared index library recommended (not kernel change) |
-| Composition laws | 7 algebraic properties added to formal spec | Yes — formal spec now has storage + composition laws |
-| Independent implementation challenge | Fresh agent built working GitView from laws alone; 10 ambiguities found | **Yes** — laws sufficient for kernel, NOT for View interoperability |
-| Multi-tenant hostile View | Capability tokens + partitioned namespace solve isolation at View level | No kernel change needed |
+| Operation | Description |
+|---|---|
+| `Write(bytes) → hash` | Create immutable, content-addressed blob. Same bytes → same hash. Dedup is free. |
+| `Read(hash) → bytes` | Fetch blob by hash (or by name). |
+| `Ref(name, hash) → ()` | Mutable name→hash mapping. The **only** mutation in the system. |
 
-**What this table does NOT show:** the ~50 confirmation experiments that
-ran but did not change the architecture. They were useful for building
-confidence but not for discovering architectural issues. The next phase
-(Adversarial View Design) is designed to surface friction, not confirmation.
+~140 lines of code. **FROZEN.** No codec registry. No envelope. No manifest.
+No query planner. No consensus. The kernel stores and retrieves bytes; it
+knows nothing about what the bytes mean.
+
+[→ Read the whitepaper](docs/POND_WHITEPAPER.md) for the full architecture.
 
 ---
 
-## The four layers (honest confidence assessment)
-
-| Layer | Status | Confidence |
-|---|---|---|
-| Philosophy | Excellent | High |
-| Kernel design | Very promising | Medium |
-| Prototype | Useful | Medium |
-| Production architecture | Still mostly unknown | Low |
-
-The prototype proves the philosophy. The kernel design is promising but
-attacked by Adversarial View Design (next phase). Production architecture
-(no replication, no real S3, no concurrency, no distributed execution) is
-still mostly unknown — do not extrapolate prototype results to production.
-
----
-
-## The minimal kernel
+## The Layer Hierarchy
 
 ```
-Write : bytes -> hash              (create immutable content-addressed blob)
-Read  : hash | name -> bytes       (fetch blob by hash, or resolve name then fetch)
-Ref   : name × hash -> ()          (mutable name -> hash mapping; the ONLY mutable op)
+Applications                ← SQL, Git, Feature Store, Notebook, Lakehouse
+    ↓
+Lenses                      ← Interpretation (encode/decode; code, not data)
+    ↓
+Physical Structures         ← Acceleration (indexes, stats — deterministic)
+    ↓
+Collections                 ← Named objects with namespace
+    ↓
+Kernel                      ← Bytes + History + Names (FROZEN, ~140 LOC)
+    ↓
+Backend                     ← Local disk, S3, IPFS, FoundationDB, …
 ```
 
-Three operations. No Tree. No Commit. No OPEN/SEALED. No lifecycle. No SQL.
-No Parquet. No Arrow. No format or workload concepts.
-
-Everything else — Tree, Commit, Tag, Branch, OPEN/SEALED, lifecycle, history,
-branching, time travel — is a **View-level pattern** built from these 3
-primitives.
-
-**Important caveat:** the 3-primitive kernel is an *empirical hypothesis*,
-not a proof. It is supported by 8 workloads + 6 alien workloads + 8 identity
-experiments. The destruction phases are designed to falsify it.
+Dependencies flow downward only. Each layer adds exactly one capability.
+No layer leaks upward. The kernel never changes.
 
 ---
 
-## Repository layout
+## The 7 Design Principles
 
-```
-Pond/
-├── README.md                              # this file
-├── worklog.md                             # full research worklog
-├── docs/
-│   └── pond_rfc1_storage_and_versioned_state.pdf   # RFC 1 (formal spec)
-├── scripts/
-│   └── pond_rfc1.py                       # ReportLab script that generated the RFC
-├── prototype/                             # v0.1-v0.5 code + benchmarks
-└── destruction/                           # destruction-phase experiments
-    ├── 01_mathematical.py                 # complexity budget for every operation
-    ├── 02_economic.py                     # amplification factors at 100TB S3 scale
-    ├── 03_distributed.py                  # partition, clock skew, exactly-once
-    ├── 04_storage.py                      # S3/Azure/GCS/HDFS/Redis/FDB/Postgres
-    ├── 05_scale.py                        # 10B blobs, 100M namespaces, 1B commits
-    └── 06_human.md                        # can a stranger implement Git/Iceberg/OCI?
-```
+Every architectural decision must serve these (see [DESIGN_GOALS.md](DESIGN_GOALS.md) §3):
+
+1. **Simple** — the kernel stays intellectually small (~140 LOC).
+2. **Powerful** — rich behavior emerges from composition.
+3. **Performant** — optimizations live above the core.
+4. **Scalable** — Lenses and Physical Structures evolve independently.
+5. **Efficient** — immutable data + rebuildable derived metadata.
+6. **Beautiful** — one responsibility per layer; dependencies flow downward.
+7. **Functional** — Pond must do everything users actually need (via Lenses).
 
 ---
 
-## The destruction plan
+## What's in this repo
 
-The architecture is frozen. The next phase is trying to destroy it.
-
-### Stage 1: Mathematical destruction
-Try to prove every operation has bad asymptotics. If any is O(N²) at scale,
-the architecture fails.
-
-| Operation | Target complexity | Status |
-|---|---|---|
-| Read latest | O(1) | — |
-| Read version N | O(log N) | — |
-| Branch | O(1) | — |
-| Snapshot | O(1) | — |
-| GC | O(reachable) | — |
-| Replication | ? | — |
-| Compaction | ? | — |
-| Merge | ? | — |
-| Clone | ? | — |
-| Diff | ? | — |
-
-### Stage 2: Economic destruction
-At 100TB on S3, measure: storage amplification, write amplification, read
-amplification, metadata amplification, request amplification, CPU/memory
-amplification, AWS bill. If metadata dominates or request count explodes,
-the architecture fails economically.
-
-### Stage 3: Distributed destruction
-Partition, split-brain, lost packets, clock skew, duplicate writes, retries,
-out-of-order commits, exactly-once assumptions. If any distributed failure
-corrupts the kernel, the architecture fails.
-
-### Stage 4: Storage destruction
-Implement the kernel over S3, Azure Blob, GCS, HDFS, Redis, FoundationDB,
-Postgres. If any backend requires kernel special cases, the architecture
-fails storage-independence.
-
-### Stage 5: Scale destruction
-10 billion blobs. 100 million namespaces. 1 billion commits. 1 trillion
-references. If any operation degrades non-linearly, the architecture fails.
-
-### Stage 6: Human destruction
-Give the kernel to someone who knows nothing about Pond. Ask them to
-implement Git, Iceberg, OCI, Feature Store, LakeFS without talking to you.
-If they can't, the kernel isn't actually simple.
+| Directory | Purpose |
+|---|---|
+| [`pond-core/`](pond-core/) | The kernel (FROZEN, ~140 LOC). 3 primitives: Write, Read, Ref. |
+| [`pond-sdk/`](pond-sdk/) | Lens SDK: ProllyViewBase, Lens base class, indexes, query API. |
+| [`lenses/`](lenses/) | Lens implementations: **lakehouse** (DuckDB, flagship), **vector** (ANN search). |
+| [`services/`](services/) | Cross-cutting: **transport** (compression+encryption), **schema** (registry), **replication** (coordinator). |
+| [`pond-labs/`](pond-labs/) | Experiments: feature_store_lens, interop_demo (killer demo), loc_benchmark. |
+| [`docs/`](docs/) | Whitepaper, formal algebras, benchmarks, where-Pond-fails, lens guide. |
+| [`scripts/`](scripts/) | Test suites (646 checks) and benchmarks. |
+| [`tla/`](tla/) | TLA+ formal specification (6 invariants, 56 reachable states). |
+| [`archive/`](archive/) | Historical code and docs (preserved for reference). |
 
 ---
 
 ## Quick start
 
 ```bash
-pip install duckdb pyarrow
+# Run the flagship: DuckDB lakehouse on Pond
+python lenses/lakehouse/lakehouse.py
 
-# The minimal kernel + 8 Views
-cd prototype
-python3 bench_minimality.py           # 8 Views on 3 primitives
+# Run the killer demo: bidirectional Lens interop
+python pond-labs/interop_demo.py
 
-# Destruction experiments (the current phase)
-cd ../destruction
-python3 01_mathematical.py            # complexity budget for every operation
-python3 02_economic.py                # amplification at 100TB S3 scale
-python3 03_distributed.py             # partition, clock skew, exactly-once
-python3 04_storage.py                 # backend independence test
-python3 05_scale.py                   # extreme scale simulation
+# See the LOC saved (81% reduction vs building from scratch)
+python pond-labs/loc_benchmark.py
+
+# Run the 646 verification checks
+python scripts/phase_l_property_tests.py    # 491 property tests
+python scripts/phase_l_differential_git.py  # 45 Git differential tests
+python scripts/phase_n_untested_laws.py     # 23 merge + workspace tests
+python scripts/phase_o_remaining_laws.py    # 48 remaining law tests
 ```
 
 ---
 
-## Retractions (honest correction of overclaims)
+## The honest scope
 
-Earlier versions of this README made claims stronger than the evidence
-supports. Retracting:
+Pond is not a universal storage substrate today. It excels at:
 
-1. **"Content-addressing makes the kernel inherently resilient to retries,
-   duplicates, clock skew, split-brain."** — Overclaimed. Content-addressing
-   handles idempotent writes and dedup. It does NOT handle: lost updates,
-   concurrent reference races, namespace coordination, transactional
-   visibility, causal consistency, lease expiration, conflict resolution.
-   Those require additional mechanisms (Raft, MVCC, CRDTs) the kernel
-   does not yet have.
+- **Versioned tabular data** (lakehouse) — the flagship
+- **ML feature stores** — point-in-time joins, branching, time travel
+- **Audit logs / event sourcing** — immutability is native
+- **Configuration management** — branching for environment promotion
 
-2. **"Metadata is 0.002% of data at 100TB."** — Benchmark result, not
-   architectural statement. Depends on workload (blob size, table count,
-   commit frequency). For 1KB ML checkpoints, the ratio is much higher.
-   For 1B tables, the root namespace dominates. Correct for the specific
-   workload tested; not a universal property.
+Pond struggles at (but has a Lens roadmap to fix):
+- High-frequency OLTP, distributed consensus, hot-key contention,
+  streaming joins, GPU data, millions of tiny objects, full-text search
 
-3. **"Mathematical destruction proved asymptotic complexity."** — It
-   benchmarked one implementation (Python + SQLite). It did NOT prove
-   the architecture's complexity bounds. A different implementation
-   could behave differently. Analytical claims (O(1), O(log N)) are
-   hypotheses, not theorems.
+For each struggle, there is a Lens design that closes the gap. See
+[docs/WHERE_POND_FAILS.md](docs/WHERE_POND_FAILS.md) for the full
+mapping.
 
-4. **"The kernel needs no modifications."** — Premature. The destruction
-   phase evaluated the kernel against workloads I designed. Workloads
-   I didn't design (CRDTs, multi-writer namespaces, causal consistency)
-   might require kernel changes. The kernel is *probably* sufficient
-   for the workloads tested; it is *not proven* sufficient for all
-   possible workloads.
-
-5. **"Storage independence is supported."** — True for the 6 backends
-   tested (FS, memory, SQLite, Redis, S3, FDB-analytical). Not tested
-   on real S3, real FDB, HDFS, Azure Blob, GCS. The architecture
-   *should* work on all of them (kernel uses only PutObject + GetObject
-   semantics), but empirical validation is pending.
+**The honest, ambitious claim:** Pond's kernel is too small to do any
+single workload optimally. But the Lens algebra is rich enough to do
+every workload competitively, plus give every workload free time travel,
+branching, and cross-Lens interop that no peer system provides.
 
 ---
 
-## What the destruction phase DID NOT question (Identity Destruction II)
+## Reading order (for new contributors)
 
-The destruction phase tested the kernel against designed workloads. It did
-NOT question the kernel's foundational assumptions:
-
-- **Is Reference primitive?** It's the only mutating operation. Why is the
-  centralized operation in the kernel? Could namespace be a View concern?
-- **Is the namespace model right?** `name -> hash` is one model. Could it
-  be `(name, epoch)`, paths, tenant+name, capability tokens, graph edges,
-  content queries?
-- **Is the kernel an API or laws?** APIs evolve; invariants endure. Should
-  the architecture be specified as laws (immutability, addressability,
-  name-mutability) rather than operations (Write/Read/Reference)?
-- **Can names disappear?** Reference overwrites, but can a name be deleted?
-  What happens to reachability?
-- **Can references be CRDTs?** For multi-writer/multi-region scenarios.
-- **Can two namespaces overlap?** Compose? Conflict?
-
-These are the Identity Destruction II questions. See `destruction/II_identity/`.
+1. **This file** — 5-minute intro.
+2. [docs/POND_WHITEPAPER.md](docs/POND_WHITEPAPER.md) — the contribution (20 pages).
+3. [docs/WHERE_POND_FAILS.md](docs/WHERE_POND_FAILS.md) — honest scope + Lens roadmap.
+4. [docs/LENS_GUIDE.md](docs/LENS_GUIDE.md) — how to write a Lens.
+5. [DESIGN_GOALS.md](DESIGN_GOALS.md) — 7 design principles + roadmap.
 
 ---
 
-## Comparison set (revised)
+## In one sentence
 
-Pond is NOT competing with Iceberg, Delta, or table formats. The real
-comparison set — systems with similar ambitions:
-
-- **Git** — immutable object graph + mutable refs
-- **Irmin** — content-addressable store + mutable references (OCaml)
-- **IPFS/IPNS** — content addressing + naming
-- **LakeFS** — versioned data namespaces on object storage
-- **FoundationDB** — minimal substrate with layered architecture
-- **Dolt** — versioned structured data using prolly trees
-
-Pond's differentiation (if it holds): a smaller substrate than any of these,
-specified as laws rather than APIs, with Views as the primary extension
-mechanism rather than baked-in semantics.
-
----
-
-## Architectural metrics
-
-| Metric | Goal | Current |
-|---|---|---|
-| Kernel LOC | ≤ 200-300 | ~140 (`pond_minimal.py`) |
-| Number of primitives | ≤ 3 unless admission rule satisfied | 3 |
-| Kernel dependencies (workload-specific libs) | 0 | 0 (only stdlib) |
-| View independence | Any View removable | Supported (Capability Independence Test) |
-| Storage portability | FS, S3, Redis, Postgres, memory | FS + Postgres verified; others pending Stage 4 |
-| Canonical copies | Exactly 1 durable representation | 1 (immutable blobs) |
-| Capability leakage | 0 kernel mods per new View | 0 across 14 workloads |
-| Long-term stability | API almost never changes | 3 primitives stable since v0.4 |
-
----
-
-## The Kernel Admission Rule
-
-A feature enters `pond_minimal.py` ONLY if ALL five criteria pass:
-
-1. **Universal** — required by 3+ structurally different Views
-2. **Impossible outside the kernel** — if a View can implement it, it stays out
-3. **Immutable** — kernel tracks no mutable state except name → hash
-4. **Storage-independent** — no knowledge of formats or workload types
-5. **Decades-stable** — could Linux keep this syscall for 30 years?
-
-See `prototype/ADMISSION_RULE.py` for the full rule with the feature audit table.
-
----
-
-## The philosophy
-
-> **One copy. Infinite execution. Zero coordination unless necessary.**
-
-- **One copy** — exactly one durable canonical representation (immutable blobs).
-  Everything else (caches, indexes, MVs) is derived and rebuildable.
-- **Infinite execution** — capabilities compose without limit. SQL, streaming,
-  vectors, ML, graph, future workloads all run over the same substrate.
-- **Zero coordination unless necessary** — everything stays local (single-node,
-  single-process) unless the system can prove coordination is required for
-  correctness. The discipline behind SQLite, Git, TigerBeetle, DuckDB.
-
----
-
-## What Pond is NOT
-
-- Not another Iceberg (Pond's kernel has no table format)
-- Not another Spark (Pond's kernel has no execution engine)
-- Not another DuckDB (DuckDB is one View; the kernel is backend-agnostic)
-- Not a microkernel (the OS analogy is bounded — kernel = storage, Views = engines)
-- Not a Git clone (Tree/Commit are View patterns, not kernel primitives)
-
-## What Pond IS
-
-A **universal immutable object runtime** — the smallest storage algebra
-we've found so far (Write + Read + Reference) from which SQL, vectors,
-streaming, Git, graphs, ML, time-series, OCI registries, and alien workloads
-(Minecraft, Blender, CAD, genome, medical imaging, Photoshop) all derive as
-independent Views. The destruction phases are trying to falsify this claim.
-
----
-
-## License
-
-MIT (see LICENSE file when added). All prototype code is open.
-
-## Contributing
-
-This is a research prototype going through destruction testing. The most
-valuable contribution is a workload, scale, or failure mode that breaks the
-kernel — open an issue with the scenario and what kernel change it would
-require.
-
----
-
+> Pond is an immutable object-store kernel built from three primitive
+> operations (write, read, reference). Everything else — versioning,
+> schemas, replication, transport, indexes, lenses, views — is
+> implemented as layers above the kernel rather than embedded inside it.

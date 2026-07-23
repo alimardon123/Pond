@@ -164,7 +164,7 @@ def _test_tombstone_round_trip():
     import shutil
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
     from pond_minimal import PondMinimal
 
     bench_dir = "/tmp/pond_tombstone_test"
@@ -218,7 +218,7 @@ def _test_drop_does_not_affect_other_names():
     import shutil
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
     from pond_minimal import PondMinimal
 
     bench_dir = "/tmp/pond_tombstone_isolation"
@@ -248,7 +248,7 @@ def _test_tombstone_composes_with_PondGC():
     import shutil
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engineering"))
     from pond_minimal import PondMinimal
 

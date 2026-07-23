@@ -37,7 +37,7 @@ from typing import Any, Optional, Callable
 from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pond_minimal import PondMinimal
