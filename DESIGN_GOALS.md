@@ -17,22 +17,38 @@ operations** — is sufficient for radically different workloads
 registries, semantic layers) to be implemented as independent
 **Lenses** over a shared immutable substrate.
 
-> **Honesty note (post-Phase P, final):** The kernel was previously
-> described as "3 primitives." The Second and Third Red Team
-> Reviews (`POND_SECOND_RED_TEAM.md`, `POND_THIRD_RED_TEAM.md`)
-> showed that this claim was *rhetorical*: the model silently
-> depended on Time, Coordination, Range-Read, and Key substrates
-> without naming them. The honest count is **six substrates, three
-> operations** (see `POND_FORMAL_ALGEBRAS.md` Parts II + III + IV).
-> The user-facing API is `Write`, `Read`, `Ref`. Phase N demoted
-> `ReadRange` from a kernel primitive to a Transport-layer
-> optimization (`POND_FORMAL_ALGEBRAS.md` §22), shrinking the
-> operation count from 4 to 3. Phases K + L + N + O + P are
-> complete: **0 open model questions, 683 passing tests (property
-> + differential + hazard + engineering), 6 TLA+ invariants
-> proven across 56 reachable states, 4 production-ready packages
-> built on the frozen kernel.** The research AND engineering are
-> done.
+> **Honesty note (post-Phase P, with overclaim correction):** The
+> kernel was previously described as "3 primitives." The Second and
+> Third Red Team Reviews (`POND_SECOND_RED_TEAM.md`,
+> `POND_THIRD_RED_TEAM.md`) showed that this claim was *rhetorical*:
+> the model silently depended on Time, Coordination, Range-Read, and
+> Key substrates without naming them. The honest count is **six
+> substrates, three operations** (see `POND_FORMAL_ALGEBRAS.md` Parts
+> II + III + IV). The user-facing API is `Write`, `Read`, `Ref`.
+>
+> **What has been established (Phase K-P):**
+> - The implementation matches the model (683 checks pass).
+> - 6 TLA+ invariants hold across 56 reachable states (small finite
+>   model — proves consistency, not architectural correctness).
+> - Tested behaviors match Git, Dolt, and Iceberg for the specific
+>   invariants tested (content-addressing, commit topology, time
+>   travel, manifest rebuildability).
+> - 4 production-quality packages implement the model's algebras.
+>
+> **What has NOT been established:**
+> - That the architecture is *correct* (TLA+ proves consistency, not
+>   correctness).
+> - That the architecture is *necessary* (no proof that fewer
+>   substrates wouldn't suffice).
+> - That the architecture is *competitive* (no benchmarks vs. peer
+>   systems yet).
+> - That the architecture is *adoptable* (no production use, no
+>   external expert review).
+> - That the Lens algebra *covers real workloads* (no flagship app
+>   yet).
+>
+> Phase Q (validation) addresses these gaps. The architecture is
+> frozen; the validation begins.
 
 Tagline: *one copy of data on object storage, serving all workloads
 without duplication, with no JVM, no Spark, no Iceberg-style
@@ -54,33 +70,33 @@ is measured by **substrate count (currently 6, honest)** and by
 lines of code in `pond-core` (currently ~140). "All workload
 semantics" is measured by the number of distinct Lenses implemented
 (currently 8+). "Composition is sound" is measured by formal laws
-(TLA+ proven in Phase N: 6 invariants across 56 reachable states),
-683 passing tests (Phases L + N + O + P: 562 property + 61
-differential + 23 hazard + 53 engineering — including real Dolt
-and Iceberg differentials), and 4 production-ready packages built
-on the frozen kernel (Phase P).
+(TLA+ checked 6 invariants across 56 reachable states in a finite
+model — establishes consistency, not correctness), 683 passing
+tests (verify implementation matches model, including 61
+differential tests against real Git/Dolt/Iceberg for specific
+invariants), and 4 engineering packages that implement the
+algebras. **None of this is external validation.** Phase Q
+(benchmarks, whitepaper, flagship, expert review) is where
+soundness gets tested against reality.
 
 The goal is **not** to build a product. The goal is to discover
-whether a small-substrate kernel is the right abstraction. If it
-is, the product follows for free. If it isn't, no amount of
-product work will save it. **As of Phase P, the answer is: yes,
-six substrates and three operations suffice. The model is proven
-sound by TLA+ (6 invariants across 56 states), tested sound by
-683 checks (property + differential + hazard + engineering), and
-implemented by 4 production-ready packages on the frozen kernel.
-The research AND engineering are done.**
+whether a small-substrate kernel is the right abstraction, and to
+**falsify** that hypothesis with evidence external to the model
+itself. If the hypothesis survives falsification, the product
+follows. If it doesn't, no amount of internal consistency will
+save it.
 
-> **Post-Phase P final correction:** the previous statement of
-> this goal measured "smallest" by primitive count (3). The
-> Second, Third, and Phase-L red team reviews showed that count
-> was rhetorical — three primitives advertised, but six substrates
-> actually required. Phase N demoted `ReadRange` from primitive
-> to Transport-layer optimization, returning the operation count
-> to 3 honestly. The honest metric is now substrate count
-> (6) + operation count (3). **Phases K + L + N + O + P are
-> complete. The model is frozen, proven, tested, and implemented.
-> Phase Q (adoption) is the next phase if pursued; it is not
-> research or engineering.**
+> **Post-Phase P correction (overclaim retracted):** earlier
+> versions of this document claimed "the answer is yes" and "the
+> research is done." That was overclaim. What Phase K-P actually
+> established is **internal consistency**: the implementation
+> matches the model, invariants hold, and tested behaviors match
+> peer systems. None of this proves the architecture is *right*.
+> Phase Q (validation via benchmarks, whitepaper, flagship, and
+> external review) is where the architecture gets tested against
+> reality. The honest metric remains **substrate count (6) +
+> operation count (3)**, but the verdict on whether that's the
+> right abstraction is **not yet in**.
 
 ---
 
@@ -765,49 +781,70 @@ and conceptual tests.
 | Kernel LOC | ~140 (FROZEN throughout K, L, N, O, P) |
 | Packages built | pond-core, pond-sdk, pond-feature-store, pond-arrow, pond-transport (ref + prod), pond-schema, pond-replication |
 
-### Final status: research AND engineering complete
+### Status: internal consistency established; external validation pending
 
-The Pond project — across Phases A through P — has answered its
-research question completely:
+The Pond project — across Phases A through P — has established
+**internal consistency**:
 
-> *Find the smallest storage algebra from which all workload
-> semantics can be composed, and prove that composition is sound.*
+> The implementation matches the model. Invariants hold in a finite
+> TLA+ model. Tested behaviors match Git, Dolt, and Iceberg for the
+> invariants tested. Four engineering packages implement the
+> algebras on the frozen kernel.
 
-**Answer:** six substrates, three operations, ten axioms, seventeen
-algebras. The model is:
-- **Proven** by TLA+ (6 invariants across 56 states)
-- **Tested** by 683 checks (property + differential + hazard + engineering)
-- **Implemented** by 4 production-ready packages on the frozen kernel
-- **Honest** about what it does and doesn't provide (all soft spots closed)
+This is **not** the same as proving the architecture is right. The
+architecture has not been benchmarked against peer systems. The
+architecture has not been reviewed by external distributed-systems
+engineers. The architecture has not been tested with a real
+production workload. The architecture has not been proven
+*necessary* (no lower-bound proof that fewer substrates wouldn't
+suffice).
 
-The kernel is FROZEN at ~140 LOC. The model is FROZEN at 17 algebras.
-The proof is FROZEN at 6 TLA+ invariants. The test suite is FROZEN
-at 683 passing checks. The engineering is FROZEN at 4 libraries.
+**Phase Q (validation)** is where these gaps get addressed:
 
-**Pond is done.** What remains is adoption — using Pond to build
-real things — which is a different project entirely.
+1. **Benchmarks** vs. Git, Dolt, Iceberg, LakeFS for clone, commit,
+   branch, merge, lookup, RTT, memory, CPU.
+2. **Whitepaper** (20-30 pages) describing Pond from first principles
+   with rigorous comparison to peer systems.
+3. **Flagship application** — a DuckDB-based lightweight lakehouse
+   built on Pond, to test whether the Lens algebra covers real
+   workloads.
+4. **External review** by distributed-systems engineers and
+   researchers who did not build Pond.
+5. **(optional) Lean/Coq proof** of algebra laws following from
+   axioms (stronger than TLA+ consistency).
 
-### Phase Q — Adoption (NEXT, not started, not in scope)
+The kernel is FROZEN at ~140 LOC. The model is FROZEN at 17
+algebras. The internal consistency work (Phases K-P) is done. The
+external validation work (Phase Q) is the next phase. **Whether
+Pond is the right abstraction is not yet decided.**
 
-What remains is **adoption and scale**, not research or core engineering:
+### Phase Q — Validation (CURRENT, in progress)
 
-1. **Real-world deployment.** Use Pond as the storage substrate for
-   a real application. Measure: does the model hold under production
-   traffic?
-2. **Performance optimization.** The reference implementations
-   prioritize clarity over speed. A production Transport Layer
-   would use zstd dictionaries, AES-NI, batched I/O.
-3. **More Lens implementations.** The 9 existing Lenses are
-   sufficient for the research question. More Lenses would test
-   the model further but won't change it.
-4. **Formal proof in Lean/Coq.** TLA+ proves the kernel axioms
-   are consistent. A Lean proof could prove the algebra laws
-   follow from the axioms (stronger).
-5. **FDB differential test.** Phase P.4 skipped FDB (heavy Java
-   install).
+> Status: IN PROGRESS. See `POND_WHITEPAPER.md` (Q.2),
+> `scripts/phase_q_benchmarks.py` (Q.3),
+> `pond-lakehouse/` (Q.4).
 
-Phase Q is out of scope for the current project. The research and
-engineering are done.
+Phase Q is validation, not invention. No new algebras. No new
+substrates. No new axioms. The architecture is frozen; the
+question is whether it survives contact with reality.
+
+| Track | Question | Artifact |
+|---|---|---|
+| Q.1 Overclaim correction | Are the docs honest about what's proven? | This file (revised) |
+| Q.2 Whitepaper | Can Pond be explained rigorously in 20-30 pages? | `POND_WHITEPAPER.md` |
+| Q.3 Benchmarks | Is Pond competitive with Git/Dolt/Iceberg/LakeFS? | `scripts/phase_q_benchmarks.py` |
+| Q.4 Flagship | Does the Lens algebra cover real workloads? | `pond-lakehouse/` (DuckDB lakehouse) |
+| Q.5 External review | Do experts who didn't build Pond find it sound? | (out-of-band; reports to be added) |
+
+**Phase Q succeeds if:** the benchmarks are competitive (or
+honestly explain why they're not), the whitepaper survives expert
+review, and the flagship app ships a real workload on Pond.
+
+**Phase Q fails if:** the benchmarks show Pond is fundamentally
+slower, or the flagship app cannot be built cleanly on the Lens
+algebra, or expert review identifies a fatal flaw.
+
+Either outcome is valuable. Falsification is the goal.
 
 ### What is explicitly NOT on the roadmap
 
