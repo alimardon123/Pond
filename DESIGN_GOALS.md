@@ -644,7 +644,7 @@ honestly documented and deferred to Phase N.
 ### Phase N — Model proofs (COMPLETE)
 
 > Status: COMPLETE. See `POND_PHASE_N_REPORT.md`,
-> `tla/PondKernel.tla`, `pond-transport/transport.py`,
+> `tla/PondKernel.tla`, `services/transport/transport.py`,
 > `scripts/phase_n_untested_laws.py`,
 > `scripts/phase_n_additional_hazards.py`,
 > and Part IV of `POND_FORMAL_ALGEBRAS.md`.
@@ -656,14 +656,14 @@ kernel. Five tracks executed:
 |---|---|---|
 | N.1 Demotions | `POND_FORMAL_ALGEBRAS.md` Part IV (§22-§24) | ReadRange demoted to Transport; R3 CAS demoted to conditional. Model shrinks from 4 ops to 3. |
 | N.2 TLA+ Proof | `tla/PondKernel.tla` + `.cfg` | TLC verifies 6 invariants across 56 reachable states. No error. |
-| N.3 Transport Layer | `pond-transport/transport.py` (~330 LOC) | Reference implementation: compress + encrypt + block index + envelope encryption. 8 self-tests pass. |
+| N.3 Transport Layer | `services/transport/transport.py` (~330 LOC) | Reference implementation: compress + encrypt + block index + envelope encryption. 8 self-tests pass. |
 | N.4 Untested Laws | `scripts/phase_n_untested_laws.py` | M1-M4' + W1-W5 tested. 23/23 pass. |
 | N.5 Additional Hazards | `scripts/phase_n_additional_hazards.py` | Partition + disk corruption added. 10/10 pass. |
 
 **The model is now:**
 - **Proven** (TLA+ formal verification, 6 invariants across 56 states)
 - **Minimal** (3 operations, not 4 — smaller than Phase L claimed)
-- **Implemented** (Transport Layer exists in `pond-transport/`)
+- **Implemented** (Transport Layer exists in `services/transport/`)
 - **Tested** (514 property + 45 differential + 10 hazard = 569 checks, all pass)
 - **Honest** (no law claims more than the kernel provides)
 
@@ -747,7 +747,7 @@ The Pond research project has reached its **final state**:
 - **Model**: 6 substrates, 10 axioms, 17 algebras, 0 open questions, FROZEN
 - **Proof**: 6 TLA+ invariants across 56 reachable states, FROZEN
 - **Tests**: 630 checks (562 property + 45 differential + 23 hazard), all passing, FROZEN
-- **Transport Layer**: reference implementation in `pond-transport/`
+- **Transport Layer**: reference implementation in `services/transport/`
 
 The research question — *is a small-substrate kernel the right
 abstraction?* — is answered: **yes, six substrates and three
@@ -758,9 +758,9 @@ provide.
 ### Phase P — Engineering (COMPLETE)
 
 > Status: COMPLETE. See `POND_PHASE_P_REPORT.md`,
-> `pond-schema/schema_registry.py`,
-> `pond-transport/transport_production.py`,
-> `pond-replication/replication_coordinator.py`,
+> `services/schema/schema_registry.py`,
+> `services/transport/transport_production.py`,
+> `services/replication/replication_coordinator.py`,
 > `scripts/phase_p_real_differentials.py`.
 
 Phase P closed the last engineering gap: the model's algebras are
@@ -769,22 +769,22 @@ and conceptual tests.
 
 | Track | Artifact | Tests | Pass |
 |---|---|---|---|
-| P.1 Schema Registry | `pond-schema/schema_registry.py` (~430 LOC) | 12 | 12 |
-| P.2 Production Transport | `pond-transport/transport_production.py` (~400 LOC) | 10 | 10 |
-| P.3 Replication Coordinator | `pond-replication/replication_coordinator.py` (~430 LOC) | 15 | 15 |
+| P.1 Schema Registry | `services/schema/schema_registry.py` (~430 LOC) | 12 | 12 |
+| P.2 Production Transport | `services/transport/transport_production.py` (~400 LOC) | 10 | 10 |
+| P.3 Replication Coordinator | `services/replication/replication_coordinator.py` (~430 LOC) | 15 | 15 |
 | P.4 Real Differentials | `scripts/phase_p_real_differentials.py` (~570 LOC) | 16 | 16 |
 | **Total** | | **53** | **53** |
 
 **What was built:**
 
-- **Schema Registry** (`pond-schema/`): thin layer over Names
+- **Schema Registry** (`services/schema/`): thin layer over Names
   substrate implementing §18 Schema Evolution Algebra. SE1-SE8 all
   behaviorally tested. Per SE7, no new substrate, no kernel changes.
-- **Production Transport Layer** (`pond-transport/transport_production.py`):
+- **Production Transport Layer** (`services/transport/transport_production.py`):
   zstd compression + AES-GCM encryption + per-block random nonces.
   Closes the "XOR for test clarity" caveat from Phase N.3. Tamper
   detection via GCM tags verified.
-- **Replication Coordinator** (`pond-replication/`):
+- **Replication Coordinator** (`services/replication/`):
   `PrimarySecondaryCoordinator` implements REP1-REP9 + G6 (the
   in-model replication algebra). `TwoPhaseCommitCoordinator`
   implements the A7 escape hatch for cross-Collection atomicity
@@ -868,7 +868,7 @@ Pond is the right abstraction is not yet decided.**
 > Status: IN PROGRESS. See `POND_PHASE_Q_REPORT.md`,
 > `POND_WHITEPAPER.md`, `POND_PHASE_Q_BENCHMARKS.md`,
 > `POND_PHASE_Q_REVIEW_PACKET.md`,
-> `scripts/phase_q_benchmarks.py`, `pond-lakehouse/lakehouse.py`.
+> `scripts/phase_q_benchmarks.py`, `lenses/lakehouse/lakehouse.py`.
 
 Phase Q is validation, not invention. No new algebras. No new
 substrates. No new axioms. The architecture is frozen; the
@@ -879,7 +879,7 @@ question is whether it survives contact with reality.
 | Q.1 Overclaim correction | Are the docs honest? | DESIGN_GOALS.md §1-§2 revised | DONE |
 | Q.2 Whitepaper | Can Pond be explained rigorously? | `POND_WHITEPAPER.md` (20 pages) | DONE (draft) |
 | Q.3 Benchmarks | Is Pond competitive? | `scripts/phase_q_benchmarks.py` + report | DONE (directional) |
-| Q.4 Flagship | Does Lens cover real workloads? | `pond-lakehouse/lakehouse.py` (10 tests) | DONE (works, 15-357% overhead) |
+| Q.4 Flagship | Does Lens cover real workloads? | `lenses/lakehouse/lakehouse.py` (10 tests) | DONE (works, 15-357% overhead) |
 | Q.5 External review | Do experts find it sound? | `POND_PHASE_Q_REVIEW_PACKET.md` | PREPARED, no reviews yet |
 
 **Phase Q.1 (overclaim retraction):** earlier docs said "Pond is

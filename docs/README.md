@@ -23,7 +23,7 @@
 
 ## If you want to build on Pond
 
-7. **[`../pond-lakehouse/lakehouse.py`](../pond-lakehouse/lakehouse.py)** —
+7. **[`../lenses/lakehouse/lakehouse.py`](../lenses/lakehouse/lakehouse.py)** —
    DuckDB lakehouse on Pond. The flagship.
 8. **[`../pond-labs/feature_store_lens.py`](../pond-labs/feature_store_lens.py)** —
    versioned ML feature store with point-in-time joins.

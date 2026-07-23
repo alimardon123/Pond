@@ -75,11 +75,11 @@ conflict resolution.
   returns `A ⊔ B` (least upper bound in the CRDT lattice).
 - Coordinator substrate (per A7): for non-CRDT data, layer Raft or
   Paxos on top of the kernel. The `TwoPhaseCommitCoordinator` in
-  `pond-replication/` is a reference; a Raft coordinator would
+  `services/replication/` is a reference; a Raft coordinator would
   provide linearizability.
 
 **Status:** CRDT Lens not built. Coordinator: 2PC reference shipped
-(`pond-replication/`), Raft coordinator not built.
+(`services/replication/`), Raft coordinator not built.
 
 **Without the Lens:** single-writer per ref (REP1). With CRDT Lens:
 multi-writer with automatic conflict-free convergence. With Raft
@@ -239,7 +239,7 @@ For each, the Lens design is clear; the implementation is the work.
 No Lens needed — these work today:
 
 ### 4.1 Versioned tabular data (lakehouse)
-- **Lens shipped:** `pond-lakehouse/lakehouse.py` (DuckDB lakehouse).
+- **Lens shipped:** `lenses/lakehouse/lakehouse.py` (DuckDB lakehouse).
 - Branching O(1), time travel O(1), schema evolution Parquet-native.
 - **Cross-Lens interop demonstrated:** Feature Store + Lakehouse share
   data natively (`pond-labs/interop_demo.py`).

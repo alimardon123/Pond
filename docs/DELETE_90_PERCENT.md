@@ -57,7 +57,7 @@ across 2,406 lines. Trim:
 
 The formal algebras doc should be ~1,200 lines after trimming.
 
-### 2.4 KEEP: `pond-lakehouse/lakehouse.py` + `pond-labs/feature_store_lens.py` + `pond-labs/interop_demo.py`
+### 2.4 KEEP: `lenses/lakehouse/lakehouse.py` + `pond-labs/feature_store_lens.py` + `pond-labs/interop_demo.py`
 
 These are the demonstrations. Code, not docs. Keep all three.
 
@@ -232,7 +232,7 @@ where to start. After the cut, the reviewer sees:
 1. `README.md` — 5-minute intro.
 2. `docs/POND_WHITEPAPER.md` — the contribution.
 3. `docs/WHERE_POND_FAILS.md` — the honest scope.
-4. The code (`pond-core/`, `pond-lakehouse/`, `pond-labs/`).
+4. The code (`pond-core/`, `lenses/lakehouse/`, `pond-labs/`).
 
 That's it. The formal algebras are there for those who want rigor;
 the TLA+ is there for those who want proof; the rest is archive.

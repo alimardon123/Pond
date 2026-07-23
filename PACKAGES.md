@@ -31,36 +31,39 @@ pond_repo/
 │   ├── run_lens_laws_ci.py      # CI runner for Lens contracts
 │   └── test_*.py                # Tests
 │
-├── pond-arrow/                  # Layer 3: Arrow IPC Lens
-├── pond-feature-store/          # Layer 3: ML Feature Store (older)
-├── pond-git/                    # Layer 3: Git Lens
-├── pond-lakehouse/              # Layer 3: DuckDB Lakehouse (flagship)
-├── pond-notebook/               # Layer 3: Notebook Lens
-├── pond-semantic/               # Layer 3: Semantic Models Lens
-├── pond-sql/                    # Layer 3: SQL Lens
-├── pond-streaming/              # Layer 3: Streaming Lens
-├── pond-vector/                 # Layer 3: Vector DB Lens
+├── lenses/                      # Layer 3: Lens implementations
+│   ├── lakehouse/               # DuckDB Lakehouse (flagship)
+│   │   └── lakehouse.py         # PondLakehouse + LakehouseLens
+│   └── vector/                  # Vector DB Lens
+│       ├── vector_view.py       # VectorView (ANN search)
+│       ├── auto_index.py        # Mock auto-index for testing
+│       ├── mock_kernel.py       # In-memory mock kernel for tests
+│       ├── view_sdk.py          # Mock CrossView helpers
+│       └── test_vector.py       # Tests
 │
-├── pond-schema/                 # Cross-cutting: Schema Registry (§18 algebra)
-├── pond-replication/            # Cross-cutting: Replication Coordinator (§16)
-├── pond-transport/              # Cross-cutting: Transport Layer (§17)
-│   ├── transport.py             # Reference (zlib + XOR)
-│   └── transport_production.py  # Production (zstd + AES-GCM)
+├── services/                    # Cross-cutting services (on the kernel)
+│   ├── transport/               # Transport Layer (§17 algebra)
+│   │   ├── transport.py         # Reference (zlib + XOR)
+│   │   └── transport_production.py  # Production (zstd + AES-GCM)
+│   ├── schema/                  # Schema Registry (§18 algebra)
+│   │   └── schema_registry.py   # Versioned schemas, backward/forward compat
+│   └── replication/             # Replication Coordinator (§16 algebra)
+│       └── replication_coordinator.py  # Primary-secondary + 2PC
 │
-├── pond-labs/                   # Modern experiments and demos
-│   ├── feature_store_lens.py    # Newer Feature Store Lens (point-in-time join)
-│   ├── interop_demo.py          # Bidirectional Lens interop (the killer demo)
+├── pond-labs/                   # Experiments and demos
+│   ├── feature_store_lens.py    # Feature Store Lens (point-in-time joins)
+│   ├── interop_demo.py          # Bidirectional Lens interop (killer demo)
 │   └── loc_benchmark.py         # LOC saved: 81% reduction vs from-scratch
 │
 ├── docs/                        # Documentation
 │   ├── README.md                # Doc index (start here)
 │   ├── POND_WHITEPAPER.md       # The contribution (20 pages)
-│   ├── WHERE_POND_FAILS.md      # Honest scope
+│   ├── WHERE_POND_FAILS.md      # Honest scope + Lens roadmap
 │   ├── POND_FORMAL_ALGEBRAS.md  # 17 algebras, 10 axioms
 │   ├── POND_PHASE_Q_BENCHMARKS.md
 │   ├── POND_PHASE_Q_REVIEW_PACKET.md
 │   ├── LENS_AUTHORS_GUIDE.md
-│   ├── LNS_INTERPRETATION_CONTRACT.md
+│   ├── LENS_INTERPRETATION_CONTRACT.md
 │   ├── LENS_INTEROP_SPEC.md
 │   ├── GETTING_STARTED.md
 │   ├── NON_GOALS.md
@@ -70,12 +73,11 @@ pond_repo/
 │       └── rfcs/                # 13 RFCs
 │
 ├── scripts/                     # Test and benchmark scripts
-│   ├── phase_l_*.py             # Phase L: verification (491 tests)
-│   ├── phase_n_*.py             # Phase N: proofs + untested laws
-│   ├── phase_o_*.py             # Phase O: remaining laws + hazards
-│   ├── phase_p_real_differentials.py
-│   ├── phase_q_benchmarks.py    # Phase Q: head-to-head vs Git/Dolt/Iceberg
-│   └── pond_rfc1.py             # RFC-0001 reference
+│   ├── phase_l_*.py             # Verification (491 property tests, Git diffs)
+│   ├── phase_n_*.py             # Proofs + untested laws (23 tests)
+│   ├── phase_o_*.py             # Remaining laws + hazards (61 tests)
+│   ├── phase_p_real_differentials.py  # Real Dolt + Iceberg diffs
+│   └── phase_q_benchmarks.py    # Head-to-head vs Git/Dolt/Iceberg
 │
 ├── tla/                         # TLA+ formal specification
 │   ├── PondKernel.tla           # 6 invariants, 56 reachable states
@@ -89,30 +91,31 @@ pond_repo/
     ├── engineering/             # Engineering experiments
     ├── destruction/             # Adversarial destruction tests
     ├── experiments/             # Older performance benchmarks
-    └── validation/              # External validation reports
+    ├── validation/              # External validation reports
+    ├── pond-semantic/           # Stub (3 lines, never implemented)
+    ├── pond-git/                # Broken imports (references archive/prototype)
+    ├── pond-notebook/           # Broken imports (references archive/prototype)
+    ├── pond-sql/                # Broken imports (references archive/prototype)
+    ├── pond-streaming/          # Broken imports (references archive/prototype)
+    ├── pond-arrow/              # Broken imports (references archive/prototype)
+    ├── pond-feature-store/      # Older feature store (superseded by pond-labs/)
+    └── pond_rfc1.py             # RFC-0001 PDF generator (1967 lines, archived)
 ```
 
 ## Package Dependencies
 
 ```
-pond-core          → (nothing — standalone, 3 primitives)
-pond-sdk           → pond-core
-pond-arrow         → pond-sdk
-pond-feature-store → pond-sdk
-pond-git           → pond-sdk
-pond-lakehouse     → pond-sdk + duckdb + pyarrow
-pond-notebook      → pond-sdk
-pond-semantic      → pond-sdk
-pond-sql           → pond-sdk
-pond-streaming     → pond-sdk
-pond-vector        → pond-sdk
-pond-schema        → pond-core
-pond-replication   → pond-core
-pond-transport     → pond-core
-pond-labs          → pond-core + pond-lakehouse + (pyarrow, duckdb)
+pond-core              → (nothing — standalone, 3 primitives)
+pond-sdk               → pond-core
+lenses/lakehouse       → pond-core + duckdb + pyarrow
+lenses/vector          → pond-sdk (uses mock_kernel for testing)
+services/transport     → pond-core
+services/schema        → pond-core
+services/replication   → pond-core
+pond-labs              → pond-core + lenses/lakehouse + (pyarrow, duckdb)
 ```
 
-No Lens package depends on another Lens. All Lenses depend only on
+No Lens depends on another Lens. All Lenses depend only on
 `pond-sdk`. `pond-sdk` depends only on `pond-core`. `pond-core`
 depends on nothing. This is a strict dependency DAG with no cycles.
 
@@ -124,44 +127,20 @@ layer. (Design Goal 3.4 Scalable.)
 ### How to test
 
 For each package P:
-1. Move `pond-P/` out of the import path.
+1. Move the package out of the import path.
 2. Run the test suites of every package at a *lower* layer than P.
 3. If any lower-layer test fails, P has leaked a dependency upward.
 
-### Concrete examples
-
-| If we delete... | Lower-layer tests that must still pass |
-|---|---|
-| `pond-lakehouse/` | `pond-sdk`, `pond-core` |
-| `pond-feature-store/` | `pond-sdk`, `pond-core` |
-| `pond-vector/` | `pond-sdk`, `pond-core` |
-| `pond-sdk/` | `pond-core` only |
-| `pond-core/` | (nothing — but deleting it deletes the project) |
-
 ## Adding a new package
 
-Before adding a new `pond-X` package:
+Before adding a new package:
 
 1. **Justify against the 7 design goals** (`DESIGN_GOALS.md` §3).
-   Which goal does it serve? Which does it potentially conflict with?
 2. **Verify the removability test** will pass.
 3. **Specify its Lens algebra** (RFC-0007). What is its 5-tuple?
-4. **Specify its Physical Structures** (RFC-0005). What derived
-   structures does it maintain? Are they all rebuildable?
-5. **Update this file** and `DESIGN_GOALS.md` if the package adds
-   a new layer or responsibility.
-6. **Add an entry to `worklog.md`** documenting the addition.
-
-## Removing a package
-
-Removing a package is healthy when it has been superseded or its
-functionality has been absorbed into a lower layer. The removability
-discipline makes this safe: if the package was properly designed,
-removing it requires no changes to lower layers.
-
-If removing a package *does* require lower-layer changes, that is a
-bug — the package leaked a dependency upward. Fix the leak first,
-then remove the package.
+4. **Specify its Physical Structures** (RFC-0005).
+5. **Update this file** and `DESIGN_GOALS.md`.
+6. **Add an entry to `worklog.md`**.
 
 ## Archive policy
 
@@ -169,12 +148,9 @@ The `archive/` directory contains historical code and docs preserved
 for reference. Nothing in `archive/` is needed to use or understand
 Pond. It exists so that the project's evolution is traceable.
 
-If you are looking for:
-- Early prototypes → `archive/prototype/`
-- Older SDK versions → `archive/libraries/`
-- Older Lens implementations → `archive/applications/`
-- Adversarial destruction tests → `archive/destruction/`
-- External validation reports → `archive/validation/`
-- RFCs → `docs/archive/rfcs/`
-
-If you can't find something, it's probably in `archive/`.
+Several packages were archived during the reorganization because
+they had broken imports (referencing `prototype/` and `libraries/`
+which were themselves archived) or were superseded by newer
+implementations in `pond-labs/`. These include: pond-semantic,
+pond-git, pond-notebook, pond-sql, pond-streaming, pond-arrow,
+pond-feature-store.

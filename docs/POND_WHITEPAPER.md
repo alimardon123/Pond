@@ -256,7 +256,7 @@ comparisons across processes (CC4 in `POND_FORMAL_ALGEBRAS.md`
 **Consequences:** within-Collection atomicity is free (commit blob
 + HEAD update). Cross-Collection atomicity is **not** provided;
 applications must layer a coordinator. The `TwoPhaseCommitCoordinator`
-in `pond-replication/` demonstrates this is buildable, but it is
+in `services/replication/` demonstrates this is buildable, but it is
 not part of the kernel.
 
 ### 3.5 Range-Read
@@ -585,7 +585,7 @@ construction. Most "Pond can't do X" claims are missing Lenses.
 The kernel provides no Raft, no Paxos, no 2PC. Multi-writer
 convergence is out-of-model (A7). Applications requiring
 multi-writer semantics must layer a coordinator; the
-`TwoPhaseCommitCoordinator` in `pond-replication/` demonstrates
+`TwoPhaseCommitCoordinator` in `services/replication/` demonstrates
 this is possible but does not make it part of the kernel.
 
 **Implication:** Pond is not a replacement for FoundationDB,
@@ -881,10 +881,10 @@ The architecture is frozen. The validation begins.
 | Lens SDK | `pond-sdk/` | ~3000 |
 | Feature Store | `pond-feature-store/` | ~1500 |
 | Arrow Lens | `pond-arrow/` | ~500 |
-| Transport (reference) | `pond-transport/transport.py` | ~330 |
-| Transport (production) | `pond-transport/transport_production.py` | ~400 |
-| Schema Registry | `pond-schema/schema_registry.py` | ~430 |
-| Replication Coordinator | `pond-replication/replication_coordinator.py` | ~430 |
+| Transport (reference) | `services/transport/transport.py` | ~330 |
+| Transport (production) | `services/transport/transport_production.py` | ~400 |
+| Schema Registry | `services/schema/schema_registry.py` | ~430 |
+| Replication Coordinator | `services/replication/replication_coordinator.py` | ~430 |
 | Hazard Simulator | `scripts/phase_l_hazard_simulator.py` | ~400 |
 | Property Tests | `scripts/phase_l_property_tests.py` | ~1100 |
 | Differential Tests (Git) | `scripts/phase_l_differential_git.py` | ~630 |

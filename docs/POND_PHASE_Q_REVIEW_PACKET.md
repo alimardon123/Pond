@@ -20,7 +20,7 @@ engineers and researchers who did not build Pond. It contains:
    LakeFS.
 2. **The benchmark report** (`POND_PHASE_Q_BENCHMARKS.md`) —
    head-to-head measurements vs Git, Dolt, Iceberg.
-3. **The flagship** (`pond-lakehouse/lakehouse.py`) — a working
+3. **The flagship** (`lenses/lakehouse/lakehouse.py`) — a working
    DuckDB-based lakehouse on Pond, with 10 passing tests.
 4. **The formal model** (`POND_FORMAL_ALGEBRAS.md` Parts I-IV) —
    17 algebras, 10 axioms, ~30 laws.
@@ -149,7 +149,7 @@ to change?
 1. `DESIGN_GOALS.md` §1-§2 (10 min) — what Pond is, honest accounting.
 2. `POND_WHITEPAPER.md` (1 hour) — full description + comparison.
 3. `POND_PHASE_Q_BENCHMARKS.md` (15 min) — measured performance.
-4. `pond-lakehouse/lakehouse.py` self-test (15 min) — flagship in action.
+4. `lenses/lakehouse/lakehouse.py` self-test (15 min) — flagship in action.
 5. `POND_FORMAL_ALGEBRAS.md` Parts I-IV (2 hours) — full formal model.
 6. `tla/PondKernel.tla` (15 min) — TLA+ specification.
 

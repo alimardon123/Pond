@@ -44,7 +44,7 @@ from typing import Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-core"))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-lakehouse"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "lenses/lakehouse"))
 sys.path.insert(0, SCRIPT_DIR)
 
 from pond_minimal import PondMinimal  # noqa: E402
@@ -236,7 +236,7 @@ travel walk. The Lens handles all of it.
 
 import sys, os
 sys.path.insert(0, "pond-core")
-sys.path.insert(0, "pond-lakehouse")
+sys.path.insert(0, "lenses/lakehouse")
 from pond_minimal import PondMinimal
 from lakehouse import PondLakehouse
 

@@ -49,7 +49,7 @@ import struct
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-core"))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-transport"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "services", "transport"))
 sys.path.insert(0, SCRIPT_DIR)
 from pond_minimal import PondMinimal  # noqa: E402
 from phase_l_hazard_simulator import HazardSimulator, HazardConfig  # noqa: E402
@@ -438,7 +438,7 @@ def test_TR5_transport_per_blob():
     """TR5: Transport is per-blob, not per-byte. The transport
     pipeline runs once per Write, producing one encoded blob."""
     print("\n=== TR5: Transport is per-blob ===")
-    sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-transport"))
+    sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "services", "transport"))
     from transport import TransportLayer
     k, d = make_kernel()
     try:

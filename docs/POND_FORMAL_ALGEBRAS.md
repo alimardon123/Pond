@@ -2233,7 +2233,7 @@ and proofs. The model is frozen; the verification begins.
 > Part IV resolves findings (1) and (2) by *demoting* the model
 > claims to match the kernel's honest API. Finding (3) is resolved
 > by building a reference Transport Layer (Phase N.3,
-> `pond-transport/`).
+> `services/transport/`).
 >
 > The principle: when the model and the kernel disagree, the
 > kernel wins. The model is a description of what the kernel

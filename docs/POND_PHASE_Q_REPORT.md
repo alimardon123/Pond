@@ -24,7 +24,7 @@ validation is in progress.
 | Q.1 Overclaim correction | `DESIGN_GOALS.md` §1-§2 revised | DONE — "Pond is done" retracted |
 | Q.2 Whitepaper | `POND_WHITEPAPER.md` (~6000 words, 20 pages) | DONE — draft for external review |
 | Q.3 Benchmarks | `scripts/phase_q_benchmarks.py` + `POND_PHASE_Q_BENCHMARKS.md` | DONE — directional, biased, honest |
-| Q.4 Flagship | `pond-lakehouse/lakehouse.py` (~600 LOC, 10 tests) | DONE — works, 15-357% overhead vs native |
+| Q.4 Flagship | `lenses/lakehouse/lakehouse.py` (~600 LOC, 10 tests) | DONE — works, 15-357% overhead vs native |
 | Q.5 External review packet | `POND_PHASE_Q_REVIEW_PACKET.md` | PREPARED — no reviews received yet |
 
 ---
@@ -85,7 +85,7 @@ The benchmark is directional, not definitive.
 
 ### 1.4 The flagship works
 
-`pond-lakehouse/lakehouse.py` is a DuckDB-based lakehouse on Pond.
+`lenses/lakehouse/lakehouse.py` is a DuckDB-based lakehouse on Pond.
 10 tests pass:
 - CREATE TABLE, INSERT, SELECT (with WHERE, ORDER BY, GROUP BY,
   JOIN, aggregation)
