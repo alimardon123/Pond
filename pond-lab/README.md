@@ -10,7 +10,7 @@
 |---|---|---|
 | 1 | Can Lenses interoperate bidirectionally? | **10/10 pass** (Lakehouse ↔ FeatureStore) |
 | 2 | Can one Physical Structure accelerate multiple Lenses? | **18/18 pass** (stats, bloom, zone maps) |
-| 3 | Can each Lens approach its natural opponent? | Pending |
+| 3 | Can each Lens approach its natural opponent? | **Done** (Lakehouse vs DuckDB+Parquet, FS vs Feast) |
 | 4 | How efficient is Pond on object stores (GET/PUT/LIST/HEAD/RTT)? | Pending |
 | 5 | Can Lenses compose without ETL (CSV → Lakehouse → Feature → Vector → Search)? | Pending |
 | 6 | Real-world case studies (clinical data lake, ML platform, etc.) | Pending |
