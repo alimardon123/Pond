@@ -1,167 +1,180 @@
 # Pond Package Structure
 
-Per RFC-0006 (Layered Architecture), the repository is organized into
-packages matching the architectural layers.
+Pond is organized into a clean layer hierarchy. Every package is
+removable without breaking any lower layer (Design Goal 3.4 Scalable).
 
-This document also encodes the **removability discipline** (see
-`DESIGN_GOALS.md` §3.4 Scalable): every package must be removable
-without changing any lower layer. See §3 below.
-
-## Structure
+## Structure (current)
 
 ```
-pond/
-├── DESIGN_GOALS.md             # Six design principles + repo map (READ FIRST)
-├── SDK_SPEC.md                 # Authoritative SDK contract (settles 10 validation ambiguities)
-├── PACKAGES.md                 # This file
-├── README.md
-├── worklog.md                  # Append-only research log
+pond_repo/
 │
-├── pond-core/                  # Layer 0: Storage Calculus (FROZEN)
-│   ├── pond_minimal.py         # 3 primitives: Write, Read, Reference (~140 LOC)
-│   └── __init__.py
+├── README.md                    # 5-minute intro (start here)
+├── DESIGN_GOALS.md              # 7 design principles + roadmap
+├── PACKAGES.md                  # This file
+├── SDK_SPEC.md                  # Authoritative SDK contract
+├── POND.md                      # One-page "What is Pond?"
+├── worklog.md                   # Append-only research log
 │
-├── pond-sdk/                   # Layers 1+2: State + Access Calculus
-│   ├── prolly_view.py          # Layer 1: ProllyViewBase (delta commits, trees, branching)
-│   ├── binary_encoding.py      # Binary Prolly tree encoding (metadata optimization)
-│   ├── auto_index.py           # Layer 2: IndexedView (auto-indexing, incremental)
-│   ├── view_sdk.py             # View base class + CrossView + SemanticView + adapters
-│   ├── maintenance.py          # Layer 0.5: tombstone helpers (RFC-0008) + compact_tombstones
-│   ├── view_laws.py            # Property-test harness for RFC-0007's 6 View algebra laws
-│   └── __init__.py
+├── pond-core/                   # Layer 0: Storage Kernel (FROZEN)
+│   └── pond_minimal.py          # 3 primitives: Write, Read, Ref (~140 LOC)
 │
-├── pond-sql/                   # Layer 3: Domain — SQL database
-├── pond-streaming/             # Layer 3: Domain — Streaming
-├── pond-git/                   # Layer 3: Domain — Version control
-├── pond-notebook/              # Layer 3: Domain — Knowledge base
-├── pond-feature-store/         # Layer 3: Domain — ML Feature Store (Phase E flagship)
-│   ├── feature_store.py        # FeatureStore (schema validation, versioning, point-in-time JOIN, batch serving)
-│   └── cli.py                  # 16-command CLI
-├── pond-semantic/              # Layer 3: Domain — Semantic models
-├── pond-vector/                # Layer 3: Domain — Vector DB (external validation)
-├── pond-arrow/                 # Layer 3: Domain — Arrow IPC adapter (Phase D compatibility)
-│   ├── arrow_view.py           # ArrowView (View Algebra + Arrow ecosystem interop)
-│   └── run_arrow_view_laws.py  # view_laws.py harness runner for ArrowView
+├── pond-sdk/                    # Layers 1+2: Lens SDK + Physical Structures
+│   ├── lens_sdk.py              # Lens base class, CrossLens, SemanticLens
+│   ├── lens_query.py            # Lazy query API (.where/.select/.join)
+│   ├── prolly_view.py           # ProllyViewBase (tiered commits, trees)
+│   ├── binary_encoding.py       # Binary Prolly tree encoding
+│   ├── collection.py            # Collection (reference namespace)
+│   ├── auto_index.py            # Auto-indexing (Physical Structure)
+│   ├── maintenance.py           # Tombstone helpers (RFC-0008)
+│   ├── architecture_laws.py     # 12 executable architecture laws
+│   ├── lens_laws.py             # RFC-0007 Lens algebra property tests
+│   ├── run_lens_laws_ci.py      # CI runner for Lens contracts
+│   └── test_*.py                # Tests
 │
-├── rfcs/                       # Architecture specifications
-│   ├── RFC-0001-what-is-a-view.md          # Draft (superseded by RFC-0007)
-│   ├── RFC-0002-elegance-metrics.md
-│   ├── RFC-0003-kernel-specification.md    # ACCEPTED (frozen)
-│   ├── RFC-0004-view-composition.md
-│   ├── RFC-0005-derived-structures.md      # Renamed to Materialization Calculus
-│   ├── RFC-0006-layered-architecture.md
-│   ├── RFC-0007-view-algebra.md            # ACCEPTED (verified by view_laws.py)
-│   ├── RFC-0008-deletion-as-data.md        # Tombstones; no fourth primitive
-│   ├── RFC-0009-architecture-metrics.md    # Measurable design metrics
-│   ├── RFC-0010-arrowview.md               # ACCEPTED (Phase D compatibility adapter)
-│   └── RFC-0011-feature-store.md           # ACCEPTED (Phase E flagship)
+├── pond-arrow/                  # Layer 3: Arrow IPC Lens
+├── pond-feature-store/          # Layer 3: ML Feature Store (older)
+├── pond-git/                    # Layer 3: Git Lens
+├── pond-lakehouse/              # Layer 3: DuckDB Lakehouse (flagship)
+├── pond-notebook/               # Layer 3: Notebook Lens
+├── pond-semantic/               # Layer 3: Semantic Models Lens
+├── pond-sql/                    # Layer 3: SQL Lens
+├── pond-streaming/              # Layer 3: Streaming Lens
+├── pond-vector/                 # Layer 3: Vector DB Lens
 │
-├── docs/                       # Reference documents
-│   ├── ... (FORMAL_SPEC, FORMAL_ALGEBRA, NON_GOALS, etc.)
-│   └── LIQUID_CLUSTERING_COMPARISON.md  # Databricks Liquid Clustering vs Pond analysis
-├── engineering/                # Engineering milestones (concurrency, GC, S3)
-├── validation/                 # External validation (vector challenge + report)
-├── destruction/                # Historical destruction-phase experiments
-└── prototype/                  # Early experimental code (historical)
+├── pond-schema/                 # Cross-cutting: Schema Registry (§18 algebra)
+├── pond-replication/            # Cross-cutting: Replication Coordinator (§16)
+├── pond-transport/              # Cross-cutting: Transport Layer (§17)
+│   ├── transport.py             # Reference (zlib + XOR)
+│   └── transport_production.py  # Production (zstd + AES-GCM)
+│
+├── pond-labs/                   # Modern experiments and demos
+│   ├── feature_store_lens.py    # Newer Feature Store Lens (point-in-time join)
+│   ├── interop_demo.py          # Bidirectional Lens interop (the killer demo)
+│   └── loc_benchmark.py         # LOC saved: 81% reduction vs from-scratch
+│
+├── docs/                        # Documentation
+│   ├── README.md                # Doc index (start here)
+│   ├── POND_WHITEPAPER.md       # The contribution (20 pages)
+│   ├── WHERE_POND_FAILS.md      # Honest scope
+│   ├── POND_FORMAL_ALGEBRAS.md  # 17 algebras, 10 axioms
+│   ├── POND_PHASE_Q_BENCHMARKS.md
+│   ├── POND_PHASE_Q_REVIEW_PACKET.md
+│   ├── LENS_AUTHORS_GUIDE.md
+│   ├── LNS_INTERPRETATION_CONTRACT.md
+│   ├── LENS_INTEROP_SPEC.md
+│   ├── GETTING_STARTED.md
+│   ├── NON_GOALS.md
+│   ├── POSTMORTEM_PROLLY_TREE_BUG.md
+│   ├── DELETE_90_PERCENT.md
+│   └── archive/                 # Historical docs (15 files)
+│       └── rfcs/                # 13 RFCs
+│
+├── scripts/                     # Test and benchmark scripts
+│   ├── phase_l_*.py             # Phase L: verification (491 tests)
+│   ├── phase_n_*.py             # Phase N: proofs + untested laws
+│   ├── phase_o_*.py             # Phase O: remaining laws + hazards
+│   ├── phase_p_real_differentials.py
+│   ├── phase_q_benchmarks.py    # Phase Q: head-to-head vs Git/Dolt/Iceberg
+│   └── pond_rfc1.py             # RFC-0001 reference
+│
+├── tla/                         # TLA+ formal specification
+│   ├── PondKernel.tla           # 6 invariants, 56 reachable states
+│   ├── PondKernel.cfg
+│   └── README.md
+│
+└── archive/                     # Historical code (preserved for reference)
+    ├── prototype/               # Early experimental code
+    ├── libraries/               # Older SDK versions
+    ├── applications/            # Older Lens implementations
+    ├── engineering/             # Engineering experiments
+    ├── destruction/             # Adversarial destruction tests
+    ├── experiments/             # Older performance benchmarks
+    └── validation/              # External validation reports
 ```
 
 ## Package Dependencies
 
 ```
-pond-core        → (nothing — standalone, 3 primitives)
-pond-sdk         → pond-core
-pond-sql         → pond-sdk
-pond-streaming   → pond-sdk
-pond-git         → pond-sdk
-pond-notebook    → pond-sdk
-pond-feature-store → pond-sdk + pond-semantic (optional)
-pond-semantic    → pond-sdk
-pond-vector      → pond-sdk
+pond-core          → (nothing — standalone, 3 primitives)
+pond-sdk           → pond-core
+pond-arrow         → pond-sdk
+pond-feature-store → pond-sdk
+pond-git           → pond-sdk
+pond-lakehouse     → pond-sdk + duckdb + pyarrow
+pond-notebook      → pond-sdk
+pond-semantic      → pond-sdk
+pond-sql           → pond-sdk
+pond-streaming     → pond-sdk
+pond-vector        → pond-sdk
+pond-schema        → pond-core
+pond-replication   → pond-core
+pond-transport     → pond-core
+pond-labs          → pond-core + pond-lakehouse + (pyarrow, duckdb)
 ```
 
-No domain package depends on another domain package.
-All domain packages depend only on pond-sdk.
-pond-sdk depends only on pond-core.
-pond-core depends on nothing.
+No Lens package depends on another Lens. All Lenses depend only on
+`pond-sdk`. `pond-sdk` depends only on `pond-core`. `pond-core`
+depends on nothing. This is a strict dependency DAG with no cycles.
 
-This is a strict dependency DAG with no cycles.
-
----
-
-## 3. The Removability Discipline
+## The Removability Discipline
 
 **Rule:** Every package must be removable without changing any lower
-layer.
-
-This is the operationalization of Design Goal 3.4 (Scalable) from
-`DESIGN_GOALS.md`. It is also the metric C2 (Removability test
-failures) from RFC-0009 — a hard constraint, target 0 failures.
+layer. (Design Goal 3.4 Scalable.)
 
 ### How to test
 
-For each package P, the removability test is:
-
-1. Move `pond-P/` out of the import path (or temporarily rename it).
+For each package P:
+1. Move `pond-P/` out of the import path.
 2. Run the test suites of every package at a *lower* layer than P.
-3. If any lower-layer test fails, the removability test fails —
-   P has leaked a dependency upward.
+3. If any lower-layer test fails, P has leaked a dependency upward.
 
 ### Concrete examples
 
 | If we delete... | Lower-layer tests that must still pass |
 |---|---|
-| `pond-feature-store/` | `pond-sdk`, `pond-core` (also `pond-semantic` since FS optionally depends on it, but `pond-semantic`'s own tests must still pass independently) |
-| `pond-semantic/` | `pond-sdk`, `pond-core` (and `pond-feature-store` if FS does not hard-depend on Semantic — see the `optional` annotation above) |
+| `pond-lakehouse/` | `pond-sdk`, `pond-core` |
+| `pond-feature-store/` | `pond-sdk`, `pond-core` |
 | `pond-vector/` | `pond-sdk`, `pond-core` |
-| `pond-sql/` | `pond-sdk`, `pond-core` |
 | `pond-sdk/` | `pond-core` only |
 | `pond-core/` | (nothing — but deleting it deletes the project) |
 
-### What this implies for new packages
-
-A new package P may depend on lower layers (kernel, SDK) but must
-not be depended on by them. If a feature in `pond-sdk` "needs" to
-call into `pond-feature-store`, the feature belongs in
-`pond-feature-store`, not in `pond-sdk`. Move it down, not up.
-
-### What this implies for the kernel
-
-The kernel (`pond-core`) is the most removable-of-all package in
-principle (nothing depends up to it) and the least removable in
-practice (everything depends down to it). This asymmetry is why the
-kernel is FROZEN: any change to `pond-core` ripples to every other
-package. The kernel changes only via an Accepted RFC that passes
-the Admission Rule (see `rfcs/README.md`).
-
----
-
-## 4. Adding a new package
+## Adding a new package
 
 Before adding a new `pond-X` package:
 
-1. **Justify against the design goals** (`DESIGN_GOALS.md` §3).
+1. **Justify against the 7 design goals** (`DESIGN_GOALS.md` §3).
    Which goal does it serve? Which does it potentially conflict with?
-2. **Verify the removability test** will pass. Will deleting
-   `pond-X` break any lower layer? If yes, do not add it; the
-   dependency is wrong.
-3. **Specify its View algebra** (RFC-0007). What is its
-   `(Σ, A, E, D, M)` 5-tuple? Does it satisfy the six laws?
-4. **Specify its materializations** (RFC-0005). What derived
-   structures does it maintain? Are they all rebuildable from
-   snapshots?
-5. **Update this file** (`PACKAGES.md`) and `DESIGN_GOALS.md` §5.4
-   if the package adds a new layer or responsibility.
+2. **Verify the removability test** will pass.
+3. **Specify its Lens algebra** (RFC-0007). What is its 5-tuple?
+4. **Specify its Physical Structures** (RFC-0005). What derived
+   structures does it maintain? Are they all rebuildable?
+5. **Update this file** and `DESIGN_GOALS.md` if the package adds
+   a new layer or responsibility.
 6. **Add an entry to `worklog.md`** documenting the addition.
 
----
+## Removing a package
 
-## 5. Removing a package
-
-Removing a package is healthy when the package has been superseded
-or its functionality has been absorbed into a lower layer. The
-removability discipline makes this safe: if the package was
-properly designed, removing it requires no changes to lower layers.
+Removing a package is healthy when it has been superseded or its
+functionality has been absorbed into a lower layer. The removability
+discipline makes this safe: if the package was properly designed,
+removing it requires no changes to lower layers.
 
 If removing a package *does* require lower-layer changes, that is a
 bug — the package leaked a dependency upward. Fix the leak first,
 then remove the package.
+
+## Archive policy
+
+The `archive/` directory contains historical code and docs preserved
+for reference. Nothing in `archive/` is needed to use or understand
+Pond. It exists so that the project's evolution is traceable.
+
+If you are looking for:
+- Early prototypes → `archive/prototype/`
+- Older SDK versions → `archive/libraries/`
+- Older Lens implementations → `archive/applications/`
+- Adversarial destruction tests → `archive/destruction/`
+- External validation reports → `archive/validation/`
+- RFCs → `docs/archive/rfcs/`
+
+If you can't find something, it's probably in `archive/`.

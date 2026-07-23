@@ -7,7 +7,7 @@ NOT the real SDK.  Used for testing VectorView.
 
 import json
 
-from pond_minimal import PondMinimal  # noqa: F401  (re-exported for convenience)
+from mock_kernel import PondMinimal  # noqa: F401  (re-exported for convenience)
 
 
 # ---------------------------------------------------------------------------

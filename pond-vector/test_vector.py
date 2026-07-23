@@ -20,7 +20,7 @@ import os
 # Make sure the mock SDK modules on on the path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pond_minimal import PondMinimal
+from mock_kernel import PondMinimal
 from vector_view import VectorView
 
 def banner(title: str) -> None:
