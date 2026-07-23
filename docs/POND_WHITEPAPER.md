@@ -577,7 +577,7 @@ do X," there is usually a Lens or Physical Structure that provides
 X on top of the kernel. See `WHERE_POND_FAILS.md` for the mapping
 from each gap to the Lens that closes it.
 
-The kernel is small by design. The Lens algebra is infinite by
+The kernel is small by design. The kernel admits an open-ended family of Lenses by
 construction. Most "Pond can't do X" claims are missing Lenses.
 
 ### 6.1 No distributed consensus

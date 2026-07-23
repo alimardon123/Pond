@@ -24,7 +24,7 @@ challenging for **high-frequency mutation, strong consistency, or
 hot-key** workloads.
 
 But "challenging" is not "impossible." The kernel is small; the
-Lens algebra is infinite. The question for each hard workload is:
+The kernel admits an open-ended family of Lenses. The question for each hard workload is:
 **what Lens would close the gap, and has it been built?**
 
 ---
@@ -83,8 +83,8 @@ conflict resolution.
 
 **Without the Lens:** single-writer per ref (REP1). With CRDT Lens:
 multi-writer with automatic conflict-free convergence. With Raft
-coordinator: multi-writer with linearizability. **Pond + CRDT Lens
-matches Cassandra/Dynamo; Pond + Raft matches CockroachDB/Spanner**
+coordinator: multi-writer with linearizability. **Pond + CRDT Lens (intended)
+intended to approach Cassandra/Dynamo; Pond + Raft intended to approach CockroachDB/Spanner**
 (at the cost of adding the coordinator substrate).
 
 ### 2.3 Random in-place updates at scale
@@ -108,7 +108,7 @@ profiles, IoT calibration).
 single-node LSM Lens.
 
 **Without the Lens:** Pond is read-heavy or append-heavy only. With
-LSM Lens: **Pond matches RocksDB/Pebble for update-heavy workloads**
+LSM Lens: **Pond is intended to approach RocksDB/Pebble for update-heavy workloads**
 plus free time travel (RocksDB has no time travel).
 
 ### 2.4 Hot-key contention
@@ -127,7 +127,7 @@ leaderboards).
 **Status:** not built. Estimated effort: 1 week.
 
 **Without the Lens:** ≤10 concurrent writers per key. With Counter
-CRDT Lens: **unlimited concurrent writers; matches Redis/Cassandra
+CRDT Lens: **unlimited concurrent writers; intended to approach Redis/Cassandra
 counters** plus free time travel (neither has it).
 
 ### 2.5 Streaming joins with low latency
@@ -150,7 +150,7 @@ counters** plus free time travel (neither has it).
 **Status:** not built. Estimated effort: 2-3 months.
 
 **Without the Lens:** batch or micro-batch (minute+ latency). With
-Streaming Lens: **Pond matches Flink/Kafka Streams for sub-second
+Streaming Lens: **Pond is intended to approach Flink/Kafka Streams for sub-second
 streaming joins** plus free time travel on the stream state (Flink
 has limited time travel).
 
@@ -170,7 +170,7 @@ has limited time travel).
 infrastructure.
 
 **Without the Lens:** CPU-mediated tensor loading (slow). With
-Tensor Lens: **Pond matches RAPIDS/Merlin for GPU tensor access**
+Tensor Lens: **Pond is intended to approach RAPIDS/Merlin for GPU tensor access**
 plus free versioning (RAPIDS has no built-in versioning).
 
 ### 2.7 Millions of tiny objects
@@ -191,7 +191,7 @@ plus free versioning (RAPIDS has no built-in versioning).
 **Status:** experimental (in archive). Production Lens: 2-3 weeks.
 
 **Without the Lens:** ≤1M blobs comfortable; 10M+ slow. With Packing
-Lens: **Pond matches Git packfiles / Cassandra compaction** plus
+Lens: **Pond is intended to approach Git packfiles / Cassandra compaction** plus
 free time travel (Git has it; Cassandra doesn't).
 
 ### 2.8 Full-text search
@@ -213,7 +213,7 @@ free time travel (Git has it; Cassandra doesn't).
 **Status:** not built. Estimated effort: 1-2 months.
 
 **Without the Lens:** documents can be stored in Pond but searched
-externally. With Search Lens: **Pond matches Elasticsearch/Solr for
+externally. With Search Lens: **Pond is intended to approach Elasticsearch/Solr for
 full-text search** plus free versioning (Elasticsearch has limited
 versioning; Pond has full time travel).
 
@@ -267,22 +267,22 @@ No Lens needed — these work today:
 
 | Workload | Pond today | Pond + planned Lens | Use instead (if Lens not built) |
 |---|---|---|---|
-| High-frequency OLTP | Struggles (>10 TPS/key) | **Matches RocksDB** (OLTP Lens) | FDB, Postgres |
-| Distributed consensus | Out-of-model | **Matches Cassandra** (CRDT Lens) or **CockroachDB** (Raft) | FDB, CockroachDB |
-| Random in-place updates | Struggles | **Matches RocksDB** (LSM Lens) + free time travel | RocksDB, Pebble |
-| Hot-key contention | Struggles | **Matches Redis** (Counter CRDT Lens) + free time travel | Redis, FDB |
-| Streaming joins (sub-second) | Struggles | **Matches Flink** (Streaming Lens) + free state time travel | Flink, Materialize |
-| GPU data | Struggles | **Matches RAPIDS** (Tensor Lens) + free versioning | RAPIDS, Merlin |
-| Millions of tiny objects | Struggles | **Matches Git packfiles** (Packing Lens, in archive) | Cassandra, HBase |
-| Full-text search | Struggles | **Matches Elasticsearch** (Search Lens) + free versioning | Elasticsearch, Solr |
-| Time-series (high cardinality) | Unclear | **Matches InfluxDB** (TimeSeries Lens) | InfluxDB, TimescaleDB |
-| Graph databases | Unclear | **Matches Neo4j** (Graph Lens) | Neo4j, TigerGraph |
+| High-frequency OLTP | Struggles (>10 TPS/key) | Intended to approach RocksDB (OLTP Lens) | FDB, Postgres |
+| Distributed consensus | Out-of-model | Intended to approach Cassandra (CRDT Lens) or CockroachDB (Raft; intended to approach) | FDB, CockroachDB |
+| Random in-place updates | Struggles | Intended to approach RocksDB (LSM Lens) + free time travel | RocksDB, Pebble |
+| Hot-key contention | Struggles | Intended to approach Redis (Counter CRDT Lens) + free time travel | Redis, FDB |
+| Streaming joins (sub-second) | Struggles | Intended to approach Flink (Streaming Lens) + free state time travel | Flink, Materialize |
+| GPU data | Struggles | Intended to approach RAPIDS (Tensor Lens) + free versioning | RAPIDS, Merlin |
+| Millions of tiny objects | Struggles | Intended to approach Git packfiles (Packing Lens, in archive) | Cassandra, HBase |
+| Full-text search | Struggles | Intended to approach Elasticsearch (Search Lens) + free versioning | Elasticsearch, Solr |
+| Time-series (high cardinality) | Unclear | Intended to approach InfluxDB (TimeSeries Lens) | InfluxDB, TimescaleDB |
+| Graph databases | Unclear | Intended to approach Neo4j (Graph Lens) | Neo4j, TigerGraph |
 | Notebook versioning | Unclear | **Beats Git** (cell-aware Notebook Lens) | Git (poorly) |
-| Object storage + metadata | Unclear | **Matches LakeFS** (ObjectStore Lens) | LakeFS |
+| Object storage + metadata | Unclear | Intended to approach LakeFS (ObjectStore Lens) | LakeFS |
 | Versioned tabular data | **Excels** | (already shipped) | (Pond flagship) |
 | ML feature stores | **Excels** | (already shipped) | (Pond strong) |
 | Audit logs / event sourcing | **Excels** | (no Lens needed) | (Pond fits natively) |
-| Code versioning | Excels (no Lens yet) | **Matches Git** (Git Lens) | Git |
+| Code versioning | Excels (no Lens yet) | Intended to approach Git (Git Lens) | Git |
 | Configuration management | **Excels** | (trivial Config Lens) | (Pond fits) |
 
 ---
@@ -378,7 +378,7 @@ system, the architecture is wrong. We will know within 12 months.
 Pond is not a universal storage substrate today. It is a universal
 storage *architecture* with a finite Lens roadmap to universality.
 
-The kernel is frozen. The Lens algebra is infinite. Most "can't"
+The kernel is frozen. The architecture is extensible through additional Lenses. Most "can't"
 claims are missing Lenses. The work is to build them.
 
 When a workload seems impossible on Pond, the question is not "can
