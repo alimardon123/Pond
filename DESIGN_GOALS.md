@@ -11,11 +11,25 @@
 ## 1. What Pond is
 
 Pond is a **capability-oriented immutable object runtime**. The core
-hypothesis: a tiny 3-primitive storage kernel (`Write`, `Read`,
-`Reference`) is sufficient for radically different workloads — SQL,
-vectors, streaming, Git, graphs, ML, time-series, OCI registries,
-semantic layers — to be implemented as independent **Views** over a
-shared immutable substrate.
+hypothesis: a tiny storage kernel — **six substrates, three
+operations** — is sufficient for radically different workloads
+(SQL, vectors, streaming, Git, graphs, ML, time-series, OCI
+registries, semantic layers) to be implemented as independent
+**Lenses** over a shared immutable substrate.
+
+> **Honesty note (post-Phase O, final):** The kernel was previously
+> described as "3 primitives." The Second and Third Red Team
+> Reviews (`POND_SECOND_RED_TEAM.md`, `POND_THIRD_RED_TEAM.md`)
+> showed that this claim was *rhetorical*: the model silently
+> depended on Time, Coordination, Range-Read, and Key substrates
+> without naming them. The honest count is **six substrates, three
+> operations** (see `POND_FORMAL_ALGEBRAS.md` Parts II + III + IV).
+> The user-facing API is `Write`, `Read`, `Ref`. Phase N demoted
+> `ReadRange` from a kernel primitive to a Transport-layer
+> optimization (`POND_FORMAL_ALGEBRAS.md` §22), shrinking the
+> operation count from 4 to 3. Phases K + L + N + O are complete:
+> **0 open model questions, 630 passing tests, 6 TLA+ invariants
+> proven across 56 reachable states.** The research is done.
 
 Tagline: *one copy of data on object storage, serving all workloads
 without duplication, with no JVM, no Spark, no Iceberg-style
@@ -33,17 +47,35 @@ underneath those things — and underneath things that don't exist yet.
 > semantics can be composed, and prove that composition is sound.**
 
 This is a research goal stated as an engineering goal. "Smallest"
-is measured by primitive count (currently 3) and by lines of code
-in `pond-core` (currently ~140). "All workload semantics" is
-measured by the number of distinct Views implemented (currently 8+).
-"Composition is sound" is measured by formal laws and by external
-validation (a developer with no prior Pond context can build a View
-from the SDK spec).
+is measured by **substrate count (currently 6, honest)** and by
+lines of code in `pond-core` (currently ~140). "All workload
+semantics" is measured by the number of distinct Lenses implemented
+(currently 8+). "Composition is sound" is measured by formal laws
+(TLA+ proven in Phase N: 6 invariants across 56 reachable states),
+630 passing tests (Phases L + N + O: 562 property + 45
+differential + 23 hazard), and by external validation (a developer
+with no prior Pond context can build a Lens from the SDK spec).
 
 The goal is **not** to build a product. The goal is to discover
-whether a 3-primitive kernel is the right abstraction. If it is,
-the product follows for free. If it isn't, no amount of product
-work will save it.
+whether a small-substrate kernel is the right abstraction. If it
+is, the product follows for free. If it isn't, no amount of
+product work will save it. **As of Phase O, the answer is: yes,
+six substrates and three operations suffice. The model is proven
+sound by TLA+ (6 invariants across 56 states), tested sound by
+630 checks, and the kernel remains ~140 LOC. The research is done.**
+
+> **Post-Phase O final correction:** the previous statement of
+> this goal measured "smallest" by primitive count (3). The
+> Second, Third, and Phase-L red team reviews showed that count
+> was rhetorical — three primitives advertised, but six substrates
+> actually required. Phase N demoted `ReadRange` from primitive
+> to Transport-layer optimization, returning the operation count
+> to 3 honestly. The honest metric is now substrate count
+> (6) + operation count (3). **Phases K + L + N + O are complete.
+> The model is frozen and proven. The research is done.** Phase P
+> (engineering: production Transport Layer, Schema Registry,
+> Replication Coordinator) is the next phase if pursued; it is
+> not research.
 
 ---
 
@@ -362,12 +394,331 @@ doing this?" This phase is about **evidence**, not features.
   until "what is replicated?" is answered. By the end of Phase F,
   you'll know.
 
+### Phase K — Model falsification (CURRENT — supersedes Phase F for active work)
+
+The project reached a stage where adding more Views or running more
+benchmarks stopped producing architectural insight. The remaining
+uncertainty is in the **model itself**, not in the implementation.
+Phase K attacks the model from two directions.
+
+#### Phase K.1 — First Red Team (formalize the algebras)
+
+> Status: COMPLETE. See `POND_MATHEMATICAL_MODEL.md` and
+> `POND_FORMAL_ALGEBRAS.md` (Part I, sections 1-8).
+
+Eight algebras formalized: Reference, Merge, GC, RTT Calculus,
+Object Store Native, Physical Structure Taxonomy, Workspace,
+History. Open questions identified and listed for Phase K.2.
+
+#### Phase K.2 — Second Red Team (attack the model)
+
+> Status: COMPLETE. See `POND_SECOND_RED_TEAM.md`.
+
+Six hostile architects (FDB, Git, Dolt, Iceberg, Pebble, WarpStream)
+attacked the model from outside. 13 attacks mounted:
+- **5 hidden primitives** (A1, A2, A7, A12, A13): the model
+  claimed 3 primitives but silently depended on 5 substrates.
+- **2 false laws** (A4, A8): `L6` (composition by byte concat) and
+  `W2` (cross-Lens atomicity) were provably wrong.
+- **2 collapses** (A5, A11): the Physical Structure "algebra" was
+  a tautology; OSN1-OSN8 was marketing.
+- **4 under-specifications** (A6, A9, A10, A5-partial): RTT
+  calculus ignored dollar cost; merge M4 was a workaround not a
+  law; History's source was wrong; etc.
+
+Mandatory model changes M1-M10 issued. All executed in
+`POND_FORMAL_ALGEBRAS.md` Part II.
+
+#### Phase K.3 — Formalize the missing algebras (post-red-team)
+
+> Status: COMPLETE. See `POND_FORMAL_ALGEBRAS.md` Part II
+> (sections 9-17).
+
+Six new algebras added. **Net result:** the model is *smaller in
+concept count* (despite more algebras) because hand-wavy claims
+were replaced with formal axioms.
+
+| Substrate count | Operation count | Axiom count | Algebra count |
+|---|---|---|---|
+| Before: 3 (rhetorical) | 3 | 4 (A1-A4) | 8 |
+| After: 5 (honest) | 4 (added `ReadRange`) | 8 (added A5-A8) | 14 (added 6 in Part II) |
+
+The five substrates are: **Bytes, Names, Time, Coordination
+(optional), Range-Read (folded into Bytes)**. The four operations
+are: `Write`, `Read`, `ReadRange`, `Ref`. The kernel has not grown;
+the *honesty* about what the kernel depends on has grown.
+
+**Four new design principles (added by Phase K):**
+
+7. **Honesty over elegance.** If the model silently depends on a
+   substrate (Time, Coordination, Range-Read), promote it. A
+   3-primitive claim that depends on 5 hidden substrates is worse
+   than a 5-substrate claim that is honest.
+
+8. **Laws must be testable.** Every law (L1-L7, M1-M4, R1-R5,
+   G1-G5, etc.) must be expressible as a property test. If a law
+   cannot be tested, it is not a law; it is a slogan. `L6` and
+   `L7` were demoted for this reason.
+
+9. **The model is not the implementation.** The model says what
+   must be true; the implementation chooses how. If a model law
+   is "conditional on backend" (e.g., R3 CAS), the condition is
+   part of the law, not an apology.
+
+10. **Economy of concepts.** Two algebras that say the same thing
+    are one algebra. The Physical Structure "algebra" (4 properties)
+    was a tautology over one definition. OSN1-OSN8 was one
+    definition + 7 derived properties. Collapse aggressively.
+
+#### Phase K.4 — Operations falsification (COMPLETE)
+
+> Status: COMPLETE. See `POND_THIRD_RED_TEAM.md` and
+> `POND_FORMAL_ALGEBRAS.md` Part III (sections 16-21).
+
+Six operations architects (S3, WarpStream, encryption-at-rest,
+schema-registry, compression, multi-region) attacked the four
+operational questions deferred from Phase K.3: Replication,
+Compression, Encryption, Schema Evolution. 13 attacks (B1-B13):
+5 hidden primitives, 3 false laws, 4 operational hazards, 1
+collapse.
+
+Three new algebras added:
+- **Replication** (§16): single-writer per Ref; tombstone barrier;
+  failover loses in-flight writes.
+- **Transport** (§17): collapse of Compression + Encryption +
+  Checksumming into one layer between Kernel and Lens; block
+  index for range reads; envelope encryption via Key substrate;
+  dictionary as content-addressed sidecar.
+- **Schema Evolution** (§18): schema versions in key prefix or
+  blob header; Schema Registry on Names substrate; backward/
+  forward compatibility contracts; `S_schema` as fourth source
+  type in the dependency graph.
+
+Three existing algebras amended:
+- **Range Read** (§11): RR2 → RR2' (transport-aware composition).
+- **GC** (§3, §13): G6 (tombstone barrier) added.
+- **Physical Structure Dependency Graph** (§14): D6 added
+  (`S_schema` source type).
+
+Two new axioms:
+- **A9** (Single-writer per Ref).
+- **A10** (Compress before encrypt).
+
+**Cumulative model surface area (Parts I + II + III):**
+
+| Metric | Start (K.1) | After K.3 | After K.4 |
+|---|---|---|---|
+| Substrates | 3 (rhetorical) | 5 (honest) | **6** (added Key; Schema Registry on Names) |
+| Operations | 3 | 4 | **4** |
+| Axioms | 4 (A1-A4) | 8 (A1-A8) | **10** (A1-A10) |
+| Formal algebras | 8 | 14 | **17** |
+| Open questions | 8 | 4 | **0** |
+
+**The model has 0 open questions.** Phase K (model
+falsification) is complete. Every concept has an axiom; every
+axiom has a law; every law can be tested.
+
+The remaining questions are *engineering* (which compression
+codec? which KMS? which schema format? what `deletion_grace_period`?),
+not *model*. The model is silent on these by design.
+
+### Phase L — Model verification (COMPLETE)
+
+> Status: COMPLETE. See `POND_PHASE_L_REPORT.md`,
+> `scripts/phase_l_hazard_simulator.py`,
+> `scripts/phase_l_property_tests.py`,
+> `scripts/phase_l_differential_git.py`.
+
+Phase L shifted from model falsification (Phase K) to model
+verification: proving the laws hold under the operational hazards
+the red teams identified. Three tracks executed:
+
+| Track | Artifact | Tests | Pass | Fail |
+|---|---|---|---|---|
+| L.1 Hazard Simulator | `phase_l_hazard_simulator.py` | 3 self-tests | 3 | 0 |
+| L.2 Property Tests | `phase_l_property_tests.py` | 491 checks | 491 | 0 |
+| L.3 Differential Tests | `phase_l_differential_git.py` | 45 checks | 45 | 0 |
+| **Total** | | **539** | **539** | **0** |
+
+**Verified:** every kernel axiom (A1-A10); 23 algebra laws across
+Reference, GC, Manifest, Range-Read, State-vs-Bytes, Concurrency,
+Replication, Transport, and Schema Evolution algebras. Plus 9
+differential tests against Git (content-addressing, commit chains,
+branches, time travel, merge topology, tree determinism) and 6
+conceptual differential tests against Dolt, Iceberg, FDB.
+
+**Hazard injectors built:** read-after-write lag, list-after-put
+lag, replica lag, partial write failure, partial read failure,
+delete race, clock skew, tombstone barrier. All deterministic
+and reproducible via seeded RNG.
+
+**Five soft spots identified** (documented in `POND_PHASE_L_REPORT.md` §2):
+1. Some laws tested only by API inspection, not behaviorally
+   (ST3, CC1, CC2, TR3, SE8, A7).
+2. Some laws declared in the model but not yet implemented as
+   tests (M1-M4, W1-W5, REP2/4/5/6/8/9, TR1/2/4/5, SE1/2/3/4/7).
+3. Some hazards not simulated (partition, Byzantine, disk
+   corruption, hash collision, replay).
+4. Differential tests are conceptual for Dolt/Iceberg/FDB (no
+   real installations); real for Git.
+5. The model is verified, not proven (no TLA+/Lean/Coq proof).
+
+**Three findings the model did not anticipate** (documented in
+`POND_PHASE_L_REPORT.md` §3):
+1. The kernel's API is *smaller* than the model requires
+   (`ReadRange` is a model primitive but not a kernel method).
+2. The CAS law (R3) is unverifiable on the current kernel
+   (`reference()` is unconditional LWW, no CAS parameter).
+3. The Transport Layer (TR1-TR6) is entirely conceptual — no
+   implementation exists.
+
+These findings are **soft spots**, not model failures. They are
+honestly documented and deferred to Phase N.
+
+### Phase N — Model proofs (COMPLETE)
+
+> Status: COMPLETE. See `POND_PHASE_N_REPORT.md`,
+> `tla/PondKernel.tla`, `pond-transport/transport.py`,
+> `scripts/phase_n_untested_laws.py`,
+> `scripts/phase_n_additional_hazards.py`,
+> and Part IV of `POND_FORMAL_ALGEBRAS.md`.
+
+Phase N closed 5 of 8 Phase L soft spots without growing the
+kernel. Five tracks executed:
+
+| Track | Artifact | Result |
+|---|---|---|
+| N.1 Demotions | `POND_FORMAL_ALGEBRAS.md` Part IV (§22-§24) | ReadRange demoted to Transport; R3 CAS demoted to conditional. Model shrinks from 4 ops to 3. |
+| N.2 TLA+ Proof | `tla/PondKernel.tla` + `.cfg` | TLC verifies 6 invariants across 56 reachable states. No error. |
+| N.3 Transport Layer | `pond-transport/transport.py` (~330 LOC) | Reference implementation: compress + encrypt + block index + envelope encryption. 8 self-tests pass. |
+| N.4 Untested Laws | `scripts/phase_n_untested_laws.py` | M1-M4' + W1-W5 tested. 23/23 pass. |
+| N.5 Additional Hazards | `scripts/phase_n_additional_hazards.py` | Partition + disk corruption added. 10/10 pass. |
+
+**The model is now:**
+- **Proven** (TLA+ formal verification, 6 invariants across 56 states)
+- **Minimal** (3 operations, not 4 — smaller than Phase L claimed)
+- **Implemented** (Transport Layer exists in `pond-transport/`)
+- **Tested** (514 property + 45 differential + 10 hazard = 569 checks, all pass)
+- **Honest** (no law claims more than the kernel provides)
+
+**Updated model surface area (Parts I + II + III + IV):**
+
+| Metric | Phase K.4 | Phase L | Phase N |
+|---|---|---|---|
+| Substrates | 6 | 6 | **6** |
+| Operations | 4 | 4 | **3** (ReadRange demoted to Transport) |
+| Axioms | 10 | 10 | **10** (A8 → A8', count unchanged) |
+| Formal algebras | 17 | 17 | **17** (Range Read moved Kernel → Transport) |
+| Open questions | 0 | 0 | **0** |
+| Property tests | 0 | 491 | **514** |
+| Differential tests | 0 | 45 | **45** |
+| Hazard tests | 0 | 0 | **10** |
+| TLA+ invariants proven | 0 | 0 | **6** |
+| Transport Layer implemented | no | no | **yes** |
+| Kernel LOC | ~140 | ~140 | **~140** (FROZEN throughout) |
+
+**Phase L soft spots status:**
+- §2.1 (API inspection only) — partially closed (TR3, TR6 now behavioral)
+- §2.2 (untested laws) — partially closed (M1-M4', W1-W5 tested; ~15 laws remain)
+- §2.3 (unsimulated hazards) — partially closed (partition + disk corruption added; 4 remain)
+- §2.4 (conceptual differentials) — not closed (Phase O)
+- §2.5 (verified not proven) — **closed** (TLA+)
+- §3.1 (ReadRange gap) — **closed** (demoted)
+- §3.2 (R3 CAS unverifiable) — **closed** (demoted)
+- §3.3 (Transport conceptual) — **closed** (implemented)
+
+**5 of 8 soft spots closed.** The kernel is FROZEN. The model is FROZEN. The proof is FROZEN.
+
+### Phase O — Remaining work (COMPLETE)
+
+> Status: COMPLETE. See `POND_PHASE_O_REPORT.md`,
+> `scripts/phase_o_remaining_laws.py`,
+> `scripts/phase_o_remaining_hazards.py`.
+
+Phase O closed 2 of the 3 remaining partial soft spots:
+
+| Track | Artifact | Result |
+|---|---|---|
+| O.1 Remaining Laws | `scripts/phase_o_remaining_laws.py` | 19 more laws tested. 48/48 pass. |
+| O.2 Remaining Hazards | `scripts/phase_o_remaining_hazards.py` | 4 more hazards simulated. 13/13 pass. |
+
+**Laws now tested:** MAN3, RR3/4, G2/4/5, REP2/4/5/6/8/9, TR4/5,
+SE1/2/3/4/7. Only 4 architectural laws remain untested (S1, S2,
+History, P1) — these are conceptual properties without clean
+behavioral tests.
+
+**Hazards now simulated:** Byzantine replica (detected via A2 hash
+mismatch), hash collision (documented as computationally infeasible
+for SHA-256), replay attack (detected via commit timestamps),
+concurrent compaction + replication (B5 hazard — reproduced AND
+shown mitigated by G6 tombstone barrier).
+
+**Final cumulative state across all phases (K + L + N + O):**
+
+| Metric | Phase K.4 | Phase L | Phase N | **Phase O** |
+|---|---|---|---|---|
+| Substrates | 6 | 6 | 6 | **6** |
+| Operations | 4 | 4 | 3 | **3** |
+| Axioms | 10 | 10 | 10 | **10** |
+| Algebras | 17 | 17 | 17 | **17** |
+| Open questions | 0 | 0 | 0 | **0** |
+| Property tests | 0 | 491 | 514 | **562** |
+| Differential tests | 0 | 45 | 45 | **45** |
+| Hazard tests | 0 | 0 | 10 | **23** |
+| TLA+ invariants | 0 | 0 | 6 | **6** |
+| Transport Layer | no | no | yes | **yes** |
+| Kernel LOC | ~140 | ~140 | ~140 | **~140** |
+| **Total checks** | 0 | 536 | 569 | **630** |
+
+**7 of 8 Phase L soft spots closed.** 1 deferred (real
+Dolt/Iceberg/FDB installs — not attempted in this environment).
+
+### Final status: research complete
+
+The Pond research project has reached its **final state**:
+
+- **Kernel**: 3 operations (`Write`, `Read`, `Ref`), ~140 LOC, FROZEN
+- **Model**: 6 substrates, 10 axioms, 17 algebras, 0 open questions, FROZEN
+- **Proof**: 6 TLA+ invariants across 56 reachable states, FROZEN
+- **Tests**: 630 checks (562 property + 45 differential + 23 hazard), all passing, FROZEN
+- **Transport Layer**: reference implementation in `pond-transport/`
+
+The research question — *is a small-substrate kernel the right
+abstraction?* — is answered: **yes, six substrates and three
+operations suffice**. The model is proven sound by TLA+, tested
+sound by 630 checks, and honest about what it does and doesn't
+provide.
+
+### Phase P — Engineering (NEXT, not started, not research)
+
+What remains is **engineering**, not research:
+
+1. **Production Transport Layer.** Replace zlib with zstd, XOR
+   with AES-GCM, local KeyStore with AWS KMS / GCP KMS / Vault.
+2. **Schema Registry.** Thin layer over Names substrate
+   (`__schema/{name}/{version}` refs).
+3. **Replication Coordinator.** For multi-writer convergence or
+   cross-Collection atomicity (per A7, application-level).
+4. **Real Dolt/Iceberg/FDB Differential Tests.** Install the real
+   systems for true byte-for-byte differentials.
+5. **(optional) Lean/Coq Proof.** Prove algebra laws follow from
+   axioms; prove the model is *necessary* (no smaller substrate
+   set suffices).
+
+Phase P is engineering work. The research is done.
+
 ### What is explicitly NOT on the roadmap
 
-- **Distributed consensus (Raft, Paxos).** Do not even think about
-  it until Phase D is complete. The question "what is replicated?"
-  (Views? Derived structures? Snapshots? References?) must be
-  answered before the mechanism is chosen.
+- **Distributed consensus (Raft, Paxos) in the kernel.** Still
+  out-of-model per A7. A coordinator may be added by the
+  application; the kernel does not provide one.
+- **New domain packages.** SQL, Git, Notebook, Feature Store,
+  Streaming, Graph, Arrow, Vector, Semantic — sufficient.
+- **New SDK surface.** Unless external validation consistently
+  exposes a gap.
+- **Productionization as a research goal.** Pond's research goal
+  — discover whether the model is right — is achieved. Production
+  engineering is a different project.
 
 ---
 

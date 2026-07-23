@@ -26,3 +26,9 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# TLA+ tools (downloaded, not source)
+tla/tla2tools.jar
+tla/states/
+tla/*.log
+tla/_*.tla
