@@ -351,7 +351,7 @@ reports, and any commit message that claims a result.
 
 ---
 
-## 7. The six design goals as a checklist
+## 7. The seven design goals as a checklist
 
 Before proposing any change, run it through this checklist:
 
@@ -363,6 +363,7 @@ Before proposing any change, run it through this checklist:
 | 4 | Scalable | Can the new package be removed without breaking lower layers? |
 | 5 | Efficient | Are auxiliary structures rebuildable from snapshots? |
 | 6 | Beautiful | Does the dependency graph still flow downward only? |
+| 7 | Functional | If "Pond can't do X," have we asked: what Lens is missing? |
 
 If any answer is "no," the proposal needs revision before it
 becomes code.

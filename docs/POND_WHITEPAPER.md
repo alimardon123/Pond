@@ -565,10 +565,20 @@ a gap between model and implementation.**
 
 ---
 
-## 6. What Pond does NOT do
+## 6. What Pond does NOT do (in the kernel)
 
-This section is intentionally long. Reviewers should read it
-carefully; it is the most honest part of this paper.
+This section is intentionally honest. Reviewers should read it
+carefully.
+
+**Important framing (per Design Goal 3.7 Functional):** the
+statements below describe what the *kernel* does not do. They are
+NOT claims about what Pond cannot do. For each "kernel does not
+do X," there is usually a Lens or Physical Structure that provides
+X on top of the kernel. See `WHERE_POND_FAILS.md` for the mapping
+from each gap to the Lens that closes it.
+
+The kernel is small by design. The Lens algebra is infinite by
+construction. Most "Pond can't do X" claims are missing Lenses.
 
 ### 6.1 No distributed consensus
 

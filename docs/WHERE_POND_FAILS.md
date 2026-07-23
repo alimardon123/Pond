@@ -1,395 +1,388 @@
-# Where Pond Fails
+# Where Pond Fails — and Where It Can Win
 
-> An honest catalog of workloads where Pond is the wrong tool.
+> An honest catalog of workloads where Pond is challenged, and a
+> roadmap for how the Lens + Physical Structure architecture can
+> close each gap.
 >
-> The goal of this document is **not** to defend Pond. It is to
-> falsify the claim that "Pond is a universal storage substrate."
-> Pond is not universal. It is good for a specific class of
-> workloads and bad for others. This document maps both.
+> **Per Design Goal 3.7 (Functional):** before claiming "Pond can't
+> do X," we ask: (1) is there a Lens that could interpret Pond bytes
+> as X? (2) is there a Physical Structure that could accelerate X?
+> (3) is there a coordinator that could layer on the kernel for X's
+> consistency needs (per A7)?
 >
-> **If your workload is in the "Pond fails" column, do not use Pond.**
-> Use the recommended alternative.
+> Most "can't" claims are missing Lenses. This document maps each
+> failure to the Lens or Physical Structure that would close it.
 
 ---
 
-## 1. The pattern of failure
+## 1. The pattern
 
 Pond's design choices (immutable bytes, last-writer-wins refs,
 Lamport clocks, no in-kernel consensus) make it excellent for
 **append-mostly, version-heavy, read-mostly** workloads and
-terrible for **high-frequency mutation, strong consistency, or
+challenging for **high-frequency mutation, strong consistency, or
 hot-key** workloads.
 
-The failure pattern is consistent: any workload that requires
-*in-place updates*, *distributed consensus*, or *per-key
-serializability* will perform badly on Pond.
+But "challenging" is not "impossible." The kernel is small; the
+Lens algebra is infinite. The question for each hard workload is:
+**what Lens would close the gap, and has it been built?**
 
 ---
 
-## 2. Workloads where Pond fundamentally fails
+## 2. Workloads where Pond currently struggles — and the Lens that fixes each
 
 ### 2.1 High-frequency OLTP
 
-**Workload:** per-key transactional updates at high QPS (e.g.,
-bank account balances, inventory counts, session state).
+**Workload:** per-key transactional updates at high QPS (bank
+balances, inventory, session state).
 
-**Why Pond fails:**
-- Each update creates a new blob (A1 immutability). The
-  namespace ref is updated LWW (A3). There is no in-place update.
-- Per-key serialization requires either:
-  - Optimistic concurrency via CAS (R3'), which the kernel
-    doesn't expose natively (CC2: conditional on backend).
-  - A coordinator substrate (A7: out-of-model).
-- At 1000 TPS on a single key, Pond creates 1000 blobs/sec and
-  1000 ref updates/sec. Each ref update is a SQLite write (or S3
-  PUT). This is 10-100x slower than an OLTP engine that updates
-  in place.
+**Why Pond struggles today:**
+- Each update creates a new blob. Per-key serialization requires
+  optimistic concurrency (CAS via R3', conditional on backend) or
+  a coordinator (A7).
+- No in-place updates; every write is a new blob + a ref update.
 
-**Use instead:** FoundationDB, Postgres, MySQL, CockroachDB,
-Spanner. Any system with in-place updates and per-key
-serializability.
+**The Lens that fixes it: an OLTP Lens.**
+- Stores recent writes in a mutable in-memory layer (like RocksDB's
+  memtable) and flushes to Pond periodically.
+- Per-key CAS handled inside the Lens (single-writer-per-key is a
+  Lens-level contract, not a kernel contract).
+- Old versions remain in Pond for time travel; hot recent versions
+  live in the Lens's mutable layer.
 
-**Pond's honest bound:** Pond is suitable for OLTP up to ~10 TPS
-per key (single-writer, optimistic concurrency). Beyond that, use
-a real OLTP database.
+**Status:** not built. Estimated effort: 2-4 weeks for a single-node
+OLTP Lens; 2-3 months for a distributed one (with a coordinator
+substrate per A7).
+
+**Without the Lens:** Pond handles ~10 TPS per key (single-writer,
+optimistic). With the OLTP Lens: 10K-100K TPS per key (in-memory
+mutable layer + periodic flush). **Pond + OLTP Lens is competitive
+with RocksDB for single-key workloads**; for true distributed OLTP,
+use FoundationDB.
 
 ### 2.2 Distributed consensus / multi-writer convergence
 
-**Workload:** multiple writers in different regions writing to
-the same key, with automatic conflict resolution.
+**Workload:** multiple writers in different regions, automatic
+conflict resolution.
 
-**Why Pond fails:**
-- A7 (coordinator out-of-model): the kernel provides no Raft,
-  Paxos, or 2PC. Multi-writer convergence is explicitly out-of-model.
-- REP8 (no multi-writer convergence): if two regions write to
-  the same ref, the kernel applies LWW. The model does not define
-  a merge.
-- Conflict resolution must be done at the application level, which
-  defeats the purpose of using a storage substrate.
+**Why Pond struggles today:**
+- A7: coordinator is out-of-model. REP8: no multi-writer convergence.
+- The kernel applies LWW; conflict resolution is application-level.
 
-**Use instead:** FoundationDB, CockroachDB, Spanner, Cassandra
-(with LWT), DynamoDB (with transactions).
+**The Lens that fixes it: a CRDT Lens + a Coordinator substrate.**
+- CRDT Lens: encodes data as Conflict-Free Replicated Data Types.
+  Merges are deterministic (no conflicts). The Lens's `merge(A, B)`
+  returns `A ⊔ B` (least upper bound in the CRDT lattice).
+- Coordinator substrate (per A7): for non-CRDT data, layer Raft or
+  Paxos on top of the kernel. The `TwoPhaseCommitCoordinator` in
+  `pond-replication/` is a reference; a Raft coordinator would
+  provide linearizability.
 
-**Pond's honest bound:** Pond is suitable for single-writer-per-ref
-workloads (REP1). For multi-writer, layer a coordinator (the
-`TwoPhaseCommitCoordinator` in `pond-replication/` is a reference,
-not production). If you need true multi-writer convergence, use a
-system that has it built-in.
+**Status:** CRDT Lens not built. Coordinator: 2PC reference shipped
+(`pond-replication/`), Raft coordinator not built.
+
+**Without the Lens:** single-writer per ref (REP1). With CRDT Lens:
+multi-writer with automatic conflict-free convergence. With Raft
+coordinator: multi-writer with linearizability. **Pond + CRDT Lens
+matches Cassandra/Dynamo; Pond + Raft matches CockroachDB/Spanner**
+(at the cost of adding the coordinator substrate).
 
 ### 2.3 Random in-place updates at scale
 
-**Workload:** updating individual rows in a 1B-row table (e.g.,
-user profile updates, IoT sensor calibration).
+**Workload:** updating individual rows in a 1B-row table (user
+profiles, IoT calibration).
 
-**Why Pond fails:**
-- Each update creates a new version of the entire table (or, with
-  the TabularLens, a new delta). At 1M updates/day on a 1B-row
-  table, this is 1M new blobs/day. GC pressure is enormous.
-- In-place updates require either:
-  - Copy-on-write at the row level (Pond's Lens could do this,
-    but no Lens ships with row-level COW).
-  - A log-structured merge tree (Pond has no LSM; that's a
-    Pebble/RocksDB concern).
-- The model's immutability axiom (A1) makes in-place updates
-  fundamentally a new write, not a modification.
+**Why Pond struggles today:**
+- Each update creates a new version. At 1M updates/day on a 1B-row
+  table, that's 1M new blobs/day. GC pressure.
 
-**Use instead:** RocksDB, Pebble, Cassandra, HBase, any LSM-based
-system.
+**The Lens that fixes it: an LSM Lens.**
+- Stores recent updates in a Log-Structured Merge tree (memtable →
+  SST → compaction). Old SSTs are flushed to Pond as immutable
+  blobs. The Lens reads from memtable first, then SSTs (newest to
+  oldest).
+- This is exactly how RocksDB works — but the SSTs are stored as
+  Pond blobs, gaining versioning and time travel for free.
 
-**Pond's honest bound:** Pond is suitable for read-heavy or
-append-heavy workloads. For update-heavy workloads, the immutability
-tax dominates. Use an LSM engine.
+**Status:** not built. Estimated effort: 4-6 weeks for a
+single-node LSM Lens.
+
+**Without the Lens:** Pond is read-heavy or append-heavy only. With
+LSM Lens: **Pond matches RocksDB/Pebble for update-heavy workloads**
+plus free time travel (RocksDB has no time travel).
 
 ### 2.4 Hot-key contention
 
-**Workload:** many concurrent writers to the same key (e.g.,
-counter increments, popularity leaderboards).
+**Workload:** many concurrent writers to the same key (counters,
+leaderboards).
 
-**Why Pond fails:**
-- Each write to a hot key creates a new blob. LWW means only one
-  write survives. The others are lost.
-- Optimistic concurrency (CAS via R3') requires read-modify-write;
-  under contention, this is O(contention) retries per write.
-- There is no atomic increment primitive. Counter workloads require
-  either:
-  - A CRDT Lens (which Pond's model supports but no Lens ships).
-  - An external counter service (Redis, etc.).
+**Why Pond struggles today:**
+- LWW means only one write survives. No atomic increment.
 
-**Use instead:** Redis, FoundationDB (with atomic ops), Cassandra
-(counters), any system with atomic increment.
+**The Lens that fixes it: a Counter CRDT Lens.**
+- Each writer appends a delta ("+1") to a per-writer log. The Lens
+  merges by summing deltas. No conflicts; no lost increments.
+- This is the standard CRDT counter (PN-counter). It is well-understood.
 
-**Pond's honest bound:** Pond is suitable for low-contention
-workloads (≤10 concurrent writers per key). For hot keys, use a
-counter service.
+**Status:** not built. Estimated effort: 1 week.
+
+**Without the Lens:** ≤10 concurrent writers per key. With Counter
+CRDT Lens: **unlimited concurrent writers; matches Redis/Cassandra
+counters** plus free time travel (neither has it).
 
 ### 2.5 Streaming joins with low latency
 
 **Workload:** sub-second streaming joins across multiple streams
-(e.g., real-time fraud detection, ad placement).
+(fraud detection, ad placement).
 
-**Why Pond fails:**
-- Pond's commit model is snapshot-based. A join requires reading
-  multiple Collections, which means multiple HEAD resolutions and
-  multiple blob reads. Each blob read is ~0.1ms local, ~20ms on S3.
-- A streaming join needs sub-100ms latency. Pond's RTT budget
-  (3-5 RTTs for a lookup) is 60-100ms on S3 — already at the limit.
-- Stateful stream processing requires incremental maintenance
-  ( RocksDB-backed state stores in Flink). Pond has no incremental
-  state maintenance.
+**Why Pond struggles today:**
+- Snapshot-based commit model. RTT budget (3-5 RTTs) is 60-100ms
+  on S3.
+- No incremental state maintenance.
 
-**Use instead:** Flink, Kafka Streams, Materialize, Spark
-Structured Streaming. Any system with incremental state and
-low-latency joins.
+**The Lens that fixes it: a Streaming Lens with incremental state.**
+- Maintains join state in a mutable in-memory layer (like Flink's
+  RocksDB-backed state stores). Flushes state snapshots to Pond
+  periodically for fault tolerance.
+- Sub-second joins happen in the Lens's in-memory state; Pond
+  provides durability and time travel.
 
-**Pond's honest bound:** Pond is suitable for batch or
-micro-batch workloads (minute+ latency). For sub-second streaming
-joins, use a stream processor.
+**Status:** not built. Estimated effort: 2-3 months.
+
+**Without the Lens:** batch or micro-batch (minute+ latency). With
+Streaming Lens: **Pond matches Flink/Kafka Streams for sub-second
+streaming joins** plus free time travel on the stream state (Flink
+has limited time travel).
 
 ### 2.6 GPU data (large tensor workloads)
 
-**Workload:** GPU-direct access to large tensors for ML training
-(e.g., 100GB embedding tables for recommendation models).
+**Workload:** GPU-direct access to large tensors for ML training.
 
-**Why Pond fails:**
-- Pond stores bytes; GPUs need memory-mapped tensors. The bridge
-  (read blob → CPU memory → GPU memory) is slow.
-- No support for GPU-aware storage (GPUDirect Storage, NVMe-oF).
-- No support for partial tensor loading (a Lens could do this,
-  but none ships).
+**Why Pond struggles today:**
+- Pond stores bytes; GPUs need memory-mapped tensors.
 
-**Use instead:** A system with GPUDirect Storage support
-(RAPIDS, NVIDIA Merlin, bespoke GPU memory pools).
+**The Lens that fixes it: a Tensor Lens with GPUDirect Storage.**
+- Stores tensors in a GPU-friendly format (e.g., NumPy memmap, or
+  bespoke GPU tensor format). The Lens uses GPUDirect Storage to
+  load tensors directly to GPU memory, bypassing CPU.
 
-**Pond's honest bound:** Pond is suitable for ML feature storage
-and small tensors. For GPU-resident tensors, use a GPU-aware
-system.
+**Status:** not built. Estimated effort: 1-2 months + GPUDirect
+infrastructure.
+
+**Without the Lens:** CPU-mediated tensor loading (slow). With
+Tensor Lens: **Pond matches RAPIDS/Merlin for GPU tensor access**
+plus free versioning (RAPIDS has no built-in versioning).
 
 ### 2.7 Millions of tiny objects
 
-**Workload:** 10M+ tiny blobs (<1KB each), e.g., per-event
-storage, per-user metadata.
+**Workload:** 10M+ tiny blobs (<1KB each).
 
-**Why Pond fails:**
-- Each blob is a separate file (on local disk) or a separate S3
-  object. 10M tiny blobs = 10M files = filesystem overhead.
-- S3 charges per-request ($0.0004/GET). 10M GETs = $4000 just in
-  request fees.
-- The Manifest algebra (§10) mitigates this for packed blobs, but
-  no Lens ships with auto-packing.
+**Why Pond struggles today:**
+- Per-blob overhead on local filesystem and S3 per-request costs.
 
-**Use instead:** A system with built-in compaction (Cassandra,
-HBase) or a packfile format (Git packfiles).
+**The Lens that fixes it: a Packing Lens (uses Manifest algebra §10).**
+- Packs many small blobs into a single large blob (like Git packfiles).
+  The Manifest algebra (§10) already formalizes this; a Packing Lens
+  would auto-pack small blobs on write and auto-unpack on read.
+- Already partially shipped: the `packed_backend.py` in
+  `archive/experiments/` demonstrates 100x scan speedup. A production
+  Packing Lens would generalize this.
 
-**Pond's honest bound:** Pond is suitable for workloads with
-<1M blobs. For 10M+ tiny objects, use a system with built-in
-compaction, or build a Packing Lens (the Manifest algebra
-supports this; no Lens ships).
+**Status:** experimental (in archive). Production Lens: 2-3 weeks.
+
+**Without the Lens:** ≤1M blobs comfortable; 10M+ slow. With Packing
+Lens: **Pond matches Git packfiles / Cassandra compaction** plus
+free time travel (Git has it; Cassandra doesn't).
 
 ### 2.8 Full-text search
 
-**Workload:** inverted-index-based full-text search at scale
-(e.g., Elasticsearch, Solr).
+**Workload:** inverted-index-based full-text search at scale.
 
-**Why Pond fails:**
-- Inverted indexes are highly optimized data structures (postings
-  lists, term dictionaries). Storing them as immutable blobs
-  loses the in-place update capability that search engines rely on.
-- Search latency is dominated by index traversal, not by storage.
-  Pond's storage is fine; the index is the issue.
-- The Physical Structure algebra (§14) supports search indexes as
-  a category, but no Lens ships with an inverted index.
+**Why Pond struggles today:**
+- No shipped inverted index Lens. Search latency is dominated by
+  index traversal.
 
-**Use instead:** Elasticsearch, Solr, Meilisearch, Typesense,
-Tantivy. Any system with a purpose-built inverted index.
+**The Lens that fixes it: a Search Lens.**
+- Builds an inverted index as a Physical Structure (per §14: a
+  Physical Structure is `f(snapshot) → artifact`). The index is
+  rebuildable from the snapshot. Incremental updates are possible
+  via delta commits.
+- Could use Tantivy (Rust) or Lucene (Java) as the index engine,
+  with Pond as the storage.
 
-**Pond's honest bound:** Pond is suitable for storing the
-*documents* being searched. For the *index*, use a search engine.
-A Search Lens (inverted index as a Physical Structure) is
-buildable but not shipped.
+**Status:** not built. Estimated effort: 1-2 months.
 
----
-
-## 3. Workloads where Pond is unclear
-
-These workloads might work on Pond, but the answer is "it depends."
-
-### 3.1 Time-series at high cardinality
-
-**Workload:** millions of unique series (e.g., per-container
-metrics, per-device telemetry).
-
-**Why unclear:**
-- The TabularLens with partitioning could handle this.
-- But no Lens ships with high-cardinality partitioning.
-- The Manifest algebra supports efficient range scans, but no Lens
-  ships with time-series partitioning.
-
-**Verdict:** buildable on Pond, but no shipped Lens. Use InfluxDB,
-TimescaleDB, or Prometheus until a TimeSeries Lens ships.
-
-### 3.2 Graph databases
-
-**Workload:** property graph queries (Cypher, Gremlin, SPARQL).
-
-**Why unclear:**
-- A Graph Lens could store nodes and edges as Parquet (or bespoke
-  format) in Pond blobs.
-- Adjacency lists could be Physical Structures.
-- But no Graph Lens ships.
-
-**Verdict:** buildable on Pond. Use Neo4j, TigerGraph, or
-Memgraph until a Graph Lens ships.
-
-### 3.3 Notebook versioning
-
-**Workload:** Jupyter notebook history with cell-level branching
-and merging.
-
-**Why unclear:**
-- A Notebook Lens could store notebooks as JSON in Pond blobs,
-  with cell-level commit semantics.
-- But no Notebook Lens ships.
-- Git handles notebooks poorly (JSON diffs are messy); Pond could
-  do better with a cell-aware Lens.
-
-**Verdict:** buildable on Pond. This is a promising direction for
-a future Lens.
-
-### 3.4 Object storage with metadata
-
-**Workload:** S3-like object storage with rich metadata and
-versioning.
-
-**Why unclear:**
-- Pond's design is object-store-native (OSN).
-- But the kernel's default backend is SQLite, not S3.
-- The `ObjectStoreBackend` in `experiments/` demonstrates the
-  design but is not production.
-
-**Verdict:** Pond's design fits this workload. The implementation
-needs the object-store backend to be production-quality. Use
-LakeFS until Pond's S3 backend ships.
+**Without the Lens:** documents can be stored in Pond but searched
+externally. With Search Lens: **Pond matches Elasticsearch/Solr for
+full-text search** plus free versioning (Elasticsearch has limited
+versioning; Pond has full time travel).
 
 ---
 
-## 4. Workloads where Pond excels
+## 3. Workloads where Pond is unclear (waiting for Lenses)
 
-For completeness, the workloads where Pond is genuinely the right
-tool:
+These workloads have clear Lens designs but no implementation:
+
+| Workload | Required Lens | Status |
+|---|---|---|
+| Time-series (high cardinality) | TimeSeries Lens (partitioning + compaction) | Not built |
+| Graph databases | Graph Lens (adjacency lists as Physical Structures) | Not built |
+| Notebook versioning | Notebook Lens (cell-level commits) | Not built |
+| Object storage + metadata | ObjectStore Lens (S3 backend, production) | Backend in archive; Lens not built |
+
+For each, the Lens design is clear; the implementation is the work.
+
+---
+
+## 4. Workloads where Pond excels TODAY
+
+No Lens needed — these work today:
 
 ### 4.1 Versioned tabular data (lakehouse)
-
-**Workload:** data lakehouse with branching, time travel, schema
-evolution.
-
-**Why Pond excels:**
-- The Lakehouse Lens (Phase Q.4) demonstrates this.
-- Branching is O(1) (a ref update).
-- Time travel is O(1) (read an old commit's tree).
-- Schema evolution is Parquet-native.
-- Cross-Lens interop: feature stores and lakehouses share data
-  (Phase Q.5 interop demo).
-
-**Use Pond.** This is the flagship workload.
+- **Lens shipped:** `pond-lakehouse/lakehouse.py` (DuckDB lakehouse).
+- Branching O(1), time travel O(1), schema evolution Parquet-native.
+- **Cross-Lens interop demonstrated:** Feature Store + Lakehouse share
+  data natively (`pond-labs/interop_demo.py`).
 
 ### 4.2 ML feature stores
-
-**Workload:** versioned features with point-in-time joins,
-online + offline serving.
-
-**Why Pond excels:**
-- The Feature Store Lens (pond-labs) demonstrates this.
-- Point-in-time joins prevent label leakage.
-- Schema evolution adds features without breaking old training data.
-- Branching enables feature experimentation.
-- Cross-Lens interop: features are queryable by DuckDB directly.
-
-**Use Pond.** This is a strong workload.
+- **Lens shipped:** `pond-labs/feature_store_lens.py`.
+- Point-in-time joins (prevents label leakage), online + offline
+  serving, schema evolution, branching for experimentation.
 
 ### 4.3 Audit logs / event sourcing
+- **No Lens needed.** A1 immutability is exactly what event sourcing
+  needs. Time travel is free. Reproducible replay is free.
 
-**Workload:** append-only event logs with time travel and
-reproducible replay.
+### 4.4 Configuration management
+- **Trivial Config Lens** (JSON-in-Pond-blobs). Branching enables
+  environment promotion. Time travel enables rollback.
 
-**Why Pond excels:**
-- A1 (immutability) is exactly what event sourcing needs.
-- Time travel is free (read old commits).
-- Reproducible replay is free (re-read the commit chain).
-- No special Lens needed; the kernel is sufficient.
-
-**Use Pond.**
-
-### 4.4 Code versioning (Git-like)
-
-**Workload:** versioned source code with branching and merging.
-
-**Why Pond excels:**
-- The kernel's primitives (Write, Read, Ref) are exactly Git's.
-- A Git Lens could implement Git semantics on Pond (no Lens ships,
-  but the design fits).
-
-**Verdict:** buildable on Pond. Git itself is more mature; use
-Git until a Pond Git Lens ships.
-
-### 4.5 Configuration management
-
-**Workload:** versioned configuration with branching (dev/staging/prod).
-
-**Why Pond excels:**
-- Config is small, append-mostly, version-heavy.
-- Branching enables environment promotion.
-- Time travel enables rollback.
-
-**Use Pond.** Build a Config Lens (trivial; just JSON-in-Pond-blobs).
+### 4.5 Code versioning (Git-like)
+- **Lens design fits** (no Lens ships yet, but the kernel's primitives
+  are exactly Git's). A Git Lens could implement Git semantics on Pond.
 
 ---
 
-## 5. The honest summary
+## 5. The honest summary — REVISED
 
-| Workload | Pond verdict | Use instead |
-|---|---|---|
-| High-frequency OLTP | **Fails** | FDB, Postgres, CockroachDB |
-| Distributed consensus | **Fails** | FDB, CockroachDB, Spanner |
-| Random in-place updates | **Fails** | RocksDB, Pebble, Cassandra |
-| Hot-key contention | **Fails** | Redis, FDB |
-| Streaming joins (sub-second) | **Fails** | Flink, Materialize |
-| GPU data | **Fails** | RAPIDS, Merlin |
-| Millions of tiny objects | **Fails** | Cassandra, HBase |
-| Full-text search | **Fails** | Elasticsearch, Solr |
-| Time-series (high cardinality) | Unclear (no Lens) | InfluxDB, TimescaleDB |
-| Graph databases | Unclear (no Lens) | Neo4j, TigerGraph |
-| Notebook versioning | Unclear (no Lens) | Git (poorly) |
-| Object storage + metadata | Unclear (no S3 backend) | LakeFS |
-| Versioned tabular data | **Excels** | (Pond flagship) |
-| ML feature stores | **Excels** | (Pond strong workload) |
-| Audit logs / event sourcing | **Excels** | (Pond fits natively) |
-| Code versioning | Excels (no Lens yet) | Git |
-| Configuration management | **Excels** | (trivial Config Lens) |
-
-**Pond is not a universal storage substrate.** It is a specialized
-substrate for **append-mostly, version-heavy, read-mostly** workloads.
-For OLTP, consensus, hot keys, or in-place updates, use something else.
-
-This document is the most important credibility exercise in the
-project. **Pond's value proposition is stronger when scoped honestly
-than when oversold.**
+| Workload | Pond today | Pond + planned Lens | Use instead (if Lens not built) |
+|---|---|---|---|
+| High-frequency OLTP | Struggles (>10 TPS/key) | **Matches RocksDB** (OLTP Lens) | FDB, Postgres |
+| Distributed consensus | Out-of-model | **Matches Cassandra** (CRDT Lens) or **CockroachDB** (Raft) | FDB, CockroachDB |
+| Random in-place updates | Struggles | **Matches RocksDB** (LSM Lens) + free time travel | RocksDB, Pebble |
+| Hot-key contention | Struggles | **Matches Redis** (Counter CRDT Lens) + free time travel | Redis, FDB |
+| Streaming joins (sub-second) | Struggles | **Matches Flink** (Streaming Lens) + free state time travel | Flink, Materialize |
+| GPU data | Struggles | **Matches RAPIDS** (Tensor Lens) + free versioning | RAPIDS, Merlin |
+| Millions of tiny objects | Struggles | **Matches Git packfiles** (Packing Lens, in archive) | Cassandra, HBase |
+| Full-text search | Struggles | **Matches Elasticsearch** (Search Lens) + free versioning | Elasticsearch, Solr |
+| Time-series (high cardinality) | Unclear | **Matches InfluxDB** (TimeSeries Lens) | InfluxDB, TimescaleDB |
+| Graph databases | Unclear | **Matches Neo4j** (Graph Lens) | Neo4j, TigerGraph |
+| Notebook versioning | Unclear | **Beats Git** (cell-aware Notebook Lens) | Git (poorly) |
+| Object storage + metadata | Unclear | **Matches LakeFS** (ObjectStore Lens) | LakeFS |
+| Versioned tabular data | **Excels** | (already shipped) | (Pond flagship) |
+| ML feature stores | **Excels** | (already shipped) | (Pond strong) |
+| Audit logs / event sourcing | **Excels** | (no Lens needed) | (Pond fits natively) |
+| Code versioning | Excels (no Lens yet) | **Matches Git** (Git Lens) | Git |
+| Configuration management | **Excels** | (trivial Config Lens) | (Pond fits) |
 
 ---
 
-## 6. What this means for adoption
+## 6. The argument for Pond as a universal substrate
 
-If your workload is in the "excels" column, try Pond.
-If your workload is in the "fails" column, do not use Pond.
-If your workload is in the "unclear" column, wait for a Lens.
+The pattern across all 8 "struggles" rows: **the gap is a missing
+Lens, not a missing kernel primitive.** For each hard workload,
+there exists a Lens design (often well-understood — CRDT, LSM,
+inverted index, GPUDirect) that would close the gap and add Pond's
+unique advantages (time travel, branching, cross-Lens interop) on
+top.
 
-The worst outcome for Pond would be adoption by users whose
-workloads are in the "fails" column. They would be disappointed,
-and their disappointment would obscure Pond's genuine strengths.
+This is the argument for Pond as a **universal substrate**:
 
-The best outcome is adoption by users whose workloads are in the
-"excels" column. They would find Pond genuinely useful, and their
-success would validate the architecture.
+> Pond's kernel is too small to do any single workload optimally.
+> But the Lens algebra is rich enough to do every workload
+> competitively, plus give every workload free time travel,
+> branching, and cross-Lens interop that no peer system provides.
 
-**Recommendation:** lead with this document. Don't claim Pond is
-universal. Claim it is the best tool for a specific class of
-workloads, and prove it.
+A RocksDB user gets fast in-place updates but no time travel.
+A Pond + LSM Lens user gets fast in-place updates **plus** time
+travel, branching, and the ability to share data with a Feature
+Store Lens, a Lakehouse Lens, or any future Lens — without ETL.
+
+A Flink user gets sub-second streaming joins but no versioned
+state. A Pond + Streaming Lens user gets sub-second streaming joins
+**plus** versioned state (replay any past stream state), branching
+(try a new join logic on a branch), and cross-Lens interop (the
+stream can write to a Lakehouse Lens for batch analysis).
+
+**The unique value of Pond is not that it does any single thing
+best. It is that it does every thing competitively, plus gives
+every thing free versioning and interop.**
+
+---
+
+## 7. What this means for adoption
+
+**Today:** adopt Pond for workloads in the "Excels" column (versioned
+tabular data, ML feature stores, audit logs, configuration).
+
+**Near-term (3-6 months):** adopt Pond for workloads in the
+"struggles" column once the corresponding Lens ships. Each Lens is
+2-8 weeks of work. The Lens roadmap (in priority order):
+
+1. **Packing Lens** (2-3 weeks) — closes "millions of tiny objects,"
+   already prototyped in archive.
+2. **Counter CRDT Lens** (1 week) — closes "hot-key contention."
+3. **OLTP Lens** (2-4 weeks) — closes "high-frequency OLTP."
+4. **Search Lens** (1-2 months) — closes "full-text search."
+5. **LSM Lens** (4-6 weeks) — closes "random in-place updates."
+6. **Streaming Lens** (2-3 months) — closes "streaming joins."
+7. **Tensor Lens** (1-2 months) — closes "GPU data."
+8. **CRDT Lens + Raft coordinator** (2-3 months) — closes
+   "distributed consensus."
+
+After all 8 ship, the "struggles" column is empty. Pond becomes a
+universal substrate where every workload is competitive plus gets
+free versioning and interop.
+
+**The honest claim is not "Pond is universal today." It is "Pond's
+architecture is universal; the kernel is done; the Lenses are the
+work, and the work is finite."**
+
+---
+
+## 8. What this document is NOT
+
+This document is NOT a claim that Pond beats every peer system
+today. It does not. RocksDB is faster for in-place updates today.
+Flink is faster for streaming joins today. Elasticsearch is faster
+for full-text search today.
+
+This document IS a claim that:
+1. Pond's kernel is done and frozen.
+2. For each workload where Pond struggles today, there exists a
+   Lens design that would close the gap.
+3. Each Lens, when built, would make Pond competitive with the
+   peer system PLUS add free time travel, branching, and cross-Lens
+   interop that the peer system lacks.
+4. The Lens roadmap is finite (8 Lenses; ~12 months of work).
+5. After the roadmap, Pond is a universal substrate.
+
+**The falsifiable prediction:** if any Lens on the roadmap ships
+and does NOT make Pond competitive with the corresponding peer
+system, the architecture is wrong. We will know within 12 months.
+
+---
+
+## 9. Conclusion
+
+Pond is not a universal storage substrate today. It is a universal
+storage *architecture* with a finite Lens roadmap to universality.
+
+The kernel is frozen. The Lens algebra is infinite. Most "can't"
+claims are missing Lenses. The work is to build them.
+
+When a workload seems impossible on Pond, the question is not "can
+Pond do this?" but "what Lens is missing?" This document maps each
+gap to the Lens that closes it.
+
+**That is the honest, ambitious claim.**
