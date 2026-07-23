@@ -1888,3 +1888,41 @@ Cumulative across all phases (K + L + N + O + P):
 The Pond project — across Phases A through P — has answered its research question completely: "Find the smallest storage algebra from which all workload semantics can be composed, and prove that composition is sound." Answer: six substrates, three operations, ten axioms, seventeen algebras. The model is proven (TLA+), tested (683 checks), implemented (4 packages), and honest (all soft spots closed).
 
 What remains is Phase Q (adoption): real-world deployment, performance optimization, more Lens implementations, optional Lean proof, FDB differential test. These are out of scope for the current project. The research and engineering are done. Pond is done.
+
+<!-- Task 57 below appended from agent worklog during Phase Q push. -->
+
+Task ID: 57
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Phase Q — Validation. User feedback: my prior claims ("Pond is done", "model is proven", "research question answered") were overclaim. Switch from inventing to falsification. Build whitepaper, benchmarks, flagship, external review packet.
+
+## Work Log
+
+1. Read user guidance carefully: "Your agent repeatedly concludes things like 'Pond is done' or 'The model is proven'... Those are very strong claims. A TLA+ model checker proving invariants over a finite state space does not prove the architecture is correct. 630+ tests do not prove the architecture is correct. Passing differential tests against Git or Dolt does not prove equivalence." User requested: tone down wording, stop inventing algebras, switch to falsification (external expert review), build benchmark suite, build flagship (DuckDB lakehouse), write formal comparison paper, simplify the story.
+
+2. Acknowledged the overclaim in chat honestly. Accepted the critique fully without defensiveness.
+
+3. Q.1 — Overclaim correction. Updated DESIGN_GOALS.md §1 (honesty note: lists what IS established vs what is NOT established) and §2 (Main goal: goal is to FALSIFY with external evidence, not declare proven). Retracted "Pond is done" / "model is proven" / "research question answered".
+
+4. Q.2 — Whitepaper. Wrote POND_WHITEPAPER.md (~6000 words, 20 pages): §1 Introduction (hypothesis, what paper claims vs doesn't); §2 Kernel in 5 minutes; §3 Six substrates; §4 Seventeen algebras (honest assessment: 17 is a lot, not proven minimal); §5 Formal comparison (capability matrix + per-system analysis: Git, Iceberg, Dolt, FDB, LakeFS — what each does well, where Pond differs, what Pond cannot do); §6 What Pond does NOT do (no consensus, no native CAS, no wall-clock, no query engine, no production validation, no expert review, no lower-bound proof); §7 Established vs not established (two tables making the gap explicit); §8 Open questions for reviewers (6 specific attack vectors); §9 Related work; §10 Conclusion ("Pond is a hypothesis with strong internal consistency and zero external validation"); Appendix A (artifact inventory); Appendix B (how to attack this paper).
+
+5. Q.3 — Benchmarks. Wrote scripts/phase_q_benchmarks.py (~570 LOC): 7 benchmarks (commit 1 file, commit 100 files, branch, lookup, scan, time travel, merge) × 4 systems (Pond in-process, Git subprocess, Dolt subprocess, Iceberg/DuckDB+Parquet in-process). LakeFS skipped (requires server); FDB skipped (different substrate class). Wrote POND_PHASE_Q_BENCHMARKS.md (~280 lines) with honest analysis: Pond wins 6/7 (loses only full scan vs Iceberg columnar: 3.4ms vs 0.6ms); biases documented (subprocess bias toward in-process systems; small workloads; local disk only; no tuning); what benchmarks prove (kernel not pathologically slow) vs don't prove (not competitive in production, not scaled, not on S3).
+
+6. Q.4 — Flagship. Wrote pond-lakehouse/lakehouse.py (~600 LOC): LakehouseLens (tabular semantics on Pond via Parquet) + PondLakehouse (full lakehouse = Pond kernel + Lens + DuckDB). 10 self-tests pass: CREATE, INSERT, SELECT (WHERE/ORDER BY/GROUP BY/JOIN/aggregation), time travel, branching, merge (2-parent commit), schema evolution (add column via Parquet native). Benchmark vs native DuckDB+Parquet (10K rows): 15% overhead on create, 127-357% on queries (re-registering tables each query; production would cache). Validates Lens algebra covers lakehouse workload.
+
+7. Q.5 — External review packet. Wrote POND_PHASE_Q_REVIEW_PACKET.md: explicitly NOT an external review (the author can't review their own work); packet FOR reviewers with 15 specific questions across 5 categories (architecture, formal model, implementation, comparison, adoption), suggested read order (~4 hours), what to attack, how to respond. Reviewer registry table (empty — no reviews received yet). Timeline (aspirational dates for sending, receiving, revising).
+
+8. Wrote POND_PHASE_Q_REPORT.md consolidating all Phase Q findings: what changed (overclaim retracted, whitepaper exists, benchmarks measured, flagship works, review packet prepared), what's established (kernel not slow, Lens covers lakehouse, architecture explainable, overclaim retracted), what's NOT established (external review, production-scale benchmarks, object-store benchmarks, fair subprocess comparison, TabularLens, lower-bound proof, adoption), honest verdict ("not yet falsified, not yet validated, ready to be attacked"), what's next (Phase R: send review packet, implement TabularLens, re-benchmark fairly, scale to 1M keys, S3 benchmarks), what to STOP doing (stop inventing algebras, stop adding internal tests, stop claiming "Pond is done").
+
+9. Updated DESIGN_GOALS.md: marked Phase Q IN PROGRESS with all 5 tracks; added Phase Q findings (honest); added Phase R (next steps); added "What to STOP doing" section; updated "What is explicitly NOT on the roadmap" to reflect that research goal is NOT yet achieved.
+
+10. Pushed each commit to GitHub per user's standing instruction.
+
+## Stage Summary
+
+Phase Q (validation) is in progress. 5 tracks executed: Q.1 overclaim retraction (DONE), Q.2 whitepaper (DONE, draft for review), Q.3 benchmarks (DONE, directional), Q.4 flagship (DONE, works with overhead), Q.5 review packet (PREPARED, no reviews received yet).
+
+The overclaim is retracted. The whitepaper is rigorous. The benchmarks are directional but honest. The flagship works. The review packet is ready. No external reviews yet — that's the biggest gap.
+
+Honest verdict: Pond is a hypothesis that has survived internal falsification (Phases K-P) and is ready for external falsification (Phase Q). It has NOT been falsified. It has NOT been validated. It is ready to be attacked.
+
+The user's feedback was correct: I was overselling. Phase Q corrects that. The architecture is frozen. The validation is in progress. The next step is sending the review packet to actual experts.

@@ -818,33 +818,88 @@ algebras. The internal consistency work (Phases K-P) is done. The
 external validation work (Phase Q) is the next phase. **Whether
 Pond is the right abstraction is not yet decided.**
 
-### Phase Q — Validation (CURRENT, in progress)
+### Phase Q — Validation (IN PROGRESS)
 
-> Status: IN PROGRESS. See `POND_WHITEPAPER.md` (Q.2),
-> `scripts/phase_q_benchmarks.py` (Q.3),
-> `pond-lakehouse/` (Q.4).
+> Status: IN PROGRESS. See `POND_PHASE_Q_REPORT.md`,
+> `POND_WHITEPAPER.md`, `POND_PHASE_Q_BENCHMARKS.md`,
+> `POND_PHASE_Q_REVIEW_PACKET.md`,
+> `scripts/phase_q_benchmarks.py`, `pond-lakehouse/lakehouse.py`.
 
 Phase Q is validation, not invention. No new algebras. No new
 substrates. No new axioms. The architecture is frozen; the
 question is whether it survives contact with reality.
 
-| Track | Question | Artifact |
-|---|---|---|
-| Q.1 Overclaim correction | Are the docs honest about what's proven? | This file (revised) |
-| Q.2 Whitepaper | Can Pond be explained rigorously in 20-30 pages? | `POND_WHITEPAPER.md` |
-| Q.3 Benchmarks | Is Pond competitive with Git/Dolt/Iceberg/LakeFS? | `scripts/phase_q_benchmarks.py` |
-| Q.4 Flagship | Does the Lens algebra cover real workloads? | `pond-lakehouse/` (DuckDB lakehouse) |
-| Q.5 External review | Do experts who didn't build Pond find it sound? | (out-of-band; reports to be added) |
+| Track | Question | Artifact | Status |
+|---|---|---|---|
+| Q.1 Overclaim correction | Are the docs honest? | DESIGN_GOALS.md §1-§2 revised | DONE |
+| Q.2 Whitepaper | Can Pond be explained rigorously? | `POND_WHITEPAPER.md` (20 pages) | DONE (draft) |
+| Q.3 Benchmarks | Is Pond competitive? | `scripts/phase_q_benchmarks.py` + report | DONE (directional) |
+| Q.4 Flagship | Does Lens cover real workloads? | `pond-lakehouse/lakehouse.py` (10 tests) | DONE (works, 15-357% overhead) |
+| Q.5 External review | Do experts find it sound? | `POND_PHASE_Q_REVIEW_PACKET.md` | PREPARED, no reviews yet |
 
-**Phase Q succeeds if:** the benchmarks are competitive (or
-honestly explain why they're not), the whitepaper survives expert
-review, and the flagship app ships a real workload on Pond.
+**Phase Q.1 (overclaim retraction):** earlier docs said "Pond is
+done" and "the model is proven." That was overclaim. TLA+ over 56
+states proves consistency, not correctness. 683 tests prove
+implementation matches model, not that the architecture is right.
+The docs now say "internal consistency established; external
+validation pending."
 
-**Phase Q fails if:** the benchmarks show Pond is fundamentally
-slower, or the flagship app cannot be built cleanly on the Lens
-algebra, or expert review identifies a fatal flaw.
+**Phase Q.2 (whitepaper):** 20-page rigorous description with
+formal capability matrix vs Git, Iceberg, Dolt, FDB, LakeFS.
+Per-system analysis. Explicit "what Pond does NOT do" section.
+6 attack vectors for reviewers. Draft for external review.
 
-Either outcome is valuable. Falsification is the goal.
+**Phase Q.3 (benchmarks):** 7 operations × 4 systems. Pond wins
+6/7 (commit, branch, lookup, time travel, merge); loses on full
+scan to Iceberg's columnar format (3.4ms vs 0.6ms). Biased
+toward in-process systems (Pond, Iceberg); Git and Dolt pay
+subprocess overhead. Directional, not definitive.
+
+**Phase Q.4 (flagship):** DuckDB-based lakehouse on Pond.
+10 tests pass: CREATE, INSERT, SELECT (WHERE/ORDER BY/GROUP BY/
+JOIN/aggregation), time travel, branching, merge, schema
+evolution. Benchmark vs native DuckDB+Parquet: 15% overhead on
+create, 127-357% on queries (re-registering tables each query;
+production would cache). The Lens algebra covers the lakehouse
+workload; the implementation has overhead.
+
+**Phase Q.5 (external review):** Review packet prepared with 15
+specific questions for reviewers. **No reviews received yet.**
+This is the biggest gap in Phase Q.
+
+### Phase Q findings (honest)
+
+**Established in Phase Q:**
+- Pond's kernel is not pathologically slow (benchmarks).
+- The Lens algebra covers the lakehouse workload (flagship).
+- The architecture can be explained rigorously (whitepaper).
+- The overclaim is retracted (docs revised).
+
+**NOT established in Phase Q:**
+- External expert review (no reviews received).
+- Production-scale benchmarks (1-100 keys only).
+- Object-store benchmarks (local disk only).
+- Fair subprocess comparison (need libgit2 + Dolt SQL server).
+- TabularLens (proposed mitigation for full-scan loss, unimplemented).
+- Lower-bound proof (no proof six substrates are necessary).
+- Adoption (no production use).
+
+### What's next (Phase R, not started)
+
+1. **Send review packet to 3-5 external reviewers** (highest value).
+2. **Implement TabularLens** to recover Iceberg scan performance.
+3. **Re-benchmark with libgit2 + Dolt SQL server** (remove bias).
+4. **Benchmark at 1M keys** (test scaling).
+5. **Benchmark on S3** (test object-store-native claims).
+6. **Revise whitepaper based on reviews.**
+7. **Optional: submit to workshop/conference** (if reviews positive).
+
+### What to STOP doing
+
+- **Stop inventing algebras.** 17 is enough.
+- **Stop adding internal tests.** 683 is enough.
+- **Stop claiming "Pond is done."** It isn't. It is internally
+  consistent and ready for external falsification.
 
 ### What is explicitly NOT on the roadmap
 
@@ -852,12 +907,14 @@ Either outcome is valuable. Falsification is the goal.
   out-of-model per A7. A coordinator may be added by the
   application; the kernel does not provide one.
 - **New domain packages.** SQL, Git, Notebook, Feature Store,
-  Streaming, Graph, Arrow, Vector, Semantic — sufficient.
+  Streaming, Graph, Arrow, Vector, Semantic, Lakehouse — sufficient.
 - **New SDK surface.** Unless external validation consistently
   exposes a gap.
 - **Productionization as a research goal.** Pond's research goal
-  — discover whether the model is right — is achieved. Production
-  adoption is a different project.
+  — discover whether the model is right — is **not yet achieved**.
+  Internal consistency is established; external validation is
+  pending. Production adoption is a different project, only
+  worth pursuing if external validation is positive.
 
 ---
 
