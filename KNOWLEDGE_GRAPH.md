@@ -125,6 +125,13 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/README.md` | — | — | Folder purpose. |
 
+### 2.5b pond-lab/ (Lab experiments — 2 files)
+
+| File | LOC | Exports | Purpose |
+|---|---|---|---|
+| `pond-lab/track1_compat_matrix.py` | 340 | (tests) | **Track 1:** Bidirectional Lens compatibility matrix (10/10 pass). 6 badges. |
+| `pond-lab/README.md` | — | — | Lab tracks overview. |
+
 ### 2.6 scripts/ (Tests and benchmarks — 11 files, ~5400 LOC)
 
 | File | LOC | Checks | Purpose |
