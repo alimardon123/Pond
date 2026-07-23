@@ -26,8 +26,8 @@ Design:
 import json, time, sys, os, struct, hashlib
 from typing import Optional, Iterator
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prototype"))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "libraries"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-core"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-sdk"))
 from pond_minimal import PondMinimal
 from prolly_view import ProllyViewBase, ProllyTree
 
