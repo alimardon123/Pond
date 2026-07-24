@@ -134,22 +134,23 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/README.md` | — | — | Folder purpose. |
 
-### 2.5b pond-lab/ (Lab experiments — 12 files)
+### 2.5b pond-lab/ (Lab experiments — 13 files)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
 | `pond-lab/track1_compat_matrix.py` | 340 | (tests) | **Track 1:** Bidirectional Lens compatibility matrix (10/10 pass). Level 1 cert. |
 | `pond-lab/track2_index_portability.py` | 380 | (tests) | **Track 2:** Index portability (18/18 pass). Level 2 cert. |
-| `pond-lab/track3_lens_vs_opponent.py` | 460 | (benchmarks) | **Track 3:** Lens-vs-opponent benchmarks (Lakehouse vs DuckDB+Parquet, FS vs Feast). |
+| `pond-lab/track3_lens_vs_opponent.py` | 460 | (benchmarks) | **Track 3:** Lens-vs-opponent benchmarks. |
 | `pond-lab/track4_object_store_efficiency.py` | 480 | (tests) | **Track 4:** Object-store efficiency (7 experiments; packing = 204x reduction). |
 | `pond-lab/track5_lens_composability.py` | 380 | (tests) | **Track 5:** Lens composability — ETL-free chain (15/15 pass). |
-| `pond-lab/track6_case_studies.py` | 440 | (tests) | **Track 6:** Real-world case studies (25/25 pass). Clinical + ML. |
-| `pond-lab/track7_reverse_composability.py` | 450 | (tests) | **Track 7:** Reverse composability — symmetric interop (24/24 pass). |
-| `pond-lab/track8_storage_independence.py` | 350 | (tests) | **Track 8:** Storage Independence cert (23/23 pass). Level 3 cert. |
+| `pond-lab/track6_case_studies.py` | 440 | (tests) | **Track 6:** Real-world case studies (25/25 pass). |
+| `pond-lab/track7_reverse_composability.py` | 450 | (tests) | **Track 7:** Reverse composability (24/24 pass). |
+| `pond-lab/track8_storage_independence.py` | 350 | (tests) | **Track 8:** Storage Independence cert (23/23 pass). |
 | `pond-lab/track9_production_lakehouse.py` | 500 | (tests) | **Track 9:** Production Lakehouse with caching (20/20 pass, 2.2x speedup). |
-| `pond-lab/track10_storage_optimization.py` | 430 | (tests) | **Track 10:** Storage optimization at scale (10/10 pass, 996x fewer GETs at 500K). |
+| `pond-lab/track10_storage_optimization.py` | 430 | (tests) | **Track 10:** Storage optimization at scale (10/10 pass, 996x fewer GETs). |
+| `pond-lab/track11_pond_vs_iceberg.py` | 640 | (benchmarks) | **Track 11:** Head-to-head vs Iceberg at 100K+500K (Pond wins 4/7 at 500K). |
 | `pond-lab/COMPATIBILITY_SUITE.md` | 80 | — | Compatibility Suite: 3 certification levels. |
-| `pond-lab/README.md` | — | — | Lab tracks overview (10 tracks). |
+| `pond-lab/README.md` | — | — | Lab tracks overview (11 tracks). |
 
 ### 2.6 scripts/ (Tests and benchmarks — 11 files, ~5400 LOC)
 

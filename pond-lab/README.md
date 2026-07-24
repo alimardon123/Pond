@@ -18,6 +18,7 @@
 | 8 | Storage Independence certification (same bytes, different engines) | **23/23 pass** (Level 3 of Compatibility Suite) |
 | 9 | Production-quality Lakehouse Lens (caching, invalidation, multi-table) | **20/20 pass** (2.2x speedup with cache) |
 | 10 | Storage optimization at scale (packed Parquet, up to 500K records) | **10/10 pass** (996x fewer GETs at 500K) |
+| 11 | Head-to-head vs Iceberg at scale (100K + 500K, multi-workload) | **Done** (Pond wins 4/7 ops at 500K) |
 
 ## Track 1: Bidirectional Lens Compatibility Matrix
 
