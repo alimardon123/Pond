@@ -150,8 +150,13 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-lab/track10_storage_optimization.py` | 430 | (tests) | **Track 10:** Storage optimization at scale (10/10 pass, 996x fewer GETs). |
 | `pond-lab/track11_pond_vs_iceberg.py` | 640 | (benchmarks) | **Track 11:** Head-to-head vs Iceberg proxy at 100K+500K (Pond wins 4/7 at 500K). |
 | `pond-lab/track12_pond_vs_real_iceberg.py` | 540 | (benchmarks) | **Track 12:** Head-to-head vs REAL Apache Iceberg (pyiceberg v0.11.1). Pond wins 5/6 at 100K. |
+| `pond-lab/track13_honest_benchmarks.py` | 500 | (benchmarks) | **Track 13:** Honest benchmarks with correctness assertions + kernel/query separation. |
 | `pond-lab/COMPATIBILITY_SUITE.md` | 80 | — | Compatibility Suite: 3 certification levels. |
 | `pond-lab/README.md` | — | — | Lab tracks overview (12 tracks). |
+| `pond-sdk/extensions/README.md` | 80 | — | Extensions architecture overview. |
+| `pond-sdk/extensions/semantic/README.md` | 60 | — | Semantic adapters overview. |
+| `pond-sdk/extensions/physical_structures/README.md` | 90 | — | Physical Structure type hierarchy. |
+| `tests/test_all.py` | 110 | (pytest) | Single pytest entry point: 21 test functions covering all suites. |
 
 ### 2.6 scripts/ (Tests and benchmarks — 11 files, ~5400 LOC)
 
