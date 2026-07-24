@@ -491,186 +491,28 @@ class CrossLens:
 
 
 # ===========================================================================
-# OssieSemanticLens — aligned with Apache Ossie open semantic interchange spec
+# Semantic models are now an OPTIONAL extension.
+#
+# The base Lens (this file) does NOT include semantic model support.
+# To use semantic models (Ossie, Cube, dbt, etc.), install the extension:
+#
+#   from extensions.semantic_ossie import SemanticLens, OssieAdapter
+#
+# Or create a custom adapter:
+#
+#   from extensions.semantic_base import SemanticModelAdapter
+#   from extensions.semantic_ossie import SemanticLens
+#
+#   class MyAdapter(SemanticModelAdapter): ...
+#   semantic = SemanticLens(kernel, "semantic", adapter=MyAdapter())
+#
+# This keeps the core Lens SDK small and lets different deployments
+# use different semantic standards.
 # ===========================================================================
-
-class SemanticModelAdapter:
-    """Abstract interface for semantic model formats.
-    Pond supports multiple semantic model standards (Ossie, Cube, dbt, etc.)
-    via adapters. The kernel and Lens SDK are NOT coupled to any specific format."""
-    def export_model(self, lens: 'Lens') -> dict:
-        raise NotImplementedError
-    def import_model(self, lens: 'Lens', model: dict) -> None:
-        raise NotImplementedError
-
-
-class OssieAdapter(SemanticModelAdapter):
-    """Apache Ossie adapter — one implementation of the semantic model interface."""
-
-    def export_model(self, lens: 'Lens') -> dict:
-        """Export semantic definitions in Ossie format."""
-        state = lens.base.read_all()
-        model = {"name": lens.name, "datasets": [], "metrics": [], "relationships": []}
-        for key in state:
-            if key.startswith("_semantic/metrics/"):
-                model["metrics"].append(lens.decode(lens.kernel.read_blob(state[key])))
-            elif key.startswith("_semantic/relationships/"):
-                model["relationships"].append(lens.decode(lens.kernel.read_blob(state[key])))
-        return model
-
-    def import_model(self, lens: 'Lens', model: dict) -> None:
-        """Import an Ossie-format model into the Lens."""
-        for metric in model.get("metrics", []):
-            lens.put(f"_semantic/metrics/{metric['name']}", metric)
-        for rel in model.get("relationships", []):
-            lens.put(f"_semantic/relationships/{rel['name']}", rel)
-
-
-class SemanticLens(Lens):
-    """
-    A Lens that manages semantic models (metrics, dimensions, relationships).
-
-    NOT coupled to any specific semantic model standard. Uses adapters:
-      - OssieAdapter for Apache Ossie format
-      - Future: CubeAdapter, DbtAdapter, etc.
-
-    The Lens stores metric/dimension/relationship definitions as blobs.
-    Adapters translate between the internal format and external standards.
-    """
-
-    def import_ossie_model(self, model: dict) -> str:
-        """Import an Ossie-format semantic model.
-        The model dict follows the Ossie core spec."""
-        model_bytes = json.dumps(model, sort_keys=True).encode()
-        h = self.kernel.write(model_bytes)
-        self.put_raw(f"_ossie/models/{model['name']}", h)
-        # Also index each metric, dimension, and relationship
-        for metric in model.get("metrics", []):
-            self.put(f"_semantic/metrics/{metric['name']}", metric)
-        for dataset in model.get("datasets", []):
-            for field in dataset.get("fields", []):
-                if field.get("dimension"):
-                    self.put(f"_semantic/dimensions/{field['name']}", {
-                        "name": field["name"],
-                        "source": dataset["source"],
-                        "field": field["name"],
-                        "type": field.get("type", "string"),
-                        "is_time": field.get("dimension", {}).get("is_time", False),
-                        "ai_context": field.get("ai_context"),
-                    })
-        for rel in model.get("relationships", []):
-            self.put(f"_semantic/relationships/{rel['name']}", rel)
-        return self.commit(f"import Ossie model '{model['name']}'")
-
-    def export_ossie_model(self, model_name: str) -> Optional[dict]:
-        """Export a semantic model in Ossie format."""
-        h = self.base.lookup(f"_ossie/models/{model_name}")
-        if not h:
-            return None
-        return json.loads(self.kernel.read_blob(h))
-
-    def define_metric_ossie(self, name: str, source: str, field: str,
-                            dialects: dict[str, str], dimensions: list = None,
-                            ai_context: str = None) -> None:
-        """Define a metric with multi-dialect expressions (Ossie pattern).
-        dialects: {"ANSI_SQL": "SUM(amount)", "SNOWFLAKE": "SUM(amount)", ...}"""
-        metric = {
-            "name": name,
-            "source": source,
-            "field": field,
-            "expression": {"dialects": dialects},
-            "dimensions": dimensions or [],
-            "ai_context": ai_context,
-            "created_at": time.time(),
-        }
-        self.put(f"_semantic/metrics/{name}", metric)
-
-    def define_dimension_ossie(self, name: str, source: str, field: str,
-                               dim_type: str = "string", is_time: bool = False,
-                               ai_context: str = None) -> None:
-        """Define a dimension (Ossie pattern with ai_context)."""
-        dim = {
-            "name": name,
-            "source": source,
-            "field": field,
-            "type": dim_type,
-            "dimension": {"is_time": is_time},
-            "ai_context": ai_context,
-        }
-        self.put(f"_semantic/dimensions/{name}", dim)
-
-    def define_relationship_ossie(self, name: str, from_dataset: str,
-                                  from_columns: list[str], to_dataset: str,
-                                  to_columns: list[str]) -> None:
-        """Define a relationship (Ossie pattern with composite key support)."""
-        rel = {
-            "name": name,
-            "from": {"dataset": from_dataset, "columns": from_columns},
-            "to": {"dataset": to_dataset, "columns": to_columns},
-        }
-        self.put(f"_semantic/relationships/{name}", rel)
-
-    def list_metrics(self) -> list[str]:
-        state = self.base.read_all()
-        return [k[len("_semantic/metrics/"):] for k in state
-                if k.startswith("_semantic/metrics/")]
-
-    def list_dimensions(self) -> list[str]:
-        state = self.base.read_all()
-        return [k[len("_semantic/dimensions/"):] for k in state
-                if k.startswith("_semantic/dimensions/")]
-
-    def get_metric(self, name: str) -> Optional[dict]:
-        return self.get(f"_semantic/metrics/{name}")
-
-    def execute_metric(self, metric_name: str, source_view: Lens,
-                       group_by: list[str] = None) -> list[dict]:
-        """Execute a metric query against a source Lens."""
-        metric = self.get_metric(metric_name)
-        if not metric:
-            raise ValueError(f"Metric '{metric_name}' not found")
-        data = source_view.get_all()
-        if not group_by:
-            group_by = metric.get("dimensions", [])
-        if not group_by:
-            values = [row.get(metric["field"], 0) for row in data.values()]
-            expr = metric.get("expression", {}).get("dialects", {})
-            agg = "sum"  # default
-            for dialect, sql in expr.items():
-                if "SUM" in sql.upper(): agg = "sum"; break
-                if "COUNT" in sql.upper(): agg = "count"; break
-                if "AVG" in sql.upper(): agg = "avg"; break
-            if agg == "sum": result = sum(values)
-            elif agg == "count": result = len(values)
-            elif agg == "avg": result = sum(values)/len(values) if values else 0
-            else: result = sum(values)
-            return [{"value": result, "metric": metric_name}]
-
-        groups = {}
-        for row in data.values():
-            gk = tuple(row.get(d, "") for d in group_by)
-            groups.setdefault(gk, []).append(row.get(metric["field"], 0))
-        # Determine aggregation type from dialects
-        expr = metric.get("expression", {}).get("dialects", {})
-        agg = "sum"
-        for dialect, sql in expr.items():
-            if "SUM" in sql.upper(): agg = "sum"; break
-            if "COUNT" in sql.upper(): agg = "count"; break
-            if "AVG" in sql.upper(): agg = "avg"; break
-        results = []
-        for gk, vals in groups.items():
-            if agg == "sum": v = sum(vals)
-            elif agg == "count": v = len(vals)
-            elif agg == "avg": v = sum(vals)/len(vals) if vals else 0
-            else: v = sum(vals)
-            r = {"metric": metric_name, "value": v}
-            for i, d in enumerate(group_by): r[d] = gk[i]
-            results.append(r)
-        return results
 
 
 # ===========================================================================
-# Test: Index management + Ossie SemanticLens
+# Test: Index management (semantic model test is in extensions/semantic_ossie.py)
 # ===========================================================================
 
 def test_all():
@@ -683,7 +525,7 @@ def test_all():
     print("=== INDEX MANAGEMENT TEST ===\n")
 
     # Create a Lens with data
-    db = View(kernel, "db")
+    db = Lens(kernel, "db")
     db.put("user:1", {"name": "Alice", "age": 30, "region": "US"})
     db.put("user:2", {"name": "Bob", "age": 25, "region": "EU"})
     db.put("user:3", {"name": "Carol", "age": 35, "region": "US"})
@@ -721,83 +563,6 @@ def test_all():
     print(f"  user:4 = {db.get('user:4')}")
     print(f"  count = {db.count()}")
 
-    print("\n=== OSSIE SEMANTIC VIEW TEST ===\n")
-
-    # Create Ossie semantic model
-    semantic = OssieSemanticLens(kernel, "semantic")
-
-    # Define metrics with multi-dialect expressions (Ossie pattern)
-    semantic.define_metric_ossie(
-        "total_revenue", "orders", "amount",
-        dialects={"ANSI_SQL": "SUM(amount)", "SNOWFLAKE": "SUM(amount)"},
-        dimensions=["product", "region"],
-        ai_context="Total revenue from all orders. Use this for financial reports."
-    )
-    semantic.define_metric_ossie(
-        "order_count", "orders", "amount",
-        dialects={"ANSI_SQL": "COUNT(*)"},
-        dimensions=["product"]
-    )
-
-    # Define dimensions with ai_context
-    semantic.define_dimension_ossie("product", "orders", "product", "string",
-                                    ai_context="Product name. Categories: Widget, Gadget.")
-    semantic.define_dimension_ossie("region", "users", "region", "string",
-                                    is_time=False,
-                                    ai_context="Customer region. Values: US, EU.")
-    semantic.define_dimension_ossie("order_date", "orders", "ts", "time",
-                                    is_time=True,
-                                    ai_context="Order timestamp. Use for time series.")
-
-    # Define relationships (composite key support)
-    semantic.define_relationship_ossie("user_orders", "users", ["user_id"],
-                                       "orders", ["user_id"])
-
-    semantic.commit("define Ossie semantic model")
-
-    print(f"  Metrics: {semantic.list_metrics()}")
-    print(f"  Dimensions: {semantic.list_dimensions()}")
-    print(f"  total_revenue metric: {json.dumps(semantic.get_metric('total_revenue'), indent=2)}")
-
-    # Execute metric against source data
-    orders = View(kernel, "orders")
-    orders.put("order:1", {"user_id": 1, "amount": 100, "product": "Widget"})
-    orders.put("order:2", {"user_id": 2, "amount": 200, "product": "Gadget"})
-    orders.put("order:3", {"user_id": 1, "amount": 50, "product": "Widget"})
-    orders.commit("insert 3 orders")
-
-    results = semantic.execute_metric("total_revenue", orders, group_by=["product"])
-    print(f"\n  Total revenue by product:")
-    for r in results:
-        print(f"    {r['product']}: ${r['value']}")
-
-    # Import/export Ossie model
-    ossie_model = {
-        "name": "sales_model",
-        "description": "Sales semantic model",
-        "datasets": [
-            {"name": "orders", "source": "orders", "primary_key": "order_id",
-             "fields": [
-                 {"name": "amount", "type": "float"},
-                 {"name": "product", "type": "string", "dimension": {"is_time": False}},
-                 {"name": "ts", "type": "timestamp", "dimension": {"is_time": True}},
-             ]}
-        ],
-        "metrics": [
-            {"name": "revenue", "source": "orders", "field": "amount",
-             "expression": {"dialects": {"ANSI_SQL": "SUM(amount)"}}},
-        ],
-        "relationships": [
-            {"name": "user_orders", "from": {"dataset": "users", "columns": ["user_id"]},
-             "to": {"dataset": "orders", "columns": ["user_id"]}},
-        ],
-    }
-    semantic.import_ossie_model(ossie_model)
-    exported = semantic.export_ossie_model("sales_model")
-    print(f"\n  Imported & exported Ossie model 'sales_model':")
-    print(f"  Datasets: {[d['name'] for d in exported['datasets']]}")
-    print(f"  Metrics: {[m['name'] for m in exported['metrics']]}")
-
     print("\n=== INDEX OPERATIONS: DATA vs METADATA ===\n")
     stats = kernel.storage_stats()
     print(f"  Total blobs: {stats['blob_count']}")
@@ -809,6 +574,8 @@ def test_all():
     print(f"  Zero data blobs modified during any index operation ✓")
 
     print("\n=== ALL TESTS PASSED ===")
+    print("\n  Note: Semantic model tests are in extensions/semantic_ossie.py")
+    print("  Run: python pond-sdk/extensions/semantic_ossie.py")
     kernel.close()
     shutil.rmtree(bench_dir, ignore_errors=True)
 
@@ -821,7 +588,10 @@ if __name__ == "__main__":
 # Backward-compatible aliases (Lens is the primary name; View = Lens)
 #
 # "View" is kept for backward compatibility. New code should use "Lens":
-#   from lens_sdk import Lens, IndexedLens, KeylessLens, SemanticLens
+#   from lens_sdk import Lens, IndexedLens, KeylessLens, CrossLens
+#
+# Note: SemanticLens is now an OPTIONAL extension. Import it from:
+#   from extensions.semantic_ossie import SemanticLens, OssieAdapter
 #
 # The Lens name captures Pond's philosophy: the bytes don't change;
 # only the way you observe and manipulate them changes. Like a lens
@@ -830,10 +600,27 @@ if __name__ == "__main__":
 
 View = Lens  # backward-compatible alias
 KeylessView = KeylessLens  # backward-compatible alias
-SemanticView = SemanticLens  # backward-compatible alias
 CrossView = CrossLens  # backward-compatible alias
-OssieLens = SemanticLens  # backward compat for old name
-OssieSemanticLens = SemanticLens  # backward compat
+
+# SemanticLens/OssieAdapter are now in extensions/semantic_ossie.py
+# For backward compat, lazily import them if requested:
+def __getattr__(name):
+    if name in ("SemanticLens", "SemanticView", "OssieLens", "OssieSemanticLens",
+                "OssieAdapter", "SemanticModelAdapter"):
+        try:
+            from extensions.semantic_ossie import SemanticLens, OssieAdapter
+            from extensions.semantic_base import SemanticModelAdapter
+            if name == "SemanticLens" or name == "SemanticView":
+                return SemanticLens
+            if name in ("OssieLens", "OssieSemanticLens"):
+                return SemanticLens
+            if name == "OssieAdapter":
+                return OssieAdapter
+            if name == "SemanticModelAdapter":
+                return SemanticModelAdapter
+        except ImportError:
+            pass
+    raise AttributeError(f"module 'lens_sdk' has no attribute '{name}'")
 
 # IndexedLens needs to reference IndexedLens from auto_index.py.
 # Import it lazily to avoid circular imports.
