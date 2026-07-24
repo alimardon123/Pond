@@ -602,14 +602,14 @@ View = Lens  # backward-compatible alias
 KeylessView = KeylessLens  # backward-compatible alias
 CrossView = CrossLens  # backward-compatible alias
 
-# SemanticLens/OssieAdapter are now in extensions/semantic_ossie.py
+# SemanticLens/OssieAdapter are now in extensions/semantic/
 # For backward compat, lazily import them if requested:
 def __getattr__(name):
     if name in ("SemanticLens", "SemanticView", "OssieLens", "OssieSemanticLens",
                 "OssieAdapter", "SemanticModelAdapter"):
         try:
-            from extensions.semantic_ossie import SemanticLens, OssieAdapter
-            from extensions.semantic_base import SemanticModelAdapter
+            from extensions.semantic.ossie import SemanticLens, OssieAdapter
+            from extensions.semantic.base import SemanticModelAdapter
             if name == "SemanticLens" or name == "SemanticView":
                 return SemanticLens
             if name in ("OssieLens", "OssieSemanticLens"):

@@ -4,11 +4,8 @@ Pond SDK Extensions — pluggable modules that sit between the Lens and kernel.
 Extensions are OPTIONAL. The base Lens (lens_sdk.Lens) works without any
 extensions loaded. Extensions add domain-specific capabilities:
 
-  - semantic_ossie: Apache Ossie semantic model adapter
-  - (future) semantic_cube: Cube.js semantic model adapter
-  - (future) semantic_dbt: dbt metric adapter
-  - (future) physical_structures: bloom filters, zone maps, statistics
-  - (future) packing: Manifest algebra packing Lens
+  - semantic: semantic model adapters (Ossie, Cube, dbt, custom)
+  - physical_structures: acceleration structures (bloom, stats, zone maps)
 
 Architecture:
   Kernel (Write, Read, Ref) — FROZEN
@@ -21,12 +18,32 @@ Architecture:
 
 Design principle (3.7 Functional): extensions make the Lens SDK functional
 for specific use cases without baking any single standard into the core.
-Different deployments can use different semantic standards (Ossie, Cube,
-dbt) by loading different extensions.
+
+Design principle (3.1 Simple): the core stays small; extensions are
+loaded only when needed.
+
+Design principle (3.4 Scalable): extensions are independent. Adding a
+new Physical Structure type or semantic adapter doesn't modify any
+existing code.
+
+Usage:
+    # Semantic extensions
+    from extensions.semantic.ossie import SemanticLens, OssieAdapter
+
+    # Physical Structure extensions
+    from extensions.physical_structures import BloomFilter, Statistics, ZoneMap
+
+    # Extension registry
+    from extensions import list_extensions, load_extension
 """
 
+import os
+import sys
+
+# Make pond-sdk importable for extension modules
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Extension registry — extensions register themselves here on import.
-# This allows discovery: `from pond_sdk.extensions import registered_extensions`
 _registered = {}
 
 
@@ -49,7 +66,6 @@ def load_extension(name: str):
     """Load an extension by name (imports the module)."""
     if name in _registered:
         return _registered[name]
-    # Try to import the module
     import importlib
     try:
         importlib.import_module(f"extensions.{name}")

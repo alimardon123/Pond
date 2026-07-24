@@ -18,7 +18,7 @@ To use a DIFFERENT semantic standard (e.g., Cube.js), create a new
 adapter module (semantic_cube.py) implementing SemanticModelAdapter,
 and use it with the same SemanticLens:
 
-    from extensions.semantic_base import SemanticModelAdapter
+    from extensions.semantic.base import SemanticModelAdapter
     from extensions.semantic_ossie import SemanticLens
 
     class CubeAdapter(SemanticModelAdapter): ...
@@ -37,10 +37,10 @@ import sys
 from typing import Optional, Any
 
 # Make lens_sdk importable
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from lens_sdk import Lens  # noqa: E402
-from extensions.semantic_base import SemanticModelAdapter  # noqa: E402
+from extensions.semantic.base import SemanticModelAdapter  # noqa: E402
 from extensions import register_extension  # noqa: E402
 
 
@@ -94,7 +94,7 @@ class SemanticLens(Lens):
         semantic = SemanticLens(kernel, "semantic")
 
         # Custom adapter
-        from extensions.semantic_base import SemanticModelAdapter
+        from extensions.semantic.base import SemanticModelAdapter
         class MyAdapter(SemanticModelAdapter): ...
         semantic = SemanticLens(kernel, "semantic", adapter=MyAdapter())
     """
@@ -242,7 +242,7 @@ register_extension(
 def _self_test():
     """Quick test that the extension works standalone."""
     import tempfile, shutil
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "pond-core"))
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "pond-core"))
     from pond_minimal import PondMinimal
 
     tmpdir = tempfile.mkdtemp(prefix="pond_ossie_")
@@ -274,7 +274,7 @@ def _self_test():
         assert exported["name"] == "test_model"
 
         # Test with custom adapter
-        from extensions.semantic_base import SemanticModelAdapter
+        from extensions.semantic.base import SemanticModelAdapter
 
         class CustomAdapter(SemanticModelAdapter):
             def export_model(self, lens): return {"custom": True}

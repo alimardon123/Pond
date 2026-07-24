@@ -90,6 +90,15 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-sdk/run_lens_laws_ci.py` | 267 | (CI runner) | CI runner for Lens contracts. |
 | `pond-sdk/__init__.py` | 0 | Package marker. |
 | `pond-sdk/README.md` | 52 | Folder purpose and usage. |
+| `pond-sdk/extensions/__init__.py` | 55 | `register_extension`, `list_extensions` | Extension registry. |
+| `pond-sdk/extensions/semantic/__init__.py` | 15 | — | Semantic extension package. |
+| `pond-sdk/extensions/semantic/base.py` | 45 | `SemanticModelAdapter` | Abstract interface for semantic adapters. |
+| `pond-sdk/extensions/semantic/ossie.py` | 300 | `SemanticLens`, `OssieAdapter` | Ossie adapter + pluggable SemanticLens. |
+| `pond-sdk/extensions/physical_structures/__init__.py` | 52 | — | Physical Structure extension package. |
+| `pond-sdk/extensions/physical_structures/base.py` | 105 | `PhysicalStructure` | Abstract base: build, load, exists, delete, query. |
+| `pond-sdk/extensions/physical_structures/bloom_filter.py` | 120 | `BloomFilter` | Probabilistic membership test (O(1)). |
+| `pond-sdk/extensions/physical_structures/statistics.py` | 100 | `Statistics` | Column min/max/null_count for pruning. |
+| `pond-sdk/extensions/physical_structures/zone_map.py` | 90 | `ZoneMap` | Per-chunk min/max for range pruning. |
 
 ### 2.3 lenses/ (Active Lens implementations — 2 packages)
 
