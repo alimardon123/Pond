@@ -125,7 +125,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/README.md` | — | — | Folder purpose. |
 
-### 2.5b pond-lab/ (Lab experiments — 6 files)
+### 2.5b pond-lab/ (Lab experiments — 7 files)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
@@ -134,6 +134,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-lab/track3_lens_vs_opponent.py` | 460 | (benchmarks) | **Track 3:** Lens-vs-opponent benchmarks (Lakehouse vs DuckDB+Parquet, FS vs Feast). |
 | `pond-lab/track4_object_store_efficiency.py` | 480 | (tests) | **Track 4:** Object-store efficiency (7 experiments; packing = 204x reduction). |
 | `pond-lab/track5_lens_composability.py` | 380 | (tests) | **Track 5:** Lens composability — ETL-free chain (15/15 pass). CSV → Lakehouse → Feature → Vector → Search. |
+| `pond-lab/track6_case_studies.py` | 440 | (tests) | **Track 6:** Real-world case studies (25/25 pass). Clinical data lake + ML feature platform. |
 | `pond-lab/README.md` | — | — | Lab tracks overview (6 tracks). |
 
 ### 2.6 scripts/ (Tests and benchmarks — 11 files, ~5400 LOC)

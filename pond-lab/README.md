@@ -13,7 +13,7 @@
 | 3 | Can each Lens approach its natural opponent? | **Done** (Lakehouse vs DuckDB+Parquet, FS vs Feast) |
 | 4 | How efficient is Pond on object stores (GET/PUT/LIST/HEAD/RTT)? | **Done** (7 experiments; packing = 204x reduction) |
 | 5 | Can Lenses compose without ETL (CSV → Lakehouse → Feature → Vector → Search)? | **15/15 pass** (ETL-free chain) |
-| 6 | Real-world case studies (clinical data lake, ML platform, etc.) | Pending |
+| 6 | Real-world case studies (clinical data lake, ML platform, etc.) | **25/25 pass** (2 case studies) |
 
 ## Track 1: Bidirectional Lens Compatibility Matrix
 
