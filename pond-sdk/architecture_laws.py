@@ -218,7 +218,7 @@ def law_5_history_replay_equals_snapshot():
     from binary_encoding import BinaryProllyTree
     from prolly_view import ProllyTree
 
-    current = kernel.resolve("inv5")
+    current = kernel.resolve("collections/inv5/HEAD")
     snapshot_state = None
     while current:
         commit = BinaryProllyTree.decode_commit(kernel.read_blob(current))
@@ -504,7 +504,7 @@ def law_12_merge_true_dag():
     lens.merge("feature")
 
     # Verify the HEAD commit has a second_parent (true merge)
-    head = kernel.resolve("law12")
+    head = kernel.resolve("collections/law12/HEAD")
     from binary_encoding import BinaryProllyTree
     commit = BinaryProllyTree.decode_commit(kernel.read_blob(head))
 

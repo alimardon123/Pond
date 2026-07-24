@@ -110,6 +110,13 @@ class CollectionLens:
         ANY Lens can call this on ANY collection, regardless of which
         Lens created it. This is the interop contract.
 
+        Supports TWO storage formats:
+          1. Parquet (created by CollectionLens subclasses like LakehouseLens)
+             Commit has a "parquet" field → read as Parquet
+          2. Key-value (created by Lens with Prolly tree backing)
+             Commit is binary-encoded (BinaryProllyTree) → use ProllyLensBase
+             to read key-value pairs, convert to PyArrow table
+
         Args:
             name: collection name
             commit_hash: optional commit hash for time travel (None = HEAD)
@@ -118,10 +125,44 @@ class CollectionLens:
             commit_hash = self.kernel.resolve(self._head_ref(name))
             if commit_hash is None:
                 raise KeyError(f"Collection '{name}' not found")
-        commit = json.loads(self.kernel.read(commit_hash))
-        parquet_bytes = self.kernel.read(commit["parquet"])
-        reader = pa.BufferReader(parquet_bytes)
-        return pq.read_table(reader)
+        raw = self.kernel.read_blob(commit_hash)
+
+        # Try JSON first (Parquet collections use JSON commits)
+        try:
+            commit = json.loads(raw)
+            if "parquet" in commit:
+                parquet_bytes = self.kernel.read(commit["parquet"])
+                reader = pa.BufferReader(parquet_bytes)
+                return pq.read_table(reader)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+        # Fall back to key-value (Prolly tree — binary commit format)
+        return self._read_kv_as_table(name)
+
+    def _read_kv_as_table(self, name: str) -> pa.Table:
+        """Read a key-value collection (Prolly tree) as a PyArrow table.
+        Columns: key (string), value (JSON-decoded)."""
+        # Try to use ProllyLensBase for reading
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from prolly_view import ProllyLensBase
+            base = ProllyLensBase(self.kernel, name)
+            state = base.read_all()
+            keys = []
+            values = []
+            for k, h in state.items():
+                if k.startswith("_"):
+                    continue
+                keys.append(k)
+                raw = self.kernel.read_blob(h)
+                try:
+                    values.append(json.loads(raw))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    values.append({"_raw": raw.hex()})
+            return pa.table({"key": keys, "value": values})
+        except ImportError:
+            raise ValueError(f"Cannot read key-value collection '{name}': prolly_view not available")
 
     def read_collection_commit(self, name: str,
                                commit_hash: Optional[str] = None) -> dict:

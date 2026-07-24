@@ -365,7 +365,7 @@ class LensLaws:
             # View's constructor, so we verify the kernel has the data.
 
             # Find the Lens's head commit
-            head = self.kernel.resolve(contract.name) if hasattr(contract, 'name') else None
+            head = self.kernel.resolve(f"collections/{contract.name}/HEAD") if hasattr(contract, 'name') else None
             # Note: contract.name is the Lens's name, which may not be
             # the same as the kernel reference name. This is a known
             # limitation; the harness assumes contract.name matches the

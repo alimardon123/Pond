@@ -276,11 +276,11 @@ class ProllyLensBase:
 
         # Snapshot pointer — always points to the latest snapshot commit.
         # This decouples current-state access from history access.
-        self._snapshot_ref = f"{name}__snapshot"
+        self._snapshot_ref = f"collections/{name}/snapshot"
 
         # Initialize snapshot pointer if it doesn't exist but HEAD does
         if self.kernel.resolve(self._snapshot_ref) is None:
-            head = self.kernel.resolve(self.name)
+            head = self.kernel.resolve(f"collections/{self.name}/HEAD")
             if head:
                 snap = self._find_latest_snapshot(head)
                 if snap:
@@ -288,7 +288,7 @@ class ProllyLensBase:
 
         # Count deltas since last snapshot
         self._delta_count_since_snapshot = self._count_deltas_since_snapshot(
-            self.kernel.resolve(self.name)
+            self.kernel.resolve(f"collections/{self.name}/HEAD")
         )
 
     # ------------------------------------------------------------------
@@ -325,7 +325,7 @@ class ProllyLensBase:
         if not self.has_staged():
             raise ValueError("Nothing to commit")
 
-        parent_hash = self.kernel.resolve(self.name)
+        parent_hash = self.kernel.resolve(f"collections/{self.name}/HEAD")
         index = self._commit_index
 
         write_snapshot = (
@@ -359,7 +359,7 @@ class ProllyLensBase:
             commit_hash = self.kernel.write(commit_data)
             self._delta_count_since_snapshot += 1
 
-        self.kernel.reference(self.name, commit_hash)
+        self.kernel.reference(f"collections/{self.name}/HEAD", commit_hash)
         if self._active_branch:
             self.kernel.reference(self._active_branch, commit_hash)
 
@@ -384,7 +384,7 @@ class ProllyLensBase:
         """
         # Check deltas FIRST (for both additions and deletions after snapshot)
         snap_hash = self.kernel.resolve(self._snapshot_ref)
-        head = self.kernel.resolve(self.name)
+        head = self.kernel.resolve(f"collections/{self.name}/HEAD")
         if snap_hash and head and head != snap_hash:
             # Check if HEAD is a valid commit (not a tombstone or garbage)
             try:
@@ -420,7 +420,7 @@ class ProllyLensBase:
 
     def _lookup_in_deltas(self, key: str, snapshot_hash: str) -> Optional[str]:
         """Check delta commits between HEAD and the snapshot for the key."""
-        head = self.kernel.resolve(self.name)
+        head = self.kernel.resolve(f"collections/{self.name}/HEAD")
         current = head
         while current and current != snapshot_hash:
             commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(current))
@@ -435,7 +435,7 @@ class ProllyLensBase:
 
     def _lookup_from_head(self, key: str) -> Optional[str]:
         """Fallback: walk commit chain from HEAD (for old data)."""
-        head = self.kernel.resolve(self.name)
+        head = self.kernel.resolve(f"collections/{self.name}/HEAD")
         if not head:
             return None
         current = head
@@ -472,7 +472,7 @@ class ProllyLensBase:
             if snapshot_root:
                 state = ProllyTree.read_all(self.kernel, snapshot_root)
                 # Apply deltas between snapshot and HEAD
-                head = self.kernel.resolve(self.name)
+                head = self.kernel.resolve(f"collections/{self.name}/HEAD")
                 current = head
                 deltas = []
                 while current and current != snap_hash:
@@ -488,7 +488,7 @@ class ProllyLensBase:
                 return state
 
         # Fallback: walk from HEAD (old data)
-        head = self.kernel.resolve(self.name)
+        head = self.kernel.resolve(f"collections/{self.name}/HEAD")
         if not head:
             return {}
         return self._read_state_from_commit(head)
@@ -499,7 +499,7 @@ class ProllyLensBase:
 
     def history(self, limit: int = 20) -> list[dict]:
         """Walk commit history (first-parent line)."""
-        head = self.kernel.resolve(self.name)
+        head = self.kernel.resolve(f"collections/{self.name}/HEAD")
         if not head:
             return []
         history = []
@@ -526,19 +526,19 @@ class ProllyLensBase:
     # ------------------------------------------------------------------
 
     def branch(self, branch_name: str) -> str:
-        head = self.kernel.resolve(self.name)
+        head = self.kernel.resolve(f"collections/{self.name}/HEAD")
         if not head:
             raise ValueError("No commits to branch from")
-        full_name = f"{self.name}__branch__{branch_name}"
+        full_name = f"collections/{self.name}/branches/{branch_name}"
         self.kernel.reference(full_name, head)
         return full_name
 
     def checkout(self, branch_name: str) -> None:
-        full_name = f"{self.name}__branch__{branch_name}"
+        full_name = f"collections/{self.name}/branches/{branch_name}"
         h = self.kernel.resolve(full_name)
         if not h:
             raise ValueError(f"Branch '{branch_name}' does not exist")
-        self.kernel.reference(self.name, h)
+        self.kernel.reference(f"collections/{self.name}/HEAD", h)
         # Update snapshot pointer for the branch's HEAD
         snap = self._find_latest_snapshot(h)
         if snap:
@@ -550,7 +550,7 @@ class ProllyLensBase:
         self._active_branch = full_name
 
     def list_branches(self) -> list[str]:
-        prefix = f"{self.name}__branch__"
+        prefix = f"collections/{self.name}/branches/"
         return [n[len(prefix):] for n in self.kernel.list_names() if n.startswith(prefix)]
 
     # ------------------------------------------------------------------
@@ -558,13 +558,13 @@ class ProllyLensBase:
     # ------------------------------------------------------------------
 
     def undo(self, steps: int = 1) -> str:
-        head = self.kernel.resolve(self.name)
+        head = self.kernel.resolve(f"collections/{self.name}/HEAD")
         for _ in range(steps):
             commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(head))
             if not commit.get("parent"):
                 break
             head = commit["parent"]
-        self.kernel.reference(self.name, head)
+        self.kernel.reference(f"collections/{self.name}/HEAD", head)
         # Update snapshot pointer
         snap = self._find_latest_snapshot(head)
         if snap:
@@ -593,7 +593,7 @@ class ProllyLensBase:
         Semantics: union with last-writer-wins (merged branch's values
         override current values for matching keys).
         """
-        full_name = f"{self.name}__branch__{branch_name}"
+        full_name = f"collections/{self.name}/branches/{branch_name}"
         branch_head = self.kernel.resolve(full_name)
         if not branch_head:
             raise ValueError(f"Branch '{branch_name}' does not exist")
@@ -607,14 +607,14 @@ class ProllyLensBase:
         # Build a Prolly tree for the merged state (always a snapshot)
         tree_root = ProllyTree.build(self.kernel, merged)
 
-        parent_hash = self.kernel.resolve(self.name)
+        parent_hash = self.kernel.resolve(f"collections/{self.name}/HEAD")
         # TRUE MERGE COMMIT: two parents (current HEAD + branch HEAD)
         commit_data = BinaryProllyTree.encode_commit(
             parent_hash, tree_root, {}, [], tree_root,
             message or f"merge '{branch_name}'", time.time(), self._commit_index,
             second_parent=branch_head)  # ← NEW: second parent for true DAG
         commit_hash = self.kernel.write(commit_data)
-        self.kernel.reference(self.name, commit_hash)
+        self.kernel.reference(f"collections/{self.name}/HEAD", commit_hash)
         # Update snapshot pointer — merge always creates a snapshot
         self.kernel.reference(self._snapshot_ref, commit_hash)
         self._delta_count_since_snapshot = 0
@@ -675,7 +675,7 @@ class ProllyLensBase:
     # ------------------------------------------------------------------
 
     def _compute_index(self) -> int:
-        h = self.kernel.resolve(self.name)
+        h = self.kernel.resolve(f"collections/{self.name}/HEAD")
         if not h:
             return 0
         try:
@@ -742,7 +742,7 @@ class ProllyLensBase:
         return self._read_state_from_commit(commit_hash)
 
     def _resolve_prefix(self, prefix: str) -> str:
-        current = self.kernel.resolve(self.name)
+        current = self.kernel.resolve(f"collections/{self.name}/HEAD")
         while current:
             if current.startswith(prefix):
                 return current
