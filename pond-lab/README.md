@@ -17,6 +17,7 @@
 | 7 | Is the abstraction symmetric? (reverse: Vector → Lakehouse → Feature → Search → Git → Vector) | **24/24 pass** (symmetric) |
 | 8 | Storage Independence certification (same bytes, different engines) | **23/23 pass** (Level 3 of Compatibility Suite) |
 | 9 | Production-quality Lakehouse Lens (caching, invalidation, multi-table) | **20/20 pass** (2.2x speedup with cache) |
+| 10 | Storage optimization at scale (packed Parquet, up to 500K records) | **10/10 pass** (996x fewer GETs at 500K) |
 
 ## Track 1: Bidirectional Lens Compatibility Matrix
 
