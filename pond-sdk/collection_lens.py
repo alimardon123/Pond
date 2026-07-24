@@ -37,16 +37,25 @@ except ImportError:
 
 
 class CollectionLens:
-    """Base class for all Lenses that store Parquet data in collections.
+    """Base class for Parquet-table Lenses (Lakehouse, FeatureStore, etc.).
 
-    Shared ref namespace:
-      collections/{name}/HEAD
-      collections/{name}/branches/{branch}
-      collections/{name}/definition
+    There are TWO Lens hierarchies in Pond:
+      1. Lens (lens_sdk.py) → key-value Lenses (JSON, Git, Notebook)
+         Uses Prolly tree backing, per-key staging, indexes.
+      2. CollectionLens (this file) → Parquet-table Lenses (Lakehouse, FeatureStore)
+         Uses Parquet blobs, whole-table commits, DuckDB queries.
+
+    Both share the kernel's flat namespace. CollectionLens uses:
+      collections/{name}/HEAD              — latest commit
+      collections/{name}/branches/{branch} — branch commit
+      collections/{name}/definition        — optional Lens-specific metadata
+
+    For metadata (labels, description, source), use the Collection class
+    (pond-sdk/collection.py) which is orthogonal to both hierarchies.
 
     Subclasses (LakehouseLens, FeatureStoreLens, etc.) add domain-specific
     methods on top of this shared base. All subclasses can read each
-    other's collections through the public API.
+    other's collections through the public API (read_collection).
     """
 
     def __init__(self, kernel: PondMinimal):
