@@ -17,8 +17,8 @@ What this Lens does:
 Storage model:
   - Feature data stored as Parquet in Pond blobs (same format as Lakehouse Lens)
   - Feature definitions stored as JSON in Pond blobs
-  - Commit chain uses Pond refs (features/{collection}/HEAD)
-  - Branches use Pond refs (features/{collection}/branches/{name})
+  - Commit chain uses Pond refs (collections/{name}/HEAD)
+  - Branches use Pond refs (collections/{name}/branches/{branch})
 
 The key insight: feature data is just tabular data. The Feature Store
 Lens adds *feature-specific semantics* (entity registry, point-in-time
@@ -43,10 +43,12 @@ import tempfile
 import shutil
 from typing import Optional, Iterator
 
-# Make pond-core importable
+# Make pond-core and pond-sdk importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-core"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-sdk"))
 from pond_minimal import PondMinimal  # noqa: E402
+from collection_lens import CollectionLens  # noqa: E402
 
 try:
     import pyarrow as pa
@@ -59,23 +61,29 @@ except ImportError:
 # Feature Store Lens
 # ---------------------------------------------------------------------------
 
-class FeatureStoreLens:
+class FeatureStoreLens(CollectionLens):
     """Versioned ML feature store on Pond.
 
-    A "feature collection" is a set of features for a given entity type.
-    For example: `user_features` might contain features like
-    `user_age`, `user_purchase_count_30d`, `user_avg_session_duration`.
+    Extends CollectionLens, sharing the same ref namespace:
+      collections/{name}/HEAD
+      collections/{name}/branches/{branch}
+      collections/{name}/definition
 
-    Storage:
-      - Feature data: Parquet blobs in Pond, one per (collection, snapshot)
-      - Feature definitions: JSON blobs (entity columns, feature columns,
-        timestamp column, schema version)
-      - HEAD ref: features/{collection}/HEAD -> latest commit
-      - Branch ref: features/{collection}/branches/{name} -> commit
+    ANY Lens that extends CollectionLens (LakehouseLens, FeatureStoreLens,
+    etc.) can read ANY collection created by ANY other Lens — through
+    the public API. No kernel bypass. No ETL.
+
+    FeatureStoreLens adds:
+      - Feature definition management (entity columns, feature columns)
+      - Point-in-time join (prevents label leakage)
+      - Online serving (point lookup)
+      - Schema evolution (add/rename features)
+      - Branching for feature experimentation (inherited)
+      - Time travel (inherited)
     """
 
     def __init__(self, kernel: PondMinimal):
-        self.kernel = kernel
+        super().__init__(kernel)
 
     # ------------------------------------------------------------------
     # Feature definition management
@@ -96,11 +104,11 @@ class FeatureStoreLens:
         }
         defn_bytes = json.dumps(definition, sort_keys=True).encode()
         defn_hash = self.kernel.write(defn_bytes)
-        self.kernel.reference(f"features/{collection}/definition", defn_hash)
+        self.kernel.reference(self._definition_ref(collection), defn_hash)
         return defn_hash
 
     def get_definition(self, collection: str) -> dict:
-        defn_hash = self.kernel.resolve(f"features/{collection}/definition")
+        defn_hash = self.kernel.resolve(self._definition_ref(collection))
         if defn_hash is None:
             raise KeyError(f"Collection {collection} not defined")
         return json.loads(self.kernel.read(defn_hash))
@@ -125,7 +133,7 @@ class FeatureStoreLens:
         defn["evolved_at"] = time.time()
         defn_bytes = json.dumps(defn, sort_keys=True).encode()
         defn_hash = self.kernel.write(defn_bytes)
-        self.kernel.reference(f"features/{collection}/definition", defn_hash)
+        self.kernel.reference(self._definition_ref(collection), defn_hash)
         return defn_hash
 
     # ------------------------------------------------------------------
@@ -145,7 +153,7 @@ class FeatureStoreLens:
             raise ValueError(f"Missing required columns: {missing}")
 
         # Union with existing data (if any) — feature stores are append-only
-        parent = self.kernel.resolve(f"features/{collection}/HEAD")
+        parent = self.kernel.resolve(self._head_ref(collection))
         if parent is not None:
             parent_commit = json.loads(self.kernel.read(parent))
             parent_parquet = self.kernel.read(parent_commit["parquet"])
@@ -166,14 +174,14 @@ class FeatureStoreLens:
             "collection": collection,
             "parquet": parquet_hash,
             "parent": parent,
-            "definition": self.kernel.resolve(f"features/{collection}/definition"),
+            "definition": self.kernel.resolve(self._definition_ref(collection)),
             "row_count": combined.num_rows,
             "timestamp": time.time(),
             "message": message or f"ingest {data.num_rows} rows",
         }
         commit_bytes = json.dumps(commit).encode()
         commit_hash = self.kernel.write(commit_bytes)
-        self.kernel.reference(f"features/{collection}/HEAD", commit_hash)
+        self.kernel.reference(self._head_ref(collection), commit_hash)
         return commit_hash
 
     # ------------------------------------------------------------------
@@ -254,7 +262,7 @@ class FeatureStoreLens:
                       commit_hash: Optional[str] = None) -> pa.Table:
         """Read feature data. If commit_hash is None, reads HEAD."""
         if commit_hash is None:
-            commit_hash = self.kernel.resolve(f"features/{collection}/HEAD")
+            commit_hash = self.kernel.resolve(self._head_ref(collection))
             if commit_hash is None:
                 raise KeyError(f"Collection {collection} has no data")
         commit = json.loads(self.kernel.read(commit_hash))
@@ -286,17 +294,17 @@ class FeatureStoreLens:
     def branch(self, collection: str, branch_name: str) -> str:
         """Create a branch for feature experimentation. New features
         can be ingested on the branch without affecting production HEAD."""
-        head = self.kernel.resolve(f"features/{collection}/HEAD")
+        head = self.kernel.resolve(self._head_ref(collection))
         if head is None:
             raise KeyError(f"Collection {collection} has no HEAD")
-        branch_ref = f"features/{collection}/branches/{branch_name}"
+        branch_ref = self._branch_ref(collection, branch_name)
         self.kernel.reference(branch_ref, head)
         return head
 
     def ingest_to_branch(self, collection: str, branch_name: str,
                          data: pa.Table, message: str = "") -> str:
         """Ingest to a branch (not HEAD). Appends to branch's current data."""
-        branch_ref = f"features/{collection}/branches/{branch_name}"
+        branch_ref = self._branch_ref(collection, branch_name)
         branch_head = self.kernel.resolve(branch_ref)
         if branch_head is None:
             raise KeyError(f"Branch {branch_name} not found")
@@ -318,7 +326,7 @@ class FeatureStoreLens:
             "collection": collection,
             "parquet": parquet_hash,
             "parent": branch_head,
-            "definition": self.kernel.resolve(f"features/{collection}/definition"),
+            "definition": self.kernel.resolve(self._definition_ref(collection)),
             "row_count": combined.num_rows,
             "timestamp": time.time(),
             "message": message or f"branch {branch_name}: ingest {data.num_rows} rows",
@@ -330,7 +338,7 @@ class FeatureStoreLens:
         return commit_hash
 
     def read_branch(self, collection: str, branch_name: str) -> pa.Table:
-        branch_ref = f"features/{collection}/branches/{branch_name}"
+        branch_ref = self._branch_ref(collection, branch_name)
         commit_hash = self.kernel.resolve(branch_ref)
         if commit_hash is None:
             raise KeyError(f"Branch {branch_name} not found")
@@ -338,8 +346,8 @@ class FeatureStoreLens:
 
     def merge_branch(self, collection: str, branch_name: str) -> str:
         """Merge a branch into HEAD. Union merge."""
-        head = self.kernel.resolve(f"features/{collection}/HEAD")
-        branch_ref = f"features/{collection}/branches/{branch_name}"
+        head = self.kernel.resolve(self._head_ref(collection))
+        branch_ref = self._branch_ref(collection, branch_name)
         branch_head = self.kernel.resolve(branch_ref)
         if branch_head is None:
             raise KeyError(f"Branch {branch_name} not found")
@@ -358,14 +366,14 @@ class FeatureStoreLens:
             "parquet": parquet_hash,
             "parent": head,
             "second_parent": branch_head,
-            "definition": self.kernel.resolve(f"features/{collection}/definition"),
+            "definition": self.kernel.resolve(self._definition_ref(collection)),
             "row_count": merged.num_rows,
             "timestamp": time.time(),
             "message": f"merge branch {branch_name}",
         }
         commit_bytes = json.dumps(commit).encode()
         commit_hash = self.kernel.write(commit_bytes)
-        self.kernel.reference(f"features/{collection}/HEAD", commit_hash)
+        self.kernel.reference(self._head_ref(collection), commit_hash)
         return commit_hash
 
     # ------------------------------------------------------------------
@@ -373,23 +381,9 @@ class FeatureStoreLens:
     # ------------------------------------------------------------------
 
     def history(self, collection: str) -> list[dict]:
-        head = self.kernel.resolve(f"features/{collection}/HEAD")
-        if head is None:
-            return []
-        history = []
-        current = head
-        while current:
-            commit = json.loads(self.kernel.read(current))
-            history.append({
-                "hash": current[:8],
-                "message": commit["message"],
-                "row_count": commit["row_count"],
-                "timestamp": commit["timestamp"],
-                "parent": commit.get("parent", "")[:8] if commit.get("parent") else None,
-                "second_parent": commit.get("second_parent", "")[:8] if commit.get("second_parent") else None,
-            })
-            current = commit.get("parent")
-        return history
+        """Walk the commit chain. Uses inherited CollectionLens.history()
+        which returns full hashes (not truncated)."""
+        return super().history(collection)
 
     # ------------------------------------------------------------------
     # Encoding helpers
@@ -560,7 +554,7 @@ def _self_test():
         # Let me use the full hash from history
         original_full_hash = None
         # Walk back to find the first commit
-        current = kernel.resolve("features/user_features/HEAD")
+        current = kernel.resolve("collections/user_features/HEAD")
         first_commit = None
         while current:
             commit = json.loads(kernel.read(current))

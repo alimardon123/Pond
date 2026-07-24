@@ -87,7 +87,7 @@ class CachedLakehouse:
         matches the current HEAD, reuse it. Otherwise, re-read.
         """
         if commit_hash is None:
-            commit_hash = self.kernel.resolve(f"tables/{table_name}/HEAD")
+            commit_hash = self.kernel.resolve(f"collections/{table_name}/HEAD")
 
         cached = self._cache.get(table_name)
         if cached and cached[0] == commit_hash:

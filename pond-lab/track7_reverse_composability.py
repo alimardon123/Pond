@@ -111,7 +111,7 @@ def forward_chain(kernel, lh, fs):
     check(True, "Feature Store reads same data (PIT join ready)")
 
     # Vector builds embeddings from same data
-    head = kernel.resolve("tables/users/HEAD")
+    head = kernel.resolve("collections/users/HEAD")
     commit = json.loads(kernel.read(head))
     parquet = kernel.read(commit["parquet"])
     reader = pa.BufferReader(parquet)
@@ -174,7 +174,7 @@ def reverse_chain_step1_vector_writes(kernel):
         "row_count": 3,
     }
     commit_hash = kernel.write(json.dumps(commit).encode())
-    kernel.reference("vectors/embeddings/HEAD", commit_hash)
+    kernel.reference("collections/embeddings/HEAD", commit_hash)
 
     check(True, f"Vector Lens writes 3 embeddings (commit: {commit_hash[:8]})")
     return vectors_table
@@ -184,7 +184,7 @@ def reverse_chain_step2_lakehouse_reads(kernel, lh):
     """Step 2: Lakehouse Lens reads Vector's data via SQL."""
     print("\n--- Reverse Step 2: Lakehouse reads Vector's data ---")
 
-    table = read_parquet_from_ref(kernel, "vectors/embeddings/HEAD")
+    table = read_parquet_from_ref(kernel, "collections/embeddings/HEAD")
     con = duckdb.connect()
     con.register("embeddings", table)
 
@@ -205,7 +205,7 @@ def reverse_chain_step3_feature_reads(kernel, fs):
     """Step 3: Feature Store Lens reads Vector's data for PIT join."""
     print("\n--- Reverse Step 3: Feature Store reads Vector's data ---")
 
-    table = read_parquet_from_ref(kernel, "vectors/embeddings/HEAD")
+    table = read_parquet_from_ref(kernel, "collections/embeddings/HEAD")
 
     # Feature Store defines a collection from the Vector data
     fs.define_collection("vector_features",
@@ -232,7 +232,7 @@ def reverse_chain_step4_search_reads(kernel):
     """Step 4: Search Lens reads Vector's data for full-text search."""
     print("\n--- Reverse Step 4: Search reads Vector's data ---")
 
-    table = read_parquet_from_ref(kernel, "vectors/embeddings/HEAD")
+    table = read_parquet_from_ref(kernel, "collections/embeddings/HEAD")
     texts = table.column("text").to_pylist()
     ids = table.column("entity_id").to_pylist()
 
@@ -258,7 +258,7 @@ def reverse_chain_step5_git_reads(kernel):
     """Step 5: Git Lens (simulated) reads Vector's data as a versioned file."""
     print("\n--- Reverse Step 5: Git reads Vector's data ---")
 
-    table = read_parquet_from_ref(kernel, "vectors/embeddings/HEAD")
+    table = read_parquet_from_ref(kernel, "collections/embeddings/HEAD")
     ids = table.column("entity_id").to_pylist()
     texts = table.column("text").to_pylist()
 
@@ -280,10 +280,10 @@ def reverse_chain_step5_git_reads(kernel):
         "timestamp": time.time(),
     }
     commit_hash = kernel.write(json.dumps(git_commit).encode())
-    kernel.reference("git/docs/HEAD", commit_hash)
+    kernel.reference("collections/docs/HEAD", commit_hash)
 
     # Verify: Git can "cat" a file that originated from Vector data
-    git_h = kernel.resolve("git/docs/HEAD")
+    git_h = kernel.resolve("collections/docs/HEAD")
     git_commit_data = json.loads(kernel.read(git_h))
     git_tree = json.loads(kernel.read(git_commit_data["tree"]))
     doc1_hash = git_tree["docs/doc_1.txt"]
@@ -303,7 +303,7 @@ def reverse_chain_step6_back_to_vector(kernel):
     print("\n--- Reverse Step 6: Data circles back to Vector ---")
 
     # The Vector Lens can read the Git-stored files (they're just kernel blobs)
-    git_h = kernel.resolve("git/docs/HEAD")
+    git_h = kernel.resolve("collections/docs/HEAD")
     git_commit = json.loads(kernel.read(git_h))
     git_tree = json.loads(kernel.read(git_commit["tree"]))
 
@@ -353,10 +353,10 @@ def symmetry_proof(kernel):
     pa.parquet.write_table(fs_data, sink)
     fs_bytes = sink.getvalue().to_pybytes()
     fs_blob = kernel.write(fs_bytes)
-    kernel.reference("features/symmetry_test/HEAD", fs_blob)
+    kernel.reference("collections/symmetry_test/HEAD", fs_blob)
 
     # Search reads it (different Lens, same kernel)
-    f_h = kernel.resolve("features/symmetry_test/HEAD")
+    f_h = kernel.resolve("collections/symmetry_test/HEAD")
     # The ref points directly to the Parquet blob (not a commit)
     f_reader = pa.BufferReader(kernel.read_blob(f_h))
     f_table = pa.parquet.read_table(f_reader)
@@ -365,10 +365,10 @@ def symmetry_proof(kernel):
 
     # Git writes data
     git_file = kernel.write(b"symmetry test file")
-    kernel.reference("git/symmetry/HEAD", git_file)
+    kernel.reference("collections/symmetry/HEAD", git_file)
 
     # Vector reads it (different Lens, same kernel)
-    g_h = kernel.resolve("git/symmetry/HEAD")
+    g_h = kernel.resolve("collections/symmetry/HEAD")
     g_content = kernel.read_blob(g_h)
     check(g_content == b"symmetry test file",
           f"Vector reads Git's data (symmetric)")

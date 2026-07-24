@@ -112,7 +112,7 @@ def cert1_same_data_different_engines():
         lh.create_table("test_data", data)
 
         # Read the SAME Parquet bytes
-        reader = read_parquet_from_kernel(kernel, "tables/test_data/HEAD")
+        reader = read_parquet_from_kernel(kernel, "collections/test_data/HEAD")
         table = pa.parquet.read_table(reader)
 
         # --- Engine 1: DuckDB ---
@@ -250,7 +250,7 @@ def cert3_engine_swap():
         lh.create_table("sales", data)
 
         # Get the raw Parquet bytes from the kernel (this is the "storage")
-        head = kernel.resolve("tables/sales/HEAD")
+        head = kernel.resolve("collections/sales/HEAD")
         commit = json.loads(kernel.read(head))
         parquet_bytes = kernel.read(commit["parquet"])
 

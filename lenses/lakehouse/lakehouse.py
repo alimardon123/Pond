@@ -53,10 +53,12 @@ import shutil
 import io
 from typing import Optional, Iterator
 
-# Make pond-core importable
+# Make pond-core and pond-sdk importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
 from pond_minimal import PondMinimal  # noqa: E402
+from collection_lens import CollectionLens  # noqa: E402
 
 # DuckDB for the query engine
 try:
@@ -81,200 +83,91 @@ except ImportError:
 # LakehouseLens — tabular semantics on Pond
 # ---------------------------------------------------------------------------
 
-class LakehouseLens:
+class LakehouseLens(CollectionLens):
     """A Lens that implements tabular semantics on Pond's generic bytes.
 
-    Storage model:
-      - Each table version is stored as a Parquet file in a Pond blob.
-      - A table's commit chain is a sequence of (parent, parquet_hash)
-        commits, similar to Git but for tabular data.
-      - Schema is stored alongside the Parquet (Parquet is self-describing).
-      - Branching creates a new ref pointing at the current HEAD.
-      - Time travel reads old parquet blobs.
-      - Schema evolution is handled by Parquet's native schema evolution
-        (read schema is the reader's; writer schema is in the file).
+    Extends CollectionLens, which provides the shared ref namespace:
+      collections/{name}/HEAD
+      collections/{name}/branches/{branch}
+      collections/{name}/definition
 
-    This Lens implements L1-L7 (the Lens algebra):
-      L1 Round-trip: D(E(table)) = table (Parquet is lossless)
-      L2 Purity of read: reads never call Write or Ref
-      L3 Encoding preservation: every table state is persistable
-      L4 Determinism: same table → same Parquet bytes → same hash
-      L5 Kernel independence: kernel sees only Parquet bytes
-      L6 Composition (at name level): tables in different Collections
-         don't interfere
-      L7' Kernel never decodes: kernel returns Parquet bytes; Lens
-         decodes via DuckDB/PyArrow
+    ANY Lens that extends CollectionLens can read ANY collection created
+    by ANY other Lens — through the public API, no kernel bypass.
+
+    LakehouseLens adds:
+      - create_table / insert (write Parquet to kernel)
+      - read_table (read Parquet from kernel — inherited as read_collection)
+      - SQL query via DuckDB
+      - Time travel (inherited)
+      - Branching (inherited)
+      - Merge (inherited, union merge)
+      - History (inherited)
+      - Schema evolution (Parquet-native)
     """
-
-    def __init__(self, kernel: PondMinimal):
-        self.kernel = kernel
-
-    # ------------------------------------------------------------------
-    # Table operations
-    # ------------------------------------------------------------------
 
     def create_table(self, table_name: str, data: pa.Table) -> str:
         """Create a new table. `data` is a PyArrow Table.
         Returns the commit hash."""
-        # Encode the table as Parquet bytes
         parquet_bytes = self._encode_table(data)
         parquet_hash = self.kernel.write(parquet_bytes)
-
-        # Build a commit blob
-        commit = {
-            "table": table_name,
-            "parquet": parquet_hash,
-            "parent": None,  # first commit
-            "schema": str(data.schema),
-            "row_count": data.num_rows,
-            "timestamp": time.time(),
-            "message": f"create {table_name}",
-        }
-        commit_bytes = json.dumps(commit).encode()
-        commit_hash = self.kernel.write(commit_bytes)
-
-        # Set the table's HEAD ref
-        self.kernel.reference(f"tables/{table_name}/HEAD", commit_hash)
-        return commit_hash
+        return self._write_commit(table_name, parquet_hash,
+                                   message=f"create {table_name}",
+                                   extra={"row_count": data.num_rows})
 
     def insert(self, table_name: str, new_data: pa.Table) -> str:
         """Insert rows into a table. Reads the current HEAD, concatenates,
         writes a new commit. Returns the new commit hash."""
-        # Read current table
-        current = self.read_table(table_name)
-        # Concatenate (schema may evolve; promote_options handles missing columns)
+        current = self.read_collection(table_name)
         try:
             combined = pa.concat_tables([current, new_data], promote_options="default")
         except TypeError:
-            # Older pyarrow without promote_options
             combined = pa.concat_tables([current, new_data])
-        # Encode
         parquet_bytes = self._encode_table(combined)
         parquet_hash = self.kernel.write(parquet_bytes)
-        # Build commit
-        parent = self.kernel.resolve(f"tables/{table_name}/HEAD")
-        commit = {
-            "table": table_name,
-            "parquet": parquet_hash,
-            "parent": parent,
-            "schema": str(combined.schema),
-            "row_count": combined.num_rows,
-            "timestamp": time.time(),
-            "message": f"insert {new_data.num_rows} rows",
-        }
-        commit_bytes = json.dumps(commit).encode()
-        commit_hash = self.kernel.write(commit_bytes)
-        self.kernel.reference(f"tables/{table_name}/HEAD", commit_hash)
-        return commit_hash
+        parent = self.kernel.resolve(self._head_ref(table_name))
+        return self._write_commit(table_name, parquet_hash, parent=parent,
+                                   message=f"insert {new_data.num_rows} rows",
+                                   extra={"row_count": combined.num_rows})
 
     def read_table(self, table_name: str, commit_hash: Optional[str] = None) -> pa.Table:
-        """Read a table. If commit_hash is None, reads the latest HEAD.
-        Otherwise reads the table at the given commit (time travel)."""
-        if commit_hash is None:
-            commit_hash = self.kernel.resolve(f"tables/{table_name}/HEAD")
-            if commit_hash is None:
-                raise KeyError(f"Table {table_name} not found")
-        # Read the commit blob
-        commit = json.loads(self.kernel.read(commit_hash))
-        # Read the parquet blob
-        parquet_bytes = self.kernel.read(commit["parquet"])
-        # Decode
-        return self._decode_table(parquet_bytes)
-
-    def branch(self, table_name: str, branch_name: str) -> str:
-        """Create a branch of a table. Returns the branch's HEAD hash."""
-        head = self.kernel.resolve(f"tables/{table_name}/HEAD")
-        if head is None:
-            raise KeyError(f"Table {table_name} not found")
-        branch_ref = f"tables/{table_name}/branches/{branch_name}"
-        self.kernel.reference(branch_ref, head)
-        return head
+        """Read a table. Delegates to CollectionLens.read_collection.
+        ANY Lens can call this on ANY collection."""
+        return self.read_collection(table_name, commit_hash)
 
     def commit_to_branch(self, table_name: str, branch_name: str,
                          new_data: pa.Table) -> str:
         """Commit new data to a branch (not HEAD)."""
-        # Read branch's current state
-        branch_ref = f"tables/{table_name}/branches/{branch_name}"
-        branch_head = self.kernel.resolve(branch_ref)
-        if branch_head is None:
-            raise KeyError(f"Branch {branch_name} not found")
-        # Read current branch state
-        current = self.read_table(table_name, branch_head)
+        current = self.read_branch(table_name, branch_name)
         try:
             combined = pa.concat_tables([current, new_data], promote_options="default")
         except TypeError:
             combined = pa.concat_tables([current, new_data])
         parquet_bytes = self._encode_table(combined)
         parquet_hash = self.kernel.write(parquet_bytes)
-        commit = {
-            "table": table_name,
-            "parquet": parquet_hash,
-            "parent": branch_head,
-            "schema": str(combined.schema),
-            "row_count": combined.num_rows,
-            "timestamp": time.time(),
-            "message": f"branch {branch_name}: insert {new_data.num_rows} rows",
-        }
-        commit_bytes = json.dumps(commit).encode()
-        commit_hash = self.kernel.write(commit_bytes)
-        self.kernel.reference(branch_ref, commit_hash)
-        return commit_hash
+        return self.commit_to_branch_raw(table_name, branch_name, parquet_hash,
+                                         message=f"branch {branch_name}: insert {new_data.num_rows} rows",
+                                         extra={"row_count": combined.num_rows})
 
-    def merge_branch(self, table_name: str, branch_name: str) -> str:
-        """Merge a branch into HEAD. Creates a 2-parent merge commit."""
-        head = self.kernel.resolve(f"tables/{table_name}/HEAD")
-        branch_ref = f"tables/{table_name}/branches/{branch_name}"
-        branch_head = self.kernel.resolve(branch_ref)
-        if branch_head is None:
-            raise KeyError(f"Branch {branch_name} not found")
-        # Read both states
-        head_table = self.read_table(table_name, head)
-        branch_table = self.read_table(table_name, branch_head)
-        # Union (this is a simple merge policy; production would do
-        # row-level merge with conflict detection)
-        try:
-            merged = pa.concat_tables([head_table, branch_table], promote_options="default")
-        except TypeError:
-            merged = pa.concat_tables([head_table, branch_table])
-        parquet_bytes = self._encode_table(merged)
-        parquet_hash = self.kernel.write(parquet_bytes)
-        # 2-parent merge commit
+    def commit_to_branch_raw(self, name: str, branch_name: str,
+                             parquet_hash: str, message: str = "",
+                             extra: Optional[dict] = None) -> str:
+        """Write a commit to a branch using a raw parquet hash."""
+        ref = self._branch_ref(name, branch_name)
+        parent = self.kernel.resolve(ref)
+        if parent is None:
+            raise KeyError(f"Branch '{branch_name}' not found in '{name}'")
         commit = {
-            "table": table_name,
             "parquet": parquet_hash,
-            "parent": head,
-            "second_parent": branch_head,
-            "schema": str(merged.schema),
-            "row_count": merged.num_rows,
+            "parent": parent,
+            "message": message,
             "timestamp": time.time(),
-            "message": f"merge branch {branch_name}",
         }
-        commit_bytes = json.dumps(commit).encode()
+        if extra:
+            commit.update(extra)
+        commit_bytes = json.dumps(commit, sort_keys=True).encode()
         commit_hash = self.kernel.write(commit_bytes)
-        self.kernel.reference(f"tables/{table_name}/HEAD", commit_hash)
+        self.kernel.reference(ref, commit_hash)
         return commit_hash
-
-    def history(self, table_name: str) -> list[dict]:
-        """Walk the commit chain for a table. Returns list of commits
-        (most recent first)."""
-        head = self.kernel.resolve(f"tables/{table_name}/HEAD")
-        if head is None:
-            return []
-        history = []
-        current = head
-        while current:
-            commit = json.loads(self.kernel.read(current))
-            history.append({
-                "hash": current,
-                "table": commit["table"],
-                "row_count": commit["row_count"],
-                "message": commit["message"],
-                "timestamp": commit["timestamp"],
-                "parent": commit.get("parent"),
-                "second_parent": commit.get("second_parent"),
-            })
-            current = commit.get("parent")
-        return history
 
     # ------------------------------------------------------------------
     # Encoding helpers

@@ -189,7 +189,7 @@ def case_study_1_clinical_data_lake():
         check(main_count == 4, f"Main HEAD: {main_count} rows (trial data not visible)")
 
         # Branch has the trial data
-        branch_head = kernel.resolve("tables/patients/branches/trial_protocol")
+        branch_head = kernel.resolve("collections/patients/branches/trial_protocol")
         commit = json.loads(kernel.read(branch_head))
         parquet = kernel.read(commit["parquet"])
         reader = pa.BufferReader(parquet)
@@ -205,7 +205,7 @@ def case_study_1_clinical_data_lake():
         print("\n  Step 5: Full-text search (same data, no Elasticsearch)")
 
         # Build a simple inverted index from the notes column (Physical Structure)
-        head = kernel.resolve("tables/patients/HEAD")
+        head = kernel.resolve("collections/patients/HEAD")
         commit = json.loads(kernel.read(head))
         parquet = kernel.read(commit["parquet"])
         reader = pa.BufferReader(parquet)
@@ -443,7 +443,7 @@ def case_study_2_ml_feature_platform():
         print("\n  Step 6: Cross-Lens interop (SQL on feature data)")
 
         # The Lakehouse Lens can read the Feature Store's data via SQL
-        head = kernel.resolve("features/user_engagement/HEAD")
+        head = kernel.resolve("collections/user_engagement/HEAD")
         commit = json.loads(kernel.read(head))
         parquet = kernel.read(commit["parquet"])
         reader = pa.BufferReader(parquet)

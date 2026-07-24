@@ -122,7 +122,7 @@ def main():
         # We need to adapt: the Lakehouse Lens uses tables/{name}/HEAD,
         # but Feature Store uses features/{name}/HEAD. The interop is at
         # the kernel level — we can read either ref.
-        head_hash = kernel.resolve("features/user_features/HEAD")
+        head_hash = kernel.resolve("collections/user_features/HEAD")
         commit = json.loads(kernel.read(head_hash))
         parquet_bytes = kernel.read(commit["parquet"])
         # Lakehouse Lens can decode (Parquet is universal)
@@ -153,8 +153,8 @@ def main():
         # In a production system, Lenses might agree on a shared namespace
         # (e.g., both use features/{name}/HEAD). Here we demonstrate that
         # the kernel's flat namespace allows cross-Lens branching.
-        head_hash = kernel.resolve("features/user_features/HEAD")
-        kernel.reference("features/user_features/branches/lh_dev", head_hash)
+        head_hash = kernel.resolve("collections/user_features/HEAD")
+        kernel.reference("collections/user_features/branches/lh_dev", head_hash)
         print(f"  Lakehouse Lens created branch 'lh_dev' on user_features (via kernel)")
 
         # Feature Store Lens reads the branch
@@ -177,7 +177,7 @@ def main():
         print(f"  Feature Store Lens ingested 2 rows to branch 'lh_dev'")
 
         # Lakehouse Lens reads the updated branch
-        branch_head = kernel.resolve("features/user_features/branches/lh_dev")
+        branch_head = kernel.resolve("collections/user_features/branches/lh_dev")
         commit = json.loads(kernel.read(branch_head))
         parquet_bytes = kernel.read(commit["parquet"])
         reader = pa.BufferReader(parquet_bytes)
@@ -194,7 +194,7 @@ def main():
 
         # Walk back to the original commit
         original_commit = None
-        current = kernel.resolve("features/user_features/HEAD")
+        current = kernel.resolve("collections/user_features/HEAD")
         while current:
             c = json.loads(kernel.read(current))
             if c.get("parent") is None:
@@ -243,7 +243,7 @@ def main():
         print(f"  Feature Store Lens ingested 2 rows with new schema")
 
         # Lakehouse Lens sees the new schema automatically (Parquet-native)
-        head = kernel.resolve("features/user_features/HEAD")
+        head = kernel.resolve("collections/user_features/HEAD")
         commit = json.loads(kernel.read(head))
         parquet = kernel.read(commit["parquet"])
         reader = pa.BufferReader(parquet)
@@ -273,7 +273,7 @@ def main():
         # Lakehouse Lens can walk the same commit chain
         # (it doesn't have a history method, but it can traverse the kernel)
         lh_history_count = 0
-        current = kernel.resolve("features/user_features/HEAD")
+        current = kernel.resolve("collections/user_features/HEAD")
         while current:
             c = json.loads(kernel.read(current))
             lh_history_count += 1
@@ -316,14 +316,14 @@ def main():
               f"Cross-Lens: PIT join → SQL analysis: avg={expected:.3f} (got {result[0]:.3f})")
 
         # Step 3: Lakehouse Lens branches for analysis
-        kernel.reference("features/user_features/branches/analysis",
-                        kernel.resolve("features/user_features/HEAD"))
+        kernel.reference("collections/user_features/branches/analysis",
+                        kernel.resolve("collections/user_features/HEAD"))
 
         # Step 4: Feature Store Lens merges analysis branch back
         # (in a real workflow, the analysis branch would have new features
         # derived from the analysis; here we just demonstrate the merge works)
         fs.merge_branch("user_features", "analysis")
-        head = kernel.resolve("features/user_features/HEAD")
+        head = kernel.resolve("collections/user_features/HEAD")
         commit = json.loads(kernel.read(head))
         check(commit.get("second_parent") is not None,
               "Cross-Lens: merge commit has 2 parents (LH branch + FS HEAD)")

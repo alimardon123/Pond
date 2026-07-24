@@ -121,7 +121,7 @@ def step2_lakehouse_to_feature_store(kernel, lh, fs, users_table):
 
     # The Feature Store Lens can read the same Parquet data that the
     # Lakehouse Lens wrote. No ETL, no copy.
-    head = kernel.resolve("tables/users/HEAD")
+    head = kernel.resolve("collections/users/HEAD")
     commit = json.loads(kernel.read(head))
     parquet_bytes = kernel.read(commit["parquet"])
 
@@ -173,7 +173,7 @@ def step3_feature_to_vector(kernel, fs):
     # We simulate this: read the same Parquet bytes, extract numeric features,
     # and create a simple vector representation.
 
-    head = kernel.resolve("features/user_features/HEAD")
+    head = kernel.resolve("collections/user_features/HEAD")
     commit = json.loads(kernel.read(head))
     parquet_bytes = kernel.read(commit["parquet"])
 
@@ -217,7 +217,7 @@ def step4_vector_to_search(kernel):
     # A Search Lens would build an inverted index from text data.
     # The text data is in the SAME Parquet blob that the Lakehouse Lens wrote.
 
-    head = kernel.resolve("tables/users/HEAD")
+    head = kernel.resolve("collections/users/HEAD")
     commit = json.loads(kernel.read(head))
     parquet_bytes = kernel.read(commit["parquet"])
 

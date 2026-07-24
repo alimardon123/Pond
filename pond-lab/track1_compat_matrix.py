@@ -95,7 +95,7 @@ def test_bidirectional(kernel, lh, fs):
     })
     lh.create_table("users", users)
     # FeatureStore reads the same data (via kernel)
-    head = kernel.resolve("tables/users/HEAD")
+    head = kernel.resolve("collections/users/HEAD")
     commit = json.loads(kernel.read(head))
     parquet = kernel.read(commit["parquet"])
     reader = pa.BufferReader(parquet)
@@ -117,7 +117,7 @@ def test_bidirectional(kernel, lh, fs):
     })
     fs.ingest("user_stats", fs_data)
     # Lakehouse reads via DuckDB
-    head = kernel.resolve("features/user_stats/HEAD")
+    head = kernel.resolve("collections/user_stats/HEAD")
     commit = json.loads(kernel.read(head))
     parquet = kernel.read(commit["parquet"])
     reader = pa.BufferReader(parquet)
@@ -131,11 +131,11 @@ def test_branch_safe(kernel, lh, fs):
     print("\n  Test 2: Branch-safe")
 
     # Lakehouse creates a branch
-    head_before = kernel.resolve("tables/users/HEAD")
-    kernel.reference("tables/users/branches/dev", head_before)
+    head_before = kernel.resolve("collections/users/HEAD")
+    kernel.reference("collections/users/branches/dev", head_before)
 
     # FeatureStore reads — should see the SAME HEAD (unaffected)
-    head_after = kernel.resolve("tables/users/HEAD")
+    head_after = kernel.resolve("collections/users/HEAD")
     check(head_before == head_after,
           "Branch on Lakehouse doesn't move FeatureStore's HEAD")
 
@@ -159,7 +159,7 @@ def test_merge_safe(kernel, lh, fs):
 
     # FeatureStore reads the merged state
     # Union merge: 3 (original HEAD) + 4 (branch had 3+1) = 7 (with dups)
-    head = kernel.resolve("tables/users/HEAD")
+    head = kernel.resolve("collections/users/HEAD")
     commit = json.loads(kernel.read(head))
     parquet = kernel.read(commit["parquet"])
     reader = pa.BufferReader(parquet)
@@ -188,7 +188,7 @@ def test_schema_safe(kernel, lh, fs):
     lh.insert("users", new_data)
 
     # FeatureStore sees the new column
-    head = kernel.resolve("tables/users/HEAD")
+    head = kernel.resolve("collections/users/HEAD")
     commit = json.loads(kernel.read(head))
     parquet = kernel.read(commit["parquet"])
     reader = pa.BufferReader(parquet)
@@ -202,7 +202,7 @@ def test_time_travel_safe(kernel, lh, fs):
     print("\n  Test 5: Time-travel-safe")
 
     # Walk back to the first commit
-    current = kernel.resolve("tables/users/HEAD")
+    current = kernel.resolve("collections/users/HEAD")
     first_commit = None
     while current:
         c = json.loads(kernel.read(current))
@@ -236,7 +236,7 @@ def test_index_compatible(kernel, lh, fs):
     # Verify point lookup still works after all the above operations.
 
     # Read the current state via the kernel (any Lens can read)
-    head = kernel.resolve("tables/users/HEAD")
+    head = kernel.resolve("collections/users/HEAD")
     commit = json.loads(kernel.read(head))
     parquet = kernel.read(commit["parquet"])
     reader = pa.BufferReader(parquet)
