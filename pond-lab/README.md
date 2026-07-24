@@ -19,6 +19,7 @@
 | 9 | Production-quality Lakehouse Lens (caching, invalidation, multi-table) | **20/20 pass** (2.2x speedup with cache) |
 | 10 | Storage optimization at scale (packed Parquet, up to 500K records) | **10/10 pass** (996x fewer GETs at 500K) |
 | 11 | Head-to-head vs Iceberg at scale (100K + 500K, multi-workload) | **Done** (Pond wins 4/7 ops at 500K) |
+| 12 | Head-to-head vs REAL Apache Iceberg (pyiceberg v0.11.1) | **Done** (Pond wins 5/6 ops at 100K) |
 
 ## Track 1: Bidirectional Lens Compatibility Matrix
 

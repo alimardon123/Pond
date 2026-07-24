@@ -134,7 +134,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/README.md` | — | — | Folder purpose. |
 
-### 2.5b pond-lab/ (Lab experiments — 13 files)
+### 2.5b pond-lab/ (Lab experiments — 14 files)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
@@ -148,9 +148,10 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-lab/track8_storage_independence.py` | 350 | (tests) | **Track 8:** Storage Independence cert (23/23 pass). |
 | `pond-lab/track9_production_lakehouse.py` | 500 | (tests) | **Track 9:** Production Lakehouse with caching (20/20 pass, 2.2x speedup). |
 | `pond-lab/track10_storage_optimization.py` | 430 | (tests) | **Track 10:** Storage optimization at scale (10/10 pass, 996x fewer GETs). |
-| `pond-lab/track11_pond_vs_iceberg.py` | 640 | (benchmarks) | **Track 11:** Head-to-head vs Iceberg at 100K+500K (Pond wins 4/7 at 500K). |
+| `pond-lab/track11_pond_vs_iceberg.py` | 640 | (benchmarks) | **Track 11:** Head-to-head vs Iceberg proxy at 100K+500K (Pond wins 4/7 at 500K). |
+| `pond-lab/track12_pond_vs_real_iceberg.py` | 540 | (benchmarks) | **Track 12:** Head-to-head vs REAL Apache Iceberg (pyiceberg v0.11.1). Pond wins 5/6 at 100K. |
 | `pond-lab/COMPATIBILITY_SUITE.md` | 80 | — | Compatibility Suite: 3 certification levels. |
-| `pond-lab/README.md` | — | — | Lab tracks overview (11 tracks). |
+| `pond-lab/README.md` | — | — | Lab tracks overview (12 tracks). |
 
 ### 2.6 scripts/ (Tests and benchmarks — 11 files, ~5400 LOC)
 
