@@ -134,17 +134,20 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/README.md` | — | — | Folder purpose. |
 
-### 2.5b pond-lab/ (Lab experiments — 7 files)
+### 2.5b pond-lab/ (Lab experiments — 10 files)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
-| `pond-lab/track1_compat_matrix.py` | 340 | (tests) | **Track 1:** Bidirectional Lens compatibility matrix (10/10 pass). 6 badges. |
-| `pond-lab/track2_index_portability.py` | 380 | (tests) | **Track 2:** Index portability (18/18 pass). Stats, bloom, zone maps shared across Lenses. |
+| `pond-lab/track1_compat_matrix.py` | 340 | (tests) | **Track 1:** Bidirectional Lens compatibility matrix (10/10 pass). Level 1 cert. |
+| `pond-lab/track2_index_portability.py` | 380 | (tests) | **Track 2:** Index portability (18/18 pass). Level 2 cert. |
 | `pond-lab/track3_lens_vs_opponent.py` | 460 | (benchmarks) | **Track 3:** Lens-vs-opponent benchmarks (Lakehouse vs DuckDB+Parquet, FS vs Feast). |
 | `pond-lab/track4_object_store_efficiency.py` | 480 | (tests) | **Track 4:** Object-store efficiency (7 experiments; packing = 204x reduction). |
-| `pond-lab/track5_lens_composability.py` | 380 | (tests) | **Track 5:** Lens composability — ETL-free chain (15/15 pass). CSV → Lakehouse → Feature → Vector → Search. |
-| `pond-lab/track6_case_studies.py` | 440 | (tests) | **Track 6:** Real-world case studies (25/25 pass). Clinical data lake + ML feature platform. |
-| `pond-lab/README.md` | — | — | Lab tracks overview (6 tracks). |
+| `pond-lab/track5_lens_composability.py` | 380 | (tests) | **Track 5:** Lens composability — ETL-free chain (15/15 pass). |
+| `pond-lab/track6_case_studies.py` | 440 | (tests) | **Track 6:** Real-world case studies (25/25 pass). Clinical + ML. |
+| `pond-lab/track7_reverse_composability.py` | 450 | (tests) | **Track 7:** Reverse composability — symmetric interop (24/24 pass). |
+| `pond-lab/track8_storage_independence.py` | 350 | (tests) | **Track 8:** Storage Independence cert (23/23 pass). Level 3 cert. |
+| `pond-lab/COMPATIBILITY_SUITE.md` | 80 | — | Compatibility Suite: 3 certification levels. |
+| `pond-lab/README.md` | — | — | Lab tracks overview (8 tracks). |
 
 ### 2.6 scripts/ (Tests and benchmarks — 11 files, ~5400 LOC)
 

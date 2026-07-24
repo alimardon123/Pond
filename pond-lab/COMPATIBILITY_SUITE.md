@@ -56,7 +56,7 @@ Every Physical Structure must pass:
 |---|---|
 | Level 1 (Lakehouse ↔ FeatureStore) | ✅ 10/10 pass (Track 1) |
 | Level 2 (BloomFilter, Statistics, ZoneMap) | ✅ 18/18 pass (Track 2) |
-| Level 3 (Storage Independence) | Not yet tested |
+| Level 3 (Storage Independence) | ✅ 23/23 pass (Track 8) |
 
 ## Running
 
