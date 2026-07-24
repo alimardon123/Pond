@@ -48,7 +48,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-core"))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-sdk"))
 from pond_minimal import PondMinimal  # noqa: E402
-from collection_lens import CollectionLens  # noqa: E402
+from pond_lens import PondLens  # noqa: E402
 
 try:
     import pyarrow as pa
@@ -61,25 +61,21 @@ except ImportError:
 # Feature Store Lens
 # ---------------------------------------------------------------------------
 
-class FeatureStoreLens(CollectionLens):
+class FeatureStoreLens(PondLens):
     """Versioned ML feature store on Pond.
 
-    Extends CollectionLens, sharing the same ref namespace:
-      collections/{name}/HEAD
-      collections/{name}/branches/{branch}
-      collections/{name}/definition
+    Extends PondLens, the ONE base class for ALL Lenses.
+    Inherits: read_collection, write_parquet, append_parquet, branch,
+    merge_branch, history, list_collections, time travel.
 
-    ANY Lens that extends CollectionLens (LakehouseLens, FeatureStoreLens,
-    etc.) can read ANY collection created by ANY other Lens — through
-    the public API. No kernel bypass. No ETL.
+    ANY PondLens subclass can read FeatureStore collections via read_collection().
+    FeatureStoreLens can read ANY collection (Parquet or KV) via read_collection().
 
-    FeatureStoreLens adds:
+    Adds:
       - Feature definition management (entity columns, feature columns)
       - Point-in-time join (prevents label leakage)
       - Online serving (point lookup)
       - Schema evolution (add/rename features)
-      - Branching for feature experimentation (inherited)
-      - Time travel (inherited)
     """
 
     def __init__(self, kernel: PondMinimal):

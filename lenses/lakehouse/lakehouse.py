@@ -58,7 +58,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
 from pond_minimal import PondMinimal  # noqa: E402
-from collection_lens import CollectionLens  # noqa: E402
+from pond_lens import PondLens  # noqa: E402
 
 # DuckDB for the query engine
 try:
@@ -83,55 +83,32 @@ except ImportError:
 # LakehouseLens — tabular semantics on Pond
 # ---------------------------------------------------------------------------
 
-class LakehouseLens(CollectionLens):
-    """A Lens that implements tabular semantics on Pond's generic bytes.
+class LakehouseLens(PondLens):
+    """Parquet-table Lens with DuckDB query engine.
 
-    Extends CollectionLens, which provides the shared ref namespace:
-      collections/{name}/HEAD
-      collections/{name}/branches/{branch}
-      collections/{name}/definition
+    Extends PondLens, the ONE base class for ALL Lenses.
+    Inherits: read_collection, branch, merge_branch, history, list_collections.
+    Adds: create_table, insert, SQL query via DuckDB, table caching.
 
-    ANY Lens that extends CollectionLens can read ANY collection created
-    by ANY other Lens — through the public API, no kernel bypass.
-
-    LakehouseLens adds:
-      - create_table / insert (write Parquet to kernel)
-      - read_table (read Parquet from kernel — inherited as read_collection)
-      - SQL query via DuckDB
-      - Time travel (inherited)
-      - Branching (inherited)
-      - Merge (inherited, union merge)
-      - History (inherited)
-      - Schema evolution (Parquet-native)
+    ANY PondLens subclass can read Lakehouse collections via read_collection().
+    LakehouseLens can read ANY collection (Parquet or KV) via read_collection().
     """
 
+    def __init__(self, kernel: PondMinimal):
+        super().__init__(kernel)
+        self.duckdb = duckdb.connect()
+
     def create_table(self, table_name: str, data: pa.Table) -> str:
-        """Create a new table. `data` is a PyArrow Table.
-        Returns the commit hash."""
-        parquet_bytes = self._encode_table(data)
-        parquet_hash = self.kernel.write(parquet_bytes)
-        return self._write_commit(table_name, parquet_hash,
-                                   message=f"create {table_name}",
-                                   extra={"row_count": data.num_rows})
+        """Create a new table. Uses PondLens.write_parquet()."""
+        return self.write_parquet(table_name, data, message=f"create {table_name}")
 
     def insert(self, table_name: str, new_data: pa.Table) -> str:
-        """Insert rows into a table. Reads the current HEAD, concatenates,
-        writes a new commit. Returns the new commit hash."""
-        current = self.read_collection(table_name)
-        try:
-            combined = pa.concat_tables([current, new_data], promote_options="default")
-        except TypeError:
-            combined = pa.concat_tables([current, new_data])
-        parquet_bytes = self._encode_table(combined)
-        parquet_hash = self.kernel.write(parquet_bytes)
-        parent = self.kernel.resolve(self._head_ref(table_name))
-        return self._write_commit(table_name, parquet_hash, parent=parent,
-                                   message=f"insert {new_data.num_rows} rows",
-                                   extra={"row_count": combined.num_rows})
+        """Insert rows into a table. Uses PondLens.append_parquet()."""
+        return self.append_parquet(table_name, new_data, message=f"insert {new_data.num_rows} rows")
 
     def read_table(self, table_name: str, commit_hash: Optional[str] = None) -> pa.Table:
-        """Read a table. Delegates to CollectionLens.read_collection.
-        ANY Lens can call this on ANY collection."""
+        """Read a table. Delegates to PondLens.read_collection().
+        ANY lens can call this on ANY collection."""
         return self.read_collection(table_name, commit_hash)
 
     def commit_to_branch(self, table_name: str, branch_name: str,

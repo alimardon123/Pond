@@ -75,7 +75,8 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
-| `pond-sdk/collection_lens.py` | 280 | `CollectionLens` | Shared base for Parquet-storing Lenses. Shared `collections/{name}/HEAD` namespace. All Lenses interop through public API. |
+| `pond-sdk/pond_lens.py` | 310 | `PondLens` | **THE ONE base class for ALL Lenses.** Cross-format read (Parquet + KV). Shared namespace. Branch/merge/history. |
+| `pond-sdk/collection_lens.py` | 325 | `CollectionLens` | Legacy base (superseded by PondLens, kept for backward compat). |
 | `pond-sdk/lens_sdk.py` | 846 | `Lens`, `View` (alias), `KeylessLens`, `CrossLens` | Lens base class with index management. `View = Lens` alias. |
 | `pond-sdk/prolly_view.py` | 761 | `ProllyTree`, `ProllyViewBase` | Prolly tree storage + tiered commits (delta + snapshot) + branching + merge + history. |
 | `pond-sdk/auto_index.py` | 604 | `AutoIndex`, `IndexedView` | Physical Structure for secondary indexes. Auto-indexing (lazy/eager/incremental). |

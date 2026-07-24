@@ -30,7 +30,7 @@ from binary_encoding import BinaryProllyTree
 from maintenance import (drop_name, is_dropped, resolve_active,
                          TOMBSTONE_HASH)
 from lens_query import LensQuery
-from collection_lens import CollectionLens
+from pond_lens import PondLens
 
 
 # ===========================================================================
@@ -54,14 +54,17 @@ from collection_lens import CollectionLens
 # Enhanced Lens with full index management
 # ===========================================================================
 
-class Lens(CollectionLens):
+class Lens(PondLens):
     """
     Key-value Lens with Prolly tree backing.
 
-    Extends CollectionLens, sharing the `collections/{name}/HEAD` namespace.
-    This means ANY CollectionLens subclass (LakehouseLens, FeatureStoreLens,
-    etc.) can read this Lens's collections via `read_collection()`, and this
-    Lens can read Parquet collections via the inherited `read_collection()`.
+    Extends PondLens, the ONE base class for ALL Lenses.
+    Inherits: read_collection (cross-format), branch, merge_branch, history,
+    list_collections, write_parquet, append_parquet.
+
+    ANY PondLens subclass (LakehouseLens, FeatureStoreLens) can read this
+    Lens's collections via read_collection(). This Lens can read Parquet
+    collections via inherited read_collection().
 
     Key-value operations:
       - put(key, data): stage a key→blob mapping
@@ -81,8 +84,7 @@ class Lens(CollectionLens):
     """
 
     def __init__(self, kernel: PondMinimal, name: str):
-        super().__init__(kernel)
-        self.name = name
+        super().__init__(kernel, name)
         self.base = ProllyLensBase(kernel, name)
 
     # --- Write path ---
