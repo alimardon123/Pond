@@ -134,7 +134,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/README.md` | — | — | Folder purpose. |
 
-### 2.5b pond-lab/ (Lab experiments — 10 files)
+### 2.5b pond-lab/ (Lab experiments — 11 files)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
@@ -146,8 +146,9 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-lab/track6_case_studies.py` | 440 | (tests) | **Track 6:** Real-world case studies (25/25 pass). Clinical + ML. |
 | `pond-lab/track7_reverse_composability.py` | 450 | (tests) | **Track 7:** Reverse composability — symmetric interop (24/24 pass). |
 | `pond-lab/track8_storage_independence.py` | 350 | (tests) | **Track 8:** Storage Independence cert (23/23 pass). Level 3 cert. |
+| `pond-lab/track9_production_lakehouse.py` | 500 | (tests) | **Track 9:** Production Lakehouse with caching (20/20 pass, 2.2x speedup). |
 | `pond-lab/COMPATIBILITY_SUITE.md` | 80 | — | Compatibility Suite: 3 certification levels. |
-| `pond-lab/README.md` | — | — | Lab tracks overview (8 tracks). |
+| `pond-lab/README.md` | — | — | Lab tracks overview (9 tracks). |
 
 ### 2.6 scripts/ (Tests and benchmarks — 11 files, ~5400 LOC)
 
