@@ -115,6 +115,7 @@ The seven principles, in priority order:
 5. **Efficient** — immutable data + rebuildable derived metadata.
 6. **Beautiful** — one responsibility per layer; dependencies flow downward.
 7. **Functional** — Pond must do everything users actually need.
+8. **Storage-Independent** — stored bytes never depend on the execution engine.
 
 ### 3.1 Simple — the kernel remains intellectually small
 
@@ -218,8 +219,42 @@ right statement is "Pond can do X via a Lens that hasn't been
 built yet" — not "Pond can't do X."
 
 This principle keeps Pond honest about its scope while preventing
-premature defeatism. The kernel is small; the Lens algebra is
-infinite. Most "can't" claims are missing Lenses.
+premature defeatism. The kernel is small; the architecture is
+extensible through additional Lenses. Most "can't" claims are
+missing Lenses.
+
+### 3.8 Storage-Independent — stored bytes never depend on the execution engine
+
+**Storage Independence Law:** The stored bytes never depend on the
+execution engine. Spark, DuckDB, Polars, Ray, DataFusion, Flink —
+all observe the same storage. Storage survives execution engines.
+Execution engines become replaceable.
+
+This is the strongest architectural idea in Pond: storage semantics
+are independent from execution. The kernel stores immutable bytes;
+Lenses interpret them; execution engines query through Lenses. No
+execution engine "owns" storage. Switching from DuckDB to Spark to
+Polars is changing the query engine, not the storage.
+
+```
+Execution Layer (Spark, Flink, DuckDB, Polars, Ray, SQL)
+    ↓ (observes, never owns)
+Lens Layer (Lakehouse, Git, Feature Store, Vector, Search, Streaming)
+    ↓ (interprets, never owns)
+Kernel (Write, Read, Ref — immutable bytes + refs)
+    ↓
+Backend (local disk, S3, IPFS, FDB)
+```
+
+**Test:** Can you switch execution engines without rewriting,
+converting, or regenerating any stored data? If yes, storage is
+independent. If no, an execution engine has leaked into storage.
+
+This principle is the foundation for the LTAP (Long-Term Architecture
+Plan): a lightweight Databricks/Spark/Flink alternative where the
+storage layer is frozen and execution engines are pluggable. But
+the execution engine is NOT built yet — the storage model must be
+proven first.
 
 ---
 
@@ -351,7 +386,7 @@ reports, and any commit message that claims a result.
 
 ---
 
-## 7. The seven design goals as a checklist
+## 7. The eight design goals as a checklist
 
 Before proposing any change, run it through this checklist:
 
@@ -364,6 +399,7 @@ Before proposing any change, run it through this checklist:
 | 5 | Efficient | Are auxiliary structures rebuildable from snapshots? |
 | 6 | Beautiful | Does the dependency graph still flow downward only? |
 | 7 | Functional | If "Pond can't do X," have we asked: what Lens is missing? |
+| 8 | Storage-Independent | Can you switch execution engines without rewriting storage? |
 
 If any answer is "no," the proposal needs revision before it
 becomes code.
