@@ -212,10 +212,87 @@ class KeyValueLens(PondLens):
 
         Collection-agnostic API: commit(collection, message="")
         Backward compat API:    commit(message="")  [requires name in __init__]
+
+        After committing, zone maps for the staged entries are automatically
+        computed and stored (if the pruning extension is available). This
+        enables Vortex-style predicate pushdown via PruningReader.
         """
         collection, rest = self._resolve_collection(*args)
         message = rest[0] if rest else ""
-        return self._get_base(collection).commit(message or f"{collection} commit")
+        commit_hash = self._get_base(collection).commit(message or f"{collection} commit")
+
+        # Best-effort: build zone maps for newly committed entries
+        # Zone maps enable Vortex-style predicate pushdown (skip blobs
+        # without decoding). This is best-effort — if the pruning
+        # extension isn't available, the commit still succeeds.
+        try:
+            self._build_zone_maps_for_staged(collection)
+        except Exception:
+            pass  # zone map computation is best-effort
+
+        return commit_hash
+
+    def _build_zone_maps_for_staged(self, collection: str) -> None:
+        """Build zone maps for entries that were just committed.
+
+        For each staged key→blob_hash, reads the blob, computes min/max
+        of JSON fields, and stores the zone map via ZoneMapIndex.
+
+        This is best-effort: if the blob isn't JSON, the zone map is
+        skipped for that entry.
+        """
+        try:
+            from zone_map_index import ZoneMapIndex
+            from pruning import ZoneMap
+        except ImportError:
+            return  # pruning extension not available
+
+        zm_index = ZoneMapIndex(self.kernel)
+        base = self._get_base(collection)
+
+        # Read the current state (after commit)
+        state = base.read_all()
+        had_changes = False
+
+        for key, blob_hash in state.items():
+            if key.startswith("_"):
+                continue
+            rg_key = f"kv/{key}"  # KV zone maps use kv/ prefix
+
+            # Skip if zone map already exists for this key
+            existing_zm = zm_index.get_zone_map(collection, rg_key)
+            if existing_zm is not None:
+                continue
+
+            # Read the blob and compute zone map
+            try:
+                raw = self.kernel.read_blob(blob_hash)
+                row = json.loads(raw)  # KeyValueLens default encoding is JSON
+                if not isinstance(row, dict):
+                    continue
+
+                zm = ZoneMap(row_count=1)
+                for col, val in row.items():
+                    if val is None:
+                        zm.null_count[col] = 1
+                    else:
+                        try:
+                            # Only compute min/max for comparable types
+                            if isinstance(val, (int, float, str)):
+                                zm.min[col] = val
+                                zm.max[col] = val
+                                zm.null_count[col] = 0
+                        except Exception:
+                            pass
+
+                if zm.min:  # only store if we got at least one column
+                    zm_index.add_zone_map(collection, rg_key, zm, blob_hash)
+                    had_changes = True
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue  # not JSON — skip zone map for this entry
+
+        if had_changes:
+            zm_index.commit_zone_maps(collection, f"zone maps for {collection}")
 
     # --- Read path ---
 
@@ -328,6 +405,67 @@ class KeyValueLens(PondLens):
         collection, rest = self._resolve_collection(*args)
         adapter = _CollectionAdapter(self, collection)
         return LensQuery(adapter).join(rest[0], rest[1])
+
+    # --- Pruning-accelerated read (Vortex-style predicate pushdown) ---
+
+    def read_with_pruning(self, *args, **kwargs):
+        """Scan a collection with Vortex-style predicate pushdown.
+
+        Collection-agnostic API: read_with_pruning(collection, predicates=None, row_filter=None)
+        Backward compat API:    read_with_pruning(predicates=None, row_filter=None)
+
+        Reads zone maps first (small, cheap), evaluates the pruning
+        predicate, and only fetches + decodes data blobs that MIGHT match.
+        Skips blobs whose zone maps prove they can't match — WITHOUT
+        reading or decoding the data blob.
+
+        Args:
+            collection: collection name (or omitted if using default)
+            predicates: list of (column, op, value) tuples for pruning.
+                Example: [("age", ">", 30), ("region", "=", "US")]
+                All predicates are ANDed together.
+                If None, no pruning (reads all blobs).
+            row_filter: optional function(row_dict) -> bool for exact
+                row-level filtering after pruning.
+
+        Yields:
+            Rows (dicts) from non-pruned blobs (optionally filtered).
+        """
+        collection, rest = self._resolve_collection(*args)
+        predicates = rest[0] if len(rest) > 0 else kwargs.get("predicates")
+        row_filter = rest[1] if len(rest) > 1 else kwargs.get("row_filter")
+
+        try:
+            from zone_map_index import ZoneMapIndex
+            from pruning import PruningPredicate, ColumnPredicate
+            from pruning_reader import PruningReader
+        except ImportError:
+            # No pruning extension — fall back to full scan
+            for row in self.iterate(collection):
+                if row_filter is None or row_filter(row):
+                    yield row
+            return
+
+        zm_index = ZoneMapIndex(self.kernel)
+        if not zm_index.has_zone_maps(collection):
+            # No zone maps — fall back to full scan
+            for row in self.iterate(collection):
+                if row_filter is None or row_filter(row):
+                    yield row
+            return
+
+        # Build pruning predicate
+        predicate = None
+        if predicates:
+            col_preds = [ColumnPredicate(column=c, op=o, value=v)
+                         for c, o, v in predicates]
+            predicate = PruningPredicate(col_preds, combine="and")
+
+        reader = PruningReader(self.kernel, zm_index, collection, predicate)
+
+        # Decode function: JSON bytes → row dict
+        for row in reader.scan(decode_fn=self.decode, row_filter=row_filter):
+            yield row
 
     # --- Version control ---
 

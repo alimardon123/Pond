@@ -106,17 +106,49 @@ class AutoIndex:
 
 
 # ---------------------------------------------------------------------------
-# AutoIndexMixin — composable with ANY Pond lens (KV or tabular)
+# AutoIndexMixin — DEPRECATED. Use CollectionIndexer instead.
+#
+# This mixin is deprecated because it imports KeyValueLens from
+# lenses/keyvalue/, which violates Principle 6 (Beautiful: dependencies
+# flow downward only). Extensions must NOT depend on specific lenses.
+#
+# CollectionIndexer (in collection_index.py) is the replacement. It
+# operates on kernel + collection name — no lens dependency.
+#
+# This file is kept for backward compatibility. New code should use:
+#   from extensions.indexing.collection_index import CollectionIndexer
 # ---------------------------------------------------------------------------
 
+import warnings
+
 class AutoIndexMixin:
-    """Mixin that adds automatic indexing to ANY Pond lens.
+    """DEPRECATED. Use CollectionIndexer instead.
+
+    This mixin adds automatic indexing to KV-style lenses. It is deprecated
+    because it creates a dependency from extensions → lenses (violating
+    Principle 6: dependencies flow downward only).
+
+    Migration guide:
+        # Old (deprecated):
+        from extensions.indexing.auto_index import AutoIndexMixin, IndexedLens
+        lens = IndexedLens(kernel, "users")
+        lens.register_index("by_name", lambda d: d["name"])
+        result = lens.find_by("by_name", "alice")
+
+        # New (recommended):
+        from extensions.indexing.collection_index import CollectionIndexer
+        indexer = CollectionIndexer(kernel)
+        indexer.build_index("users", "by_name",
+                            extractor=lambda d: d["name"],
+                            scan_rows=kv_lens.iterate("users"))
+        rowid = indexer.lookup("users", "by_name", "alice")
+        row = kv_lens.get("users", rowid)
 
     EXTENSION METADATA:
-      extension_type: "mixin"
-      supported_lens_types: ["KeyValueLens", "KeylessLens", "SemanticLens", "LakehouseLens", "FeatureStoreLens"]
+      extension_type: "mixin" (DEPRECATED — will be removed in a future version)
+      supported_lens_types: ["KeyValueLens", "KeylessLens", "SemanticLens"]
       supported_storage: ["ProllyTreeIndex"]
-      not_supported: []
+      not_supported: ["LakehouseLens", "FeatureStoreLens"]
 
     TWO MODES OF OPERATION:
 
