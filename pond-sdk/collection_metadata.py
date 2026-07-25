@@ -309,6 +309,33 @@ class CollectionMetadata:
             return True
         return self.indexer.is_index_stale(collection, index_name, scan_fn, extractor)
 
+    def register_lazy_index(self, collection: str, index_name: str,
+                            extractor, scan_fn, staleness_budget: int = 5) -> None:
+        """Register an index for LAZY auto-refresh."""
+        if not _PRUNING_AVAILABLE or self.indexer is None:
+            return
+        self.indexer.register_lazy_index(collection, index_name, extractor, scan_fn, staleness_budget)
+
+    def register_eager_index(self, collection: str, index_name: str,
+                             extractor, scan_fn) -> None:
+        """Register an index for EAGER auto-refresh."""
+        if not _PRUNING_AVAILABLE or self.indexer is None:
+            return
+        self.indexer.register_eager_index(collection, index_name, extractor, scan_fn)
+
+    def notify_write(self, collection: str) -> None:
+        """Notify the indexer that a write has occurred on a collection.
+
+        For EAGER indexes: refreshes immediately.
+        For LAZY indexes: staleness accumulates (refreshed on next lookup).
+        For MANUAL indexes: no-op.
+
+        The lens should call this after each commit.
+        """
+        if not _PRUNING_AVAILABLE or self.indexer is None:
+            return
+        self.indexer.notify_write(collection)
+
     # ==================================================================
     # Compaction — clean up stale metadata after collection rewrites
     # ==================================================================

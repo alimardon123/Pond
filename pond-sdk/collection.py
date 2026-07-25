@@ -303,6 +303,23 @@ class Collection:
         """Check if an index is stale (doesn't match current data)."""
         return self.metadata.is_index_stale(self.name, index_name, scan_fn, extractor)
 
+    def register_lazy_index(self, index_name: str, extractor, scan_fn,
+                            staleness_budget: int = 5) -> None:
+        """Register an index for LAZY auto-refresh (refresh on lookup if stale)."""
+        self.metadata.register_lazy_index(self.name, index_name, extractor, scan_fn, staleness_budget)
+
+    def register_eager_index(self, index_name: str, extractor, scan_fn) -> None:
+        """Register an index for EAGER auto-refresh (refresh on every write)."""
+        self.metadata.register_eager_index(self.name, index_name, extractor, scan_fn)
+
+    def notify_write(self) -> None:
+        """Notify that a write has occurred on this collection.
+
+        For EAGER indexes: refreshes immediately.
+        For LAZY indexes: staleness accumulates.
+        """
+        self.metadata.notify_write(self.name)
+
     def compact_zone_maps(self) -> int:
         """Remove stale zone maps (after insert/merge replaces old data)."""
         return self.metadata.compact_zone_maps(self.name)

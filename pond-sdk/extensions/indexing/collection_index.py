@@ -79,10 +79,109 @@ class CollectionIndexer(CollectionIndexerInterface):
 
     The index maps index_key → _rowid. The _rowid is the universal row
     identifier (UUIDv7 for tabular lenses, the key for KV lenses).
+
+    INDEX MODES:
+      - "manual" (default): caller explicitly calls build_index/refresh_index.
+        No automatic refresh. The index may become stale after writes.
+      - "lazy": index is refreshed on lookup if stale (exceeds staleness_budget
+        commits since last build). Caller must call register_lazy_index() to
+        set up the mode, extractor, and scan_fn.
+      - "eager": index is refreshed on every notify_write() call. The caller
+        (typically the lens) calls notify_write() after each commit.
+        Caller must call register_eager_index() to set up.
+
+    The lazy/eager modes replace the old AutoIndexMixin's functionality,
+    but are data-side (no lens dependency). The lens calls notify_write()
+    or the indexer checks staleness on lookup — both work without coupling
+    to the lens's internal staging state.
     """
 
     def __init__(self, kernel: PondMinimal):
         self.kernel = kernel
+        # Registered indexes for lazy/eager modes
+        # Key: (collection, index_name) → {extractor, scan_fn, mode, staleness_budget, last_commit_index}
+        self._registered: dict[tuple[str, str], dict] = {}
+
+    def register_lazy_index(self, collection: str, index_name: str,
+                            extractor: Callable[[Any], Union[str, list[str]]],
+                            scan_fn: Callable[[], Any],
+                            staleness_budget: int = 5) -> None:
+        """Register an index for LAZY auto-refresh.
+
+        The index will be refreshed on lookup if the number of commits
+        since the last build exceeds staleness_budget.
+
+        Args:
+            collection: collection name
+            index_name: index name
+            extractor: function(row_dict) → str | list[str]
+            scan_fn: callback yielding (rowid, row_dict) pairs
+            staleness_budget: max commits before refresh (default 5)
+        """
+        self._registered[(collection, index_name)] = {
+            "extractor": extractor,
+            "scan_fn": scan_fn,
+            "mode": "lazy",
+            "staleness_budget": staleness_budget,
+            "last_commit_index": self._get_commit_index(collection),
+        }
+
+    def register_eager_index(self, collection: str, index_name: str,
+                             extractor: Callable[[Any], Union[str, list[str]]],
+                             scan_fn: Callable[[], Any]) -> None:
+        """Register an index for EAGER auto-refresh.
+
+        The index will be refreshed on every notify_write() call for
+        this collection. This gives always-fresh reads but slower writes.
+
+        Args:
+            collection: collection name
+            index_name: index name
+            extractor: function(row_dict) → str | list[str]
+            scan_fn: callback yielding (rowid, row_dict) pairs
+        """
+        self._registered[(collection, index_name)] = {
+            "extractor": extractor,
+            "scan_fn": scan_fn,
+            "mode": "eager",
+            "staleness_budget": 0,
+            "last_commit_index": self._get_commit_index(collection),
+        }
+
+    def notify_write(self, collection: str) -> None:
+        """Notify the indexer that a write (commit) has occurred on a collection.
+
+        For EAGER indexes: refreshes the index immediately.
+        For LAZY indexes: increments the staleness counter (refresh on next lookup).
+        For MANUAL indexes: no-op.
+
+        The lens should call this after each commit:
+            lens.commit("users", "insert alice")
+            indexer.notify_write("users")
+        """
+        current_commit = self._get_commit_index(collection)
+        for (coll, idx_name), config in self._registered.items():
+            if coll != collection:
+                continue
+            if config["mode"] == "eager":
+                # Refresh immediately
+                self.refresh_index(coll, idx_name,
+                                   config["extractor"], config["scan_fn"])
+                config["last_commit_index"] = current_commit
+            # For lazy: just let staleness accumulate (checked on lookup)
+
+    def _get_commit_index(self, collection: str) -> int:
+        """Get the current commit count for a collection (from history)."""
+        try:
+            base = ProllyLensBase(self.kernel, collection)
+            head = self.kernel.resolve(f"collections/{collection}/HEAD")
+            if head is None:
+                return 0
+            from binary_encoding import BinaryProllyTree
+            commit = BinaryProllyTree.decode_commit(self.kernel.read_blob(head))
+            return commit.get("index", 0)
+        except Exception:
+            return 0
 
     # ------------------------------------------------------------------
     # Index ref naming
@@ -246,9 +345,24 @@ class CollectionIndexer(CollectionIndexerInterface):
                index_key: str) -> Optional[str]:
         """Look up a single _rowid by index key.
 
+        For LAZY indexes: checks staleness first and refreshes if needed.
+        For EAGER/MANUAL indexes: just looks up (index is assumed fresh).
+
         Returns the _rowid string, or None if not found.
-        The caller uses the lens to retrieve the actual row by _rowid.
         """
+        # Check if this is a registered lazy index that needs refresh
+        key = (collection, index_name)
+        if key in self._registered:
+            config = self._registered[key]
+            if config["mode"] == "lazy":
+                current_commit = self._get_commit_index(collection)
+                staleness = current_commit - config["last_commit_index"]
+                if staleness > config["staleness_budget"]:
+                    # Refresh before lookup
+                    self.refresh_index(collection, index_name,
+                                       config["extractor"], config["scan_fn"])
+                    config["last_commit_index"] = current_commit
+
         ref = self._index_ref(collection, index_name)
         tree_root = resolve_active(self.kernel, ref)
         if not tree_root:
