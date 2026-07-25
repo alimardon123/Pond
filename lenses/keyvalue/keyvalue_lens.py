@@ -112,16 +112,15 @@ class KeyValueLens(PondLens):
         Args:
             kernel: the PondMinimal kernel instance
             name: OPTIONAL. If provided, enables backward-compatible
-                  single-collection API (lens.put(key, data) instead of
-                  lens.put(collection, key, data)). New code should omit
-                  name and pass collection to each method.
+                  single-collection API.
         """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
-        # Backward compat: if name is provided, bind to that collection
         self._default_collection = name
         if name is not None:
-            self.name = name  # backward compat attribute
+            self.name = name
+        # Attached indexer for auto-notify on commit (set via attach_indexer)
+        self._attached_indexer = None
 
     def _resolve_collection(self, *args) -> tuple:
         """Resolve the collection name from args or default.
@@ -222,16 +221,29 @@ class KeyValueLens(PondLens):
         message = rest[0] if rest else ""
         commit_hash = self._get_base(collection).commit(message or f"{collection} commit")
 
-        # Notify registered indexers (EAGER mode auto-refresh)
-        # This is a no-op if no indexers are registered.
-        try:
-            from collection_metadata import CollectionMetadata
-            meta = CollectionMetadata(self.kernel)
-            meta.notify_write(collection)
-        except Exception:
-            pass  # indexer notification is best-effort
+        # Notify attached indexer (EAGER mode auto-refresh)
+        # This is a no-op if no indexer is attached.
+        if self._attached_indexer is not None:
+            try:
+                self._attached_indexer.notify_write(collection)
+            except Exception:
+                pass  # indexer notification is best-effort
 
         return commit_hash
+
+    def attach_indexer(self, indexer) -> None:
+        """Attach a CollectionMetadata or CollectionIndexer for auto-notify.
+
+        After attaching, every commit() call will automatically notify
+        the indexer (triggering EAGER refresh or LAZY staleness increment).
+
+        Usage:
+            meta = CollectionMetadata(kernel)
+            meta.register_eager_index('users', 'by_name', extractor, scan_fn)
+            lens.attach_indexer(meta)
+            # Now every lens.commit('users', ...) auto-refreshes EAGER indexes
+        """
+        self._attached_indexer = indexer
 
     def build_zone_maps(self, *args) -> None:
         """Build zone maps for a KV collection (explicit, not auto).

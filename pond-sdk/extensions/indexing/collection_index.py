@@ -151,7 +151,8 @@ class CollectionIndexer(CollectionIndexerInterface):
     def notify_write(self, collection: str) -> None:
         """Notify the indexer that a write (commit) has occurred on a collection.
 
-        For EAGER indexes: refreshes the index immediately.
+        For EAGER indexes: refreshes the index immediately (or builds it
+        if it doesn't exist yet).
         For LAZY indexes: increments the staleness counter (refresh on next lookup).
         For MANUAL indexes: no-op.
 
@@ -164,9 +165,17 @@ class CollectionIndexer(CollectionIndexerInterface):
             if coll != collection:
                 continue
             if config["mode"] == "eager":
-                # Refresh immediately
-                self.refresh_index(coll, idx_name,
-                                   config["extractor"], config["scan_fn"])
+                # Check if index exists
+                ref = self._index_ref(coll, idx_name)
+                existing_root = resolve_active(self.kernel, ref)
+                if existing_root is None or existing_root == TOMBSTONE_HASH:
+                    # Index doesn't exist yet — build it
+                    self.build_index(coll, idx_name,
+                                     config["extractor"], config["scan_fn"])
+                else:
+                    # Index exists — refresh it
+                    self.refresh_index(coll, idx_name,
+                                       config["extractor"], config["scan_fn"])
                 config["last_commit_index"] = current_commit
             # For lazy: just let staleness accumulate (checked on lookup)
 

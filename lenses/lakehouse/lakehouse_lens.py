@@ -254,6 +254,7 @@ class LakehouseLens(PondLens):
         commit_hash = self._write_via_prolly(table_name, combined, key_col, rg_size,
                                         message=message or f"insert {new_data.num_rows} rows")
 
+        self._notify_indexers(table_name)
         return commit_hash
 
     def read_table(self, table_name: str,
@@ -330,6 +331,7 @@ class LakehouseLens(PondLens):
         commit_hash = self._write_merge_via_prolly(name, merged, head, branch_head,
                                              rg_size, f"merge branch '{branch_name}'")
 
+        self._notify_indexers(name)
         return commit_hash
 
     # ==================================================================
@@ -423,6 +425,7 @@ class LakehouseLens(PondLens):
 
         # Invalidate read cache
         self._cached_tables.pop(f"{name}:{commit_hash}", None)
+        self._notify_indexers(name)
         return commit_hash
 
     def range_read(self, name: str,
@@ -792,6 +795,7 @@ class LakehouseLens(PondLens):
             except Exception:
                 pass  # zone map commit is best-effort
 
+        self._notify_indexers(name)
         return commit_hash
 
     def _write_via_prolly_to_branch(self, name: str, branch_name: str,
@@ -830,6 +834,7 @@ class LakehouseLens(PondLens):
                 self.kernel.reference(self._head_ref(name), original_head)
         # Move the new commit to the branch ref
         self.kernel.reference(ref, commit_hash)
+        self._notify_indexers(name)
         return commit_hash
 
     def _write_merge_via_prolly(self, name: str, table: pa.Table,
@@ -886,6 +891,7 @@ class LakehouseLens(PondLens):
         base._staged_del.clear()
         base._commit_index += 1
         self._cached_tables.pop(f"{name}:{commit_hash}", None)
+        self._notify_indexers(name)
         return commit_hash
 
     def _read_all_row_groups(self, name: str,
@@ -1047,6 +1053,24 @@ class LakehouseLens(PondLens):
             return 0
         except Exception:
             return 0
+
+    def _notify_indexers(self, collection: str) -> None:
+        """Notify registered indexers that a write has occurred.
+
+        For EAGER indexes: refreshes immediately.
+        For LAZY indexes: staleness accumulates (refreshed on next lookup).
+        For MANUAL indexes: no-op.
+
+        Called automatically after every commit (create_table, insert,
+        range_write, merge_branch). Best-effort — if CollectionMetadata
+        isn't available, the commit still succeeds.
+        """
+        try:
+            from collection_metadata import CollectionMetadata
+            meta = CollectionMetadata(self.kernel)
+            meta.notify_write(collection)
+        except Exception:
+            pass  # indexer notification is best-effort
 
 
 # ---------------------------------------------------------------------------
