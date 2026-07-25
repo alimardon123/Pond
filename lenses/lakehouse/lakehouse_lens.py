@@ -172,9 +172,23 @@ class LakehouseLens(PondLens):
     def __init__(self, kernel: PondMinimal):
         super().__init__(kernel)
         self.duckdb = duckdb.connect()
-        # Cache for read_table() — keyed by (name, commit_hash).
-        # Invalidated on writes to that name.
         self._cached_tables: dict[str, tuple[str, pa.Table]] = {}
+        self._attached_indexer = None
+
+    def attach_indexer(self, indexer) -> None:
+        """Attach a CollectionMetadata or CollectionIndexer for auto-notify.
+
+        After attaching, every commit (create_table, insert, range_write,
+        merge_branch) auto-notifies the indexer. EAGER indexes refresh
+        immediately; LAZY indexes accumulate staleness.
+
+        Usage:
+            meta = CollectionMetadata(kernel)
+            meta.register_eager_index('users', 'by_age', extractor, scan_fn)
+            lens.attach_indexer(meta)
+            lens.create_table('users', data)  # auto-refreshes EAGER index
+        """
+        self._attached_indexer = indexer
 
     # ==================================================================
     # Unified storage: ALL writes go through ProllyTreeIndex.
@@ -1055,22 +1069,19 @@ class LakehouseLens(PondLens):
             return 0
 
     def _notify_indexers(self, collection: str) -> None:
-        """Notify registered indexers that a write has occurred.
+        """Notify attached indexer that a write has occurred.
 
         For EAGER indexes: refreshes immediately.
         For LAZY indexes: staleness accumulates (refreshed on next lookup).
         For MANUAL indexes: no-op.
 
-        Called automatically after every commit (create_table, insert,
-        range_write, merge_branch). Best-effort — if CollectionMetadata
-        isn't available, the commit still succeeds.
+        Called automatically after every commit. Best-effort.
         """
-        try:
-            from collection_metadata import CollectionMetadata
-            meta = CollectionMetadata(self.kernel)
-            meta.notify_write(collection)
-        except Exception:
-            pass  # indexer notification is best-effort
+        if self._attached_indexer is not None:
+            try:
+                self._attached_indexer.notify_write(collection)
+            except Exception:
+                pass  # indexer notification is best-effort
 
 
 # ---------------------------------------------------------------------------
