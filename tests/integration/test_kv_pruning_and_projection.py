@@ -42,10 +42,13 @@ def test_kv_pruning():
             lens.put("users", f"user:{i}", {"name": f"user_{i}", "age": 20 + i * 10})
         lens.commit("users", "insert 5 users")
 
+        # Build zone maps explicitly (KV zone maps are NOT auto-built)
+        lens.build_zone_maps("users")
+
         # Verify zone maps were built
         zm_index = ZoneMapIndex(kernel)
         assert zm_index.has_zone_maps("users"), "Zone maps not built for KV collection"
-        print("  [OK] Zone maps auto-built at KV commit time")
+        print("  [OK] Zone maps built via explicit build_zone_maps() call")
 
         # Pruning: age > 35
         # Users: age 20, 30, 40, 50, 60

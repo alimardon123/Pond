@@ -213,34 +213,28 @@ class KeyValueLens(PondLens):
         Collection-agnostic API: commit(collection, message="")
         Backward compat API:    commit(message="")  [requires name in __init__]
 
-        After committing, zone maps for the staged entries are automatically
-        computed and stored (if the pruning extension is available). This
-        enables Vortex-style predicate pushdown via PruningReader.
+        Zone maps are NOT auto-built for KV commits (too much overhead for
+        per-row entries). Use build_zone_maps(collection) explicitly to
+        build zone maps for a KV collection when you want pruning support.
         """
         collection, rest = self._resolve_collection(*args)
         message = rest[0] if rest else ""
-        commit_hash = self._get_base(collection).commit(message or f"{collection} commit")
+        return self._get_base(collection).commit(message or f"{collection} commit")
 
-        # Best-effort: build zone maps for newly committed entries
-        # Zone maps enable Vortex-style predicate pushdown (skip blobs
-        # without decoding). This is best-effort — if the pruning
-        # extension isn't available, the commit still succeeds.
-        try:
-            self._build_zone_maps_for_staged(collection)
-        except Exception:
-            pass  # zone map computation is best-effort
+    def build_zone_maps(self, *args) -> None:
+        """Build zone maps for a KV collection (explicit, not auto).
 
-        return commit_hash
+        Collection-agnostic API: build_zone_maps(collection)
+        Backward compat API:    build_zone_maps()  [uses default collection]
 
-    def _build_zone_maps_for_staged(self, collection: str) -> None:
-        """Build zone maps for entries that were just committed.
+        Zone maps are NOT built automatically for KV commits because KV
+        entries are individual blobs (1 zone map per blob = 2x writes).
+        Instead, call this method explicitly when you want pruning support.
 
-        For each staged key→blob_hash, reads the blob, computes min/max
-        of JSON fields, and stores the zone map via ZoneMapIndex.
-
-        This is best-effort: if the blob isn't JSON, the zone map is
-        skipped for that entry.
+        For LakehouseLens, zone maps ARE auto-built (1 zone map per row
+        group of 10K rows = negligible overhead).
         """
+        collection, rest = self._resolve_collection(*args)
         try:
             from zone_map_index import ZoneMapIndex
             from pruning import ZoneMap
@@ -249,47 +243,34 @@ class KeyValueLens(PondLens):
 
         zm_index = ZoneMapIndex(self.kernel)
         base = self._get_base(collection)
-
-        # Read the current state (after commit)
         state = base.read_all()
         had_changes = False
 
         for key, blob_hash in state.items():
             if key.startswith("_"):
                 continue
-            rg_key = f"kv/{key}"  # KV zone maps use kv/ prefix
-
-            # Skip if zone map already exists for this key
+            rg_key = f"kv/{key}"
             existing_zm = zm_index.get_zone_map(collection, rg_key)
             if existing_zm is not None:
                 continue
-
-            # Read the blob and compute zone map
             try:
                 raw = self.kernel.read_blob(blob_hash)
-                row = json.loads(raw)  # KeyValueLens default encoding is JSON
+                row = json.loads(raw)
                 if not isinstance(row, dict):
                     continue
-
                 zm = ZoneMap(row_count=1)
                 for col, val in row.items():
                     if val is None:
                         zm.null_count[col] = 1
-                    else:
-                        try:
-                            # Only compute min/max for comparable types
-                            if isinstance(val, (int, float, str)):
-                                zm.min[col] = val
-                                zm.max[col] = val
-                                zm.null_count[col] = 0
-                        except Exception:
-                            pass
-
-                if zm.min:  # only store if we got at least one column
+                    elif isinstance(val, (int, float, str)):
+                        zm.min[col] = val
+                        zm.max[col] = val
+                        zm.null_count[col] = 0
+                if zm.min:
                     zm_index.add_zone_map(collection, rg_key, zm, blob_hash)
                     had_changes = True
             except (json.JSONDecodeError, UnicodeDecodeError):
-                continue  # not JSON — skip zone map for this entry
+                continue
 
         if had_changes:
             zm_index.commit_zone_maps(collection, f"zone maps for {collection}")

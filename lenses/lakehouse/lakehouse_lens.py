@@ -192,7 +192,8 @@ class LakehouseLens(PondLens):
     def create_table(self, table_name: str, data: pa.Table,
                      key_col: Optional[str] = None,
                      row_group_size: int = 0,
-                     message: str = "") -> str:
+                     message: str = "",
+                     build_zone_maps: bool = True) -> str:
         """Create a new table. Stores data as row groups in ProllyTreeIndex.
 
         Args:
@@ -206,6 +207,9 @@ class LakehouseLens(PondLens):
                 (e.g., 10_000) for OLTP-style storage with fast point
                 lookups.
             message: commit message (default: "create {table_name}").
+            build_zone_maps: if True (default), auto-build zone maps for
+                Vortex-style predicate pushdown. Set to False to disable
+                (saves write overhead when pruning is not needed).
 
         Returns:
             The new HEAD commit hash.
@@ -213,7 +217,8 @@ class LakehouseLens(PondLens):
         if row_group_size == 0:
             row_group_size = max(data.num_rows, 1)  # one group = whole table
         return self._write_via_prolly(table_name, data, key_col, row_group_size,
-                                        message=message or f"create {table_name}")
+                                        message=message or f"create {table_name}",
+                                        build_zone_maps=build_zone_maps)
 
     def insert(self, table_name: str, new_data: pa.Table,
                key_col: Optional[str] = None,
