@@ -75,8 +75,31 @@ class VectorLens(PondLens):
 
     def __init__(self, kernel: PondMinimal):
         super().__init__(kernel)
-        # Cache of ProllyLensBase instances per collection (for staging state)
         self._bases: dict[str, ProllyLensBase] = {}
+        self._attached_indexer = None
+
+    def attach_indexer(self, indexer) -> None:
+        """Attach a CollectionMetadata or CollectionIndexer for auto-notify.
+
+        After attaching, every commit (insert, delete_vector) auto-notifies
+        the indexer. EAGER indexes refresh immediately; LAZY indexes
+        accumulate staleness.
+
+        Usage:
+            meta = CollectionMetadata(kernel)
+            meta.register_eager_index('vectors', 'by_id', extractor, scan_fn)
+            lens.attach_indexer(meta)
+            lens.insert('vectors', 'v1', [1.0, 2.0])  # auto-refreshes
+        """
+        self._attached_indexer = indexer
+
+    def _notify_indexers(self, collection: str) -> None:
+        """Notify attached indexer after a commit. Best-effort."""
+        if self._attached_indexer is not None:
+            try:
+                self._attached_indexer.notify_write(collection)
+            except Exception:
+                pass
 
     def _get_base(self, collection: str) -> ProllyLensBase:
         """Get or create the ProllyLensBase for a collection."""
@@ -144,12 +167,16 @@ class VectorLens(PondLens):
         }
         blob_hash = self.kernel.write(self.encode(record))
         self._get_base(collection).stage(str(id), blob_hash)
-        return self._get_base(collection).commit(f"insert vector {id}")
+        commit_hash = self._get_base(collection).commit(f"insert vector {id}")
+        self._notify_indexers(collection)
+        return commit_hash
 
     def delete_vector(self, collection: str, id: str) -> str:
         """Delete a vector by ID. Returns the commit hash."""
         self._get_base(collection).stage_delete(str(id))
-        return self._get_base(collection).commit(f"delete vector {id}")
+        commit_hash = self._get_base(collection).commit(f"delete vector {id}")
+        self._notify_indexers(collection)
+        return commit_hash
 
     # ==================================================================
     # Read path — vector operations
