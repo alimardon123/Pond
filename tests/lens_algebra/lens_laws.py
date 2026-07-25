@@ -522,7 +522,7 @@ def _test_default_view_passes_laws():
 def _test_indexed_view_passes_laws():
     """Smoke test: KeyValueLens + CollectionMetadata index should pass all 6 laws.
 
-    This replaces the old IndexedLens test. IndexedLens is deprecated;
+    This replaces the old CollectionIndexer test. CollectionIndexer is deprecated;
     new code uses KeyValueLens + CollectionMetadata (data-side indexing).
     """
     import shutil
@@ -585,7 +585,7 @@ def _run_all_tests():
     print("--- Test 1: Default View class ---\n")
     _test_default_view_passes_laws()
     print()
-    print("--- Test 2: IndexedLens class ---\n")
+    print("--- Test 2: CollectionIndexer class ---\n")
     _test_indexed_view_passes_laws()
     print()
     print("=== ALL HARNESS TESTS PASSED ===")

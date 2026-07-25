@@ -10,7 +10,7 @@ extensions loaded. Extensions add domain-specific capabilities:
 Architecture:
   Kernel (Write, Read, Ref) — FROZEN
       ↓
-  Lens SDK (Lens, ProllyLensBase, IndexedLens) — core, no extensions
+  Lens SDK (Lens, ProllyLensBase, CollectionIndexer) — core, no extensions
       ↓
   Extensions (semantic adapters, physical structures) — OPTIONAL, pluggable
       ↓

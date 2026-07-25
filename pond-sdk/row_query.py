@@ -13,7 +13,7 @@ that the architecture review asked for.
 
 GENERIC: works on any object that exposes `keys() -> iterable[str]`
 and `get(key) -> dict | None`. This includes KeyValueLens (and its
-subclasses like KeylessLens, SemanticLens, IndexedLens). It also
+subclasses like KeylessLens, SemanticLens, CollectionIndexer). It also
 works on any plain iterable of dicts (lists, generators, etc.) —
 useful for testing and for lenses that expose row iteration via a
 different API.

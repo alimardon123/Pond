@@ -955,16 +955,16 @@ class LakehouseLens(PondLens):
         return pq.read_table(reader)
 
     # ==================================================================
-    # Generic row-level interface (for AutoIndexMixin compatibility)
+    # Generic row-level interface (for CollectionIndexer compatibility)
     #
-    # These methods allow AutoIndexMixin to work with LakehouseLens by
+    # These methods allow CollectionIndexer to work with LakehouseLens by
     # providing a universal row-iteration interface. Each row is identified
     # by a _rowid (UUIDv7, auto-generated if not present in the data).
     #
     # NOTE: LakehouseLens is NOT bound to a single collection (unlike
     # KeyValueLens which takes a name in __init__). The _scan_rows and
     # _get_row methods use self._indexed_collection, which is set by
-    # AutoIndexMixin when it registers an index for a specific collection.
+    # CollectionIndexer when it registers an index for a specific collection.
     # ==================================================================
 
     def _is_tabular(self) -> bool:

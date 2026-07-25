@@ -59,7 +59,7 @@ def make_default_view_contract(kernel) -> tuple:
 
 
 def make_indexed_view_contract(kernel) -> tuple:
-    """Contract for KeyValueLens + CollectionMetadata index (replaces deprecated IndexedLens)."""
+    """Contract for KeyValueLens + CollectionMetadata index (replaces deprecated CollectionIndexer)."""
     from keyvalue_lens import KeyValueLens
     from collection_metadata import CollectionMetadata
     lens = KeyValueLens(kernel, "ci_indexed")
@@ -114,7 +114,7 @@ def make_multikey_view_contract(kernel) -> tuple:
 
     Tests multi-key index support: extractor returns a list of tags,
     and the row is indexed under each tag. Uses CollectionMetadata
-    (data-side) instead of the deprecated IndexedLens.
+    (data-side) instead of the deprecated CollectionIndexer.
     """
     from keyvalue_lens import KeyValueLens
     from collection_metadata import CollectionMetadata
@@ -186,9 +186,9 @@ def make_keyless_view_contract(kernel) -> tuple:
 # Registry of Lens contracts to test
 VIEW_CONTRACTS = [
     ("Default View", make_default_view_contract),
-    ("IndexedLens", make_indexed_view_contract),
+    ("CollectionIndexer", make_indexed_view_contract),
     ("SemanticLens", make_semantic_view_contract),
-    ("Multikey IndexedLens", make_multikey_view_contract),
+    ("Multikey CollectionIndexer", make_multikey_view_contract),
     ("KeylessLens", make_keyless_view_contract),
 ]
 

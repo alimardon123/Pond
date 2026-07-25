@@ -677,7 +677,7 @@ KeylessView = KeylessLens  # backward-compatible alias
 CrossView = CrossLens  # backward-compatible alias
 
 
-# SemanticLens/OssieAdapter are in extensions/semantic/. IndexedLens is in
+# SemanticLens/OssieAdapter are in extensions/semantic/. CollectionIndexer is in
 # extensions/indexing/. Both are imported lazily on attribute access to
 # avoid circular imports.
 def __getattr__(name):
@@ -696,7 +696,14 @@ def __getattr__(name):
                 return SemanticModelAdapter
         except ImportError:
             pass
-    if name == "IndexedLens":
-        from extensions.indexing.auto_index import IndexedLens
-        return IndexedLens
+    if name in ("IndexedLens", "IndexedView"):
+        # DEPRECATED: IndexedLens is kept for backward compat.
+        # Use CollectionMetadata + CollectionIndexer instead.
+        import warnings
+        warnings.warn(
+            "IndexedLens is deprecated. Use CollectionMetadata instead.",
+            DeprecationWarning, stacklevel=2
+        )
+        from extensions.indexing.auto_index import _get_indexed_lens
+        return _get_indexed_lens()
     raise AttributeError(f"module 'keyvalue_lens' has no attribute '{name}'")

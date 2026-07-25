@@ -42,7 +42,7 @@ external validators tried to build Lenses from the SDK spec alone.
 ### 1.1. Constructor contract
 
 ```python
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 
 kernel = PondMinimal(base_dir: str)
 ```
@@ -79,7 +79,7 @@ primitives. They do not extend the kernel's algebra. See
 > without first writing the marker blob — it will raise
 > `ValueError`.
 
-### 1.3. Terminology: KeyValueLens / Lens / View
+### 1.3. Terminology
 
 The preferred term is **KeyValueLens** (the app-facing KEY-VALUE
 lens). Two legacy aliases are kept for backward compatibility:
@@ -87,41 +87,49 @@ lens). Two legacy aliases are kept for backward compatibility:
   - `View`  = `KeyValueLens`  (older class name)
 
 All three names refer to the same class and are interchangeable.
-New code and documentation should use `KeyValueLens`. The class
-lives in `pond-sdk/keyvalue_lens.py`; the old `pond-sdk/lens_sdk.py`
-is now a backward-compat shim that re-exports from `keyvalue_lens`.
+New code should use `KeyValueLens`. The class lives in
+`lenses/keyvalue/keyvalue_lens.py`.
 
 KeyValueLens is NOT the universal base class — that's `PondLens`
-in `pond-sdk/pond_lens.py`. KeyValueLens is a peer of `LakehouseLens`
-and `FeatureStoreLens`; all three extend `PondLens` directly.
+in `pond-sdk/base_lens.py`. KeyValueLens is a peer of `LakehouseLens`
+and `VectorLens`; all three extend `PondLens` directly. No production
+lens inherits from another lens.
 
 ### 1.4. Constructing a Lens
 
-A KeyValueLens is constructed with its kernel instance and a name:
+KeyValueLens is collection-agnostic (like all Pond lenses). Pass the
+collection name to each operation:
 
 ```python
 from keyvalue_lens import KeyValueLens
 
-lens = KeyValueLens(kernel, name: str)
-# or, for an auto-indexed lens:
-from auto_index import IndexedLens
-lens = IndexedLens(kernel, name: str)
-# or, for a custom lens:
-class MyLens(KeyValueLens):
-    ...
-lens = MyLens(kernel, name: str)
+lens = KeyValueLens(kernel)  # NOT bound to a collection
+lens.put("users", "user:1", {"name": "alice"})
+lens.get("users", "user:1")
+lens.commit("users", "insert alice")
 ```
 
-The `name` is the lens's identifier in the kernel's root namespace.
-It appears in:
+Backward compat: `KeyValueLens(kernel, "users")` still works — the
+name binds to a default collection. Old code using `lens.put(key, data)`
+continues to work via this compat layer.
+
+For indexing, use CollectionMetadata (data-side, not lens-side):
+```python
+from collection_metadata import CollectionMetadata
+meta = CollectionMetadata(kernel)
+meta.build_index("users", "by_name",
+                 extractor=lambda r: r["name"],
+                 scan_fn=lambda: ((k, lens.get("users", k)) for k in lens.keys("users")))
+rowid = meta.lookup_index("users", "by_name", "alice")
+row = lens.get("users", rowid)
+```
+
+The collection name appears in:
 - The HEAD reference: `collections/{name}/HEAD` → latest commit hash.
 - Branch references: `collections/{name}/branches/{branch}`.
-- Index references: `{name}__index__{index_name}` (legacy convention).
+- Index references: `collections/{name}/indexes/{index_name}`.
+- Zone map references: `collections/{name}/zone_maps`.
 - Definition reference: `collections/{name}/definition` (optional metadata).
-
-The name must be a non-empty string. It must not contain `__`
-(double-underscore) — that sequence is reserved for the kernel
-namespace convention (see §2.5).
 
 ### 1.5. Lifetime
 

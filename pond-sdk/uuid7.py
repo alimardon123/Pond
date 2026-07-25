@@ -18,7 +18,7 @@ Properties:
   - Backward-compatible: formatted as a standard UUID string (36 chars with dashes).
 
 Used by:
-  - AutoIndexMixin: generates _rowid for rows that don't have a natural key.
+  - CollectionIndexer: generates _rowid for rows that don't have a natural key.
   - LakehouseLens: hidden _rowid column for row-level indexing.
   - Any lens that needs distributed row identification.
 

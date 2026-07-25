@@ -101,7 +101,7 @@ class SemanticMixin:
 
     EXTENSION METADATA:
       extension_type: "mixin"
-      supported_lens_types: ["KeyValueLens", "KeylessLens", "IndexedLens"]
+      supported_lens_types: ["KeyValueLens", "KeylessLens", "CollectionIndexer"]
       supported_storage: ["ProllyTreeIndex"]
       not_supported: ["LakehouseLens", "FeatureStoreLens"]  # tabular lenses use column-level semantics
 
@@ -140,7 +140,7 @@ class SemanticMixin:
 
     # Extension metadata (for introspection / tooling)
     extension_type = "mixin"
-    supported_lens_types = ["KeyValueLens", "KeylessLens", "IndexedLens"]
+    supported_lens_types = ["KeyValueLens", "KeylessLens", "CollectionIndexer"]
     supported_storage = ["ProllyTreeIndex"]
     not_supported = ["LakehouseLens", "FeatureStoreLens"]  # tabular lenses use column-level semantics
 
