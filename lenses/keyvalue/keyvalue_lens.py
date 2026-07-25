@@ -4,32 +4,43 @@ KeyValueLens — the app-facing KEY-VALUE lens.
 This is one of three peer app-facing lenses in Pond:
   - KeyValueLens  (this file)        — per-row key→blob storage over ProllyTreeIndex
   - LakehouseLens (lenses/lakehouse)  — whole-table Parquet I/O + range read/write
-  - FeatureStoreLens (pond-labs)     — versioned ML feature store on Parquet
+  - FeatureStoreLens (pond-labs)      — versioned ML feature store on Parquet
 
 All three extend PondLens (base_lens.py), the thin shared-namespace base.
 PondLens provides only ref-namespace operations (branch, list_collections,
 set_definition, get_definition, history) — no format awareness. Each
 app-facing lens owns its OWN read/write API.
 
+COLLECTION-AGNOSTIC: KeyValueLens is a STATELESS read/write engine. It does
+NOT bind to a single collection in __init__. You pass the collection name to
+each operation:
+
+    lens = KeyValueLens(kernel)
+    lens.put("users", "user:1", {"name": "alice"})
+    lens.get("users", "user:1")
+    lens.commit("users", "msg")
+
+This matches LakehouseLens's API (create_table(name, data), read_table(name)).
+The same lens instance can operate on ANY collection.
+
 KeyValueLens stores each row as a single blob in the ProllyTreeIndex,
-keyed by a user-supplied (or auto-generated) primary key. This makes it
-suitable for:
+keyed by a user-supplied primary key (or auto-generated UUIDv7 for
+KeylessLens). This makes it suitable for:
   - OLTP workloads (point lookups via Prolly tree, O(log N))
-  - Streaming/event logs (KeylessLens variant with auto-UUID keys)
+  - Streaming/event logs (KeylessLens variant with auto-UUIDv7 keys)
   - Document storage (each blob is a JSON document)
   - Cross-lens blob sharing (CrossLens helpers below)
 
-Index management:
-  Indexes are derived structures (Prolly trees of key→blob_hash).
-  - Create index: scan data once, build a new Prolly tree (metadata only)
-  - Drop index: remove the Reference to the index tree (1 operation)
-  - Refresh index: rebuild the Prolly tree from current data (metadata only)
-  Data blobs are immutable (kernel Law 1). Indexes are derived and rebuildable.
+Backward-compat: the old API `KeyValueLens(kernel, name)` still works via
+a compatibility wrapper that binds to a single collection. New code should
+use the collection-agnostic API.
 
 Backward-compat aliases (defined at the END of this file):
   Lens = KeyValueLens  (old name, kept for compat)
   View = KeyValueLens  (older name, kept for compat)
 """
+
+from __future__ import annotations
 
 import json
 import time
@@ -49,487 +60,470 @@ from maintenance import (drop_name, is_dropped, resolve_active,
                          TOMBSTONE_HASH)
 from row_query import LensQuery
 from base_lens import PondLens
+from uuid7 import uuidv7
 
 
 # ===========================================================================
-# KeyValueLens — the app-facing key-value lens.
-#
-# This is NOT the universal base class. The universal base is PondLens
-# (base_lens.py), which provides only ref-namespace operations.
-# KeyValueLens is a peer of LakehouseLens and FeatureStoreLens — all
-# three extend PondLens directly and own their own read/write APIs.
-#
-# KeyValueLens stores each row as a blob in the ProllyTreeIndex, keyed
-# by a user-supplied primary key. Point lookups are O(log N) via the
-# Prolly tree. Branches, history, and time travel are inherited from
-# ProllyLensBase (via self.base).
-#
-# Backward-compat: `Lens` and `View` are aliases for `KeyValueLens`,
-# defined at the END of this file. New code should use `KeyValueLens`.
+# KeyValueLens — the app-facing key-value lens (collection-agnostic)
 # ===========================================================================
 
 class KeyValueLens(PondLens):
     """App-facing KEY-VALUE lens with ProllyTreeIndex backing.
 
-    Extends PondLens (the shared-namespace base). The base class provides
-    branch(), list_collections(), set_definition(), get_definition(),
-    and history(). KeyValueLens adds:
+    COLLECTION-AGNOSTIC: This lens is a stateless read/write engine. It
+    does NOT bind to a single collection. Pass the collection name to
+    each operation:
 
-      Key-value operations:
-        - put(key, data): stage a key→blob mapping
-        - put_auto(data): stage with auto-generated UUID4 key (returns key)
-        - get(key): read a single value by key (O(log N))
-        - get_raw(key): read raw bytes (no decode)
-        - delete(key): stage a deletion
-        - commit(): atomically commit all staged changes
-        - keys(), count(), exists(key), get_all()
+        lens = KeyValueLens(kernel)
+        lens.put("users", "user:1", {"name": "alice"})
+        lens.commit("users", "insert alice")
+        lens.get("users", "user:1")  # → {"name": "alice"}
 
-      Lazy query API:
-        - where(predicate=None, **kwargs)
-        - select(*fields)
-        - map(fn)
-        - join(other, on='field')
+    The same lens instance can operate on ANY collection. This matches
+    LakehouseLens's API design.
 
-      Version control (delegated to ProllyLensBase):
-        - branch(name), checkout(name), list_branches()
-        - merge(name) [union merge with 2-parent commit]
-        - undo(steps), history(limit), diff(a, b)
+    Key-value operations (all take collection as first arg):
+      - put(collection, key, data): stage a key→blob mapping
+      - put_auto(collection, data): stage with auto-generated UUIDv7 key
+      - get(collection, key): read a single value by key (O(log N))
+      - get_raw(collection, key): read raw bytes (no decode)
+      - delete(collection, key): stage a deletion
+      - commit(collection, message): atomically commit all staged changes
+      - keys(collection), count(collection), exists(collection, key)
+      - get_all(collection)
 
-      Index management (METADATA ONLY — data blobs never touched):
-        - create_index(name, extractor): builds a Prolly tree mapping
-          extracted_key → blob_hash.
-        - drop_index(name): tombstones the index Reference.
-        - refresh_index(name, extractor): rebuilds the index from current data.
-        - list_indexes(), list_all_indexes()
-        - lookup_by_index(name, key): O(log N) secondary lookup.
+    Lazy query API:
+      - where(collection, predicate=None, **kwargs)
+      - select(collection, *fields)
+      - map(collection, fn)
+      - join(collection, other, on='field')
 
-    Subclasses:
-      - KeylessLens (this file) — overrides put() to auto-generate keys.
-      - SemanticLens (extensions/semantic/) — adds semantic-model adapter.
-      - IndexedLens (indexing.py) — adds eager/lazy auto-indexing.
+    Version control (delegated to ProllyLensBase):
+      - branch(collection, branch_name), checkout(collection, branch_name)
+      - list_branches(collection)
+      - merge(collection, branch_name) [union merge with 2-parent commit]
+      - undo(collection, steps), history(collection, limit)
+      - diff(collection, a, b)
     """
 
-    def __init__(self, kernel: PondMinimal, name: str):
-        # PondLens.__init__ takes only (kernel); the name is a Lens-specific
-        # attribute (each Lens instance is bound to one collection, while
-        # PondLens itself is collection-agnostic).
+    def __init__(self, kernel: PondMinimal, name: Optional[str] = None):
+        """Create a KeyValueLens.
+
+        Args:
+            kernel: the PondMinimal kernel instance
+            name: OPTIONAL. If provided, enables backward-compatible
+                  single-collection API (lens.put(key, data) instead of
+                  lens.put(collection, key, data)). New code should omit
+                  name and pass collection to each method.
+        """
         super().__init__(kernel)
-        self.name = name
-        self.base = ProllyLensBase(kernel, name)
+        self._bases: dict[str, ProllyLensBase] = {}
+        # Backward compat: if name is provided, bind to that collection
+        self._default_collection = name
+        if name is not None:
+            self.name = name  # backward compat attribute
+
+    def _resolve_collection(self, *args) -> tuple:
+        """Resolve the collection name from args or default.
+
+        If _default_collection is set (backward compat mode), the first
+        arg is NOT the collection — it's the key. We prepend the default.
+        Otherwise, the first arg IS the collection.
+
+        Returns (collection, remaining_args).
+        """
+        if self._default_collection is not None:
+            return self._default_collection, args
+        else:
+            if not args:
+                raise TypeError("Collection name required (lens is not bound to a default collection)")
+            return args[0], args[1:]
+
+    def _get_base(self, collection: str) -> ProllyLensBase:
+        """Get or create the ProllyLensBase for a collection.
+
+        ProllyLensBase holds per-collection staging state (_staged_add,
+        _staged_del). We cache one instance per collection so staged
+        changes persist across calls until commit.
+        """
+        if collection not in self._bases:
+            self._bases[collection] = ProllyLensBase(self.kernel, collection)
+        return self._bases[collection]
+
+    @property
+    def base(self) -> ProllyLensBase:
+        """Backward compat: return the ProllyLensBase for the default collection.
+
+        New code should use _get_base(collection) instead.
+        """
+        if self._default_collection is None:
+            raise TypeError("lens is not bound to a default collection; use _get_base(collection)")
+        return self._get_base(self._default_collection)
 
     # --- Write path ---
-    def put(self, key: str, data: Any) -> str:
+
+    def put(self, *args) -> str:
+        """Stage a key→blob mapping.
+
+        Collection-agnostic API: put(collection, key, data)
+        Backward compat API:    put(key, data)  [requires name in __init__]
+        """
+        collection, rest = self._resolve_collection(*args)
+        key, data = rest[0], rest[1]
         blob_hash = self.kernel.write(self.encode(data))
-        self.base.stage(key, blob_hash)
+        self._get_base(collection).stage(key, blob_hash)
         return blob_hash
 
-    def put_auto(self, data: Any) -> str:
-        """Stage data with an auto-generated primary key. Returns the key.
+    def put_auto(self, *args) -> str:
+        """Stage data with an auto-generated UUIDv7 key. Returns the key.
 
-        The key is a 32-character hex string (UUID4 without dashes).
-        Use this when your data does not have a natural primary key
-        (event logs, time-series, append-only streams). The generated
-        key is returned so you can retrieve the data later via get(key).
-
-        This is a Layer 2 SDK convenience. The kernel still requires
-        a key; this method generates one on the caller's behalf.
-
-        The key is generated via uuid4 (random, ~122 bits of entropy).
-        Collisions are astronomically unlikely (~10^-37 probability
-        for 10^12 records).
+        Collection-agnostic API: put_auto(collection, data)
+        Backward compat API:    put_auto(data)  [requires name in __init__]
         """
-        key = uuid.uuid4().hex  # 32-char hex string, no dashes
+        collection, rest = self._resolve_collection(*args)
+        data = rest[0]
+        key = uuidv7()
         blob_hash = self.kernel.write(self.encode(data))
-        self.base.stage(key, blob_hash)
+        self._get_base(collection).stage(key, blob_hash)
         return key
 
-    def put_raw(self, key: str, blob_hash: str) -> None:
-        self.base.stage(key, blob_hash)
+    def put_raw(self, *args) -> None:
+        """Stage a pre-existing blob hash under the given key.
 
-    def delete(self, key: str) -> None:
-        self.base.stage_delete(key)
+        Collection-agnostic API: put_raw(collection, key, blob_hash)
+        Backward compat API:    put_raw(key, blob_hash)  [requires name in __init__]
+        """
+        collection, rest = self._resolve_collection(*args)
+        key, blob_hash = rest[0], rest[1]
+        self._get_base(collection).stage(key, blob_hash)
 
-    def commit(self, message: str = "") -> str:
-        return self.base.commit(message or f"{self.name} commit")
+    def delete(self, *args) -> None:
+        """Stage a deletion for the given key.
+
+        Collection-agnostic API: delete(collection, key)
+        Backward compat API:    delete(key)  [requires name in __init__]
+        """
+        collection, rest = self._resolve_collection(*args)
+        key = rest[0]
+        self._get_base(collection).stage_delete(key)
+
+    def commit(self, *args) -> str:
+        """Atomically commit all staged changes for the collection.
+
+        Collection-agnostic API: commit(collection, message="")
+        Backward compat API:    commit(message="")  [requires name in __init__]
+        """
+        collection, rest = self._resolve_collection(*args)
+        message = rest[0] if rest else ""
+        return self._get_base(collection).commit(message or f"{collection} commit")
 
     # --- Read path ---
-    def get(self, key: str) -> Optional[Any]:
-        h = self.base.lookup(key)
+
+    def get(self, *args) -> Optional[Any]:
+        """Read a single value by key. O(log N) via ProllyTreeIndex.
+
+        Collection-agnostic API: get(collection, key)
+        Backward compat API:    get(key)  [requires name in __init__]
+        """
+        collection, rest = self._resolve_collection(*args)
+        key = rest[0]
+        h = self._get_base(collection).lookup(key)
         return self.decode(self.kernel.read_blob(h)) if h else None
 
-    def get_raw(self, key: str) -> Optional[bytes]:
-        h = self.base.lookup(key)
+    def get_raw(self, *args) -> Optional[bytes]:
+        """Read raw bytes by key (no decode)."""
+        collection, rest = self._resolve_collection(*args)
+        key = rest[0]
+        h = self._get_base(collection).lookup(key)
         return self.kernel.read_blob(h) if h else None
 
-    def get_all(self) -> dict[str, Any]:
-        state = self.base.read_all()
+    def get_all(self, *args) -> dict[str, Any]:
+        """Read all key→value pairs from the collection."""
+        collection, rest = self._resolve_collection(*args)
+        state = self._get_base(collection).read_all()
         return {k: self.decode(self.kernel.read_blob(h))
                 for k, h in state.items() if not k.startswith("_")}
 
-    def keys(self) -> list[str]:
-        return [k for k in self.base.read_all() if not k.startswith("_")]
+    def keys(self, *args) -> list[str]:
+        """List all user keys in the collection (excludes internal _ keys)."""
+        collection, rest = self._resolve_collection(*args)
+        return [k for k in self._get_base(collection).read_all() if not k.startswith("_")]
 
-    def exists(self, key: str) -> bool:
-        return self.base.lookup(key) is not None
+    def exists(self, *args) -> bool:
+        """Check if a key exists in the collection."""
+        collection, rest = self._resolve_collection(*args)
+        key = rest[0]
+        return self._get_base(collection).lookup(key) is not None
 
-    def count(self) -> int:
-        return sum(1 for k in self.base.read_all() if not k.startswith("_"))
+    def count(self, *args) -> int:
+        """Count user keys in the collection."""
+        collection, rest = self._resolve_collection(*args)
+        return sum(1 for k in self._get_base(collection).read_all() if not k.startswith("_"))
 
     # ------------------------------------------------------------------
-    # Collection-like API — make Lens feel like an iterable of rows.
-    # This is the "direct, easy, simple and elegant way of reading
-    # data" per the architecture review. See view_query.py for the
-    # lazy query API (.where, .select, .map, .join).
+    # Collection-like API — make a collection feel like an iterable of rows.
+    # Uses the LensQuery lazy query API (row_query.py).
     # ------------------------------------------------------------------
 
-    def __iter__(self):
-        """Iterate over decoded rows (not keys).
+    def iterate(self, *args):
+        """Iterate over decoded rows in the collection.
 
-            for row in view:
-                print(row)
-
-        Equivalent to:
-            for key in lens.keys():
-                row = lens.get(key)
-                if row is not None:
-                    yield row
+        Collection-agnostic: iterate(collection)
+        Backward compat:    iterate()  [uses default collection]
         """
-        for key in self.keys():
-            row = self.get(key)
+        collection, rest = self._resolve_collection(*args)
+        for key in self.keys(collection):
+            row = self.get(collection, key)
             if row is not None:
                 yield row
 
-    def __len__(self) -> int:
-        """len(lens) == lens.count()."""
-        return self.count()
+    def __iter__(self):
+        """Backward compat: iterate over default collection."""
+        if self._default_collection is None:
+            raise TypeError("lens is not bound to a default collection; use iterate(collection)")
+        return self.iterate(self._default_collection)
 
-    def __contains__(self, key: str) -> bool:
-        """key in view == lens.exists(key)."""
-        return self.exists(key)
+    def __len__(self):
+        """Backward compat: len(lens) == lens.count()."""
+        if self._default_collection is None:
+            raise TypeError("lens is not bound to a default collection; use count(collection)")
+        return self.count(self._default_collection)
 
-    def where(self, predicate=None, **kwargs) -> LensQuery:
+    def __contains__(self, key: str):
+        """Backward compat: key in lens == lens.exists(key)."""
+        if self._default_collection is None:
+            raise TypeError("lens is not bound to a default collection; use exists(collection, key)")
+        return self.exists(self._default_collection, key)
+
+    def where(self, *args, **kwargs) -> LensQuery:
         """Start a lazy query that filters rows.
 
-            # Filter with kwargs
-            for row in lens.where(region="US"):
-                ...
-
-            # Filter with a predicate
-            for row in lens.where(lambda r: r["amount"] > 100):
-                ...
-
-        See LensQuery for full chaining: .where().select().map().join().
+        Collection-agnostic: where(collection, predicate=None, **kwargs)
+        Backward compat:    where(predicate=None, **kwargs)  [uses default]
         """
-        return LensQuery(self).where(predicate, **kwargs)
+        collection, rest = self._resolve_collection(*args)
+        adapter = _CollectionAdapter(self, collection)
+        # rest may contain the predicate if in compat mode
+        if rest and callable(rest[0]):
+            return LensQuery(adapter).where(rest[0], **kwargs)
+        elif rest and isinstance(rest[0], dict):
+            return LensQuery(adapter).where(rest[0], **kwargs)
+        else:
+            return LensQuery(adapter).where(**kwargs)
 
-    def select(self, *fields: str) -> LensQuery:
-        """Start a lazy query that projects rows to only these fields.
+    def select(self, *args) -> LensQuery:
+        """Start a lazy query that projects rows to only these fields."""
+        collection, rest = self._resolve_collection(*args)
+        adapter = _CollectionAdapter(self, collection)
+        return LensQuery(adapter).select(*rest)
 
-            for row in lens.select("order_id", "amount"):
-                ...
-        """
-        return LensQuery(self).select(*fields)
+    def map(self, *args) -> LensQuery:
+        """Start a lazy query that transforms each row via fn(row)."""
+        collection, rest = self._resolve_collection(*args)
+        adapter = _CollectionAdapter(self, collection)
+        return LensQuery(adapter).map(rest[0])
 
-    def map(self, fn: Callable) -> LensQuery:
-        """Start a lazy query that transforms each row via fn(row).
-
-            for row in lens.map(lambda r: {**r, "amount_usd": r["amount"] * 1.1}):
-                ...
-        """
-        return LensQuery(self).map(fn)
-
-    def join(self, other, on: str):
-        """JOIN with another Lens.
-
-            for row in orders.join(customers, on="customer_id"):
-                print(row["order_id"], row["customer_name"])
-
-        LEFT JOIN semantics: left rows with no match are yielded as-is.
-        Right side wins on field conflicts.
-        """
-        return LensQuery(self).join(other, on)
+    def join(self, *args):
+        """JOIN this collection with another collection or query."""
+        collection, rest = self._resolve_collection(*args)
+        adapter = _CollectionAdapter(self, collection)
+        return LensQuery(adapter).join(rest[0], rest[1])
 
     # --- Version control ---
-    def branch(self, name: str) -> str: return self.base.branch(name)
-    def checkout(self, name: str) -> None: self.base.checkout(name)
-    def list_branches(self) -> list[str]: return self.base.list_branches()
-    def merge(self, name: str) -> str: return self.base.merge(name)
-    def undo(self, steps: int = 1) -> str: return self.base.undo(steps)
-    def history(self, limit: int = 20) -> list[dict]: return self.base.history(limit)
-    def diff(self, a: str, b: str) -> dict: return self.base.diff(a, b)
 
-    # ------------------------------------------------------------------
-    # INDEX MANAGEMENT — metadata only, NO data rewrite
-    # ------------------------------------------------------------------
+    def branch(self, *args) -> str:
+        """Create a branch on the collection. O(1) — just a ref copy."""
+        collection, rest = self._resolve_collection(*args)
+        return self._get_base(collection).branch(rest[0])
 
-    def create_index(self, index_name: str, key_extractor: Callable[[Any], str]) -> str:
-        """
-        Create a secondary index. METADATA ONLY — does NOT touch data blobs.
+    def checkout(self, *args) -> None:
+        """Checkout a branch on the collection."""
+        collection, rest = self._resolve_collection(*args)
+        self._get_base(collection).checkout(rest[0])
 
-        How it works:
-        1. Scan all data entries (read blobs, extract index keys)
-        2. Build a Prolly tree mapping index_key → blob_hash
-        3. Store the tree root as a Reference (metadata)
+    def list_branches(self, *args) -> list[str]:
+        """List all branches on the collection."""
+        collection, rest = self._resolve_collection(*args)
+        return self._get_base(collection).list_branches()
 
-        Data blobs are NEVER modified. The index is a derived structure.
-        """
-        state = self.base.read_all()
-        index_entries = {}
-        for pk, bh in state.items():
-            if pk.startswith("_"):
-                continue
-            data = self.decode(self.kernel.read_blob(bh))
-            idx_key = key_extractor(data)
-            index_entries[f"_index/{index_name}/{idx_key}"] = bh
-        tree_root = ProllyTree.build(self.kernel, index_entries)
-        self.kernel.reference(f"{self.name}__index__{index_name}", tree_root)
-        return tree_root
+    def merge(self, *args) -> str:
+        """Merge a branch into the collection's HEAD. Union merge with 2-parent commit."""
+        collection, rest = self._resolve_collection(*args)
+        return self._get_base(collection).merge(rest[0])
 
-    def drop_index(self, index_name: str) -> bool:
-        """
-        Drop an index. METADATA ONLY — does NOT touch data blobs.
+    def undo(self, *args) -> str:
+        """Undo the last N commits on the collection."""
+        collection, rest = self._resolve_collection(*args)
+        steps = rest[0] if rest else 1
+        return self._get_base(collection).undo(steps)
 
-        Per RFC-0008 (Deletion as Data), this uses the tombstone pattern:
-          1. drop_name(kernel, ref_name) rebinds the index's Reference to
-             TOMBSTONE_HASH. The index is now logically deleted.
-          2. Subsequent lookup_by_index calls return None (resolve_active
-             sees the tombstone and treats it as unbound).
-          3. The previously-pointed-to index tree blob becomes unreachable;
-             PondGC will sweep it on the next collection.
-          4. compact_tombstones(kernel) (Layer 0.5 maintenance) can later
-             remove the name's row from the roots table.
+    def history(self, *args) -> list[dict]:
+        """Walk the commit chain for the collection."""
+        collection, rest = self._resolve_collection(*args)
+        limit = rest[0] if rest else 100
+        return self._get_base(collection).history(limit)
 
-        Data blobs are NEVER modified. The index Reference becomes a
-        tombstone; the index tree blob becomes orphaned.
-
-        Returns True if the index existed and was dropped, False if the
-        index was not registered (or was already a tombstone).
-        """
-        ref_name = f"{self.name}__index__{index_name}"
-        current = self.kernel.resolve(ref_name)
-        if not current or current == TOMBSTONE_HASH:
-            return False
-        drop_name(self.kernel, ref_name)
-        return True
-
-    def refresh_index(self, index_name: str, key_extractor: Callable[[Any], str]) -> str:
-        """
-        Refresh an index (rebuild from current data). METADATA ONLY.
-
-        This is the same as create_index but overwrites the existing index
-        (including a previously-tombstoned index — refresh_index revives
-        a dropped index).
-        """
-        return self.create_index(index_name, key_extractor)
-
-    def list_indexes(self) -> list[str]:
-        """List all ACTIVE (non-tombstoned) indexes for this Lens.
-
-        Per RFC-0008, tombstoned indexes are excluded. Use
-        list_all_indexes() to include tombstoned indexes.
-        """
-        prefix = f"{self.name}__index__"
-        return [n[len(prefix):] for n in self.kernel.list_names()
-                if n.startswith(prefix) and not is_dropped(self.kernel, n)]
-
-    def list_all_indexes(self) -> list[str]:
-        """List ALL indexes, including tombstoned ones. Mainly for
-        maintenance/diagnostic tools."""
-        prefix = f"{self.name}__index__"
-        return [n[len(prefix):] for n in self.kernel.list_names()
-                if n.startswith(prefix)]
-
-    def lookup_by_index(self, index_name: str, index_key: str) -> Optional[Any]:
-        """Look up data via a secondary index. O(log N).
-
-        Per RFC-0008, returns None if the index has been dropped
-        (tombstoned). This makes drop_index immediately effective for
-        readers — no need to wait for compaction.
-        """
-        ref_name = f"{self.name}__index__{index_name}"
-        tree_root = resolve_active(self.kernel, ref_name)
-        if not tree_root:
-            return None
-        full_key = f"_index/{index_name}/{index_key}"
-        bh = ProllyTree.lookup(self.kernel, tree_root, full_key)
-        return self.decode(self.kernel.read_blob(bh)) if bh else None
+    def diff(self, *args) -> dict:
+        """Diff two commits on the collection."""
+        collection, rest = self._resolve_collection(*args)
+        return self._get_base(collection).diff(rest[0], rest[1])
 
     # --- Serialization (override in subclass) ---
+
     def encode(self, data: Any) -> bytes:
         return json.dumps(data, sort_keys=True).encode()
+
     def decode(self, data: bytes) -> Any:
         return json.loads(data)
 
 
+# ---------------------------------------------------------------------------
+# _CollectionAdapter — adapts a (KeyValueLens, collection) pair to the
+# LensQuery interface (keys()/get()). This lets LensQuery work with the
+# collection-agnostic lens API.
+# ---------------------------------------------------------------------------
+
+class _CollectionAdapter:
+    """Adapter that exposes keys()/get() for a specific collection.
+
+    LensQuery uses duck-typing (hasattr source 'keys' and 'get'). This
+    adapter wraps a (lens, collection) pair to provide those methods.
+    """
+
+    def __init__(self, lens: KeyValueLens, collection: str):
+        self._lens = lens
+        self._collection = collection
+
+    def keys(self) -> list[str]:
+        return self._lens.keys(self._collection)
+
+    def get(self, key: str):
+        return self._lens.get(self._collection, key)
+
+
 # ===========================================================================
-# KeylessLens — KeyValueLens with auto-generated UUID primary keys.
+# KeylessLens — KeyValueLens variant that auto-generates UUIDv7 keys.
 #
-# This IS KeyValueLens-specific. The "auto-key" pattern only makes sense
-# when the underlying storage is per-row keyed (ProllyTreeIndex stores
-# key→blob). LakehouseLens writes whole Parquet blobs (no per-row keys
-# at storage layer); FeatureStoreLens uses entity columns from the data
-# (application provides them). So KeylessLens stays in this file as a
-# thin subclass that overrides put() to require key=None and delegate
-# to put_auto().
+# The "auto-key" pattern only makes sense for KV-style storage (per-row
+# keyed). KeylessLens stays in this file as a thin subclass.
 # ===========================================================================
 
 class KeylessLens(KeyValueLens):
-    """KeyValueLens where primary keys are auto-generated, not user-supplied.
+    """KeyValueLens variant that auto-generates UUIDv7 primary keys.
 
     Use this when your data does not have a natural primary key:
     event logs, time-series, metrics, append-only streams, audit
-    trails. The lens generates a UUID4 for each row; the caller
+    trails. The lens generates a UUIDv7 for each row; the caller
     receives the key from put() and can use it for later retrieval.
 
-    This is the first-class version of the auto-key pattern. Instead
-    of calling `lens.put_auto(data)` on a regular KeyValueLens, you
-    construct a KeylessLens and call `lens.put(data)` — the key
-    generation is built into the put path.
+    UUIDv7 is time-ordered, making it suitable for distributed generation
+    and range scans via ProllyTreeIndex.
 
-    Internally, KeylessLens just overrides put() to delegate to
-    put_auto(). All other KeyValueLens operations (get, delete,
-    branch, merge, history, indexes) work unchanged.
+    COLLECTION-AGNOSTIC: Like KeyValueLens, KeylessLens is a stateless
+    engine. Pass the collection name to each operation:
 
-    For indexed lookups on KeylessLens data, register indexes on
-    fields WITHIN the data (e.g., a timestamp, a user_id) and use
-    lookup_by_index() to query without knowing the primary key.
+        lens = KeylessLens(kernel)
+        key = lens.put("events", {"event": "click", "user": "u1"})
+        lens.commit("events", "log click")
     """
 
-    def put(self, key: Optional[str], data: Any) -> str:
-        """Stage data with an auto-generated key. Returns the key.
+    def put(self, *args) -> str:
+        """Stage data with an auto-generated UUIDv7 key. Returns the key.
 
-        Args:
-            key: MUST be None for KeylessLens. Passing a non-None key
-                raises TypeError — if you want to supply your own
-                keys, use the regular `KeyValueLens` class instead.
-            data: the data to store.
+        Collection-agnostic API: put(collection, key=None, data)
+        Backward compat API:    put(key=None, data)  [requires name in __init__]
 
-        Returns:
-            The auto-generated 32-char hex key (UUID4 without dashes).
-            Use this key to retrieve the data via get(key) later.
+        The key MUST be None for KeylessLens. If you want to supply your
+        own keys, use the regular KeyValueLens class.
         """
-        if key is not None:
-            raise TypeError(
-                "KeylessLens.put() does not accept a key. "
-                "Pass key=None, or use the regular KeyValueLens class "
-                "if you want to supply your own keys."
-            )
-        return self.put_auto(data)
+        collection, rest = self._resolve_collection(*args)
+        if len(rest) == 2:
+            # put(collection, key, data) or put(key, data) in compat mode
+            key, data = rest[0], rest[1]
+            if key is not None:
+                raise TypeError(
+                    "KeylessLens.put() does not accept a key. "
+                    "Pass key=None, or use the regular KeyValueLens class."
+                )
+        elif len(rest) == 1:
+            # put(data) — key omitted
+            data = rest[0]
+        else:
+            raise TypeError(f"put() expects 1-3 args, got {len(rest)}")
+        return self.put_auto(collection, data)
 
-    def put_many(self, rows: list[Any]) -> list[str]:
+    def put_many(self, *args) -> list[str]:
         """Stage multiple rows, each with an auto-generated key.
 
-        Args:
-            rows: list of data values to store.
-
-        Returns:
-            List of generated keys, one per row.
+        Collection-agnostic: put_many(collection, rows)
+        Backward compat:    put_many(rows)  [requires name in __init__]
         """
-        return [self.put_auto(row) for row in rows]
+        collection, rest = self._resolve_collection(*args)
+        rows = rest[0]
+        return [self.put_auto(collection, row) for row in rows]
 
 
 # ===========================================================================
-# CrossLens — read/write across Views
+# CrossLens — cross-collection read/write operations between KeyValueLenses
 # ===========================================================================
 
 class CrossLens:
-    """Cross-Lens read/write operations between two KeyValueLens instances.
+    """Cross-collection read/write operations.
 
-    These helpers operate on KeyValueLens instances (any subclass —
-    KeyValueLens, KeylessLens, SemanticLens, IndexedLens). They do
-    NOT work on LakehouseLens or FeatureStoreLens because those lenses
-    don't expose per-key get/put (they use whole-table Parquet I/O).
+    These helpers operate on KeyValueLens instances. They do NOT work on
+    LakehouseLens or FeatureStoreLens because those lenses don't expose
+    per-key get/put (they use whole-table Parquet I/O).
 
-    Semantics (settled per Phase B.3 SDK polish):
-
-    - **Source = HEAD commit of the source lens's currently-checked-out
-      branch.** CrossLens does NOT take a commit-hash argument; it
-      always reads from the source lens's current HEAD. To read from
-      a specific historical commit, check out that commit's branch
-      first, then call CrossLens.
-    - **Tombstoned indexes are skipped.** If `from_lens` has tombstoned
-      indexes (per RFC-0008), `read_all_from` returns only non-internal
-      user keys; tombstoned index References are excluded (they start
-      with `{name}__index__` and resolve to TOMBSTONE_HASH).
-    - **Zero-copy sharing.** `share_blob` copies the blob HASH, not
-      the blob CONTENT. The two lenses now reference the same kernel
-      blob (content-addressed dedup for free).
-    - **No cross-lens atomicity.** A `write_to` followed by a `commit`
-      on the target lens is atomic for the target, but there is no
-      cross-lens atomic commit. If you need atomic multi-lens commits,
-      use a higher-level coordinator (future RFC).
-    - **Pipe is non-transactional.** `pipe` reads the source's current
-      state at call time and writes to the target's staging area. The
-      target is NOT committed; the caller must call `to_lens.commit()`
-      after `pipe` returns.
+    Semantics:
+    - Source = HEAD commit of the source collection.
+    - Tombstoned indexes are skipped.
+    - Zero-copy sharing: share_blob copies the blob HASH, not CONTENT.
+    - No cross-collection atomicity. Use a coordinator for multi-collection commits.
+    - Pipe is non-transactional. The target is NOT committed; caller must commit.
     """
     @staticmethod
-    def read_from(lens: "KeyValueLens", key: str) -> Optional[Any]:
-        """Read a single key from the lens's current HEAD.
-
-        Returns None if the key does not exist or was deleted.
-        """
-        return lens.get(key)
+    def read_from(lens: KeyValueLens, collection: str, key: str) -> Optional[Any]:
+        """Read a single key from the collection's current HEAD."""
+        return lens.get(collection, key)
 
     @staticmethod
-    def read_all_from(lens: "KeyValueLens") -> dict[str, Any]:
-        """Read all non-internal keys from the lens's current HEAD.
-
-        Keys starting with `_` (internal: schema, index metadata,
-        semantic definitions) are excluded. Tombstoned names are
-        excluded (they are not in `lens.get_all()` because `get_all`
-        walks the lens state, not the root namespace).
-        """
-        return lens.get_all()
+    def read_all_from(lens: KeyValueLens, collection: str) -> dict[str, Any]:
+        """Read all non-internal keys from the collection's current HEAD."""
+        return lens.get_all(collection)
 
     @staticmethod
-    def write_to(lens: "KeyValueLens", key: str, data: Any) -> str:
-        """Stage a write on the target lens. Does NOT commit.
-
-        The caller must call `lens.commit(message)` after one or more
-        `write_to` calls to make the changes durable.
-        """
-        return lens.put(key, data)
+    def write_to(lens: KeyValueLens, collection: str, key: str, data: Any) -> str:
+        """Stage a write on the target collection. Does NOT commit."""
+        return lens.put(collection, key, data)
 
     @staticmethod
-    def share_blob(from_lens: "KeyValueLens", from_key: str,
-                    to_lens: "KeyValueLens", to_key: str) -> bool:
-        """Zero-copy: share a blob's HASH from one lens to another.
-
-        The blob's CONTENT is not copied. Both lenses now reference
-        the same kernel blob (content-addressed dedup for free).
+    def share_blob(from_lens: KeyValueLens, from_collection: str, from_key: str,
+                    to_lens: KeyValueLens, to_collection: str, to_key: str) -> bool:
+        """Zero-copy: share a blob's HASH from one collection to another.
 
         Returns True if the source key existed and the share succeeded,
         False if the source key was not found.
-
-        The target lens's staging area is updated; the caller must
-        call `to_lens.commit(message)` to make the share durable.
         """
-        h = from_lens.base.lookup(from_key)
+        h = from_lens._get_base(from_collection).lookup(from_key)
         if h is None:
             return False
-        to_lens.put_raw(to_key, h)
+        to_lens.put_raw(to_collection, to_key, h)
         return True
 
     @staticmethod
-    def pipe(from_lens: "KeyValueLens", to_lens: "KeyValueLens",
+    def pipe(from_lens: KeyValueLens, from_collection: str,
+             to_lens: KeyValueLens, to_collection: str,
              transformer: Optional[Callable] = None) -> int:
-        """Copy all non-internal keys from `from_lens` to `to_lens`.
+        """Copy all non-internal keys from source to target collection.
 
-        If `transformer` is None: zero-copy share (each blob hash is
-        staged directly via `put_raw`, no re-encoding).
+        If transformer is None: zero-copy share (each blob hash is staged
+        directly via put_raw, no re-encoding).
+        If transformer is provided: re-encode path. The transformer
+        receives (key, decoded_data) and returns (new_key, new_data).
 
-        If `transformer` is provided: re-encode path. The transformer
-        receives `(key, decoded_data)` and returns `(new_key, new_data)`.
-        The new_data is re-encoded via `to_lens.encode` and written as
-        a new blob.
-
-        The target lens's staging area is updated; the caller must
-        call `to_lens.commit(message)` to make the pipe durable.
-
-        Returns the number of keys copied.
+        Returns the number of keys copied. Target is NOT committed.
         """
-        state = from_lens.base.read_all()
+        state = from_lens._get_base(from_collection).read_all()
         count = 0
         for key, h in state.items():
             if key.startswith("_"):
@@ -537,125 +531,25 @@ class CrossLens:
             if transformer:
                 data = from_lens.decode(from_lens.kernel.read_blob(h))
                 to_key, to_data = transformer(key, data)
-                to_lens.put(to_key, to_data)
+                to_lens.put(to_collection, to_key, to_data)
             else:
-                to_lens.put_raw(key, h)
+                to_lens.put_raw(to_collection, key, h)
             count += 1
         return count
 
 
 # ===========================================================================
-# Semantic models are now an OPTIONAL extension.
-#
-# The base Lens (this file) does NOT include semantic model support.
-# To use semantic models (Ossie, Cube, dbt, etc.), install the extension:
-#
-#   from extensions.semantic_ossie import SemanticLens, OssieAdapter
-#
-# Or create a custom adapter:
-#
-#   from extensions.semantic_base import SemanticModelAdapter
-#   from extensions.semantic_ossie import SemanticLens
-#
-#   class MyAdapter(SemanticModelAdapter): ...
-#   semantic = SemanticLens(kernel, "semantic", adapter=MyAdapter())
-#
-# This keeps the core Lens SDK small and lets different deployments
-# use different semantic standards.
-# ===========================================================================
-
-
-# ===========================================================================
-# Test: Index management (semantic model test is in extensions/semantic_ossie.py)
-# ===========================================================================
-
-def test_all():
-    import shutil
-    bench_dir = "/tmp/pond_sdk_v2_test"
-    if os.path.exists(bench_dir): shutil.rmtree(bench_dir)
-    os.makedirs(bench_dir)
-    kernel = PondMinimal(bench_dir)
-
-    print("=== INDEX MANAGEMENT TEST ===\n")
-
-    # Create a Lens with data
-    db = KeyValueLens(kernel, "db")
-    db.put("user:1", {"name": "Alice", "age": 30, "region": "US"})
-    db.put("user:2", {"name": "Bob", "age": 25, "region": "EU"})
-    db.put("user:3", {"name": "Carol", "age": 35, "region": "US"})
-    db.commit("insert 3 users")
-
-    # Create index on "region"
-    db.create_index("by_region", lambda d: d.get("region", ""))
-    print(f"  Created index 'by_region'")
-    print(f"  Indexes: {db.list_indexes()}")
-    print(f"  Lookup 'US': {db.lookup_by_index('by_region', 'US')}")
-
-    # Add more data (index is now stale)
-    db.put("user:4", {"name": "Dave", "age": 28, "region": "EU"})
-    db.commit("add Dave")
-    print(f"\n  After adding Dave (index is stale):")
-    print(f"  Lookup 'EU' (stale — misses Dave): {db.lookup_by_index('by_region', 'EU')}")
-
-    # Refresh index (METADATA ONLY — no data rewrite)
-    db.refresh_index("by_region", lambda d: d.get("region", ""))
-    print(f"\n  After refresh_index:")
-    print(f"  Lookup 'EU' (now includes Dave): {db.lookup_by_index('by_region', 'EU')}")
-
-    # Create another index
-    db.create_index("by_age", lambda d: str(d.get("age", 0)))
-    print(f"\n  Indexes: {db.list_indexes()}")
-
-    # Drop an index (METADATA ONLY)
-    db.drop_index("by_age")
-    print(f"  After drop_index('by_age'): {db.list_indexes()}")
-    print(f"  Lookup 'by_age' after drop: {db.lookup_by_index('by_age', '30')}")
-
-    # Verify data is untouched
-    print(f"\n  Data verification (untouched by index ops):")
-    print(f"  user:1 = {db.get('user:1')}")
-    print(f"  user:4 = {db.get('user:4')}")
-    print(f"  count = {db.count()}")
-
-    print("\n=== INDEX OPERATIONS: DATA vs METADATA ===\n")
-    stats = kernel.storage_stats()
-    print(f"  Total blobs: {stats['blob_count']}")
-    print(f"  Indexes are stored as Prolly trees (metadata blobs)")
-    print(f"  Data blobs are NEVER touched by index operations")
-    print(f"  create_index: scans data → builds Prolly tree (metadata)")
-    print(f"  drop_index: overwrites Reference to empty tree (metadata)")
-    print(f"  refresh_index: rebuilds Prolly tree from current data (metadata)")
-    print(f"  Zero data blobs modified during any index operation ✓")
-
-    print("\n=== ALL TESTS PASSED ===")
-    print("\n  Note: Semantic model tests are in extensions/semantic_ossie.py")
-    print("  Run: python pond-sdk/extensions/semantic_ossie.py")
-    kernel.close()
-    shutil.rmtree(bench_dir, ignore_errors=True)
-
-
-if __name__ == "__main__":
-    test_all()
-
-
-# ===========================================================================
 # Backward-compatible aliases.
 #
-# This file was previously called `keyvalue_lens.py` and the class was called
+# This file was previously called `lens_sdk.py` and the class was called
 # `Lens` (and earlier, `View`). The class was renamed to `KeyValueLens`
-# to make its role explicit: it is the app-facing KEY-VALUE lens, a peer
-# of LakehouseLens and FeatureStoreLens — NOT the universal base class
-# (that's PondLens in base_lens.py).
+# to make its role explicit.
 #
 # New code should use `KeyValueLens`:
 #   from keyvalue_lens import KeyValueLens, KeylessLens, CrossLens
 #
 # Old code that imports `Lens` or `View` continues to work via the
-# aliases below. The aliases are kept indefinitely — there is no plan
-# to remove them.
-#
-# SemanticLens is an OPTIONAL extension. Import it from:
-#   from extensions.semantic.ossie import SemanticLens, OssieAdapter
+# aliases below.
 # ===========================================================================
 
 Lens = KeyValueLens  # backward-compatible alias (old class name)
@@ -663,9 +557,10 @@ View = KeyValueLens  # backward-compatible alias (older class name)
 KeylessView = KeylessLens  # backward-compatible alias
 CrossView = CrossLens  # backward-compatible alias
 
+
 # SemanticLens/OssieAdapter are in extensions/semantic/. IndexedLens is in
-# indexing.py. Both are imported lazily on attribute access to avoid
-# circular imports (indexing.py imports KeyValueLens from this module).
+# extensions/indexing/. Both are imported lazily on attribute access to
+# avoid circular imports.
 def __getattr__(name):
     if name in ("SemanticLens", "SemanticView", "OssieLens", "OssieSemanticLens",
                 "OssieAdapter", "SemanticModelAdapter"):

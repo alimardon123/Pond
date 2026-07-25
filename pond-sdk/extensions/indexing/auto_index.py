@@ -517,36 +517,60 @@ class AutoIndexMixin:
 # ---------------------------------------------------------------------------
 # IndexedLens — convenience class: KeyValueLens + AutoIndexMixin
 # ---------------------------------------------------------------------------
+# Lazy import of KeyValueLens to avoid path issues.
+# KeyValueLens lives in lenses/keyvalue/, not pond-sdk/.
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lenses", "keyvalue"))
-from keyvalue_lens import KeyValueLens
-
-
-class IndexedLens(KeyValueLens, AutoIndexMixin):
-    """A KeyValueLens with automatic indexing enabled.
-
-    Convenience class — equivalent to:
-        class MyLens(KeyValueLens, AutoIndexMixin): pass
-
-    Indexes can be:
-      - EAGER: updated on every commit (slow writes, always-fresh reads)
-      - LAZY: updated on read when stale (fast writes, eventually-fresh reads)
-      - BACKGROUND: updated periodically (fast writes, periodic refresh)
-
-    For streaming/OLTP: use LAZY mode (default). Writes stay O(1).
-    For OLAP: use EAGER mode. Indexes always fresh for fast scans.
-    For mixed: use LAZY with low staleness_budget (e.g., 2-3 commits).
-
-    Indexes are METADATA ONLY. Data blobs are never modified.
-
-    Subclasses that want auto-indexing should extend this class OR mix
-    KeyValueLens + AutoIndexMixin directly.
-    """
-
-    def __init__(self, kernel: PondMinimal, name: str):
-        super().__init__(kernel, name)
-        self._init_auto_index()
+def _get_keyvalue_lens():
+    import sys as _sys
+    import os as _os
+    # auto_index.py is at pond-sdk/extensions/indexing/auto_index.py
+    # keyvalue_lens.py is at lenses/keyvalue/keyvalue_lens.py
+    # So we need to go up 3 levels: indexing/ → extensions/ → pond-sdk/ → repo root
+    kv_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "..", "lenses", "keyvalue")
+    if kv_path not in _sys.path:
+        _sys.path.insert(0, kv_path)
+    from keyvalue_lens import KeyValueLens
+    return KeyValueLens
 
 
-# Backward-compatible alias
-IndexedView = IndexedLens  # backward-compatible alias
+# Create IndexedLens dynamically to avoid import path issues
+_InitializedIndexedLens = None
+
+def _get_indexed_lens():
+    global _InitializedIndexedLens
+    if _InitializedIndexedLens is None:
+        KeyValueLens = _get_keyvalue_lens()
+
+        class IndexedLens(KeyValueLens, AutoIndexMixin):
+            """A KeyValueLens with automatic indexing enabled.
+
+            Convenience class — equivalent to:
+                class MyLens(KeyValueLens, AutoIndexMixin): pass
+
+            Indexes can be:
+              - EAGER: updated on every commit (slow writes, always-fresh reads)
+              - LAZY: updated on read when stale (fast writes, eventually-fresh reads)
+              - BACKGROUND: updated periodically (fast writes, periodic refresh)
+
+            For streaming/OLTP: use LAZY mode (default). Writes stay O(1).
+            For OLAP: use EAGER mode. Indexes always fresh for fast scans.
+            For mixed: use LAZY with low staleness_budget (e.g., 2-3 commits).
+
+            Indexes are METADATA ONLY. Data blobs are never modified.
+            """
+
+            def __init__(self, kernel, name=None):
+                super().__init__(kernel, name)
+                self._init_auto_index()
+
+        _InitializedIndexedLens = IndexedLens
+    return _InitializedIndexedLens
+
+
+# Use __getattr__ to lazily create IndexedLens on first access
+def __getattr__(name):
+    if name == "IndexedLens":
+        return _get_indexed_lens()
+    if name == "IndexedView":
+        return _get_indexed_lens()
+    raise AttributeError(f"module 'extensions.indexing.auto_index' has no attribute '{name}'")

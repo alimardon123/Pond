@@ -92,11 +92,13 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-sdk/__init__.py` | 0 | Package marker. |
 | `pond-sdk/README.md` | 52 | Folder purpose and usage. |
 | `pond-sdk/extensions/__init__.py` | 55 | `register_extension`, `list_extensions` | Extension registry. |
-| `pond-sdk/extensions/indexing/__init__.py` | 27 | `AutoIndexMixin`, `IndexedLens`, `AutoIndex` | Indexing extension package. Auto-indexing mixins for KV-style lenses. |
-| `pond-sdk/extensions/indexing/auto_index.py` | 433 | `AutoIndexMixin`, `IndexedLens` | Auto-indexing mixin (eager/lazy modes). Composable with KeyValueLens. Extension metadata: supported_lens_types, supported_storage. |
+| `pond-sdk/extensions/indexing/__init__.py` | 27 | `CollectionIndexer`, `AutoIndexMixin`, `AutoIndex` | Indexing extension package. Collection-level indexing + legacy lens-mixin approach. |
+| `pond-sdk/extensions/indexing/collection_index.py` | 200 | `CollectionIndexer` | Collection-level indexer. Operates on kernel + collection name. Any lens can use it. Indexes belong to collections (data-side), not lenses. |
+| `pond-sdk/extensions/indexing/auto_index.py` | 433 | `AutoIndexMixin`, `IndexedLens` | Legacy auto-indexing mixin (eager/lazy modes). New code should use CollectionIndexer instead. |
 | `pond-sdk/extensions/semantic/__init__.py` | 15 | — | Semantic extension package. |
 | `pond-sdk/extensions/semantic/base.py` | 45 | `SemanticModelAdapter` | Abstract interface for semantic adapters. |
 | `pond-sdk/extensions/semantic/ossie.py` | 300 | `SemanticLens`, `OssieAdapter` | Ossie adapter + pluggable SemanticLens. |
+| `pond-sdk/extensions/physical_structures/pruning.py` | 180 | `ZoneMap`, `PruningPredicate`, `ColumnPredicate` | Vortex-style predicate pushdown. Zone maps (min/max/null_count per row group) + pruning predicates. Skip row groups without decoding. |
 | `pond-sdk/extensions/physical_structures/__init__.py` | 52 | — | Physical Structure extension package. |
 | `pond-sdk/extensions/physical_structures/base.py` | 105 | `PhysicalStructure` | Abstract base: build, load, exists, delete, query. |
 | `pond-sdk/extensions/physical_structures/bloom_filter.py` | 120 | `BloomFilter` | Probabilistic membership test (O(1)). |
