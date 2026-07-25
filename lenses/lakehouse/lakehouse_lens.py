@@ -251,8 +251,10 @@ class LakehouseLens(PondLens):
         else:
             rg_size = row_group_size
 
-        return self._write_via_prolly(table_name, combined, key_col, rg_size,
+        commit_hash = self._write_via_prolly(table_name, combined, key_col, rg_size,
                                         message=message or f"insert {new_data.num_rows} rows")
+
+        return commit_hash
 
     def read_table(self, table_name: str,
                    commit_hash: Optional[str] = None) -> pa.Table:
@@ -325,8 +327,10 @@ class LakehouseLens(PondLens):
         # Write merged data as row groups via ProllyTreeIndex
         rg_size = max(merged.num_rows, 1)  # one group for simplicity
         # Use internal helper to write row groups + create merge commit
-        return self._write_merge_via_prolly(name, merged, head, branch_head,
+        commit_hash = self._write_merge_via_prolly(name, merged, head, branch_head,
                                              rg_size, f"merge branch '{branch_name}'")
+
+        return commit_hash
 
     # ==================================================================
     # Range read/write over the ProllyTreeIndex (OLTP / streaming / point
@@ -1019,6 +1023,30 @@ class LakehouseLens(PondLens):
         if filtered.num_rows == 0:
             return None
         return filtered.to_pylist()[0]
+
+    def compact_zone_maps(self, collection: str) -> int:
+        """Remove stale zone maps for a collection.
+
+        After insert/merge, old data blobs are replaced by new ones.
+        The old zone maps become stale. This method removes them.
+
+        This is NOT called automatically (to avoid overhead on every
+        insert/merge). Call it explicitly when you want to clean up:
+
+            lens.create_table("users", data)
+            lens.insert("users", more_data)
+            lens.compact_zone_maps("users")  # clean up stale zone maps
+
+        Returns the number of stale zone maps removed.
+        """
+        try:
+            from collection_metadata import CollectionMetadata
+            meta = CollectionMetadata(self.kernel)
+            if meta.has_zone_maps(collection):
+                return meta.compact_zone_maps(collection)
+            return 0
+        except Exception:
+            return 0
 
 
 # ---------------------------------------------------------------------------
