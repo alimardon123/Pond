@@ -106,35 +106,37 @@ class AutoIndex:
 
 
 # ---------------------------------------------------------------------------
-# AutoIndexMixin — composable with any KV-style lens backed by ProllyTreeIndex
+# AutoIndexMixin — composable with ANY Pond lens (KV or tabular)
 # ---------------------------------------------------------------------------
 
 class AutoIndexMixin:
-    """Mixin that adds automatic indexing to any KV-style Pond lens.
+    """Mixin that adds automatic indexing to ANY Pond lens.
 
     EXTENSION METADATA:
       extension_type: "mixin"
-      supported_lens_types: ["KeyValueLens", "KeylessLens", "SemanticLens"]
+      supported_lens_types: ["KeyValueLens", "KeylessLens", "SemanticLens", "LakehouseLens", "FeatureStoreLens"]
       supported_storage: ["ProllyTreeIndex"]
-      not_supported: ["LakehouseLens", "FeatureStoreLens"]  # use Physical Structures instead
+      not_supported: []
 
-    GENERIC: works with any lens that exposes:
-      - self.kernel         — the PondMinimal kernel
-      - self.name           — the collection name
-      - self.base           — a persistent ProllyLensBase for this collection
-                              (used for staging + committing)
-      - self.put(key, data) — stage a key→value mapping (KV-style)
-      - self.delete(key)    — stage a deletion
-      - self.commit(msg)    — commit staged changes
-      - self.encode(data)   — encode a value to bytes
-      - self.decode(bytes)  — decode bytes to a value
+    TWO MODES OF OPERATION:
 
-    Both KeyValueLens and any future KV-style lens that uses ProllyTreeIndex
-    (and exposes `self.base`) can use this mixin. Tabular lenses (LakehouseLens)
-    use a different acceleration model (Physical Structures: Statistics,
-    ZoneMap, BloomFilter) because they store row groups, not individual keys.
+    1. KV-style (legacy, for KeyValueLens and subclasses):
+       Uses self.base (ProllyLensBase) for staging + committing. Indexes
+       map index_key → blob_hash. The lens's key IS the row identifier.
 
-    Use by mixing with a KV-style lens:
+    2. Row-level (generic, for ANY lens including tabular):
+       Uses _rowid (UUIDv7) as the universal row identifier. Indexes map
+       index_key → _rowid. The lens must implement:
+         - self._scan_rows() -> iterator of (rowid, row_dict)
+         - self._get_row(rowid) -> Optional[row_dict]
+       For KV lenses, _scan_rows iterates keys()+get() and rowid = key.
+       For tabular lenses, _scan_rows iterates table rows and rowid = _rowid column.
+
+    The _rowid approach is inspired by PostgreSQL's ctid and Apache Hudi's
+    _hoodie_record_key. UUIDv7 (time-ordered) is used for distributed
+    read/write support — no central ID allocator needed.
+
+    Use by mixing with any lens:
 
         from keyvalue_lens import KeyValueLens
         from extensions.indexing.auto_index import AutoIndexMixin
@@ -142,8 +144,10 @@ class AutoIndexMixin:
         class MyIndexedLens(KeyValueLens, AutoIndexMixin):
             pass
 
-    Or use the convenience class `IndexedLens` defined at the end of
-    this file.
+        # Or with LakehouseLens:
+        from lakehouse_lens import LakehouseLens
+        class IndexedLakehouse(LakehouseLens, AutoIndexMixin):
+            pass
 
     Adds:
       - register_index(name, extractor, mode, staleness_budget)
@@ -155,15 +159,21 @@ class AutoIndexMixin:
       - refresh_all_indexes()
 
     The mixin OVERRIDES `put`, `delete`, and `commit` to track index
-    changes. It does NOT override `get` or `get_all` — those still use
-    the base lens implementation (O(log N) via ProllyTreeIndex).
+    changes (KV-style mode). For tabular lenses, use rebuild_index_after_write()
+    after batch writes since the put/delete/commit override doesn't apply.
     """
 
     # Extension metadata (for introspection / tooling)
     extension_type = "mixin"
-    supported_lens_types = ["KeyValueLens", "KeylessLens", "SemanticLens"]
+    supported_lens_types = ["KeyValueLens", "KeylessLens", "SemanticLens",
+                            "LakehouseLens", "FeatureStoreLens"]
     supported_storage = ["ProllyTreeIndex"]
-    not_supported = ["LakehouseLens", "FeatureStoreLens"]  # use Physical Structures
+    not_supported = []
+
+    # The hidden row identifier column name (for tabular lenses).
+    # Like PostgreSQL's ctid — a system column that uniquely identifies each row.
+    # UUIDv7 is used for time-ordered, distributed-friendly generation.
+    ROWID_COLUMN = "_rowid"
 
     def _init_auto_index(self):
         """Call this from __init__ to initialize auto-index state.
@@ -176,11 +186,78 @@ class AutoIndexMixin:
         self._commit_count = 0
 
     # ------------------------------------------------------------------
+    # Generic row-level interface (works with ANY lens)
+    #
+    # These methods provide a universal row-iteration interface that works
+    # for both KV lenses (rowid = key) and tabular lenses (rowid = _rowid column).
+    # Tabular lenses override these to scan Parquet row groups.
+    # ------------------------------------------------------------------
+
+    def _scan_rows(self):
+        """Yield (rowid, row_dict) for every row in the collection.
+
+        DEFAULT (KV-style): uses self.base.read_all() + self.get().
+        Tabular lenses (LakehouseLens) override this to scan row groups.
+
+        Yields:
+            (rowid: str, row: dict) tuples
+        """
+        # KV-style: rowid = key, row = decoded value
+        state = self.base.read_all()
+        for key, blob_hash in state.items():
+            if key.startswith("_"):
+                continue
+            row = self.decode(self.kernel.read_blob(blob_hash))
+            yield key, row
+
+    def _get_row(self, rowid: str) -> Optional[Any]:
+        """Get a single row by its rowid.
+
+        DEFAULT (KV-style): uses self.get(rowid).
+        Tabular lenses override this to scan for the _rowid column.
+
+        Returns:
+            The row dict, or None if not found.
+        """
+        # KV-style: rowid = key
+        return self.get(rowid)
+
+    def _is_tabular(self) -> bool:
+        """Check if this lens is tabular (stores row groups, not individual keys).
+
+        Tabular lenses override this to return True. The mixin uses this to
+        decide whether to use KV-style index tracking (put/delete/commit overrides)
+        or batch-rebuild index tracking.
+        """
+        return False
+
+    def rebuild_index_after_write(self, index_name: Optional[str] = None) -> None:
+        """Rebuild index(es) after a batch write (for tabular lenses).
+
+        Tabular lenses (LakehouseLens) do batch writes (create_table, insert)
+        that bypass the put/delete/commit overrides. After such a write, call
+        this method to rebuild the affected indexes.
+
+        Args:
+            index_name: specific index to rebuild, or None for all indexes.
+        """
+        if not hasattr(self, '_auto_indexes'):
+            return
+        if index_name:
+            idx = self._auto_indexes.get(index_name)
+            if idx:
+                self._rebuild_index(idx)
+        else:
+            for idx in self._auto_indexes.values():
+                self._rebuild_index(idx)
+
+    # ------------------------------------------------------------------
     # Register/unregister indexes
     # ------------------------------------------------------------------
 
     def register_index(self, name: str, extractor: Callable[[Any], Union[str, list[str]]],
-                       mode: str = "lazy", staleness_budget: int = 5) -> None:
+                       mode: str = "lazy", staleness_budget: int = 5,
+                       collection: Optional[str] = None) -> None:
         """Register an automatic index.
 
         Args:
@@ -189,10 +266,16 @@ class AutoIndexMixin:
             mode: 'eager' (rebuild on commit), 'lazy' (rebuild on read
                 when stale, default), 'background' (not yet implemented).
             staleness_budget: max commits before a lazy index is rebuilt.
+            collection: for tabular lenses (LakehouseLens), the collection
+                name to index. KV lenses ignore this (they're bound to one
+                collection via __init__).
         """
         if not hasattr(self, '_auto_indexes'):
             self._init_auto_index()
         self._auto_indexes[name] = AutoIndex(name, extractor, mode, staleness_budget)
+        # For tabular lenses, track which collection this index is for.
+        if collection is not None:
+            self._indexed_collection = collection
 
     def unregister_index(self, name: str) -> None:
         """Remove an auto-index (tombstone pattern per RFC-0008)."""
@@ -223,19 +306,25 @@ class AutoIndexMixin:
     # ------------------------------------------------------------------
 
     def put(self, key: str, data: Any) -> str:
-        """Override: stage data + track for incremental index updates."""
+        """Override: stage data + track for incremental index updates.
+
+        For KV lenses, the rowid = key. The index stores rowid as a blob
+        (because ProllyTree values must be hex blob hashes).
+        """
         if not hasattr(self, '_auto_indexes'):
-            # No auto-index state — delegate to KeyValueLens.put
+            # No auto-index state — delegate to base lens put
             return super().put(key, data)
         blob_hash = self.kernel.write(self.encode(data))
         self.base.stage(key, blob_hash)
-        # Track for incremental index updates
+        # Track for incremental index updates.
+        # Store rowid (= key for KV lenses) as a blob; use its hash.
         for idx in self._auto_indexes.values():
             if idx.incremental and idx.tree_root is not None:
                 idx_keys = AutoIndex.extract_keys(idx.extractor, data)
                 for idx_key in idx_keys:
                     full_key = f"_index/{idx.name}/{idx_key}"
-                    idx.pending_additions[full_key] = blob_hash
+                    rowid_blob_hash = self.kernel.write(str(key).encode())
+                    idx.pending_additions[full_key] = rowid_blob_hash
         return blob_hash
 
     def delete(self, key: str) -> None:
@@ -297,8 +386,13 @@ class AutoIndexMixin:
             return None
 
         full_key = f"_index/{index_name}/{index_key}"
-        bh = ProllyTree.lookup(self.kernel, idx.tree_root, full_key)
-        return self.decode(self.kernel.read_blob(bh)) if bh else None
+        rowid_blob_hash = ProllyTree.lookup(self.kernel, idx.tree_root, full_key)
+        if rowid_blob_hash:
+            # The index stores blob_hash → rowid (UTF-8). Read the blob,
+            # then use _get_row(rowid) to retrieve the actual data.
+            rowid = self.kernel.read_blob(rowid_blob_hash).decode()
+            return self._get_row(rowid)
+        return None
 
     def find_all_by(self, index_name: str, index_key: str) -> list[Any]:
         """Find ALL entries matching an index key (not just the first)."""
@@ -317,9 +411,12 @@ class AutoIndexMixin:
             return []
 
         full_key = f"_index/{index_name}/{index_key}"
-        bh = ProllyTree.lookup(self.kernel, idx.tree_root, full_key)
-        if bh:
-            return [self.decode(self.kernel.read_blob(bh))]
+        rowid_blob_hash = ProllyTree.lookup(self.kernel, idx.tree_root, full_key)
+        if rowid_blob_hash:
+            rowid = self.kernel.read_blob(rowid_blob_hash).decode()
+            row = self._get_row(rowid)
+            if row is not None:
+                return [row]
         return []
 
     # ------------------------------------------------------------------
@@ -327,16 +424,26 @@ class AutoIndexMixin:
     # ------------------------------------------------------------------
 
     def _rebuild_index(self, idx: AutoIndex) -> str:
-        """Rebuild an index from current data. Full O(N) scan."""
-        state = self.base.read_all()
+        """Rebuild an index from current data. Full O(N) scan.
+
+        Uses the generic _scan_rows() interface so it works with ANY lens
+        (KV or tabular). For KV lenses, _scan_rows iterates keys()+get().
+        For tabular lenses, _scan_rows iterates row groups.
+
+        The index maps index_key → blob_hash, where the blob contains the
+        rowid (encoded as UTF-8). This is because ProllyTree values must
+        be hex blob hashes. find_by() reads the blob to get the rowid,
+        then calls _get_row(rowid) to retrieve the actual data.
+        """
         index_entries = {}
-        for pk, bh in state.items():
-            if pk.startswith("_"):
-                continue
-            data = self.decode(self.kernel.read_blob(bh))
-            idx_keys = AutoIndex.extract_keys(idx.extractor, data)
+        for rowid, row_data in self._scan_rows():
+            idx_keys = AutoIndex.extract_keys(idx.extractor, row_data)
             for idx_key in idx_keys:
-                index_entries[f"_index/{idx.name}/{idx_key}"] = bh
+                # Store rowid as a blob, use its hash as the index value.
+                # For KV lenses, rowid = key. For tabular lenses, rowid = _rowid.
+                rowid_bytes = str(rowid).encode()
+                rowid_blob_hash = self.kernel.write(rowid_bytes)
+                index_entries[f"_index/{idx.name}/{idx_key}"] = rowid_blob_hash
 
         idx.tree_root = ProllyTree.build(self.kernel, index_entries)
         idx.last_built_at_commit = self._commit_count
@@ -411,6 +518,7 @@ class AutoIndexMixin:
 # IndexedLens — convenience class: KeyValueLens + AutoIndexMixin
 # ---------------------------------------------------------------------------
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lenses", "keyvalue"))
 from keyvalue_lens import KeyValueLens
 
 

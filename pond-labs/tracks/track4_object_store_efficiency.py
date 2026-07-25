@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "lenses"))
 sys.path.insert(0, SCRIPT_DIR)
 
 from kernel import PondMinimal  # noqa: E402
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "lenses", "keyvalue"))
 from keyvalue_lens import KeyValueLens as Lens  # noqa: E402
 
 

@@ -55,6 +55,7 @@ from typing import Optional, Any
 # Make pond-sdk importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lenses", "keyvalue"))
 from keyvalue_lens import KeyValueLens as Lens  # noqa: E402
 from extensions.semantic.base import SemanticModelAdapter  # noqa: E402
 from extensions import register_extension  # noqa: E402

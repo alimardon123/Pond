@@ -28,6 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "pond-sdk"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "lenses", "keyvalue"))
 
 from kernel import PondMinimal
 from lens_laws import LensLaws, LensContract

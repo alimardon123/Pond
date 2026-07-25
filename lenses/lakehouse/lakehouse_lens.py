@@ -730,6 +730,76 @@ class LakehouseLens(PondLens):
         reader = pa.BufferReader(parquet_bytes)
         return pq.read_table(reader)
 
+    # ==================================================================
+    # Generic row-level interface (for AutoIndexMixin compatibility)
+    #
+    # These methods allow AutoIndexMixin to work with LakehouseLens by
+    # providing a universal row-iteration interface. Each row is identified
+    # by a _rowid (UUIDv7, auto-generated if not present in the data).
+    #
+    # NOTE: LakehouseLens is NOT bound to a single collection (unlike
+    # KeyValueLens which takes a name in __init__). The _scan_rows and
+    # _get_row methods use self._indexed_collection, which is set by
+    # AutoIndexMixin when it registers an index for a specific collection.
+    # ==================================================================
+
+    def _is_tabular(self) -> bool:
+        """LakehouseLens is a tabular lens."""
+        return True
+
+    def _scan_rows(self):
+        """Yield (rowid, row_dict) for every row in the indexed collection.
+
+        Reads all row groups from the ProllyTreeIndex for the collection
+        specified by self._indexed_collection, converts to Python dicts,
+        and yields each with its _rowid.
+        """
+        from uuid7 import uuidv7
+
+        collection = getattr(self, '_indexed_collection', None)
+        if collection is None:
+            return  # No collection bound — nothing to scan
+
+        table = self.read_table(collection)
+        if table.num_rows == 0:
+            return
+
+        rowid_col = "_rowid"
+        has_rowid = rowid_col in table.column_names
+
+        rows = table.to_pylist()
+        for row in rows:
+            if has_rowid and row.get(rowid_col):
+                rowid = str(row[rowid_col])
+            else:
+                # Generate a _rowid for this scan. In production, _rowid
+                # would be assigned at write time and stored in the Parquet
+                # row group as a hidden column.
+                rowid = uuidv7()
+            yield rowid, row
+
+    def _get_row(self, rowid: str):
+        """Get a single row by its _rowid from the indexed collection.
+
+        Scans the collection for a matching _rowid column. If no _rowid
+        column exists, returns None.
+        """
+        collection = getattr(self, '_indexed_collection', None)
+        if collection is None:
+            return None
+
+        table = self.read_table(collection)
+        rowid_col = "_rowid"
+        if rowid_col not in table.column_names:
+            return None
+
+        import pyarrow.compute as pc
+        mask = pc.equal(table[rowid_col], rowid)
+        filtered = table.filter(mask)
+        if filtered.num_rows == 0:
+            return None
+        return filtered.to_pylist()[0]
+
 
 # ---------------------------------------------------------------------------
 # Lakehouse — DuckDB query layer on top of LakehouseLens

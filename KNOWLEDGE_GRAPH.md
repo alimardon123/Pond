@@ -76,9 +76,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
 | `pond-sdk/base_lens.py` | 248 | `PondLens` | **Shared namespace base for ALL Lenses.** Provides only ref-namespace operations (branch, list_collections, set_definition, get_definition, history). No format awareness — each app-facing lens owns its own read/write API. |
-| `pond-sdk/keyvalue_lens.py` | 694 | `KeyValueLens`, `KeylessLens`, `CrossLens`, `Lens`/`View` (aliases) | **App-facing KEY-VALUE lens** with ProllyTreeIndex backing. Per-row key→blob storage, O(log N) point lookups, indexes (metadata only), branching, merge, history. `Lens = KeyValueLens` and `View = KeyValueLens` are backward-compat aliases. |
-| `pond-sdk/lens_sdk.py` | 47 | (re-exports) | Backward-compat shim — re-exports everything from `keyvalue_lens.py`. Old code that imports `from lens_sdk import Lens` keeps working; new code should import from `keyvalue_lens` directly. |
-| `pond-sdk/prolly_tree.py` | 764 | `ProllyTree`, `ProllyLensBase` | ProllyTreeIndex storage + tiered commits (delta + snapshot) + branching + merge + history. The universal storage backend for KV collections. |
+| `pond-sdk/prolly_tree.py` | 764 | `ProllyTree`, `ProllyLensBase` | ProllyTreeIndex storage + tiered commits (delta + snapshot) + branching + merge + history. The universal storage backend for all collections. |
 | `pond-sdk/extensions/indexing/auto_index.py` | 607 | `AutoIndex`, `IndexedLens` | Physical Structure for secondary indexes. Auto-indexing (lazy/eager/incremental). |
 | `pond-sdk/collection.py` | 517 | `Collection` | Named collection with namespace, type, source metadata. |
 | `tests/lens_algebra/lens_laws.py` | 591 | (test harness) | RFC-0007 Lens algebra property tests (6 laws). |
@@ -89,6 +87,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-sdk/row_query.py` | 288 | `LensQuery`, `JoinedQuery` | Lazy query API: `.where()`, `.select()`, `.map()`, `.join()`, `.collect()`. |
 | `tests/integration/test_lens_query.py` | 327 | (tests) | Test: LensQuery. |
 | `pond-sdk/maintenance.py` | 315 | `drop_name`, `is_dropped`, `resolve_active`, `compact_tombstones` | Tombstone helpers (RFC-0008: deletion as data). |
+| `pond-sdk/uuid7.py` | 180 | `uuidv7`, `uuidv7_monotonic`, `uuidv7_timestamp` | UUIDv7 time-ordered UUID generation for distributed row identification (_rowid). |
 | `tests/lens_algebra/run_lens_laws_ci.py` | 267 | (CI runner) | CI runner for Lens contracts. |
 | `pond-sdk/__init__.py` | 0 | Package marker. |
 | `pond-sdk/README.md` | 52 | Folder purpose and usage. |
@@ -104,10 +103,12 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-sdk/extensions/physical_structures/statistics.py` | 100 | `Statistics` | Column min/max/null_count for pruning. |
 | `pond-sdk/extensions/physical_structures/zone_map.py` | 90 | `ZoneMap` | Per-chunk min/max for range pruning. |
 
-### 2.3 lenses/ (Active Lens implementations — 2 packages)
+### 2.3 lenses/ (Active Lens implementations — 3 packages)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
+| `lenses/keyvalue/__init__.py` | 0 | — | Package marker. |
+| `lenses/keyvalue/keyvalue_lens.py` | 694 | `KeyValueLens`, `KeylessLens`, `CrossLens`, `Lens`/`View` (aliases) | **App-facing KEY-VALUE lens** with ProllyTreeIndex backing. Per-row key→blob storage, O(log N) point lookups, branching, merge, history. `Lens = KeyValueLens` and `View = KeyValueLens` are backward-compat aliases. |
 | `lenses/lakehouse/lakehouse_lens.py` | 886 | `LakehouseLens`, `PondLakehouse` | **Flagship.** DuckDB lakehouse: CREATE TABLE, INSERT, SELECT, time travel, branching, merge, schema evolution. Owns its Parquet I/O directly (not inherited). Adds range_read/range_write/range_point_lookup as Lakehouse-specific extensions on top of the shared ProllyTreeIndex. |
 | `lenses/vector/vector_lens.py` | 198 | `VectorLens` | Vector DB with ANN search. Extends `IndexedLens`. |
 | `lenses/vector/auto_index.py` | 329 | (mock) | Mock auto-index for testing. |
@@ -251,7 +252,7 @@ implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 |---|---|---|
 | **Kernel** | 3 operations (Write, Read, Ref) on 6 substrates. FROZEN. | `pond-core/kernel.py` |
 | **Substrate** | A layer with its own axioms (Bytes, Names, Time, Coordination, Range-Read, Key). | `docs/POND_FORMAL_ALGEBRAS.md` §9 |
-| **Lens** | App-facing interpretation layer over immutable bytes. Each lens owns its own read/write API. | `pond-sdk/keyvalue_lens.py` (KeyValueLens), `lenses/lakehouse/lakehouse_lens.py` (LakehouseLens), `pond-labs/lenses/feature_store_lens.py` (FeatureStoreLens) |
+| **Lens** | App-facing interpretation layer over immutable bytes. Each lens owns its own read/write API. | `lenses/keyvalue/keyvalue_lens.py` (KeyValueLens), `lenses/lakehouse/lakehouse_lens.py` (LakehouseLens), `pond-labs/lenses/feature_store_lens.py` (FeatureStoreLens) |
 | **PondLens** | Shared namespace base for all Lenses. Provides only ref-namespace operations (branch, list_collections, set_definition, get_definition, history). No format awareness. | `pond-sdk/base_lens.py` |
 | **Physical Structure** | `f(snapshot)→artifact`. Deterministic, rebuildable. Indexes, stats, bloom filters. | `docs/POND_FORMAL_ALGEBRAS.md` §14 |
 | **Collection** | Named reference namespace. Not fundamental — just a naming convention. | `pond-sdk/collection.py` |
@@ -507,7 +508,7 @@ python tests/lens_algebra/lens_laws.py
 |---|---|
 | The kernel | `pond-core/kernel.py` |
 | Lens base class (shared namespace) | `pond-sdk/base_lens.py` → `PondLens` |
-| KeyValueLens (app-facing KV lens) | `pond-sdk/keyvalue_lens.py` → `KeyValueLens` (aliases: `Lens`, `View`) |
+| KeyValueLens (app-facing KV lens) | `lenses/keyvalue/keyvalue_lens.py` → `KeyValueLens` (aliases: `Lens`, `View`) |
 | Prolly tree (ProllyTreeIndex) | `pond-sdk/prolly_tree.py` → `ProllyTree`, `ProllyLensBase` |
 | Indexes | `pond-sdk/extensions/indexing/auto_index.py` → `IndexedLens` |
 | Lakehouse (flagship) | `lenses/lakehouse/lakehouse_lens.py` → `LakehouseLens`, `PondLakehouse` |

@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 
 from kernel import PondMinimal
+sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))
 from keyvalue_lens import KeyValueLens as Lens
 
 

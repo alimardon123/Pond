@@ -39,7 +39,8 @@ import hashlib
 import uuid
 from typing import Optional, Any, Callable, Union
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-core"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-sdk"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kernel import PondMinimal
 from prolly_tree import ProllyLensBase, ProllyTree
