@@ -79,7 +79,7 @@ import json
 import time
 import tempfile
 import shutil
-from typing import Optional, Iterator
+from typing import Optional, Iterator, Callable
 
 # Make pond-core and pond-sdk importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -375,20 +375,43 @@ class LakehouseLens(PondLens):
 
         # Stage each row group as a Parquet blob keyed by max_pk in group.
         key_array = sorted_table.column(key_col).to_pylist()
+
+        # Optionally set up zone map index for pruning
+        zm_index = None
+        try:
+            from zone_map_index import ZoneMapIndex
+            from pruning import ZoneMap
+            zm_index = ZoneMapIndex(self.kernel)
+        except ImportError:
+            pass
+
         for start in range(0, n_rows, row_group_size):
             end = min(start + row_group_size, n_rows)
             group_table = sorted_table.slice(start, end - start)
             parquet_bytes = self._encode_table(group_table)
             parquet_hash = self.kernel.write(parquet_bytes)
-            # The key for this row group is the MAX primary key in the group.
-            # range_read(start, end) scans the prolly tree from
-            # f"rg/{start}" to f"rg/{end}" and concatenates all matching groups.
             max_pk = key_array[end - 1]
             rg_key = f"{_RG_PREFIX}{max_pk}"
             base.stage(rg_key, parquet_hash)
 
+            # Compute and store zone map for this row group
+            if zm_index is not None:
+                try:
+                    zm = ZoneMap.build(group_table)
+                    zm_index.add_zone_map(name, rg_key, zm, parquet_hash)
+                except Exception:
+                    pass
+
         commit_hash = base.commit(f"range_write: {n_rows} rows in "
                                   f"{(n_rows + row_group_size - 1) // row_group_size} row groups")
+
+        # Commit zone maps (if built)
+        if zm_index is not None:
+            try:
+                zm_index.commit_zone_maps(name, f"zone maps for {name}")
+            except Exception:
+                pass
+
         # Invalidate read cache
         self._cached_tables.pop(f"{name}:{commit_hash}", None)
         return commit_hash
@@ -502,6 +525,71 @@ class LakehouseLens(PondLens):
         return None
 
     # ==================================================================
+    # Pruning-accelerated read (Vortex-style predicate pushdown)
+    # ==================================================================
+
+    def read_with_pruning(self, name: str,
+                          predicates: Optional[list] = None,
+                          row_filter: Optional[Callable] = None) -> pa.Table:
+        """Read a table with Vortex-style predicate pushdown.
+
+        Reads zone maps first (small, cheap), evaluates the pruning
+        predicate, and only fetches + decodes data blobs that MIGHT match.
+        Skips row groups whose zone maps prove they can't match — WITHOUT
+        reading or decoding the data blob.
+
+        Args:
+            name: collection name (must have zone maps, built at write time)
+            predicates: list of (column, op, value) tuples for pruning.
+                Example: [("age", ">", 30), ("region", "=", "US")]
+                All predicates are ANDed together.
+                If None, no pruning (reads all row groups).
+            row_filter: optional function(row_dict) -> bool for exact
+                row-level filtering after pruning. This catches false
+                positives from zone-map pruning.
+
+        Returns:
+            A PyArrow Table containing rows from non-pruned row groups
+            (optionally filtered by row_filter).
+        """
+        try:
+            from zone_map_index import ZoneMapIndex
+            from pruning import PruningPredicate, ColumnPredicate
+            from pruning_reader import PruningReader
+        except ImportError:
+            # No pruning extension — fall back to full read
+            return self.read_table(name)
+
+        zm_index = ZoneMapIndex(self.kernel)
+
+        # Check if zone maps exist for this collection
+        if not zm_index.has_zone_maps(name):
+            return self.read_table(name)  # No zone maps — no pruning
+
+        # Build pruning predicate from the list of (column, op, value) tuples
+        predicate = None
+        if predicates:
+            col_preds = [ColumnPredicate(column=c, op=o, value=v)
+                         for c, o, v in predicates]
+            predicate = PruningPredicate(col_preds, combine="and")
+
+        reader = PruningReader(self.kernel, zm_index, name, predicate)
+
+        # Decode function: Parquet bytes → list of row dicts
+        def decode_parquet(data_bytes):
+            table = self._decode_table(data_bytes)
+            return table.to_pylist()
+
+        # Scan with pruning
+        rows = list(reader.scan(decode_fn=decode_parquet, row_filter=row_filter))
+
+        if not rows:
+            return pa.table({})
+
+        # Convert list of dicts back to PyArrow Table
+        return pa.Table.from_pylist(rows)
+
+    # ==================================================================
     # Internal helpers: row group storage via ProllyTreeIndex.
     #
     # ALL writes (create_table, insert, commit_to_branch, merge_branch,
@@ -512,7 +600,8 @@ class LakehouseLens(PondLens):
     def _write_via_prolly(self, name: str, table: pa.Table,
                           key_col: Optional[str],
                           row_group_size: int,
-                          message: str = "") -> str:
+                          message: str = "",
+                          build_zone_maps: bool = True) -> str:
         """Write a table as row groups in ProllyTreeIndex, commit to HEAD.
 
         This is the unified write path. Splits `table` into row groups of
@@ -523,6 +612,11 @@ class LakehouseLens(PondLens):
         so the new commit contains ONLY the new row groups. This makes
         `insert` work correctly (the new table replaces the old, rather
         than accumulating).
+
+        If build_zone_maps is True (default), also computes and stores
+        zone maps (min/max/null_count per row group) in a separate
+        ProllyTreeIndex. These enable Vortex-style predicate pushdown
+        via PruningReader — skipping row groups without decoding.
 
         If key_col is None, uses row index (0..N-1) as the primary key.
         """
@@ -555,6 +649,21 @@ class LakehouseLens(PondLens):
             sorted_table = table
             key_array = list(range(n_rows))
 
+        # Optionally set up zone map index
+        zm_index = None
+        if build_zone_maps:
+            try:
+                from zone_map_index import ZoneMapIndex
+                from pruning import ZoneMap
+                zm_index = ZoneMapIndex(self.kernel)
+                # Clear old zone maps for this collection
+                zm_base = zm_index._get_base(name)
+                for k in zm_base.read_all().keys():
+                    if k.startswith(_RG_PREFIX):
+                        zm_base.stage_delete(k)
+            except ImportError:
+                zm_index = None
+
         # Stage each row group
         for start in range(0, n_rows, row_group_size):
             end = min(start + row_group_size, n_rows)
@@ -565,9 +674,25 @@ class LakehouseLens(PondLens):
             rg_key = f"{_RG_PREFIX}{max_pk}"
             base.stage(rg_key, parquet_hash)
 
+            # Compute and store zone map for this row group
+            if zm_index is not None:
+                try:
+                    zm = ZoneMap.build(group_table)
+                    zm_index.add_zone_map(name, rg_key, zm, parquet_hash)
+                except Exception:
+                    pass  # zone map computation is best-effort
+
         n_groups = (n_rows + row_group_size - 1) // row_group_size
         commit_hash = base.commit(message or f"write: {n_rows} rows in {n_groups} row groups")
         self._cached_tables.pop(f"{name}:{commit_hash}", None)
+
+        # Commit zone maps (if built)
+        if zm_index is not None:
+            try:
+                zm_index.commit_zone_maps(name, f"zone maps for {name}")
+            except Exception:
+                pass  # zone map commit is best-effort
+
         return commit_hash
 
     def _write_via_prolly_to_branch(self, name: str, branch_name: str,

@@ -100,6 +100,10 @@ def test_pruning():
     ok, output = _run_script("tests/integration/test_pruning.py")
     assert ok, f"Pruning tests failed:\n{output[-500:]}"
 
+def test_lakehouse_pruning():
+    ok, output = _run_script("tests/integration/test_lakehouse_pruning.py")
+    assert ok, f"Lakehouse pruning tests failed:\n{output[-500:]}"
+
 def test_transport_production():
     ok, output = _run_script("services/transport/transport_production.py")
     assert ok, f"Transport tests failed:\n{output[-500:]}"
