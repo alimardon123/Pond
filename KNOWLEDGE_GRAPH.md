@@ -86,6 +86,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `tests/integration/test_lens_architecture.py` | 449 | (tests) | Test: multi-Lens architecture proof (SQL/Git/Notebook lenses over same byte graph). |
 | `pond-sdk/row_query.py` | 288 | `LensQuery`, `JoinedQuery` | Lazy query API: `.where()`, `.select()`, `.map()`, `.join()`, `.collect()`. |
 | `tests/integration/test_lens_query.py` | 327 | (tests) | Test: LensQuery. |
+| `tests/integration/test_pruning.py` | 320 | (tests) | Test: Vortex-style pruning. Zone-map-based pruning works for JSON, Parquet, and custom formats. |
 | `pond-sdk/maintenance.py` | 315 | `drop_name`, `is_dropped`, `resolve_active`, `compact_tombstones` | Tombstone helpers (RFC-0008: deletion as data). |
 | `pond-sdk/uuid7.py` | 180 | `uuidv7`, `uuidv7_monotonic`, `uuidv7_timestamp` | UUIDv7 time-ordered UUID generation for distributed row identification (_rowid). |
 | `tests/lens_algebra/run_lens_laws_ci.py` | 267 | (CI runner) | CI runner for Lens contracts. |
@@ -99,6 +100,8 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-sdk/extensions/semantic/base.py` | 45 | `SemanticModelAdapter` | Abstract interface for semantic adapters. |
 | `pond-sdk/extensions/semantic/ossie.py` | 300 | `SemanticLens`, `OssieAdapter` | Ossie adapter + pluggable SemanticLens. |
 | `pond-sdk/extensions/physical_structures/pruning.py` | 180 | `ZoneMap`, `PruningPredicate`, `ColumnPredicate` | Vortex-style predicate pushdown. Zone maps (min/max/null_count per row group) + pruning predicates. Skip row groups without decoding. |
+| `pond-sdk/extensions/physical_structures/zone_map_index.py` | 280 | `ZoneMapIndex` | ProllyTreeIndex of zone maps. Stores min/max/null_count per data blob. Enables Vortex-style pruning without decoding. |
+| `pond-sdk/extensions/physical_structures/pruning_reader.py` | 200 | `PruningReader` | Generic pruning reader. Reads zone maps first, skips non-matching data blobs without decoding. Works with ANY lens/format. |
 | `pond-sdk/extensions/physical_structures/__init__.py` | 52 | — | Physical Structure extension package. |
 | `pond-sdk/extensions/physical_structures/base.py` | 105 | `PhysicalStructure` | Abstract base: build, load, exists, delete, query. |
 | `pond-sdk/extensions/physical_structures/bloom_filter.py` | 120 | `BloomFilter` | Probabilistic membership test (O(1)). |

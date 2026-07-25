@@ -96,6 +96,10 @@ def test_track9_production_lakehouse():
     ok, output = _run_script("pond-labs/tracks/track9_production_lakehouse.py")
     assert ok, f"Track 9 failed:\n{output[-500:]}"
 
+def test_pruning():
+    ok, output = _run_script("tests/integration/test_pruning.py")
+    assert ok, f"Pruning tests failed:\n{output[-500:]}"
+
 def test_transport_production():
     ok, output = _run_script("services/transport/transport_production.py")
     assert ok, f"Transport tests failed:\n{output[-500:]}"
