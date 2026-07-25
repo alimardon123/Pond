@@ -299,6 +299,17 @@ class Collection:
         """Refresh an index incrementally (only update changed entries)."""
         return self.metadata.refresh_index(self.name, index_name, extractor, scan_fn)
 
+    def refresh_index_incremental(self, index_name: str, extractor,
+                                  old_commit: str, new_commit: str,
+                                  decode_fn=None) -> str:
+        """Refresh an index using commit-diff — O(changed) not O(N).
+
+        Only processes rows that changed between old_commit and new_commit.
+        Uses ProllyTree diff to identify added/removed/modified keys.
+        """
+        return self.metadata.refresh_index_incremental(
+            self.name, index_name, extractor, old_commit, new_commit, decode_fn)
+
     def is_index_stale(self, index_name: str, scan_fn=None, extractor=None) -> bool:
         """Check if an index is stale (doesn't match current data)."""
         return self.metadata.is_index_stale(self.name, index_name, scan_fn, extractor)

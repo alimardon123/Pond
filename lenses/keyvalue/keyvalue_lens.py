@@ -213,13 +213,25 @@ class KeyValueLens(PondLens):
         Collection-agnostic API: commit(collection, message="")
         Backward compat API:    commit(message="")  [requires name in __init__]
 
-        Zone maps are NOT auto-built for KV commits (too much overhead for
-        per-row entries). Use build_zone_maps(collection) explicitly to
-        build zone maps for a KV collection when you want pruning support.
+        After committing, if any indexers are registered (via
+        CollectionMetadata.register_eager_index), they are notified
+        via notify_write(). This enables EAGER index auto-refresh
+        without coupling the lens to the indexer.
         """
         collection, rest = self._resolve_collection(*args)
         message = rest[0] if rest else ""
-        return self._get_base(collection).commit(message or f"{collection} commit")
+        commit_hash = self._get_base(collection).commit(message or f"{collection} commit")
+
+        # Notify registered indexers (EAGER mode auto-refresh)
+        # This is a no-op if no indexers are registered.
+        try:
+            from collection_metadata import CollectionMetadata
+            meta = CollectionMetadata(self.kernel)
+            meta.notify_write(collection)
+        except Exception:
+            pass  # indexer notification is best-effort
+
+        return commit_hash
 
     def build_zone_maps(self, *args) -> None:
         """Build zone maps for a KV collection (explicit, not auto).

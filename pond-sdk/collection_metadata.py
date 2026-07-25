@@ -302,6 +302,15 @@ class CollectionMetadata:
             return ""
         return self.indexer.refresh_index(collection, index_name, extractor, scan_fn)
 
+    def refresh_index_incremental(self, collection: str, index_name: str,
+                                  extractor, old_commit: str, new_commit: str,
+                                  decode_fn=None) -> str:
+        """Refresh an index using commit-diff — O(changed) not O(N)."""
+        if not _PRUNING_AVAILABLE or self.indexer is None:
+            return ""
+        return self.indexer.refresh_index_incremental(
+            collection, index_name, extractor, old_commit, new_commit, decode_fn)
+
     def is_index_stale(self, collection: str, index_name: str,
                        scan_fn=None, extractor=None) -> bool:
         """Check if an index is stale (doesn't match current data)."""

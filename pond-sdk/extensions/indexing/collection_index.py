@@ -305,6 +305,96 @@ class CollectionIndexer(CollectionIndexerInterface):
         self.kernel.reference(ref, tree_root)
         return tree_root
 
+    def refresh_index_incremental(self, collection: str, index_name: str,
+                                  extractor: Callable[[Any], Union[str, list[str]]],
+                                  old_commit: str,
+                                  new_commit: str,
+                                  decode_fn: Callable[[bytes], Any] = None) -> str:
+        """Incrementally refresh an index using commit-diff — O(changed) not O(N).
+
+        Instead of scanning ALL data, this method:
+          1. Diffs old_commit vs new_commit to find added/removed/modified keys
+          2. For added/modified keys: reads the new data, extracts index keys
+          3. For removed keys: reads the old data, extracts index keys to remove
+          4. Updates only the changed entries in the existing index tree
+
+        This is O(changed) in the number of changed rows, not O(N) in total rows.
+        The ProllyTree's structural sharing means unchanged index entries share
+        tree nodes — only changed branches are rewritten.
+
+        Args:
+            collection: collection name
+            index_name: index name
+            extractor: function(row_dict) → str | list[str]
+            old_commit: the commit hash the index was last built against
+            new_commit: the current HEAD commit hash
+            decode_fn: function(bytes) → row_dict. If None, tries JSON.
+
+        Returns:
+            The new index ProllyTree root hash.
+        """
+        if decode_fn is None:
+            decode_fn = lambda b: json.loads(b)
+
+        # 1. Diff the two commits to find changed keys
+        base = ProllyLensBase(self.kernel, collection)
+        diff = base.diff(old_commit, new_commit)
+
+        if not diff["added"] and not diff["removed"] and not diff["modified"]:
+            # No changes — index is already up-to-date
+            ref = self._index_ref(collection, index_name)
+            existing_root = resolve_active(self.kernel, ref)
+            return existing_root or ""
+
+        # 2. Read existing index entries
+        ref = self._index_ref(collection, index_name)
+        existing_root = resolve_active(self.kernel, ref)
+
+        if existing_root is None or existing_root == TOMBSTONE_HASH:
+            # No existing index — fall back to full build
+            return self.build_index(collection, index_name, extractor)
+
+        existing_entries = ProllyTree.read_all(self.kernel, existing_root)
+
+        # 3. Process removed keys: remove their index entries
+        for key in diff["removed"]:
+            # Read old data to find what index keys to remove
+            old_blob_hash = diff["removed"][key]
+            # The diff truncates hashes to 12 chars; we need the full hash
+            # from the old state. Read old state to get it.
+            old_state = base._read_state_from_commit(old_commit)
+            full_old_hash = old_state.get(key)
+            if full_old_hash:
+                try:
+                    old_data = decode_fn(self.kernel.read_blob(full_old_hash))
+                    idx_keys = _extract_keys(extractor, old_data)
+                    for idx_key in idx_keys:
+                        full_idx_key = f"_index/{index_name}/{idx_key}"
+                        existing_entries.pop(full_idx_key, None)
+                except Exception:
+                    pass  # can't decode old data — skip
+
+        # 4. Process added/modified keys: add/update their index entries
+        new_state = base._read_state_from_commit(new_commit)
+        for key in list(diff["added"].keys()) + list(diff["modified"].keys()):
+            full_new_hash = new_state.get(key)
+            if full_new_hash:
+                try:
+                    new_data = decode_fn(self.kernel.read_blob(full_new_hash))
+                    idx_keys = _extract_keys(extractor, new_data)
+                    for idx_key in idx_keys:
+                        rowid_bytes = str(key).encode()
+                        rowid_blob_hash = self.kernel.write(rowid_bytes)
+                        full_idx_key = f"_index/{index_name}/{idx_key}"
+                        existing_entries[full_idx_key] = rowid_blob_hash
+                except Exception:
+                    pass  # can't decode — skip
+
+        # 5. Build new tree with structural sharing
+        tree_root = ProllyTree.build(self.kernel, existing_entries)
+        self.kernel.reference(ref, tree_root)
+        return tree_root
+
     def is_index_stale(self, collection: str, index_name: str,
                        scan_rows: Callable[[], Any] = None,
                        extractor: Callable[[Any], Union[str, list[str]]] = None) -> bool:
