@@ -1,28 +1,24 @@
 """
 Indexing extensions — collection-level indexing for Pond.
 
-This subpackage contains tools for building and querying secondary indexes
-on collections. Indexes are data-side (belong to the collection, not to
-any lens). Any lens reading a collection can use that collection's indexes.
+Structure (follows the semantic/ pattern):
+  - base.py: CollectionIndexerInterface — abstract interface
+  - collection_index.py: CollectionIndexer — RECOMMENDED concrete implementation
+  - auto_index.py: AutoIndexMixin + IndexedLens — DEPRECATED (lens-side, has
+    Principle 6 violation). Kept for backward compat.
 
-Modules:
-  - collection_index.py: CollectionIndexer — RECOMMENDED. Standalone
-    collection-level indexer. Operates on kernel + collection name. No
-    lens dependency. Follows all design principles.
-  - auto_index.py: AutoIndexMixin + IndexedLens — DEPRECATED. Legacy
-    lens-mixin approach. Kept for backward compat; has a Principle 6
-    violation (imports from lenses/keyvalue/). New code should use
-    CollectionIndexer.
+Indexing is data-side: indexes belong to collections, not lenses. Any lens
+reading a collection can use that collection's indexes. The indexer operates
+on kernel + collection name — no lens dependency.
 
 GENERIC: CollectionIndexer works with ANY lens. The lens provides a
-scan_rows callback that yields (rowid, row_dict) pairs. For KV lenses,
-the default scan reads the ProllyTreeIndex directly. For tabular lenses,
-the caller provides scan_rows (e.g., from LakehouseLens.iterate).
+scan_rows callback that yields (rowid, row_dict) pairs.
 
-Supported storage: ProllyTreeIndex (the universal storage backend)
+Supported storage: ProllyTreeIndex
 Supported lens types: ALL (KeyValueLens, LakehouseLens, FeatureStoreLens, ...)
 """
 
+from .base import CollectionIndexerInterface
 from .collection_index import CollectionIndexer
 from .auto_index import AutoIndexMixin, AutoIndex
 
@@ -40,4 +36,4 @@ def __getattr__(name):
         return _get_indexed_lens()
     raise AttributeError(f"module 'extensions.indexing' has no attribute '{name}'")
 
-__all__ = ["CollectionIndexer", "AutoIndexMixin", "AutoIndex"]
+__all__ = ["CollectionIndexerInterface", "CollectionIndexer", "AutoIndexMixin", "AutoIndex"]

@@ -59,9 +59,18 @@ from prolly_tree import ProllyTree
 from maintenance import drop_name, is_dropped, resolve_active, TOMBSTONE_HASH
 from uuid7 import uuidv7
 
+# Import base interface — try relative first (package mode), then absolute (path mode)
+try:
+    from .base import CollectionIndexerInterface
+except ImportError:
+    from base import CollectionIndexerInterface
 
-class CollectionIndexer:
+
+class CollectionIndexer(CollectionIndexerInterface):
     """Collection-level indexer. Operates on any collection via the kernel.
+
+    Implements CollectionIndexerInterface (see base.py). This is the
+    RECOMMENDED indexer — it is data-side (no lens dependency).
 
     This is NOT a lens mixin. It is a standalone tool that builds, queries,
     and manages indexes on collections. Any lens can use it — the lens

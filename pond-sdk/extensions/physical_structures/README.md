@@ -23,10 +23,16 @@ PhysicalStructure (abstract base — base.py)
 ├── Statistics      — column min/max/null_count for range pruning
 ├── ZoneMap         — per-chunk min/max for chunk-granularity pruning
 │
+├── (pruning infrastructure — standalone, not PhysicalStructure subclasses)
+│   ├── ZoneMap (pruning.py)     — per-row-group {min, max, null_count} data class
+│   ├── ColumnPredicate           — single-column filter (=, !=, <, >, IN, BETWEEN)
+│   ├── PruningPredicate          — combines ColumnPredicates (AND/OR)
+│   ├── ZoneMapIndex              — ProllyTreeIndex of zone maps
+│   └── PruningReader             — generic reader with zone-map pruning
+│
 └── (built into SDK core, not here)
-    └── ProllyTree Index — O(log N) point lookup (auto_index.py)
+    └── ProllyTree Index — O(log N) point lookup (collection_index.py)
         This is the "default" Physical Structure, used by every Lens.
-        Future index types (HNSW, Trie, etc.) would be added here.
 ```
 
 ## Common interface
@@ -61,9 +67,12 @@ contract (Track 2 proved it works).
 | File | Class | Purpose |
 |---|---|---|
 | `base.py` | `PhysicalStructure` | Abstract base class. Defines the common interface. |
-| `bloom_filter.py` | `BloomFilter` | Probabilistic membership test. O(1) query, configurable false positive rate. |
-| `statistics.py` | `Statistics` | Column-level min/max/null_count. Used for range pruning (skip chunks where value can't exist). |
-| `zone_map.py` | `ZoneMap` | Per-chunk min/max. Finer-grained than Statistics (which covers the whole collection). |
+| `bloom_filter.py` | `BloomFilter` | Probabilistic membership test. O(1) query. |
+| `statistics.py` | `Statistics` | Column-level min/max/null_count. |
+| `zone_map.py` | `ZoneMap` | Per-chunk min/max (legacy PhysicalStructure). |
+| `pruning.py` | `ZoneMap`, `ColumnPredicate`, `PruningPredicate` | Vortex-style pruning data structures. |
+| `zone_map_index.py` | `ZoneMapIndex` | ProllyTreeIndex of zone maps. Stores min/max per data blob. |
+| `pruning_reader.py` | `PruningReader` | Generic reader with zone-map pruning. Skips blobs without decoding. |
 
 ## Usage
 

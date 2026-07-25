@@ -98,6 +98,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-sdk/extensions/__init__.py` | 55 | `register_extension`, `list_extensions` | Extension registry. |
 | `pond-sdk/extensions/indexing/__init__.py` | 27 | `CollectionIndexer`, `AutoIndexMixin`, `AutoIndex` | Indexing extension package. Collection-level indexing + legacy lens-mixin approach. |
 | `pond-sdk/extensions/indexing/collection_index.py` | 200 | `CollectionIndexer` | Collection-level indexer. Operates on kernel + collection name. Any lens can use it. Indexes belong to collections (data-side), not lenses. |
+| `pond-sdk/extensions/indexing/base.py` | 80 | `CollectionIndexerInterface` | Abstract interface for collection-level indexers. |
 | `pond-sdk/extensions/indexing/auto_index.py` | 433 | `AutoIndexMixin`, `IndexedLens` | Legacy auto-indexing mixin (eager/lazy modes). New code should use CollectionIndexer instead. |
 | `pond-sdk/extensions/semantic/__init__.py` | 15 | — | Semantic extension package. |
 | `pond-sdk/extensions/semantic/base.py` | 45 | `SemanticModelAdapter` | Abstract interface for semantic adapters. |
