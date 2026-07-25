@@ -1,40 +1,38 @@
 """
-Vector Database View — built on top of the Pond SDK specification.
+VectorLens — production-ready vector database lens for Pond.
+
+Extends PondLens directly (NOT KeyValueLens). Owns its ProllyTreeIndex
+storage code. Per the design principles, production lenses must not
+inherit from each other — each lens is independent and removable.
+
+Vectors are stored as packed binary (struct.pack) — NOT JSON — for
+efficiency. The encode/decode methods handle the custom wire format:
+
+    +-------------------+-----------------------------+
+    | Field             | Encoding                    |
+    +-------------------+-----------------------------+
+    | vec_len           | uint32  little-endian  (4B) |
+    | vector[0..N)      | N x float64 little-endian   |
+    | id_len            | uint32  little-endian  (4B) |
+    | id (utf-8)        | id_len bytes                |
+    | meta_len          | uint32  little-endian  (4B) |
+    | metadata (json)   | meta_len bytes              |
+    +-------------------+-----------------------------+
+
+The id is included inside the blob so that index extractors can
+pull it out from the decoded value.
 
 Implements:
-    insert(id, vector, metadata)   — insert a vector
-    search(query, k=5)             — k-nearest-neighbours (L2 / Euclidean)
-    get(id)                        — retrieve a vector by ID
-    delete(id)                     — delete a vector by ID
-    list_vectors()                 — list all vector IDs
-    count()                        — count vectors
+  - insert(id, vector, metadata) — insert a vector
+  - search(query, k=5) — k-nearest-neighbours (L2 / Euclidean)
+  - get_vector(id) — retrieve a vector by ID
+  - delete_vector(id) — delete a vector by ID
+  - list_vectors() — list all vector IDs
+  - count() — count vectors
+  - create_branch, checkout_branch, merge_branch, get_history
 
-Design notes
-------------
-* Extends ``IndexedLens`` and registers an ``"by_id"`` index (eager mode)
-  so that ID lookups go through the indexing layer as required.
-* Vectors are stored as packed binary (``struct.pack``) — NOT JSON — for
-  efficiency.  The overridden ``encode`` / ``decode`` methods handle the
-  custom wire format:
-
-      +-------------------+-----------------------------+
-      | Field             | Encoding                    |
-      +-------------------+-----------------------------+
-      | vec_len           | uint32  little-endian  (4B) |
-      | vector[0..N)      | N x float64 little-endian   |
-      | id_len            | uint32  little-endian  (4B) |
-      | id (utf-8)        | id_len bytes                |
-      | meta_len          | uint32  little-endian  (4B) |
-      | metadata (json)   | meta_len bytes              |
-      +-------------------+-----------------------------+
-
-  The ``id`` is included inside the blob so that the index extractor —
-  which only receives the decoded *value*, not the view key — can still
-  pull it out.  (The spec does not document the extractor call signature;
-  see the validation report for details.)
-* Search is a linear scan over all vectors (as allowed by the task).
-* Branching and history are inherited from ``View`` and re-exposed with
-  domain-friendly names.
+Uses CollectionMetadata for indexing (data-side, not lens-side).
+Search is a linear scan over all vectors (suitable for small collections).
 """
 
 from __future__ import annotations
@@ -44,42 +42,55 @@ import math
 import os
 import struct
 import sys
-from typing import Any
+from typing import Optional, Any
 
 # Make pond-core and pond-sdk importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "keyvalue"))
 
-from keyvalue_lens import KeyValueLens
+from kernel import PondMinimal
+from base_lens import PondLens
+from prolly_tree import ProllyLensBase, ProllyTree
+from binary_encoding import BinaryProllyTree
 
 
-class VectorLens(KeyValueLens):
-    """A simple vector database on Pond's KeyValueLens.
+class VectorLens(PondLens):
+    """Production-ready vector database lens.
+
+    Extends PondLens directly. Owns its ProllyTreeIndex storage code —
+    per the design principles, production lenses must not inherit from
+    each other. Each lens is independent and removable.
 
     Stores vectors as packed binary (struct.pack) for efficiency.
-    Uses KeyValueLens for storage (ProllyTreeIndex) and CollectionMetadata
-    for indexing.
+    Uses ProllyTreeIndex for storage and CollectionMetadata for indexing.
 
-    Implements:
-      - insert(id, vector, metadata) — insert a vector
-      - search(query, k=5) — k-nearest-neighbours (L2 / Euclidean)
-      - get_vector(id) — retrieve a vector by ID
-      - delete_vector(id) — delete a vector by ID
-      - list_vectors() — list all vector IDs
-      - count() — count vectors
+    COLLECTION-AGNOSTIC: Like all Pond lenses, VectorLens is a stateless
+    read/write engine. Pass the collection name to each operation:
+
+        lens = VectorLens(kernel)
+        lens.insert("vectors", "v1", [1.0, 2.0], {"label": "a"})
+        lens.search("vectors", [1.5, 1.5], k=2)
     """
 
-    # ---- lifecycle --------------------------------------------------
+    def __init__(self, kernel: PondMinimal):
+        super().__init__(kernel)
+        # Cache of ProllyLensBase instances per collection (for staging state)
+        self._bases: dict[str, ProllyLensBase] = {}
 
-    def __init__(self, kernel, name: str = None):
-        super().__init__(kernel, name)
+    def _get_base(self, collection: str) -> ProllyLensBase:
+        """Get or create the ProllyLensBase for a collection."""
+        if collection not in self._bases:
+            self._bases[collection] = ProllyLensBase(self.kernel, collection)
+        return self._bases[collection]
 
-    # ---- binary serialization (override) ----------------------------
+    # ==================================================================
+    # Binary serialization (custom format — NOT JSON)
+    # ==================================================================
 
-    def encode(self, data: Any) -> bytes:
-        """Pack a vector record into compact binary (not JSON)."""
+    @staticmethod
+    def encode(data: Any) -> bytes:
+        """Pack a vector record into compact binary."""
         vector = data["vector"]
         metadata = data.get("metadata", {})
         vid = str(data.get("id", ""))
@@ -95,7 +106,8 @@ class VectorLens(KeyValueLens):
             + struct.pack("<I", len(meta_bytes)) + meta_bytes
         )
 
-    def decode(self, data: bytes) -> dict:
+    @staticmethod
+    def decode(data: bytes) -> dict:
         """Unpack a binary record back into a dict."""
         offset = 0
 
@@ -116,11 +128,13 @@ class VectorLens(KeyValueLens):
 
         return {"id": vid, "vector": vector, "metadata": metadata}
 
-    # ---- public vector API ------------------------------------------
+    # ==================================================================
+    # Write path — vector operations (own ProllyTreeIndex storage)
+    # ==================================================================
 
-    def insert(self, id: str, vector: list[float],
+    def insert(self, collection: str, id: str, vector: list[float],
                metadata: dict | None = None) -> str:
-        """Insert (or replace) a vector.  Returns the commit hash."""
+        """Insert (or replace) a vector. Returns the commit hash."""
         if metadata is None:
             metadata = {}
         record = {
@@ -128,20 +142,59 @@ class VectorLens(KeyValueLens):
             "vector": [float(v) for v in vector],
             "metadata": metadata,
         }
-        self.put(str(id), record)
-        return self.commit(f"insert vector {id}")
+        blob_hash = self.kernel.write(self.encode(record))
+        self._get_base(collection).stage(str(id), blob_hash)
+        return self._get_base(collection).commit(f"insert vector {id}")
 
-    def search(self, query: list[float], k: int = 5) -> list[dict]:
-        """
-        Return the *k* nearest vectors to *query* using L2 distance.
+    def delete_vector(self, collection: str, id: str) -> str:
+        """Delete a vector by ID. Returns the commit hash."""
+        self._get_base(collection).stage_delete(str(id))
+        return self._get_base(collection).commit(f"delete vector {id}")
 
-        Linear scan — fine for small collections.
-        Each result dict has: id, distance, vector, metadata.
+    # ==================================================================
+    # Read path — vector operations
+    # ==================================================================
+
+    def get_vector(self, collection: str, id: str) -> Optional[dict]:
+        """Retrieve a vector record by ID (returns None if absent)."""
+        h = self._get_base(collection).lookup(str(id))
+        return self.decode(self.kernel.read_blob(h)) if h else None
+
+    def get_raw(self, collection: str, id: str) -> Optional[bytes]:
+        """Read raw bytes by ID (no decode)."""
+        h = self._get_base(collection).lookup(str(id))
+        return self.kernel.read_blob(h) if h else None
+
+    def list_vectors(self, collection: str) -> list[str]:
+        """List all vector IDs."""
+        return [k for k in self._get_base(collection).read_all()
+                if not k.startswith("_")]
+
+    def count(self, collection: str) -> int:
+        """Return the number of stored vectors."""
+        return sum(1 for k in self._get_base(collection).read_all()
+                   if not k.startswith("_"))
+
+    def get_all(self, collection: str) -> dict[str, dict]:
+        """Read all vectors from the collection."""
+        state = self._get_base(collection).read_all()
+        return {k: self.decode(self.kernel.read_blob(h))
+                for k, h in state.items() if not k.startswith("_")}
+
+    # ==================================================================
+    # Search — k-nearest-neighbours (L2 / Euclidean)
+    # ==================================================================
+
+    def search(self, collection: str, query: list[float], k: int = 5) -> list[dict]:
+        """Return the k nearest vectors to query using L2 distance.
+
+        Linear scan — fine for small collections. Each result dict has:
+        id, distance, vector, metadata.
         """
         query = [float(v) for v in query]
         scored: list[tuple[float, str, dict]] = []
 
-        for key, record in self.get_all().items():
+        for key, record in self.get_all(collection).items():
             vec = record["vector"]
             if len(vec) != len(query):
                 continue  # dimension mismatch — skip
@@ -159,60 +212,52 @@ class VectorLens(KeyValueLens):
             for dist, key, record in scored[:k]
         ]
 
-    def get(self, id: str) -> dict | None:
-        """Retrieve a vector record by ID (returns None if absent)."""
-        return super().get(str(id))
+    # ==================================================================
+    # Version control (delegated to ProllyLensBase)
+    # ==================================================================
 
-    def delete(self, id: str) -> str:
-        """Delete a vector by ID.  Returns the commit hash."""
-        super().delete(str(id))
-        return self.commit(f"delete vector {id}")
+    def create_branch(self, collection: str, branch_name: str) -> str:
+        return self._get_base(collection).branch(branch_name)
 
-    def list_vectors(self) -> list[str]:
-        """List all vector IDs."""
-        return self.keys()
+    def checkout_branch(self, collection: str, branch_name: str) -> None:
+        self._get_base(collection).checkout(branch_name)
 
-    def count(self) -> int:
-        """Return the number of stored vectors."""
-        return super().count()
+    def list_branches(self, collection: str) -> list[str]:
+        return self._get_base(collection).list_branches()
 
-    # ---- branching / history (domain-friendly wrappers) -------------
+    def merge_branch(self, collection: str, branch_name: str) -> str:
+        return self._get_base(collection).merge(branch_name)
 
-    def create_branch(self, branch_name: str) -> str:
-        return self.branch(branch_name)
+    def get_history(self, collection: str, limit: int = 20) -> list[dict]:
+        return self._get_base(collection).history(limit)
 
-    def checkout_branch(self, branch_name: str) -> None:
-        self.checkout(branch_name)
+    # ==================================================================
+    # Index-backed lookup (uses CollectionMetadata — data-side)
+    # ==================================================================
 
-    def merge_branch(self, branch_name: str) -> str:
-        return self.merge(branch_name)
-
-    def get_history(self, limit: int = 20) -> list[dict]:
-        return self.history(limit)
-
-    # ---- index-backed lookup (uses CollectionMetadata) --------------
-
-    def find_by_id(self, id: str) -> dict | None:
+    def find_by_id(self, collection: str, id: str) -> Optional[dict]:
         """O(log N) lookup via CollectionMetadata index.
 
         Builds the index on first call if it doesn't exist.
         """
         from collection_metadata import CollectionMetadata
         meta = CollectionMetadata(self.kernel)
-        collection = self._default_collection or "vectors"
 
         # Build index if it doesn't exist
         if "by_id" not in meta.list_indexes(collection):
             meta.build_index(collection, "by_id",
                              extractor=lambda r: str(r.get("id", "")),
-                             scan_fn=lambda: ((k, self.get(k)) for k in self.keys()))
+                             scan_fn=lambda: ((k, self.get_vector(collection, k))
+                                              for k in self.list_vectors(collection)))
 
         rowid = meta.lookup_index(collection, "by_id", str(id))
         if rowid is None:
             return None
-        return self.get(rowid)
+        return self.get_vector(collection, rowid)
 
-    # ---- helpers ----------------------------------------------------
+    # ==================================================================
+    # Helpers
+    # ==================================================================
 
     @staticmethod
     def _l2(a: list[float], b: list[float]) -> float:

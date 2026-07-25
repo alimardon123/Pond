@@ -1,85 +1,71 @@
 # pond-sdk
 
-The Lens SDK — Layer 1 (state) and Layer 2 (access) on top of the kernel.
+The Pond SDK — Layer 1 (storage infrastructure) and Layer 2 (extensions)
+on top of the kernel.
 
 ## What it is
 
-The SDK provides the building blocks for writing Lenses:
+The SDK provides the shared infrastructure for all Pond lenses:
 
-- **PondLens** (`pond_lens.py`) — the SHARED NAMESPACE base for ALL
-  Lenses. Provides only ref-namespace operations: `branch`,
-  `list_collections`, `set_definition`, `get_definition`, `history`.
-  No format awareness — each app-facing lens owns its own read/write API.
-- **KeyValueLens** (`keyvalue_lens.py`) — the app-facing KEY-VALUE lens.
-  Per-row key→blob storage over the ProllyTreeIndex. O(log N) point
-  lookups, indexes (metadata only), branching, merge, history, lazy
-  query API. Aliases: `Lens = KeyValueLens`, `View = KeyValueLens`
-  (kept for backward compatibility).
-- **KeylessLens** (`keyvalue_lens.py`) — KeyValueLens subclass that
-  auto-generates UUID4 primary keys. Use for event logs, time-series,
-  append-only streams.
-- **ProllyLensBase** (`prolly_view.py`) — the universal storage backend
-  for KV collections. ProllyTreeIndex (probabilistic Merkle tree) +
-  tiered commits (delta + snapshot) + branching + merge + history.
-- **IndexedLens** (`auto_index.py`) — KeyValueLens-style lens with
-  eager/lazy auto-indexing (a Physical Structure for secondary indexes).
-- **LensQuery** (`lens_query.py`) — lazy, composable query API
-  (`.where()`, `.select()`, `.map()`, `.join()`, `.collect()`).
-- **Collection** (`collection.py`) — a named collection of bytes with
-  metadata and namespace support.
-- **Maintenance** (`maintenance.py`) — tombstone helpers
-  (RFC-0008: deletion as data).
+- **PondLens** (`base_lens.py`) — the shared namespace base for ALL lenses.
+  Provides ref-namespace operations: branch, list_collections, history.
+  No format awareness — each lens owns its own read/write API.
+- **ProllyLensBase** (`prolly_tree.py`) — ProllyTreeIndex storage backend.
+  Tiered commits (delta + snapshot), O(log N) lookups, branching, merge.
+  The universal storage for all collections.
+- **CollectionMetadata** (`collection_metadata.py`) — data-side metadata
+  manager. Manages zone maps, indexes, and compaction for collections.
+  Lens-agnostic — operates on kernel + collection name.
+- **LensQuery** (`row_query.py`) — lazy, composable ROW-LEVEL query builder.
+  NOT "the query method" — for SQL use LakehouseLens.query(), for point
+  lookups use KeyValueLens.get() or LakehouseLens.range_point_lookup().
+- **UUIDv7** (`uuid7.py`) — time-ordered UUID for distributed row
+  identification (_rowid). 48-bit Unix ms + 74 random bits.
+- **BinaryEncoding** (`binary_encoding.py`) — binary Prolly tree encoding.
+- **Maintenance** (`maintenance.py`) — tombstone helpers (RFC-0008).
+- **Collection** (`collection.py`) — named collection metadata.
+
+## Extensions (pond-sdk/extensions/)
+
+Optional modules that extend Pond's capabilities. All are data-side
+(collection-level), not lens-side. Any lens can use any collection's
+metadata.
+
+- **indexing/** — CollectionIndexer (recommended, data-side) +
+  AutoIndexMixin (deprecated, lens-side).
+- **semantic/** — SemanticMixin + OssieAdapter for semantic models.
+- **physical_structures/** — ZoneMap, PruningPredicate, PruningReader,
+  BloomFilter, Statistics, ZoneMapIndex.
 
 ## Files
 
 | File | Purpose | LOC |
 |---|---|---|
-| `pond_lens.py` | PondLens — shared namespace base for all Lenses | 248 |
-| `keyvalue_lens.py` | KeyValueLens, KeylessLens, CrossLens (+ Lens/View aliases) | 694 |
-| `lens_sdk.py` | Backward-compat shim — re-exports from keyvalue_lens | 47 |
-| `prolly_view.py` | ProllyLensBase (tiered commits, ProllyTreeIndex, branching, merge) | 764 |
-| `auto_index.py` | IndexedLens (auto-indexing, lazy/eager/incremental) | 607 |
-| `collection.py` | Collection (reference namespace + metadata) | 517 |
-| `lens_laws.py` | RFC-0007 Lens algebra property tests | 591 |
-| `architecture_laws.py` | 12 executable architecture laws | 557 |
-| `binary_encoding.py` | Binary Prolly tree encoding (metadata optimization) | 323 |
-| `test_shared_lenses.py` | Test: multiple KeyValueLens subclasses sharing same byte graph | 442 |
-| `test_lens_architecture.py` | Test: multi-Lens architecture proof (SQL/Git/Notebook) | 449 |
-| `lens_query.py` | LensQuery (lazy query API) | 288 |
-| `test_lens_query.py` | Test: LensQuery | 327 |
+| `base_lens.py` | PondLens — shared namespace base for all lenses | 248 |
+| `prolly_tree.py` | ProllyLensBase + ProllyTree (universal storage backend) | 764 |
+| `collection_metadata.py` | CollectionMetadata — data-side metadata manager | 343 |
+| `row_query.py` | LensQuery — lazy row-level query builder | 306 |
+| `uuid7.py` | UUIDv7 time-ordered UUID generation | 197 |
+| `binary_encoding.py` | Binary Prolly tree encoding | 323 |
 | `maintenance.py` | Tombstone helpers (RFC-0008) | 315 |
-| `run_lens_laws_ci.py` | CI runner for Lens contracts | 267 |
-
-## Usage
-
-```python
-import sys; sys.path.insert(0, "pond-core"); sys.path.insert(0, "pond-sdk")
-from pond_minimal import PondMinimal
-from keyvalue_lens import KeyValueLens
-
-class MyLens(KeyValueLens):
-    def encode(self, data):
-        return json.dumps(data).encode()
-    def decode(self, bytes):
-        return json.loads(bytes)
-
-kernel = PondMinimal("/tmp/my-pond")
-lens = MyLens(kernel, "my-collection")
-lens.put("key1", {"hello": "world"})
-assert lens.get("key1") == {"hello": "world"}
-```
+| `collection.py` | Collection metadata (namespace, type, source) | 518 |
+| `extensions/` | Indexing, semantic, physical structures extensions | — |
 
 ## Dependencies
 
-- `pond-core/` (the kernel)
+- `pond-core/` (the kernel — 3 primitives, ~199 LOC)
 - Python stdlib only (no external packages)
 
-## Running tests
+## Architecture
 
-```bash
-python pond-sdk/architecture_laws.py    # 12 architecture laws
-python pond-sdk/lens_laws.py            # RFC-0007 Lens algebra
-python pond-sdk/test_shared_lenses.py   # multi-Lens sharing
-python pond-sdk/test_lens_architecture.py
-python pond-sdk/test_lens_query.py
 ```
+pond-core (kernel: Write, Read, Ref — FROZEN, ~199 LOC)
+    ↓
+pond-sdk (base_lens, prolly_tree, collection_metadata, extensions/)
+    ↓
+lenses/ (keyvalue, lakehouse, vector — each extends PondLens directly)
+```
+
+Lenses do NOT inherit from each other. Each production lens extends
+PondLens and owns its own storage code. Extensions are data-side
+(collection-level), not lens-side.
