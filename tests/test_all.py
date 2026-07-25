@@ -108,6 +108,10 @@ def test_kv_pruning_and_projection():
     ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
     assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"
 
+def test_collection_metadata():
+    ok, output = _run_script("tests/integration/test_collection_metadata.py")
+    assert ok, f"Collection metadata tests failed:\n{output[-500:]}"
+
 def test_transport_production():
     ok, output = _run_script("services/transport/transport_production.py")
     assert ok, f"Transport tests failed:\n{output[-500:]}"

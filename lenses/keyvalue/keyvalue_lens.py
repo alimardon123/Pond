@@ -697,13 +697,15 @@ def __getattr__(name):
         except ImportError:
             pass
     if name in ("IndexedLens", "IndexedView"):
-        # DEPRECATED: IndexedLens is kept for backward compat.
-        # Use CollectionMetadata + CollectionIndexer instead.
+        # DEPRECATED: IndexedLens has been removed. Use CollectionMetadata.
         import warnings
         warnings.warn(
-            "IndexedLens is deprecated. Use CollectionMetadata instead.",
+            "IndexedLens has been removed. Use CollectionMetadata instead: "
+            "from collection_metadata import CollectionMetadata",
             DeprecationWarning, stacklevel=2
         )
-        from extensions.indexing.auto_index import _get_indexed_lens
-        return _get_indexed_lens()
+        raise AttributeError(
+            "IndexedLens has been removed. Use CollectionMetadata: "
+            "from collection_metadata import CollectionMetadata"
+        )
     raise AttributeError(f"module 'keyvalue_lens' has no attribute '{name}'")
