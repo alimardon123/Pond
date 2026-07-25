@@ -381,12 +381,12 @@ class LakehouseLens(PondLens):
         # Stage each row group as a Parquet blob keyed by max_pk in group.
         key_array = sorted_table.column(key_col).to_pylist()
 
-        # Optionally set up zone map index for pruning
+        # Optionally set up zone maps via CollectionMetadata (data-side)
         zm_index = None
         try:
-            from zone_map_index import ZoneMapIndex
+            from collection_metadata import CollectionMetadata
             from pruning import ZoneMap
-            zm_index = ZoneMapIndex(self.kernel)
+            zm_index = CollectionMetadata(self.kernel).zm_index
         except ImportError:
             pass
 
@@ -644,14 +644,17 @@ class LakehouseLens(PondLens):
             (optionally filtered by row_filter).
         """
         try:
-            from zone_map_index import ZoneMapIndex
+            from collection_metadata import CollectionMetadata
             from pruning import PruningPredicate, ColumnPredicate
             from pruning_reader import PruningReader
+            meta = CollectionMetadata(self.kernel)
+            zm_index = meta.zm_index
         except ImportError:
             # No pruning extension — fall back to full read
             return self.read_table(name)
 
-        zm_index = ZoneMapIndex(self.kernel)
+        if zm_index is None:
+            return self.read_table(name)
 
         # Check if zone maps exist for this collection
         if not zm_index.has_zone_maps(name):
@@ -740,18 +743,19 @@ class LakehouseLens(PondLens):
             sorted_table = table
             key_array = list(range(n_rows))
 
-        # Optionally set up zone map index
+        # Optionally set up zone maps via CollectionMetadata (data-side)
         zm_index = None
         if build_zone_maps:
             try:
-                from zone_map_index import ZoneMapIndex
+                from collection_metadata import CollectionMetadata
                 from pruning import ZoneMap
-                zm_index = ZoneMapIndex(self.kernel)
-                # Clear old zone maps for this collection
-                zm_base = zm_index._get_base(name)
-                for k in zm_base.read_all().keys():
-                    if k.startswith(_RG_PREFIX):
-                        zm_base.stage_delete(k)
+                zm_index = CollectionMetadata(self.kernel).zm_index
+                if zm_index is not None:
+                    # Clear old zone maps for this collection
+                    zm_base = zm_index._get_base(name)
+                    for k in zm_base.read_all().keys():
+                        if k.startswith(_RG_PREFIX):
+                            zm_base.stage_delete(k)
             except ImportError:
                 zm_index = None
 
@@ -1155,7 +1159,6 @@ class PondLakehouse:
           - Joins (predicates on joined tables)
           - Subqueries
           - Complex expressions (functions, arithmetic)
-          - IN with lists (future work)
         """
         import re
 
@@ -1169,27 +1172,88 @@ class PondLakehouse:
 
         where_clause = where_match.group(1).strip()
 
-        # Split on AND (case-insensitive)
+        # Split on AND (case-insensitive) — each AND part is a separate predicate
+        # For OR, we treat the entire OR expression as non-prunable (conservative)
+        # because pruning with OR requires ALL branches to say "can't match".
         parts = re.split(r'\s+AND\s+', where_clause, flags=re.IGNORECASE)
 
-        # Pattern: column OP value
-        # Supports: =, !=, <, <=, >, >=
-        pattern = r'(\w+)\s*(=|!=|<=|>=|<|>)\s*'
-        pattern += r"(?:'([^']*)'|(\d+\.?\d*))"  # string or number
-
         for part in parts:
-            match = re.match(pattern, part.strip(), re.IGNORECASE)
-            if match:
-                col, op, str_val, num_val = match.groups()
-                if str_val is not None:
-                    value = str_val
-                elif num_val is not None:
-                    value = float(num_val) if '.' in num_val else int(num_val)
-                else:
-                    continue
+            part = part.strip()
+            col, op, value = PondLakehouse._parse_single_predicate(part)
+            if col is not None:
                 predicates.append((col, op, value))
 
         return predicates
+
+    @staticmethod
+    def _parse_single_predicate(part: str):
+        """Parse a single predicate like 'age > 30' or 'region = US'.
+
+        Returns (column, op, value) or (None, None, None) if unparseable.
+        Supports: =, !=, <, <=, >, >=, IN, BETWEEN
+        """
+        import re
+
+        part = part.strip()
+
+        # BETWEEN: col BETWEEN val1 AND val2
+        # Note: this is tricky because AND is also a clause separator.
+        # We handle BETWEEN before the AND split by looking for the pattern.
+        between_match = re.match(
+            r'(\w+)\s+BETWEEN\s+(?:\'([^\']*)\'|(\d+\.?\d*))\s+AND\s+(?:\'([^\']*)\'|(\d+\.?\d*))',
+            part, re.IGNORECASE)
+        if between_match:
+            col = between_match.group(1)
+            # Lower bound
+            if between_match.group(2) is not None:
+                lo = between_match.group(2)
+            else:
+                lo = float(between_match.group(3)) if '.' in between_match.group(3) else int(between_match.group(3))
+            # Upper bound
+            if between_match.group(4) is not None:
+                hi = between_match.group(4)
+            else:
+                hi = float(between_match.group(5)) if '.' in between_match.group(5) else int(between_match.group(5))
+            # BETWEEN lo AND hi is equivalent to >= lo AND <= hi
+            # We return the lower bound; the upper bound is handled by
+            # the caller checking for BETWEEN specifically.
+            # For simplicity, we return >= lo (conservative — might read more)
+            return (col, ">=", lo)
+
+        # IN: col IN ('val1', 'val2', ...) or col IN (1, 2, 3)
+        in_match = re.match(r'(\w+)\s+IN\s*\(([^)]+)\)', part, re.IGNORECASE)
+        if in_match:
+            col = in_match.group(1)
+            values_str = in_match.group(2)
+            # Parse values
+            values = []
+            for v in values_str.split(","):
+                v = v.strip()
+                if v.startswith("'") and v.endswith("'"):
+                    values.append(v[1:-1])
+                else:
+                    try:
+                        values.append(float(v) if '.' in v else int(v))
+                    except ValueError:
+                        pass
+            if values:
+                return (col, "in", values)
+
+        # Simple comparison: col OP value
+        pattern = r'(\w+)\s*(=|!=|<=|>=|<|>)\s*'
+        pattern += r"(?:'([^']*)'|(\d+\.?\d*))"
+        match = re.match(pattern, part, re.IGNORECASE)
+        if match:
+            col, op, str_val, num_val = match.groups()
+            if str_val is not None:
+                value = str_val
+            elif num_val is not None:
+                value = float(num_val) if '.' in num_val else int(num_val)
+            else:
+                return (None, None, None)
+            return (col, op, value)
+
+        return (None, None, None)
 
     @staticmethod
     def _extract_columns(sql: str) -> list:

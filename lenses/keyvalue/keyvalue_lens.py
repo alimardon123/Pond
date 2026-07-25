@@ -236,12 +236,15 @@ class KeyValueLens(PondLens):
         """
         collection, rest = self._resolve_collection(*args)
         try:
-            from zone_map_index import ZoneMapIndex
+            from collection_metadata import CollectionMetadata
             from pruning import ZoneMap
         except ImportError:
             return  # pruning extension not available
 
-        zm_index = ZoneMapIndex(self.kernel)
+        meta = CollectionMetadata(self.kernel)
+        zm_index = meta.zm_index
+        if zm_index is None:
+            return
         base = self._get_base(collection)
         state = base.read_all()
         had_changes = False
@@ -417,19 +420,16 @@ class KeyValueLens(PondLens):
         row_filter = rest[1] if len(rest) > 1 else kwargs.get("row_filter")
 
         try:
-            from zone_map_index import ZoneMapIndex
+            from collection_metadata import CollectionMetadata
             from pruning import PruningPredicate, ColumnPredicate
             from pruning_reader import PruningReader
+            meta = CollectionMetadata(self.kernel)
+            zm_index = meta.zm_index
         except ImportError:
-            # No pruning extension — fall back to full scan
-            for row in self.iterate(collection):
-                if row_filter is None or row_filter(row):
-                    yield row
-            return
+            zm_index = None
 
-        zm_index = ZoneMapIndex(self.kernel)
-        if not zm_index.has_zone_maps(collection):
-            # No zone maps — fall back to full scan
+        if zm_index is None or not zm_index.has_zone_maps(collection):
+            # No pruning extension or no zone maps — fall back to full scan
             for row in self.iterate(collection):
                 if row_filter is None or row_filter(row):
                     yield row
