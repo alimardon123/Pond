@@ -84,5 +84,27 @@ class CollectionIndexerInterface(ABC):
     def rebuild_index(self, collection: str, index_name: str,
                       extractor: Callable[[Any], Union[str, list[str]]],
                       scan_rows: Callable[[], Iterator[tuple[str, Any]]] = None) -> str:
-        """Rebuild an index from current data."""
+        """Rebuild an index from current data (full O(N) scan)."""
+        ...
+
+    @abstractmethod
+    def refresh_index(self, collection: str, index_name: str,
+                      extractor: Callable[[Any], Union[str, list[str]]],
+                      scan_rows: Callable[[], Iterator[tuple[str, Any]]] = None) -> str:
+        """Refresh an index incrementally — only update changed entries.
+
+        Uses ProllyTree structural sharing: unchanged entries share tree
+        nodes, only changed branches are rewritten. Falls back to full
+        build_index() if no existing index exists.
+        """
+        ...
+
+    @abstractmethod
+    def is_index_stale(self, collection: str, index_name: str,
+                       scan_rows: Callable[[], Iterator[tuple[str, Any]]] = None,
+                       extractor: Callable[[Any], Union[str, list[str]]] = None) -> bool:
+        """Check if an index is stale (doesn't match current data).
+
+        Returns True if the index needs refreshing, False if up-to-date.
+        """
         ...

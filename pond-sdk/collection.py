@@ -295,6 +295,14 @@ class Collection:
         """Drop an index from this collection."""
         return self.metadata.drop_index(self.name, index_name)
 
+    def refresh_index(self, index_name: str, extractor, scan_fn=None) -> str:
+        """Refresh an index incrementally (only update changed entries)."""
+        return self.metadata.refresh_index(self.name, index_name, extractor, scan_fn)
+
+    def is_index_stale(self, index_name: str, scan_fn=None, extractor=None) -> bool:
+        """Check if an index is stale (doesn't match current data)."""
+        return self.metadata.is_index_stale(self.name, index_name, scan_fn, extractor)
+
     def compact_zone_maps(self) -> int:
         """Remove stale zone maps (after insert/merge replaces old data)."""
         return self.metadata.compact_zone_maps(self.name)

@@ -154,7 +154,7 @@ pond-sdk/extensions/
 ├── indexing/              # Collection-level indexing (data-side, not lens-side)
 │   ├── __init__.py        # Package marker + exports
 │   ├── collection_index.py # CollectionIndexer (RECOMMENDED — data-side, no lens dependency)
-│   └── auto_index.py      # AutoIndexMixin + IndexedLens (DEPRECATED — has lens dependency)
+
 ├── semantic/              # Semantic model adapters (Ossie, future Cube/dbt)
 │   ├── base.py            # SemanticModelAdapter (abstract interface)
 │   └── ossie.py           # SemanticMixin + SemanticLens + OssieAdapter
@@ -170,7 +170,7 @@ pond-sdk/extensions/
 
 **Extension categories:**
 - **indexing/** — Collection-level indexing. CollectionIndexer (recommended,
-  data-side, no lens dependency) + AutoIndexMixin (deprecated, lens-side).
+  data-side, no lens dependency).
   Indexes belong to collections, not lenses. Any lens can use any collection's indexes.
 - **semantic/** — Semantic model management (metrics, dimensions, relationships).
   Composable via SemanticMixin. Supported: KeyValueLens and subclasses.
@@ -186,7 +186,7 @@ pond-sdk/extensions/
 2. **Generic:** Extensions are composable via mixins. A lens adds an
    extension's capability by mixing in the mixin:
    ```python
-   class MyLens(KeyValueLens, AutoIndexMixin, SemanticMixin):
+   class MySemanticLens(KeyValueLens, SemanticMixin):
        pass
    ```
 
@@ -207,7 +207,7 @@ pond-sdk/extensions/
 
 ### 3.3 Extension types
 
-- **Mixins** (`AutoIndexMixin`, `SemanticMixin`): composable with KV-style
+- **Mixins** (`SemanticMixin`): composable with KV-style
   lenses. Add methods via multiple inheritance.
 - **Physical Structures** (`BloomFilter`, `Statistics`, `ZoneMap`): derived
   structures stored as kernel blobs. Work with any collection (KV or tabular).
@@ -220,15 +220,10 @@ Every extension class declares metadata as class attributes so tooling
 can introspect what it supports:
 
 ```python
-class AutoIndexMixin:
-    extension_type = "mixin"                                    # "mixin" | "physical_structure" | "adapter"
-    supported_lens_types = ["KeyValueLens", "KeylessLens", "SemanticLens"]
-    supported_storage = ["ProllyTreeIndex"]
-    not_supported = ["LakehouseLens", "FeatureStoreLens"]       # use Physical Structures instead
 ```
 
 This lets tools (and humans) answer:
-- "Can I use AutoIndexMixin with LakehouseLens?" → No (it's in `not_supported`).
+- "Can I use semantic models with LakehouseLens?" → Not yet (SemanticMixin is KV-only).
 - "What storage does SemanticMixin require?" → ProllyTreeIndex.
 - "What lens types does BloomFilter work with?" → Any (it's a Physical Structure).
 
@@ -268,7 +263,7 @@ inherited from `LakehouseLens`. After applying this rule, it now extends
 - **Prolly tree:** `prolly_tree.py` (not `prolly_view.py`)
 - **Row query:** `row_query.py` (not `query.py` — avoids confusion with
   "the query method for data in Pond")
-- **Indexing extension:** `indexing.py` (not `auto_index.py`)
+- **Indexing extension:** `indexing.py` (not `collection_index.py`)
 - **Lens files:** `{role}_lens.py` (e.g., `keyvalue_lens.py`, `lakehouse_lens.py`,
   `vector_lens.py`)
 - **Test files:** `test_{purpose}.py` (e.g., `test_shared_lenses.py`)
@@ -278,7 +273,7 @@ inherited from `LakehouseLens`. After applying this rule, it now extends
 - **Kernel:** `PondMinimal`
 - **Base lens:** `PondLens`
 - **Lenses:** `{Name}Lens` (e.g., `KeyValueLens`, `LakehouseLens`, `FeatureStoreLens`)
-- **Mixins:** `{Capability}Mixin` (e.g., `AutoIndexMixin`, `SemanticMixin`)
+- **Mixins:** `{Capability}Mixin` (e.g., `SemanticMixin`)
 - **Storage:** `ProllyLensBase`, `ProllyTree`
 - **Query:** `LensQuery` (the row-level lazy query builder)
 

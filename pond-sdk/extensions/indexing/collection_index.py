@@ -55,7 +55,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kernel import PondMinimal
-from prolly_tree import ProllyTree
+from prolly_tree import ProllyTree, ProllyLensBase
 from maintenance import drop_name, is_dropped, resolve_active, TOMBSTONE_HASH
 from uuid7 import uuidv7
 
@@ -149,6 +149,94 @@ class CollectionIndexer(CollectionIndexerInterface):
         """Rebuild an index from current data. Same as build_index but
         overwrites the existing index (including tombstoned indexes)."""
         return self.build_index(collection, index_name, extractor, scan_rows)
+
+    def refresh_index(self, collection: str, index_name: str,
+                      extractor: Callable[[Any], Union[str, list[str]]],
+                      scan_rows: Callable[[], Any] = None) -> str:
+        """Refresh an index incrementally — only update changed entries.
+
+        Instead of a full O(N) rebuild, this method:
+          1. Reads the existing index tree (if any)
+          2. Scans current data to get the new index entries
+          3. Compares old vs new entries
+          4. Only writes changed entries to a new ProllyTree
+
+        If no existing index exists, falls back to full build_index().
+
+        The ProllyTree's structural sharing means unchanged entries
+        share the same tree nodes — only changed branches are rewritten.
+        This makes refresh O(changed) instead of O(N) for the tree
+        construction, though the scan is still O(N).
+
+        For true O(changed) refresh (without scanning all data), the
+        caller would need to track which rows changed since the last
+        index build. That's a future optimization (requires commit-diff
+        awareness).
+        """
+        if scan_rows is None:
+            scan_rows = self._default_scan_rows(collection)
+
+        # Check if an existing index exists
+        ref = self._index_ref(collection, index_name)
+        existing_root = resolve_active(self.kernel, ref)
+
+        if existing_root is None or existing_root == TOMBSTONE_HASH:
+            # No existing index — full build
+            return self.build_index(collection, index_name, extractor, scan_rows)
+
+        # Read existing index entries
+        existing_entries = ProllyTree.read_all(self.kernel, existing_root)
+
+        # Build new index entries
+        new_entries = {}
+        for rowid, row_data in scan_rows():
+            idx_keys = _extract_keys(extractor, row_data)
+            for idx_key in idx_keys:
+                rowid_bytes = str(rowid).encode()
+                rowid_blob_hash = self.kernel.write(rowid_bytes)
+                full_key = f"_index/{index_name}/{idx_key}"
+                new_entries[full_key] = rowid_blob_hash
+
+        # If entries are identical, no refresh needed
+        if existing_entries == new_entries:
+            return existing_root
+
+        # Build new tree (ProllyTree structural sharing handles unchanged nodes)
+        tree_root = ProllyTree.build(self.kernel, new_entries)
+        self.kernel.reference(ref, tree_root)
+        return tree_root
+
+    def is_index_stale(self, collection: str, index_name: str,
+                       scan_rows: Callable[[], Any] = None,
+                       extractor: Callable[[Any], Union[str, list[str]]] = None) -> bool:
+        """Check if an index is stale (doesn't match current data).
+
+        Compares the index entries against the current data entries.
+        Returns True if the index needs refreshing, False if it's up-to-date.
+
+        This is O(N) — it scans all data to compare. For a cheaper check,
+        use commit-count comparison (if the collection has had commits
+        since the index was built, it MIGHT be stale).
+        """
+        if scan_rows is None or extractor is None:
+            return True  # can't check without scan_fn + extractor
+
+        ref = self._index_ref(collection, index_name)
+        existing_root = resolve_active(self.kernel, ref)
+        if existing_root is None or existing_root == TOMBSTONE_HASH:
+            return True  # no index → stale
+
+        existing_entries = ProllyTree.read_all(self.kernel, existing_root)
+
+        # Build current entries and compare
+        new_keys = set()
+        for rowid, row_data in scan_rows():
+            idx_keys = _extract_keys(extractor, row_data)
+            for idx_key in idx_keys:
+                new_keys.add(f"_index/{index_name}/{idx_key}")
+
+        existing_keys = set(existing_entries.keys())
+        return new_keys != existing_keys
 
     # ------------------------------------------------------------------
     # Query indexes

@@ -295,6 +295,20 @@ class CollectionMetadata:
             return False
         return self.indexer.drop_index(collection, index_name)
 
+    def refresh_index(self, collection: str, index_name: str,
+                      extractor, scan_fn=None) -> str:
+        """Refresh an index incrementally (only update changed entries)."""
+        if not _PRUNING_AVAILABLE or self.indexer is None:
+            return ""
+        return self.indexer.refresh_index(collection, index_name, extractor, scan_fn)
+
+    def is_index_stale(self, collection: str, index_name: str,
+                       scan_fn=None, extractor=None) -> bool:
+        """Check if an index is stale (doesn't match current data)."""
+        if not _PRUNING_AVAILABLE or self.indexer is None:
+            return True
+        return self.indexer.is_index_stale(collection, index_name, scan_fn, extractor)
+
     # ==================================================================
     # Compaction — clean up stale metadata after collection rewrites
     # ==================================================================
