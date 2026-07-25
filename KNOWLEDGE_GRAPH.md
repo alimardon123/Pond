@@ -556,3 +556,24 @@ $ for f in $(find . -name "*.md" -not -path "./archive/*" -not -path "./.git/*")
 ```
 
 **Last verified:** 2026-07-24 (commit after this file is committed).
+
+### 2.10 Additional files (READMEs and package markers)
+
+| File | Purpose |
+|---|---|
+| `lenses/keyvalue/README.md` | README for KeyValueLens. |
+| `lenses/lakehouse/README.md` | README for LakehouseLens. |
+| `lenses/lakehouse/__init__.py` | Package marker. |
+| `lenses/vector/README.md` | README for VectorLens. |
+| `lenses/vector/__init__.py` | Package marker. |
+| `pond-labs/benchmarks/README.md` | README for benchmarks. |
+| `pond-labs/demos/README.md` | README for demos. |
+| `pond-labs/lenses/README.md` | README for lab lenses. |
+| `pond-sdk/extensions/indexing/README.md` | README for indexing extensions. |
+| `services/replication/README.md` | README for replication coordinator. |
+| `services/schema/README.md` | README for schema registry. |
+| `services/transport/README.md` | README for transport layer. |
+| `tests/README.md` | README for test suite. |
+| `tests/architecture/README.md` | README for architecture laws. |
+| `tests/integration/README.md` | README for integration tests. |
+| `tests/lens_algebra/README.md` | README for lens algebra tests. |

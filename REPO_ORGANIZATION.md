@@ -141,27 +141,39 @@ they work with any lens/storage/abstraction that meets their interface.
 
 ### 3.1 Where extensions live
 
+**Decision: extensions stay inside `pond-sdk/extensions/`.**
+
+Extensions depend on pond-sdk infrastructure (ProllyTree, ProllyLensBase,
+binary_encoding, maintenance). Moving them to repo root would create an
+upward dependency (extensions → pond-sdk), but pond-sdk is Layer 1 and
+extensions are Layer 2 — downward dependency is correct. Extensions ARE
+part of the SDK; they're just optional modules within it.
+
 ```
 pond-sdk/extensions/
-├── indexing/              # Auto-indexing mixins (KV-style secondary indexes)
+├── indexing/              # Collection-level indexing (data-side, not lens-side)
 │   ├── __init__.py        # Package marker + exports
-│   └── auto_index.py      # AutoIndexMixin + IndexedLens (convenience class)
+│   ├── collection_index.py # CollectionIndexer (RECOMMENDED — data-side, no lens dependency)
+│   └── auto_index.py      # AutoIndexMixin + IndexedLens (DEPRECATED — has lens dependency)
 ├── semantic/              # Semantic model adapters (Ossie, future Cube/dbt)
 │   ├── base.py            # SemanticModelAdapter (abstract interface)
 │   └── ossie.py           # SemanticMixin + SemanticLens + OssieAdapter
-└── physical_structures/   # Physical Structures (BloomFilter, Statistics, ZoneMap)
+└── physical_structures/   # Physical Structures (pruning, zone maps, bloom filters, stats)
     ├── base.py            # PhysicalStructure (abstract base)
-    ├── bloom_filter.py
-    ├── statistics.py
-    └── zone_map.py
+    ├── bloom_filter.py    # Probabilistic membership test
+    ├── statistics.py      # Column min/max/null_count for pruning
+    ├── zone_map.py        # Per-chunk min/max for range pruning (legacy)
+    ├── pruning.py         # ZoneMap, PruningPredicate, ColumnPredicate (Vortex-style)
+    ├── zone_map_index.py  # ZoneMapIndex — ProllyTreeIndex of zone maps
+    └── pruning_reader.py  # PruningReader — generic reader with zone-map pruning
 ```
 
 **Extension categories:**
-- **indexing/** — Mixins that add secondary index management to KV-style lenses.
-  Composable via multiple inheritance. Supported: KeyValueLens and subclasses.
-- **semantic/** — Mixins and adapters for semantic model management (metrics,
-  dimensions, relationships). Composable via multiple inheritance. Supported:
-  KeyValueLens and subclasses.
+- **indexing/** — Collection-level indexing. CollectionIndexer (recommended,
+  data-side, no lens dependency) + AutoIndexMixin (deprecated, lens-side).
+  Indexes belong to collections, not lenses. Any lens can use any collection's indexes.
+- **semantic/** — Semantic model management (metrics, dimensions, relationships).
+  Composable via SemanticMixin. Supported: KeyValueLens and subclasses.
 - **physical_structures/** — Standalone derived structures (not mixins). Built
   on any collection via build/load/query class methods. Supported: any
   collection (KV or tabular) — these are storage-format-agnostic.

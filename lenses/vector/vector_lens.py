@@ -41,34 +41,40 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import struct
+import sys
 from typing import Any
 
-from auto_index import IndexedLens          # Layer 2 (mock or real, depending on path)
-from view_sdk import CrossLens               # cross-lens helpers (mock or real)
+# Make pond-core and pond-sdk importable
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "keyvalue"))
+
+from keyvalue_lens import KeyValueLens
 
 
-class VectorLens(IndexedLens):
-    """A simple vector database on Pond's IndexedLens."""
+class VectorLens(KeyValueLens):
+    """A simple vector database on Pond's KeyValueLens.
+
+    Stores vectors as packed binary (struct.pack) for efficiency.
+    Uses KeyValueLens for storage (ProllyTreeIndex) and CollectionMetadata
+    for indexing.
+
+    Implements:
+      - insert(id, vector, metadata) — insert a vector
+      - search(query, k=5) — k-nearest-neighbours (L2 / Euclidean)
+      - get_vector(id) — retrieve a vector by ID
+      - delete_vector(id) — delete a vector by ID
+      - list_vectors() — list all vector IDs
+      - count() — count vectors
+    """
 
     # ---- lifecycle --------------------------------------------------
 
-    def __init__(self, kernel, name: str):
+    def __init__(self, kernel, name: str = None):
         super().__init__(kernel, name)
-        # Auto-index by ID (eager so reads are always fresh).
-        # The extractor receives the decoded record and returns its "id".
-        self.register_index(
-            "by_id",
-            self._id_extractor,
-            mode="eager",
-        )
-
-    # ---- index helper -----------------------------------------------
-
-    @staticmethod
-    def _id_extractor(record: dict) -> str:
-        """Extract the ID from a decoded record (for the by_id index)."""
-        return record.get("id")
 
     # ---- binary serialization (override) ----------------------------
 
@@ -184,11 +190,27 @@ class VectorLens(IndexedLens):
     def get_history(self, limit: int = 20) -> list[dict]:
         return self.history(limit)
 
-    # ---- index-backed lookup (demonstrates IndexedLens usage) -------
+    # ---- index-backed lookup (uses CollectionMetadata) --------------
 
     def find_by_id(self, id: str) -> dict | None:
-        """O(log N) lookup via the registered by_id index."""
-        return self.find_by("by_id", str(id))
+        """O(log N) lookup via CollectionMetadata index.
+
+        Builds the index on first call if it doesn't exist.
+        """
+        from collection_metadata import CollectionMetadata
+        meta = CollectionMetadata(self.kernel)
+        collection = self._default_collection or "vectors"
+
+        # Build index if it doesn't exist
+        if "by_id" not in meta.list_indexes(collection):
+            meta.build_index(collection, "by_id",
+                             extractor=lambda r: str(r.get("id", "")),
+                             scan_fn=lambda: ((k, self.get(k)) for k in self.keys()))
+
+        rowid = meta.lookup_index(collection, "by_id", str(id))
+        if rowid is None:
+            return None
+        return self.get(rowid)
 
     # ---- helpers ----------------------------------------------------
 
