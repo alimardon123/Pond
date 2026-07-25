@@ -91,6 +91,8 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))
+sys.path.insert(0, os.path.join(HERE, "extensions", "physical_structures"))
+sys.path.insert(0, os.path.join(HERE, "extensions", "indexing"))
 
 from kernel import PondMinimal
 
@@ -237,6 +239,67 @@ class Collection:
         self.kernel.reference(f"{self.name}__meta", meta_hash)
 
     # ------------------------------------------------------------------
+    # Data-side metadata: zone maps, indexes, pruning
+    # ------------------------------------------------------------------
+    # These delegate to CollectionMetadata (which delegates to
+    # ZoneMapIndex, CollectionIndexer, PruningReader). The Collection
+    # is the single entry point — lenses call Collection methods,
+    # not extension methods directly.
+
+    @property
+    def metadata(self) -> "CollectionMetadata":
+        """Lazily-initialized CollectionMetadata for this collection."""
+        if not hasattr(self, '_metadata_cache'):
+            from collection_metadata import CollectionMetadata
+            self._metadata_cache = CollectionMetadata(self.kernel)
+        return self._metadata_cache
+
+    def build_zone_maps(self, scan_fn) -> str:
+        """Build zone maps for this collection.
+
+        Args:
+            scan_fn: generator yielding (row_group_key, data_bytes, row_count).
+                The lens provides this — it knows how to iterate its data.
+        """
+        return self.metadata.build_zone_maps(self.name, scan_fn)
+
+    def has_zone_maps(self) -> bool:
+        """Check if this collection has zone maps."""
+        return self.metadata.has_zone_maps(self.name)
+
+    def scan_with_pruning(self, predicate=None, start_key=None, end_key=None):
+        """Scan data blob hashes with pruning. Yields blob_hash strings."""
+        yield from self.metadata.scan_with_pruning(self.name, predicate, start_key, end_key)
+
+    def read_with_pruning(self, predicates=None, decode_fn=None, row_filter=None):
+        """Read rows with Vortex-style predicate pushdown."""
+        yield from self.metadata.read_with_pruning(self.name, predicates, decode_fn, row_filter)
+
+    def drop_zone_maps(self) -> bool:
+        """Drop all zone maps for this collection."""
+        return self.metadata.drop_zone_maps(self.name)
+
+    def build_index(self, index_name: str, extractor, scan_fn=None) -> str:
+        """Build a secondary index on this collection."""
+        return self.metadata.build_index(self.name, index_name, extractor, scan_fn)
+
+    def lookup_index(self, index_name: str, index_key: str):
+        """Look up a _rowid by index key."""
+        return self.metadata.lookup_index(self.name, index_name, index_key)
+
+    def list_indexes(self) -> list[str]:
+        """List all active indexes on this collection."""
+        return self.metadata.list_indexes(self.name)
+
+    def drop_index(self, index_name: str) -> bool:
+        """Drop an index from this collection."""
+        return self.metadata.drop_index(self.name, index_name)
+
+    def compact_zone_maps(self) -> int:
+        """Remove stale zone maps (after insert/merge replaces old data)."""
+        return self.metadata.compact_zone_maps(self.name)
+
+    # ------------------------------------------------------------------
     # Namespace
     # ------------------------------------------------------------------
 
@@ -322,7 +385,7 @@ class Collection:
         views = [v for v in Collection.list(kernel) if v.get("source") is not None]
         if source:
             views = [v for v in views if v.get("source") == source]
-        return lenss
+        return views
 
     @staticmethod
     def list_base(kernel: PondMinimal) -> list[dict]:
