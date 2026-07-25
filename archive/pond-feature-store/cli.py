@@ -34,9 +34,9 @@ for pkg in ["pond-core", "pond-sdk", "pond-feature-store", "pond-semantic"]:
     sys.path.insert(0, os.path.join(REPO_ROOT, pkg))
 sys.path.insert(0, SCRIPT_DIR)  # for feature_store.py
 
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 from feature_store import FeatureStore
-from lens_sdk import View, SemanticLens
+from keyvalue_lens import View, SemanticLens
 
 
 def get_store():

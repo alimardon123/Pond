@@ -91,7 +91,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, HERE)
 
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +451,7 @@ def test_Collection_with_lens():
     Collection.create(kernel, "analytics/users", labels=["sql"], created_by="SqlLens",
                    description="User table")
 
-    from lens_sdk import Lens
+    from keyvalue_lens import KeyValueLens as Lens
     lens = Lens(kernel, "analytics/users")
     lens.put("user:1", {"name": "Alice", "age": 30})
     lens.put("user:2", {"name": "Bob", "age": 25})

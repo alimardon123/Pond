@@ -359,7 +359,7 @@ def exp5_postgres_backend():
     print("  VERDICT: ✓ SURVIVED")
     print()
     print("  The kernel is storage-independent. The same 3 primitives work over:")
-    print("    - Local filesystem (pond_minimal.py)")
+    print("    - Local filesystem (kernel.py)")
     print("    - Relational store (this experiment, simulated with SQLite)")
     print("    - (In principle: S3, Redis, memory — same design)")
     print()
@@ -384,10 +384,10 @@ def exp7_anti_iceberg():
     print()
 
     print("  What Pond's kernel imports:")
-    # Read pond_minimal.py and check imports
-    with open(os.path.join(os.path.dirname(__file__), "pond_minimal.py")) as f:
+    # Read kernel.py and check imports
+    with open(os.path.join(os.path.dirname(__file__), "kernel.py")) as f:
         content = f.read()
-    print("    --- pond_minimal.py imports ---")
+    print("    --- kernel.py imports ---")
     for line in content.split("\n"):
         if line.startswith("import ") or line.startswith("from "):
             print(f"    {line}")
@@ -447,7 +447,7 @@ def exp8_alien_workloads():
     os.makedirs(bench_dir)
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from pond_minimal import PondMinimal
+    from kernel import PondMinimal
     from views_minimal import write_tree, read_tree, write_commit, read_commit
 
     kernel = PondMinimal(bench_dir)

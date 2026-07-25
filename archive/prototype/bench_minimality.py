@@ -1,7 +1,7 @@
 """
 Minimality test: can all 8 Views run on a 3-primitive kernel?
 
-The minimal kernel (pond_minimal.py) has ONLY:
+The minimal kernel (kernel.py) has ONLY:
   1. Write(bytes) -> hash
   2. Read(hash_or_name) -> bytes
   3. Reference(name, hash)
@@ -21,7 +21,7 @@ import time
 import struct
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 from views_minimal import (
     SQLLens, VectorLens, StreamView, GitLens,
     GraphView, MLView, TimeSeriesView, OCIView,

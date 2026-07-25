@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from notebook import NotebookLens
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prototype"))
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 
 
 def get_kernel_and_notebook(notebook_dir=None):

@@ -56,7 +56,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 
-from lens_sdk import Lens
+from keyvalue_lens import Lens
 
 
 class ObjectStoreKernel:

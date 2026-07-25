@@ -37,7 +37,7 @@ Available types:
   - BloomFilter: probabilistic membership test
   - Statistics: column-level min/max/null_count
   - ZoneMap: per-chunk min/max for range pruning
-  - IndexStructure: Prolly tree index (wrapper around auto_index.py)
+  - IndexStructure: Prolly tree index (wrapper around indexing.py)
 
 Future types (implement PhysicalStructure):
   - HNSW: vector ANN index

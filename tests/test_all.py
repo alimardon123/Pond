@@ -57,43 +57,43 @@ def test_remaining_hazards():
     assert ok, f"Remaining hazards failed:\n{output[-500:]}"
 
 def test_architecture_laws():
-    ok, output = _run_script("pond-sdk/architecture_laws.py")
+    ok, output = _run_script("tests/architecture/architecture_laws.py")
     assert ok, f"Architecture laws failed:\n{output[-500:]}"
 
 def test_lakehouse():
-    ok, output = _run_script("lenses/lakehouse/lakehouse.py")
+    ok, output = _run_script("lenses/lakehouse/lakehouse_lens.py")
     assert ok, f"Lakehouse tests failed:\n{output[-500:]}"
 
 def test_feature_store_lens():
-    ok, output = _run_script("pond-labs/feature_store_lens.py")
+    ok, output = _run_script("pond-labs/lenses/feature_store_lens.py")
     assert ok, f"Feature Store Lens failed:\n{output[-500:]}"
 
 def test_interop_demo():
-    ok, output = _run_script("pond-labs/interop_demo.py")
+    ok, output = _run_script("pond-labs/demos/interop_demo.py")
     assert ok, f"Interop demo failed:\n{output[-500:]}"
 
 def test_loc_benchmark():
-    ok, output = _run_script("pond-labs/loc_benchmark.py")
+    ok, output = _run_script("pond-labs/benchmarks/loc_benchmark.py")
     assert ok, f"LOC benchmark failed:\n{output[-500:]}"
 
 def test_track1_compat():
-    ok, output = _run_script("pond-lab/track1_compat_matrix.py")
+    ok, output = _run_script("pond-labs/tracks/track1_compat_matrix.py")
     assert ok, f"Track 1 failed:\n{output[-500:]}"
 
 def test_track2_index_portability():
-    ok, output = _run_script("pond-lab/track2_index_portability.py")
+    ok, output = _run_script("pond-labs/tracks/track2_index_portability.py")
     assert ok, f"Track 2 failed:\n{output[-500:]}"
 
 def test_track7_reverse():
-    ok, output = _run_script("pond-lab/track7_reverse_composability.py")
+    ok, output = _run_script("pond-labs/tracks/track7_reverse_composability.py")
     assert ok, f"Track 7 failed:\n{output[-500:]}"
 
 def test_track8_storage_independence():
-    ok, output = _run_script("pond-lab/track8_storage_independence.py")
+    ok, output = _run_script("pond-labs/tracks/track8_storage_independence.py")
     assert ok, f"Track 8 failed:\n{output[-500:]}"
 
 def test_track9_production_lakehouse():
-    ok, output = _run_script("pond-lab/track9_production_lakehouse.py")
+    ok, output = _run_script("pond-labs/tracks/track9_production_lakehouse.py")
     assert ok, f"Track 9 failed:\n{output[-500:]}"
 
 def test_transport_production():

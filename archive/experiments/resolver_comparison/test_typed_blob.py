@@ -29,7 +29,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, HERE)
 
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 from typed_blob import (TypedBlob, TypedLens, TypedIndex, CodecRegistry,
                          CODEC_JSON, CODEC_GIT_TREE, CODEC_NOTEBOOK,
                          CODEC_RAW, CODEC_CSV)

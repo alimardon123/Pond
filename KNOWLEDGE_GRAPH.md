@@ -36,11 +36,11 @@
 │ Services (cross-cutting; between kernel and lenses)             │
 │  • services/transport/  • services/schema/  • services/replication/ │
 ├─────────────────────────────────────────────────────────────────┤
-│ SDK (Lens base class, ProllyViewBase, indexes, query API)       │
+│ SDK (PondLens base, KeyValueLens, ProllyTreeIndex, indexes, query) │
 │  • pond-sdk/                                                    │
 ├─────────────────────────────────────────────────────────────────┤
 │ Kernel (FROZEN; 3 operations; ~140 LOC)                         │
-│  • pond-core/pond_minimal.py                                    │
+│  • pond-core/kernel.py                                    │
 ├─────────────────────────────────────────────────────────────────┤
 │ Backend (local disk, S3, IPFS, FDB — pluggable)                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -67,32 +67,34 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 
 | File | LOC | Purpose |
 |---|---|---|
-| `pond-core/pond_minimal.py` | 199 | The kernel. `PondMinimal` class with `write()`, `read()`, `reference()`, `resolve()`, `list_names()`. SQLite-backed root namespace. |
+| `pond-core/kernel.py` | 199 | The kernel. `PondMinimal` class with `write()`, `read()`, `reference()`, `resolve()`, `list_names()`. SQLite-backed root namespace. |
 | `pond-core/__init__.py` | 0 | Package marker. |
 | `pond-core/README.md` | 43 | Folder purpose and usage. |
 
-### 2.2 pond-sdk/ (Lens SDK — 15 files, ~6400 LOC)
+### 2.2 pond-sdk/ (Lens SDK — 14 files, ~7300 LOC)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
-| `pond-sdk/pond_lens.py` | 310 | `PondLens` | **THE ONE base class for ALL Lenses.** Cross-format read (Parquet + KV). Shared namespace. Branch/merge/history. |
-| `pond-sdk/collection_lens.py` | 325 | `CollectionLens` | Legacy base (superseded by PondLens, kept for backward compat). |
-| `pond-sdk/lens_sdk.py` | 846 | `Lens`, `View` (alias), `KeylessLens`, `CrossLens` | Lens base class with index management. `View = Lens` alias. |
-| `pond-sdk/prolly_view.py` | 761 | `ProllyTree`, `ProllyViewBase` | Prolly tree storage + tiered commits (delta + snapshot) + branching + merge + history. |
-| `pond-sdk/auto_index.py` | 604 | `AutoIndex`, `IndexedView` | Physical Structure for secondary indexes. Auto-indexing (lazy/eager/incremental). |
+| `pond-sdk/base_lens.py` | 248 | `PondLens` | **Shared namespace base for ALL Lenses.** Provides only ref-namespace operations (branch, list_collections, set_definition, get_definition, history). No format awareness — each app-facing lens owns its own read/write API. |
+| `pond-sdk/keyvalue_lens.py` | 694 | `KeyValueLens`, `KeylessLens`, `CrossLens`, `Lens`/`View` (aliases) | **App-facing KEY-VALUE lens** with ProllyTreeIndex backing. Per-row key→blob storage, O(log N) point lookups, indexes (metadata only), branching, merge, history. `Lens = KeyValueLens` and `View = KeyValueLens` are backward-compat aliases. |
+| `pond-sdk/lens_sdk.py` | 47 | (re-exports) | Backward-compat shim — re-exports everything from `keyvalue_lens.py`. Old code that imports `from lens_sdk import Lens` keeps working; new code should import from `keyvalue_lens` directly. |
+| `pond-sdk/prolly_tree.py` | 764 | `ProllyTree`, `ProllyLensBase` | ProllyTreeIndex storage + tiered commits (delta + snapshot) + branching + merge + history. The universal storage backend for KV collections. |
+| `pond-sdk/extensions/indexing/auto_index.py` | 607 | `AutoIndex`, `IndexedLens` | Physical Structure for secondary indexes. Auto-indexing (lazy/eager/incremental). |
 | `pond-sdk/collection.py` | 517 | `Collection` | Named collection with namespace, type, source metadata. |
-| `pond-sdk/lens_laws.py` | 587 | (test harness) | RFC-0007 Lens algebra property tests (6 laws). |
-| `pond-sdk/architecture_laws.py` | 557 | (10 laws) | Executable architecture laws (Identity, Reachability, History, Lens, Derived, Branch, Merge, Determinism, Scale, Index). |
+| `tests/lens_algebra/lens_laws.py` | 591 | (test harness) | RFC-0007 Lens algebra property tests (6 laws). |
+| `tests/architecture/architecture_laws.py` | 557 | (12 laws) | Executable architecture laws (Identity, Reachability, History, Lens, Derived, Branch, Merge, Determinism, Scale, Index). |
 | `pond-sdk/binary_encoding.py` | 323 | `BinaryProllyTree` | Binary Prolly tree encoding (metadata optimization). |
-| `pond-sdk/test_shared_lenses.py` | 441 | (tests) | Test: multiple Lenses sharing same byte graph. |
-| `pond-sdk/test_lens_architecture.py` | 449 | (tests) | Test: multi-Lens architecture proof. |
-| `pond-sdk/lens_query.py` | 285 | `ViewQuery`, `JoinedQuery` | Lazy query API: `.where()`, `.select()`, `.map()`, `.join()`, `.collect()`. |
-| `pond-sdk/test_lens_query.py` | 327 | (tests) | Test: ViewQuery. |
+| `tests/integration/test_shared_lenses.py` | 442 | (tests) | Test: multiple KeyValueLens subclasses sharing same byte graph. |
+| `tests/integration/test_lens_architecture.py` | 449 | (tests) | Test: multi-Lens architecture proof (SQL/Git/Notebook lenses over same byte graph). |
+| `pond-sdk/row_query.py` | 288 | `LensQuery`, `JoinedQuery` | Lazy query API: `.where()`, `.select()`, `.map()`, `.join()`, `.collect()`. |
+| `tests/integration/test_lens_query.py` | 327 | (tests) | Test: LensQuery. |
 | `pond-sdk/maintenance.py` | 315 | `drop_name`, `is_dropped`, `resolve_active`, `compact_tombstones` | Tombstone helpers (RFC-0008: deletion as data). |
-| `pond-sdk/run_lens_laws_ci.py` | 267 | (CI runner) | CI runner for Lens contracts. |
+| `tests/lens_algebra/run_lens_laws_ci.py` | 267 | (CI runner) | CI runner for Lens contracts. |
 | `pond-sdk/__init__.py` | 0 | Package marker. |
 | `pond-sdk/README.md` | 52 | Folder purpose and usage. |
 | `pond-sdk/extensions/__init__.py` | 55 | `register_extension`, `list_extensions` | Extension registry. |
+| `pond-sdk/extensions/indexing/__init__.py` | 27 | `AutoIndexMixin`, `IndexedLens`, `AutoIndex` | Indexing extension package. Auto-indexing mixins for KV-style lenses. |
+| `pond-sdk/extensions/indexing/auto_index.py` | 433 | `AutoIndexMixin`, `IndexedLens` | Auto-indexing mixin (eager/lazy modes). Composable with KeyValueLens. Extension metadata: supported_lens_types, supported_storage. |
 | `pond-sdk/extensions/semantic/__init__.py` | 15 | — | Semantic extension package. |
 | `pond-sdk/extensions/semantic/base.py` | 45 | `SemanticModelAdapter` | Abstract interface for semantic adapters. |
 | `pond-sdk/extensions/semantic/ossie.py` | 300 | `SemanticLens`, `OssieAdapter` | Ossie adapter + pluggable SemanticLens. |
@@ -106,8 +108,8 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
-| `lenses/lakehouse/lakehouse.py` | 594 | `LakehouseLens`, `PondLakehouse` | **Flagship.** DuckDB lakehouse: CREATE TABLE, INSERT, SELECT, time travel, branching, merge, schema evolution. |
-| `lenses/vector/vector_view.py` | 198 | `VectorView` | Vector DB with ANN search. Extends `IndexedView`. |
+| `lenses/lakehouse/lakehouse_lens.py` | 886 | `LakehouseLens`, `PondLakehouse` | **Flagship.** DuckDB lakehouse: CREATE TABLE, INSERT, SELECT, time travel, branching, merge, schema evolution. Owns its Parquet I/O directly (not inherited). Adds range_read/range_write/range_point_lookup as Lakehouse-specific extensions on top of the shared ProllyTreeIndex. |
+| `lenses/vector/vector_lens.py` | 198 | `VectorLens` | Vector DB with ANN search. Extends `IndexedLens`. |
 | `lenses/vector/auto_index.py` | 329 | (mock) | Mock auto-index for testing. |
 | `lenses/vector/mock_kernel.py` | 46 | `PondMinimal` (mock) | In-memory mock kernel for tests. |
 | `lenses/vector/view_sdk.py` | 39 | `CrossLens` (mock) | Mock CrossLens helpers. |
@@ -131,30 +133,30 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
-| `pond-labs/feature_store_lens.py` | 584 | `FeatureStoreLens` | Versioned ML feature store: point-in-time joins, online/offline serving, schema evolution, branching. |
-| `pond-labs/interop_demo.py` | 359 | (demo) | **Killer demo:** bidirectional Feature Store ↔ Lakehouse interop (12/12 pass). |
-| `pond-labs/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
+| `pond-labs/lenses/feature_store_lens.py` | 584 | `FeatureStoreLens` | Versioned ML feature store: point-in-time joins, online/offline serving, schema evolution, branching. |
+| `pond-labs/demos/interop_demo.py` | 359 | (demo) | **Killer demo:** bidirectional Feature Store ↔ Lakehouse interop (12/12 pass). |
+| `pond-labs/benchmarks/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/README.md` | — | — | Folder purpose. |
 
 ### 2.5b pond-lab/ (Lab experiments — 14 files)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
-| `pond-lab/track1_compat_matrix.py` | 340 | (tests) | **Track 1:** Bidirectional Lens compatibility matrix (10/10 pass). Level 1 cert. |
-| `pond-lab/track2_index_portability.py` | 380 | (tests) | **Track 2:** Index portability (18/18 pass). Level 2 cert. |
-| `pond-lab/track3_lens_vs_opponent.py` | 460 | (benchmarks) | **Track 3:** Lens-vs-opponent benchmarks. |
-| `pond-lab/track4_object_store_efficiency.py` | 480 | (tests) | **Track 4:** Object-store efficiency (7 experiments; packing = 204x reduction). |
-| `pond-lab/track5_lens_composability.py` | 380 | (tests) | **Track 5:** Lens composability — ETL-free chain (15/15 pass). |
-| `pond-lab/track6_case_studies.py` | 440 | (tests) | **Track 6:** Real-world case studies (25/25 pass). |
-| `pond-lab/track7_reverse_composability.py` | 450 | (tests) | **Track 7:** Reverse composability (24/24 pass). |
-| `pond-lab/track8_storage_independence.py` | 350 | (tests) | **Track 8:** Storage Independence cert (23/23 pass). |
-| `pond-lab/track9_production_lakehouse.py` | 500 | (tests) | **Track 9:** Production Lakehouse with caching (20/20 pass, 2.2x speedup). |
-| `pond-lab/track10_storage_optimization.py` | 430 | (tests) | **Track 10:** Storage optimization at scale (10/10 pass, 996x fewer GETs). |
-| `pond-lab/track11_pond_vs_iceberg.py` | 640 | (benchmarks) | **Track 11:** Head-to-head vs Iceberg proxy at 100K+500K (Pond wins 4/7 at 500K). |
-| `pond-lab/track12_pond_vs_real_iceberg.py` | 540 | (benchmarks) | **Track 12:** Head-to-head vs REAL Apache Iceberg (pyiceberg v0.11.1). Pond wins 5/6 at 100K. |
-| `pond-lab/track13_honest_benchmarks.py` | 500 | (benchmarks) | **Track 13:** Honest benchmarks with correctness assertions + kernel/query separation. |
-| `pond-lab/COMPATIBILITY_SUITE.md` | 80 | — | Compatibility Suite: 3 certification levels. |
-| `pond-lab/README.md` | — | — | Lab tracks overview (12 tracks). |
+| `pond-labs/tracks/track1_compat_matrix.py` | 340 | (tests) | **Track 1:** Bidirectional Lens compatibility matrix (10/10 pass). Level 1 cert. |
+| `pond-labs/tracks/track2_index_portability.py` | 380 | (tests) | **Track 2:** Index portability (18/18 pass). Level 2 cert. |
+| `pond-labs/tracks/track3_lens_vs_opponent.py` | 460 | (benchmarks) | **Track 3:** Lens-vs-opponent benchmarks. |
+| `pond-labs/tracks/track4_object_store_efficiency.py` | 480 | (tests) | **Track 4:** Object-store efficiency (7 experiments; packing = 204x reduction). |
+| `pond-labs/tracks/track5_lens_composability.py` | 380 | (tests) | **Track 5:** Lens composability — ETL-free chain (15/15 pass). |
+| `pond-labs/tracks/track6_case_studies.py` | 440 | (tests) | **Track 6:** Real-world case studies (25/25 pass). |
+| `pond-labs/tracks/track7_reverse_composability.py` | 450 | (tests) | **Track 7:** Reverse composability (24/24 pass). |
+| `pond-labs/tracks/track8_storage_independence.py` | 350 | (tests) | **Track 8:** Storage Independence cert (23/23 pass). |
+| `pond-labs/tracks/track9_production_lakehouse.py` | 500 | (tests) | **Track 9:** Production Lakehouse with caching (20/20 pass, 2.2x speedup). |
+| `pond-labs/tracks/track10_storage_optimization.py` | 430 | (tests) | **Track 10:** Storage optimization at scale (10/10 pass, 996x fewer GETs). |
+| `pond-labs/tracks/track11_pond_vs_iceberg.py` | 640 | (benchmarks) | **Track 11:** Head-to-head vs Iceberg proxy at 100K+500K (Pond wins 4/7 at 500K). |
+| `pond-labs/tracks/track12_pond_vs_real_iceberg.py` | 540 | (benchmarks) | **Track 12:** Head-to-head vs REAL Apache Iceberg (pyiceberg v0.11.1). Pond wins 5/6 at 100K. |
+| `pond-labs/tracks/track13_honest_benchmarks.py` | 500 | (benchmarks) | **Track 13:** Honest benchmarks with correctness assertions + kernel/query separation. |
+| `pond-labs/tracks/COMPATIBILITY_SUITE.md` | 80 | — | Compatibility Suite: 3 certification levels. |
+| `pond-labs/tracks/README.md` | — | — | Lab tracks overview (12 tracks). |
 | `pond-sdk/extensions/README.md` | 80 | — | Extensions architecture overview. |
 | `pond-sdk/extensions/semantic/README.md` | 60 | — | Semantic adapters overview. |
 | `pond-sdk/extensions/physical_structures/README.md` | 90 | — | Physical Structure type hierarchy. |
@@ -209,6 +211,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 |---|---|---|
 | `README.md` | 130 | 5-minute intro to Pond. Start here. |
 | `DESIGN_GOALS.md` | 1013 | 7 design principles + roadmap. |
+| `REPO_ORGANIZATION.md` | 220 | Folder rules, naming conventions, promotion process, no lens-to-lens inheritance. |
 | `PACKAGES.md` | 156 | Package structure and dependency graph. |
 | `SDK_SPEC.md` | 1095 | Authoritative SDK contract (13 ambiguities settled). |
 | `KNOWLEDGE_GRAPH.md` | — | This file. The navigational map of the repo. |
@@ -246,13 +249,14 @@ implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 
 | Concept | Definition | Where |
 |---|---|---|
-| **Kernel** | 3 operations (Write, Read, Ref) on 6 substrates. FROZEN. | `pond-core/pond_minimal.py` |
+| **Kernel** | 3 operations (Write, Read, Ref) on 6 substrates. FROZEN. | `pond-core/kernel.py` |
 | **Substrate** | A layer with its own axioms (Bytes, Names, Time, Coordination, Range-Read, Key). | `docs/POND_FORMAL_ALGEBRAS.md` §9 |
-| **Lens** | Interpretation layer: `encode(data)→bytes`, `decode(bytes)→data`. Never owns bytes. | `pond-sdk/lens_sdk.py` |
+| **Lens** | App-facing interpretation layer over immutable bytes. Each lens owns its own read/write API. | `pond-sdk/keyvalue_lens.py` (KeyValueLens), `lenses/lakehouse/lakehouse_lens.py` (LakehouseLens), `pond-labs/lenses/feature_store_lens.py` (FeatureStoreLens) |
+| **PondLens** | Shared namespace base for all Lenses. Provides only ref-namespace operations (branch, list_collections, set_definition, get_definition, history). No format awareness. | `pond-sdk/base_lens.py` |
 | **Physical Structure** | `f(snapshot)→artifact`. Deterministic, rebuildable. Indexes, stats, bloom filters. | `docs/POND_FORMAL_ALGEBRAS.md` §14 |
 | **Collection** | Named reference namespace. Not fundamental — just a naming convention. | `pond-sdk/collection.py` |
-| **Prolly Tree** | Probabilistic Merkle tree with content-addressed chunks. O(log N) lookup. | `pond-sdk/prolly_view.py` |
-| **Tiered Commit** | Delta commits (O(1) write) + snapshot commits (O(changed_chunks)) + snapshot pointer. | `pond-sdk/prolly_view.py` |
+| **Prolly Tree** | Probabilistic Merkle tree with content-addressed chunks. O(log N) lookup. | `pond-sdk/prolly_tree.py` |
+| **Tiered Commit** | Delta commits (O(1) write) + snapshot commits (O(changed_chunks)) + snapshot pointer. | `pond-sdk/prolly_tree.py` |
 | **Tombstone** | Deletion as data: `Ref(name, TOMBSTONE_HASH)`. RFC-0008. | `pond-sdk/maintenance.py` |
 | **Manifest** | Sidecar listing blob hashes in a pack. Enables physical reachability (1000x GC speedup). | `docs/POND_FORMAL_ALGEBRAS.md` §10 |
 | **Transport Layer** | Compress → encrypt → checksum. Between kernel and Lens. | `services/transport/` |
@@ -263,10 +267,10 @@ implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 
 | Axiom | Statement | File |
 |---|---|---|
-| A1 | Immutability: `Read(Write(b)) = b` always | `pond-core/pond_minimal.py` |
-| A2 | Content-addressing: same bytes → same hash | `pond-core/pond_minimal.py` |
-| A3 | Name mutability (LWW): Ref is the only mutation | `pond-core/pond_minimal.py` |
-| A4 | Referential integrity: Ref requires hash exists | `pond-core/pond_minimal.py` |
+| A1 | Immutability: `Read(Write(b)) = b` always | `pond-core/kernel.py` |
+| A2 | Content-addressing: same bytes → same hash | `pond-core/kernel.py` |
+| A3 | Name mutability (LWW): Ref is the only mutation | `pond-core/kernel.py` |
+| A4 | Referential integrity: Ref requires hash exists | `pond-core/kernel.py` |
 | A5 | Monotonic logical clock (Lamport) | `docs/POND_FORMAL_ALGEBRAS.md` §9 |
 | A6 | Atomic commit blob (within-Collection) | `docs/POND_FORMAL_ALGEBRAS.md` §9 |
 | A7 | Coordinator out-of-model (cross-Collection needs coordinator) | `docs/POND_FORMAL_ALGEBRAS.md` §9 |
@@ -296,11 +300,13 @@ implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 pond-core (FROZEN, ~140 LOC)
     │
     ├── pond-sdk (depends on pond-core)
-    │   ├── lens_sdk.py ← prolly_view.py, binary_encoding.py, maintenance.py, lens_query.py
-    │   ├── prolly_view.py ← binary_encoding.py
-    │   ├── auto_index.py ← prolly_view.py
+    │   ├── base_lens.py ← pond-core  (shared namespace base, no format awareness)
+    │   ├── keyvalue_lens.py ← pond_lens, prolly_view, binary_encoding, maintenance, lens_query
+    │   ├── lens_sdk.py ← keyvalue_lens  (backward-compat shim, re-exports)
+    │   ├── prolly_tree.py ← binary_encoding
+    │   ├── indexing.py ← prolly_view
     │   ├── collection.py
-    │   ├── lens_query.py
+    │   ├── query.py
     │   └── maintenance.py
     │
     ├── lenses/ (depend on pond-core + pond-sdk)
@@ -333,7 +339,7 @@ pond-core (FROZEN, ~140 LOC)
 | Workload | Required Lens | Status | Reference Impl |
 |---|---|---|---|
 | Versioned tabular data | Lakehouse Lens | **Shipped** | `lenses/lakehouse/` |
-| ML feature stores | Feature Store Lens | **Shipped** | `pond-labs/feature_store_lens.py` |
+| ML feature stores | Feature Store Lens | **Shipped** | `pond-labs/lenses/feature_store_lens.py` |
 | Code versioning | Git Lens | Reference in archive | `archive/pond-git/` |
 | SQL (native) | SQL Lens | Reference in archive | `archive/pond-sql/` |
 | Streaming | Streaming Lens | Reference in archive | `archive/pond-streaming/` |
@@ -450,13 +456,13 @@ graph TD
 python -c "import sys; sys.path.insert(0,'pond-core'); from pond_minimal import PondMinimal; k=PondMinimal('/tmp/p'); h=k.write(b'hi'); print(k.read(h))"
 
 # Flagship (lakehouse)
-python lenses/lakehouse/lakehouse.py
+python lenses/lakehouse/lakehouse_lens.py
 
 # Killer demo (interop)
-python pond-labs/interop_demo.py
+python pond-labs/demos/interop_demo.py
 
 # LOC benchmark
-python pond-labs/loc_benchmark.py
+python pond-labs/benchmarks/loc_benchmark.py
 
 # All 646 checks
 python scripts/phase_l_property_tests.py
@@ -474,8 +480,8 @@ python services/schema/schema_registry.py
 python services/replication/replication_coordinator.py
 
 # SDK tests
-python pond-sdk/architecture_laws.py
-python pond-sdk/lens_laws.py
+python tests/architecture/architecture_laws.py
+python tests/lens_algebra/lens_laws.py
 ```
 
 ### 7.2 Key numbers
@@ -499,12 +505,13 @@ python pond-sdk/lens_laws.py
 
 | Looking for... | Go to... |
 |---|---|
-| The kernel | `pond-core/pond_minimal.py` |
-| Lens base class | `pond-sdk/lens_sdk.py` → `Lens` (`View` alias) |
-| Prolly tree | `pond-sdk/prolly_view.py` → `ProllyTree` |
-| Indexes | `pond-sdk/auto_index.py` → `IndexedView` |
-| Lakehouse (flagship) | `lenses/lakehouse/lakehouse.py` → `PondLakehouse` |
-| Feature Store | `pond-labs/feature_store_lens.py` → `FeatureStoreLens` |
+| The kernel | `pond-core/kernel.py` |
+| Lens base class (shared namespace) | `pond-sdk/base_lens.py` → `PondLens` |
+| KeyValueLens (app-facing KV lens) | `pond-sdk/keyvalue_lens.py` → `KeyValueLens` (aliases: `Lens`, `View`) |
+| Prolly tree (ProllyTreeIndex) | `pond-sdk/prolly_tree.py` → `ProllyTree`, `ProllyLensBase` |
+| Indexes | `pond-sdk/extensions/indexing/auto_index.py` → `IndexedLens` |
+| Lakehouse (flagship) | `lenses/lakehouse/lakehouse_lens.py` → `LakehouseLens`, `PondLakehouse` |
+| Feature Store | `pond-labs/lenses/feature_store_lens.py` → `FeatureStoreLens` |
 | Compression/encryption | `services/transport/transport_production.py` |
 | Schema evolution | `services/schema/schema_registry.py` |
 | Replication/2PC | `services/replication/replication_coordinator.py` |

@@ -51,7 +51,7 @@ def measure_compression():
          "libraries/view_sdk.py",
          "Lens SDK (View + CrossLens + SemanticLens)"),
         ("ProllyLensBase", None,
-         "libraries/prolly_view.py",
+         "libraries/prolly_tree.py",
          "Prolly tree + delta journal + binary encoding"),
         ("BinaryEncoding", None,
          "libraries/binary_encoding.py",
@@ -90,7 +90,7 @@ def measure_compression():
 
     # Shared library LOC
     shared_loc = count_loc(os.path.join(base_dir, "libraries/view_sdk.py"))
-    shared_loc += count_loc(os.path.join(base_dir, "libraries/prolly_view.py"))
+    shared_loc += count_loc(os.path.join(base_dir, "libraries/prolly_tree.py"))
     shared_loc += count_loc(os.path.join(base_dir, "libraries/binary_encoding.py"))
 
     print()

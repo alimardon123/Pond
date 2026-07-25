@@ -28,7 +28,7 @@ import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prototype"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "libraries"))
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 from view_helpers import ViewBase, ShardedTree, SkipPointerHistory
 
 

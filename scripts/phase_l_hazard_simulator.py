@@ -50,7 +50,7 @@ from collections import defaultdict
 
 # Make pond-core importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pond-core"))
-from pond_minimal import PondMinimal  # noqa: E402
+from kernel import PondMinimal  # noqa: E402
 
 
 class HazardConfig:

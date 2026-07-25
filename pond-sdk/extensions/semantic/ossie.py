@@ -4,28 +4,44 @@ Apache Ossie Semantic Adapter — one implementation of the semantic model inter
 This extension provides:
   - OssieAdapter: translates between Pond's internal semantic storage
     and the Apache Ossie open semantic interchange spec.
-  - SemanticLens: a Lens subclass with semantic model management
-    (metrics, dimensions, relationships) + Ossie import/export.
+  - SemanticMixin: a mixin that adds semantic model management
+    (metrics, dimensions, relationships) + Ossie import/export to ANY
+    lens that exposes put/get/commit/base.read_all.
+  - SemanticLens: convenience class = KeyValueLens + SemanticMixin.
+
+DESIGN: Semantic models are ORTHOGONAL to storage. A semantic model
+defines metrics/dimensions/relationships over data — the data itself
+can live in a KeyValueLens collection OR a LakehouseLens table. The
+SemanticMixin works on any lens that exposes the KV-style API
+(put/get/commit), which means KeyValueLens and its subclasses.
 
 Usage:
-    from extensions.semantic_ossie import SemanticLens, OssieAdapter
+    # Convenience class (most common)
+    from extensions.semantic.ossie import SemanticLens
 
     semantic = SemanticLens(kernel, "semantic")
     semantic.define_metric("revenue", "orders", "amount",
                            dialects={"ANSI_SQL": "SUM(amount)"})
 
+    # Or compose the mixin with a custom lens
+    from keyvalue_lens import KeyValueLens
+    from extensions.semantic.ossie import SemanticMixin
+
+    class MySemanticLens(KeyValueLens, SemanticMixin):
+        pass
+
 To use a DIFFERENT semantic standard (e.g., Cube.js), create a new
 adapter module (semantic_cube.py) implementing SemanticModelAdapter,
-and use it with the same SemanticLens:
+and pass it to the mixin:
 
     from extensions.semantic.base import SemanticModelAdapter
-    from extensions.semantic_ossie import SemanticLens
+    from extensions.semantic.ossie import SemanticLens
 
     class CubeAdapter(SemanticModelAdapter): ...
     semantic = SemanticLens(kernel, "semantic", adapter=CubeAdapter())
 
-The Lens SDK core (lens_sdk.py) does NOT import this module. It is
-loaded only when the application needs Ossie semantic models.
+The Lens SDK core does NOT import this module. It is loaded only when
+the application needs Ossie semantic models.
 """
 
 from __future__ import annotations
@@ -36,10 +52,10 @@ import os
 import sys
 from typing import Optional, Any
 
-# Make lens_sdk importable
+# Make pond-sdk importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from lens_sdk import Lens  # noqa: E402
+from keyvalue_lens import KeyValueLens as Lens  # noqa: E402
 from extensions.semantic.base import SemanticModelAdapter  # noqa: E402
 from extensions import register_extension  # noqa: E402
 
@@ -75,32 +91,65 @@ class OssieAdapter(SemanticModelAdapter):
         return required_keys.issubset(model.keys())
 
 
-class SemanticLens(Lens):
+# ---------------------------------------------------------------------------
+# SemanticMixin — composable with any KV-style lens backed by ProllyTreeIndex
+# ---------------------------------------------------------------------------
+
+class SemanticMixin:
+    """Mixin that adds semantic model management to any KV-style Pond lens.
+
+    EXTENSION METADATA:
+      extension_type: "mixin"
+      supported_lens_types: ["KeyValueLens", "KeylessLens", "IndexedLens"]
+      supported_storage: ["ProllyTreeIndex"]
+      not_supported: ["LakehouseLens", "FeatureStoreLens"]  # tabular lenses use column-level semantics
+
+    GENERIC: works with any lens that exposes:
+      - self.kernel         — the PondMinimal kernel
+      - self.name           — the collection name
+      - self.base           — a persistent ProllyLensBase (for read_all/lookup)
+      - self.put(key, data) — stage a key→value mapping
+      - self.get(key)       — read a value by key
+      - self.put_raw(key, blob_hash) — stage a pre-encoded blob
+      - self.commit(msg)    — commit staged changes
+      - self.decode(bytes)  — decode bytes to a value
+
+    Both KeyValueLens and any future KV-style lens that uses ProllyTreeIndex
+    can use this mixin. Semantic definitions (metrics, dimensions, relationships)
+    are stored as key→value entries in the lens's ProllyTreeIndex, prefixed
+    with "_semantic/".
+
+    Use by mixing with a KV-style lens:
+
+        from keyvalue_lens import KeyValueLens
+        from extensions.semantic.ossie import SemanticMixin
+
+        class MySemanticLens(KeyValueLens, SemanticMixin):
+            pass
+
+    Or use the convenience class `SemanticLens` defined below.
+
+    Adds:
+      - define_metric / define_dimension / define_relationship
+      - list_metrics / list_dimensions
+      - get_metric
+      - execute_metric (evaluates a metric against a source lens)
+      - import_model / export_model (via the configured adapter)
     """
-    A Lens that manages semantic models (metrics, dimensions, relationships).
 
-    NOT coupled to any specific semantic model standard. Uses pluggable
-    adapters:
-      - OssieAdapter for Apache Ossie format (default)
-      - CubeAdapter for Cube.js format (future)
-      - DbtAdapter for dbt metrics (future)
-      - Custom adapters via SemanticModelAdapter interface
+    # Extension metadata (for introspection / tooling)
+    extension_type = "mixin"
+    supported_lens_types = ["KeyValueLens", "KeylessLens", "IndexedLens"]
+    supported_storage = ["ProllyTreeIndex"]
+    not_supported = ["LakehouseLens", "FeatureStoreLens"]  # tabular lenses use column-level semantics
 
-    The Lens stores metric/dimension/relationship definitions as blobs.
-    Adapters translate between the internal format and external standards.
+    def _init_semantic(self, adapter: Optional[SemanticModelAdapter] = None):
+        """Call this from __init__ to set the adapter.
 
-    Usage:
-        # Default (Ossie adapter)
-        semantic = SemanticLens(kernel, "semantic")
-
-        # Custom adapter
-        from extensions.semantic.base import SemanticModelAdapter
-        class MyAdapter(SemanticModelAdapter): ...
-        semantic = SemanticLens(kernel, "semantic", adapter=MyAdapter())
-    """
-
-    def __init__(self, kernel, name: str, adapter: SemanticModelAdapter = None):
-        super().__init__(kernel, name)
+        Subclasses call this after super().__init__():
+            super().__init__(kernel, name)
+            self._init_semantic(adapter)
+        """
         self.adapter = adapter or OssieAdapter()
 
     # --- Metric management (standard-agnostic) ---
@@ -113,6 +162,8 @@ class SemanticLens(Lens):
         dialects: {"ANSI_SQL": "SUM(amount)", "SNOWFLAKE": "SUM(amount)", ...}
         This is standard-agnostic — the adapter translates to the external format.
         """
+        if not hasattr(self, 'adapter'):
+            self._init_semantic()
         metric = {
             "name": name,
             "source": source,
@@ -212,6 +263,8 @@ class SemanticLens(Lens):
 
     def import_model(self, model: dict) -> str:
         """Import a semantic model using the configured adapter."""
+        if not hasattr(self, 'adapter'):
+            self._init_semantic()
         self.adapter.import_model(self, model)
         # Store the full model blob for round-trip export
         model_bytes = json.dumps(model, sort_keys=True).encode()
@@ -221,6 +274,8 @@ class SemanticLens(Lens):
 
     def export_model(self, model_name: str = None) -> Optional[dict]:
         """Export a semantic model using the configured adapter."""
+        if not hasattr(self, 'adapter'):
+            self._init_semantic()
         if model_name:
             h = self.base.lookup(f"_semantic/models/{model_name}")
             if not h:
@@ -229,12 +284,33 @@ class SemanticLens(Lens):
         return self.adapter.export_model(self)
 
 
+# ---------------------------------------------------------------------------
+# SemanticLens — convenience class: KeyValueLens + SemanticMixin
+# ---------------------------------------------------------------------------
+
+class SemanticLens(Lens, SemanticMixin):
+    """A KeyValueLens with semantic model management enabled.
+
+    Convenience class — equivalent to:
+        class MySemanticLens(KeyValueLens, SemanticMixin): pass
+
+    Subclasses that want semantic models should extend this class OR
+    mix KeyValueLens + SemanticMixin directly.
+    """
+
+    def __init__(self, kernel, name: str, adapter: SemanticModelAdapter = None):
+        super().__init__(kernel, name)
+        self._init_semantic(adapter)
+
+
 # Register this extension
 register_extension(
     "semantic_ossie",
-    "extensions.semantic_ossie",
-    {"SemanticLens": SemanticLens, "OssieAdapter": OssieAdapter}
+    "extensions.semantic.ossie",
+    {"SemanticLens": SemanticLens, "OssieAdapter": OssieAdapter,
+     "SemanticMixin": SemanticMixin}
 )
+
 
 
 # --- Self-test ---
@@ -243,7 +319,7 @@ def _self_test():
     """Quick test that the extension works standalone."""
     import tempfile, shutil
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "pond-core"))
-    from pond_minimal import PondMinimal
+    from kernel import PondMinimal
 
     tmpdir = tempfile.mkdtemp(prefix="pond_ossie_")
     try:

@@ -45,7 +45,7 @@ import sys
 from typing import Optional, Any, Iterator
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
-from pond_minimal import PondMinimal, hash_bytes
+from kernel import PondMinimal, hash_bytes
 from binary_encoding import BinaryProllyTree
 
 

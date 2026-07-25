@@ -165,7 +165,7 @@ def _test_tombstone_round_trip():
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
-    from pond_minimal import PondMinimal
+    from kernel import PondMinimal
 
     bench_dir = "/tmp/pond_tombstone_test"
     if os.path.exists(bench_dir):
@@ -219,7 +219,7 @@ def _test_drop_does_not_affect_other_names():
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
-    from pond_minimal import PondMinimal
+    from kernel import PondMinimal
 
     bench_dir = "/tmp/pond_tombstone_isolation"
     if os.path.exists(bench_dir):
@@ -250,7 +250,7 @@ def _test_tombstone_composes_with_PondGC():
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pond-core"))
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engineering"))
-    from pond_minimal import PondMinimal
+    from kernel import PondMinimal
 
     # PondGC is in engineering/02_gc.py — import lazily so this test
     # only runs when that file is present.

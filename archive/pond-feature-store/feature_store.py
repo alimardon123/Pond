@@ -53,9 +53,9 @@ for _pkg in ("pond-core", "pond-sdk", "pond-semantic"):
     sys.path.insert(0, os.path.join(_REPO_ROOT, _pkg))
 sys.path.insert(0, _HERE)
 
-from pond_minimal import PondMinimal
-from auto_index import IndexedLens
-from lens_sdk import CrossLens, SemanticLens
+from kernel import PondMinimal
+from extensions.indexing.auto_index import IndexedLens
+from keyvalue_lens import CrossLens, SemanticLens
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +841,7 @@ def test_feature_store():
     print("=== FEATURE STORE: RECURSIVE VIEW COMPOSITION ===\n")
 
     # Layer 1: Source data (SQL-like View)
-    from lens_sdk import View
+    from keyvalue_lens import View
     orders = View(kernel, "orders")
     orders.put("order:1", {"order_id": 1, "customer_id": "cust_1", "amount": 100, "product": "Widget", "ts": 1000.0})
     orders.put("order:2", {"order_id": 2, "customer_id": "cust_2", "amount": 200, "product": "Gadget", "ts": 1001.0})

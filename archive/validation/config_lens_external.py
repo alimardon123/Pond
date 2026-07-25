@@ -40,15 +40,15 @@ from typing import Any, Callable, Optional
 
 # --- Wire up imports -------------------------------------------------------
 # We import the Lens base class from the SDK. Per the task, we looked at
-# lens_sdk.py ONLY for the import path and constructor signature
+# keyvalue_lens.py ONLY for the import path and constructor signature
 # (Lens = View; Lens.__init__(self, kernel, name)). Everything else here
 # is built from the contract.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _POND_SDK = os.path.normpath(os.path.join(_HERE, "..", "pond-sdk"))
 sys.path.insert(0, _POND_SDK)
 
-from lens_sdk import Lens            # noqa: E402  (base Lens = View)
-from pond_minimal import PondMinimal  # noqa: E402  (the kernel)
+from keyvalue_lens import Lens            # noqa: E402  (base Lens = View)
+from kernel import PondMinimal  # noqa: E402  (the kernel)
 
 
 # ===========================================================================

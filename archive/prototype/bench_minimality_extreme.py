@@ -28,7 +28,7 @@ import hashlib
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pond_minimal import PondMinimal, hash_bytes
+from kernel import PondMinimal, hash_bytes
 
 
 def test_remove_reference():

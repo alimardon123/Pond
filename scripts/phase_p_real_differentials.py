@@ -36,7 +36,7 @@ import re
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-core"))
-from pond_minimal import PondMinimal  # noqa: E402
+from kernel import PondMinimal  # noqa: E402
 
 PASS = 0
 FAIL = 0

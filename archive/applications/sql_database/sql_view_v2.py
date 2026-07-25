@@ -18,8 +18,8 @@ from typing import Optional, Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prototype"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "libraries"))
-from pond_minimal import PondMinimal
-from prolly_view import ProllyLensBase
+from kernel import PondMinimal
+from prolly_tree import ProllyLensBase
 
 
 class SQLLens:

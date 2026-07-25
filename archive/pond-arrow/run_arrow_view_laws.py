@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(POND_ROOT, "pond-sdk"))
 sys.path.insert(0, os.path.join(POND_ROOT, "pond-arrow"))
 
 import pyarrow as pa
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 from lens_laws import LensLaws, LensContract
 from arrow_view import ArrowLens
 

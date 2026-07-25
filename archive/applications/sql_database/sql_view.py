@@ -3,7 +3,7 @@ from typing import Optional, Any
 
 sys.path.insert(0, "/home/z/my-project/pond_repo/prototype")
 sys.path.insert(0, "/home/z/my-project/pond_repo/libraries")
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 from delta_view import DeltaViewBase
 
 class SQLLens:

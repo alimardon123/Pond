@@ -8,8 +8,8 @@ for O(1) commits, and content-based diff between versions.
 import json, time, sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prototype"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "libraries"))
-from pond_minimal import PondMinimal
-from prolly_view import ProllyLensBase, ProllyTree
+from kernel import PondMinimal
+from prolly_tree import ProllyLensBase, ProllyTree
 
 
 class PondGit:

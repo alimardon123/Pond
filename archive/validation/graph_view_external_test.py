@@ -17,7 +17,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from graph_view_external import GraphView, TOMBSTONE_HASH  # noqa: E402
-from pond_minimal import PondMinimal  # noqa: E402
+from kernel import PondMinimal  # noqa: E402
 
 
 def fresh_kernel():

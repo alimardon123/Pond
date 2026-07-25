@@ -21,7 +21,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mock_kernel import PondMinimal
-from vector_view import VectorLens
+from vector_lens import VectorLens
 
 def banner(title: str) -> None:
     print(f"\n{'='*60}")
@@ -38,7 +38,7 @@ check.failures = 0
 
 def main() -> int:
     kernel = PondMinimal()
-    view = VectorLens(kernel, "vectors")
+    lens = VectorLens(kernel, "vectors")
 
     # ------------------------------------------------------------------
     banner("1. Insert 5 vectors")

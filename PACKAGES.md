@@ -19,9 +19,11 @@ pond_repo/
 │   └── pond_minimal.py          # 3 primitives: Write, Read, Ref (~140 LOC)
 │
 ├── pond-sdk/                    # Layers 1+2: Lens SDK + Physical Structures
-│   ├── lens_sdk.py              # Lens base class, CrossLens, SemanticLens
+│   ├── pond_lens.py             # PondLens — shared namespace base (no format awareness)
+│   ├── keyvalue_lens.py         # KeyValueLens — app-facing KV lens (ProllyTreeIndex backing)
+│   ├── lens_sdk.py              # Backward-compat shim (re-exports keyvalue_lens)
 │   ├── lens_query.py            # Lazy query API (.where/.select/.join)
-│   ├── prolly_view.py           # ProllyViewBase (tiered commits, trees)
+│   ├── prolly_view.py           # ProllyLensBase (tiered commits, ProllyTreeIndex)
 │   ├── binary_encoding.py       # Binary Prolly tree encoding
 │   ├── collection.py            # Collection (reference namespace)
 │   ├── auto_index.py            # Auto-indexing (Physical Structure)

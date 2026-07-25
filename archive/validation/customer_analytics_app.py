@@ -46,8 +46,8 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 for _pkg in ("pond-core", "pond-sdk", "pond-feature-store", "pond-arrow"):
     sys.path.insert(0, os.path.join(_REPO_ROOT, _pkg))
 
-from pond_minimal import PondMinimal
-from lens_sdk import View, CrossLens
+from kernel import PondMinimal
+from keyvalue_lens import View, CrossLens
 from feature_store import FeatureStore
 from arrow_view import ArrowLens
 

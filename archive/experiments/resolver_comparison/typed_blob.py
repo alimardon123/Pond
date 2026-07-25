@@ -31,8 +31,8 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, HERE)
 
-from pond_minimal import PondMinimal
-from lens_sdk import Lens, IndexedLens
+from kernel import PondMinimal
+from keyvalue_lens import Lens, IndexedLens
 
 
 # ---------------------------------------------------------------------------
@@ -396,14 +396,14 @@ class TypedIndex(IndexedLens):
                 # bytes and the extractor expected a dict). Skip it.
                 continue
 
-        from prolly_view import ProllyTree
+        from prolly_tree import ProllyTree
         tree_root = ProllyTree.build(self.kernel, index_entries)
         self.kernel.reference(f"{self.name}__index__{index_name}", tree_root)
         return tree_root
 
     def find_cross_lens(self, index_name: str, index_key: str) -> Optional[dict]:
         """Look up via a cross-lens index. Returns typed info about the blob."""
-        from prolly_view import ProllyTree
+        from prolly_tree import ProllyTree
         from maintenance import resolve_active
         ref_name = f"{self.name}__index__{index_name}"
         tree_root = resolve_active(self.kernel, ref_name)

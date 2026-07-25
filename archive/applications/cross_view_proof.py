@@ -17,8 +17,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "libraries"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sql_database"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "streaming"))
-from pond_minimal import PondMinimal
-from prolly_view import ProllyLensBase, ProllyTree
+from kernel import PondMinimal
+from prolly_tree import ProllyLensBase, ProllyTree
 from sql_view_v2 import SQLLens
 from streaming_view import StreamingLens
 

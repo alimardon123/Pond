@@ -23,8 +23,8 @@ from typing import Optional, Any, Callable
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pond_minimal import PondMinimal
-from prolly_view import ProllyLensBase, ProllyTree
+from kernel import PondMinimal
+from prolly_tree import ProllyLensBase, ProllyTree
 from binary_encoding import BinaryProllyTree
 
 

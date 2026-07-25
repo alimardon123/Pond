@@ -33,7 +33,7 @@ import json
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
-from pond_minimal import PondMinimal, hash_bytes
+from kernel import PondMinimal, hash_bytes
 
 
 def section(title):
@@ -50,7 +50,7 @@ def section(title):
 def exp_filesystem():
     section("Backend 1: Local filesystem (baseline)")
     print()
-    print("  Already implemented in pond_minimal.py. Uses:")
+    print("  Already implemented in kernel.py. Uses:")
     print("    - os.makedirs() for shard directories")
     print("    - open()/write()/read() for blobs")
     print("    - SQLite for root namespace")

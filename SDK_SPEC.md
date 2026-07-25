@@ -79,34 +79,45 @@ primitives. They do not extend the kernel's algebra. See
 > without first writing the marker blob — it will raise
 > `ValueError`.
 
-### 1.3. Terminology: Lens = View
+### 1.3. Terminology: KeyValueLens / Lens / View
 
-The preferred term is **Lens** (an interpretation layer over
-immutable bytes). The codebase still uses `View` as the class name
-for backward compatibility; `Lens = View` is aliased in
-`pond-sdk/lens_sdk.py`. New code and documentation should use
-"Lens."
+The preferred term is **KeyValueLens** (the app-facing KEY-VALUE
+lens). Two legacy aliases are kept for backward compatibility:
+  - `Lens`  = `KeyValueLens`  (old class name)
+  - `View`  = `KeyValueLens`  (older class name)
+
+All three names refer to the same class and are interchangeable.
+New code and documentation should use `KeyValueLens`. The class
+lives in `pond-sdk/keyvalue_lens.py`; the old `pond-sdk/lens_sdk.py`
+is now a backward-compat shim that re-exports from `keyvalue_lens`.
+
+KeyValueLens is NOT the universal base class — that's `PondLens`
+in `pond-sdk/pond_lens.py`. KeyValueLens is a peer of `LakehouseLens`
+and `FeatureStoreLens`; all three extend `PondLens` directly.
 
 ### 1.4. Constructing a Lens
 
-A Lens is constructed with its kernel instance and a name:
+A KeyValueLens is constructed with its kernel instance and a name:
 
 ```python
-from lens_sdk import View, Lens  # Lens = View (alias)
+from keyvalue_lens import KeyValueLens
 
-lens = View(kernel, name: str)
-# or:
-lens = IndexedView(kernel, name: str)
-# or, for a custom Lens:
-lens = MyLens(kernel, name: str)   # MyLens extends View or IndexedView
+lens = KeyValueLens(kernel, name: str)
+# or, for an auto-indexed lens:
+from auto_index import IndexedLens
+lens = IndexedLens(kernel, name: str)
+# or, for a custom lens:
+class MyLens(KeyValueLens):
+    ...
+lens = MyLens(kernel, name: str)
 ```
 
-The `name` is the Lens's identifier in the kernel's root namespace.
+The `name` is the lens's identifier in the kernel's root namespace.
 It appears in:
-- The kernel Reference pointing to the Lens's HEAD commit:
-  `kernel.resolve(name)` returns the HEAD commit hash.
-- Branch References: `f"{name}__branch__{branch_name}"`.
-- Index References: `f"{name}__index__{index_name}"`.
+- The HEAD reference: `collections/{name}/HEAD` → latest commit hash.
+- Branch references: `collections/{name}/branches/{branch}`.
+- Index references: `{name}__index__{index_name}` (legacy convention).
+- Definition reference: `collections/{name}/definition` (optional metadata).
 
 The name must be a non-empty string. It must not contain `__`
 (double-underscore) — that sequence is reserved for the kernel
@@ -190,10 +201,11 @@ are used by the SDK:
 
 | Pattern | Purpose | Example |
 |---|---|---|
-| `{name}` | HEAD commit reference | `analytics/orders` |
-| `{name}__branch__{branch}` | Branch reference | `analytics/orders__branch__dev` |
-| `{name}__index__{index}` | Index reference | `analytics/orders__index__by_region` |
-| `{name}__snapshot` | Snapshot pointer | `analytics/orders__snapshot` |
+| `collections/{name}/HEAD` | HEAD commit reference (shared namespace) | `collections/analytics/orders/HEAD` |
+| `collections/{name}/branches/{branch}` | Branch reference | `collections/analytics/orders/branches/dev` |
+| `collections/{name}/definition` | Optional lens-specific metadata | `collections/analytics/orders/definition` |
+| `collections/{name}/snapshot` | Latest snapshot pointer (ProllyLensBase) | `collections/analytics/orders/snapshot` |
+| `{name}__index__{index}` | Index reference (legacy convention) | `analytics/orders__index__by_region` |
 | `__schema/{name}/v{version}` | Schema version (Schema Registry) | `__schema/user_features/v1` |
 | `__stats/{name}` | Statistics (Physical Structure) | `__stats/users` |
 | `__bloom/{name}` | Bloom filter (Physical Structure) | `__bloom/user_features` |
@@ -209,14 +221,14 @@ Returns the generated key. Use this when your data does not have a
 natural primary key (event logs, time-series, append-only streams).
 
 For primary-keyless Lenses (where every entry is append-only and
-looked up by scan, not by key), use `KeylessView` (in
-`pond-sdk/lens_sdk.py`):
+looked up by scan, not by key), use `KeylessLens` (in
+`pond-sdk/keyvalue_lens.py`):
 
 ```python
-from lens_sdk import KeylessView
+from keyvalue_lens import KeylessLens
 
-lens = KeylessView(kernel, "events")
-lens.put_auto({"event": "click", "user": "u1", "ts": 1721500000})
+lens = KeylessLens(kernel, "events")
+lens.put(None, {"event": "click", "user": "u1", "ts": 1721500000})
 ```
 
 ---
@@ -235,15 +247,16 @@ the kernel and decoded via `lens.decode(bytes)`.
 
 ### 3.2. `get()` complexity (Ambiguity C)
 
-- **`View` (base class):** O(N) — reads the entire snapshot and
-  scans for the key. Suitable for small Lenses or testing.
-- **`IndexedView`:** O(log N) — uses a Prolly tree for O(log N)
-  point lookup. This is the production-grade base class.
-- **`ProllyViewBase`:** O(log N) — the underlying Prolly tree
-  implementation used by `IndexedView`.
+- **`KeyValueLens` (the app-facing KV lens):** O(log N) — uses a
+  Prolly tree (ProllyLensBase) for O(log N) point lookup. This is
+  the only KV lens class; `Lens` and `View` are aliases for it.
+- **`ProllyLensBase` (the storage backend):** O(log N) — the
+  underlying Prolly tree implementation used by KeyValueLens.
 
-**Recommendation:** always extend `IndexedView` (or `ProllyViewBase`)
-for production Lenses. The base `View` class is for prototyping only.
+**Recommendation:** extend `KeyValueLens` for production KV lenses.
+For auto-indexing, extend `IndexedLens` (in `auto_index.py`), which
+adds eager/lazy auto-index management on top of the same Prolly
+tree storage.
 
 ### 3.3. `get_all() -> dict`
 
@@ -598,9 +611,8 @@ Subclasses override these to use a different format. Examples:
 |---|---|---|---|
 | `LakehouseLens` | PyArrow Table → Parquet | Parquet → PyArrow Table | `lenses/lakehouse/lakehouse.py` |
 | `FeatureStoreLens` | PyArrow Table → Parquet | Parquet → PyArrow Table | `pond-labs/feature_store_lens.py` |
-| `VectorView` | `struct.pack` floats | `struct.unpack` | `lenses/vector/vector_view.py` |
-| `SQLView` (reference) | JSON rows | JSON rows | `archive/pond-sql/sql_view.py` |
-| Default `View` | JSON | JSON | `pond-sdk/lens_sdk.py` |
+| `VectorLens` | `struct.pack` floats | `struct.unpack` | `lenses/vector/vector_view.py` |
+| Default `KeyValueLens` | JSON | JSON | `pond-sdk/keyvalue_lens.py` |
 
 The encode/decode pair MUST satisfy Law 1 (round-trip):
 `decode(encode(d)) == d` for all `d`. This is verified by
@@ -626,7 +638,7 @@ The encode/decode pair MUST satisfy Law 1 (round-trip):
   (`services/transport/`) handles compression + encryption as a
   cross-cutting service. The SDK does not compress automatically.
 - **No cache.** The SDK reads from the kernel on every `get()`.
-  Lenses cache if they want to (e.g., `IndexedView`'s
+  Lenses cache if they want to (e.g., `IndexedLens`'s
   `_cached_entries`).
 - **No concurrency control.** The SDK is single-threaded.
 
@@ -640,8 +652,10 @@ keeping the SDK minimal. See `docs/NON_GOALS.md` for the full list.
 
 Before claiming a Lens is SDK-compliant, verify:
 
-- [ ] The Lens extends `View` or `IndexedView`, OR is built directly
-      on the kernel following §7's commit format.
+- [ ] The Lens extends `KeyValueLens` (for KV-style lenses) or
+      `PondLens` directly (for lenses with custom storage like
+      `LakehouseLens`), OR is built directly on the kernel following
+      §7's commit format.
 - [ ] The Lens's `encode`/`decode` pair satisfies round-trip
       (Law 1 of the Lens algebra).
 - [ ] The Lens's operations are deterministic (Law 2).

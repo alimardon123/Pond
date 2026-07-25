@@ -26,7 +26,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 
-from pond_minimal import PondMinimal, hash_bytes
+from kernel import PondMinimal, hash_bytes
 
 
 # ===========================================================================

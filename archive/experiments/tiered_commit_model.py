@@ -95,9 +95,9 @@ sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 from binary_encoding import BinaryProllyTree
-from prolly_view import ProllyTree, TARGET_CHUNK_ENTRIES
+from prolly_tree import ProllyTree, TARGET_CHUNK_ENTRIES
 
 
 # Configuration

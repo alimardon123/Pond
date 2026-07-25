@@ -267,7 +267,7 @@ def test_s3_vs_filesystem_equivalence():
         return
 
     from moto import mock_aws
-    from pond_minimal import PondMinimal
+    from kernel import PondMinimal
 
     @mock_aws
     def run_test():

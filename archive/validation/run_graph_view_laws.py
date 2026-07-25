@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(POND_ROOT, "pond-core"))
 sys.path.insert(0, os.path.join(POND_ROOT, "pond-sdk"))
 sys.path.insert(0, os.path.join(POND_ROOT, "validation"))
 
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 from lens_laws import LensLaws, LensContract
 from graph_view_external import GraphView
 

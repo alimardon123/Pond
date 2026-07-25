@@ -4,7 +4,7 @@ LogLens — External Implementation Challenge (Task ID 27).
 Implemented ONLY from:
   - RFC-0013: The Lens Interpretation Contract
   - RFC-0012: The Lens Architecture
-  - pond-core/pond_minimal.py (the 3-primitive kernel)
+  - pond-core/kernel.py (the 3-primitive kernel)
   - DESIGN_GOALS.md
   - pond-sdk/view_sdk.py — consulted ONLY to locate the `Lens` base class
     (alias for `View`). No other Lens implementation was read.
@@ -44,7 +44,7 @@ from typing import Any, Callable, Optional
 # ---------------------------------------------------------------------------
 # Import path setup. pond-sdk/view_sdk.py adds prototype/ and pond-sdk/ to
 # sys.path at import time and imports `pond_minimal` from there. We want to
-# use pond-core/pond_minimal.py (the file the task told us to read). Both
+# use pond-core/kernel.py (the file the task told us to read). Both
 # expose the same `PondMinimal` API (write/read/reference/resolve/list_names).
 # ---------------------------------------------------------------------------
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -52,8 +52,8 @@ POND_ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(POND_ROOT, "pond-sdk"))
 sys.path.insert(0, os.path.join(POND_ROOT, "pond-core"))
 
-from pond_minimal import PondMinimal          # the 3-primitive kernel
-from lens_sdk import Lens                     # Lens is the alias for View (RFC-0012 §2)
+from kernel import PondMinimal          # the 3-primitive kernel
+from keyvalue_lens import Lens                     # Lens is the alias for View (RFC-0012 §2)
 
 
 # ---------------------------------------------------------------------------

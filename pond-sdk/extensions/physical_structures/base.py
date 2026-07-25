@@ -20,7 +20,7 @@ For example:
   __bloom/users          → bloom filter blob hash
   __stats/users          → statistics blob hash
   __zonemaps/users       → zone map blob hash
-  __index/{collection}/{index_name} → index blob hash (already in auto_index.py)
+  __index/{collection}/{index_name} → index blob hash (already in indexing.py)
 
 The naming convention is the contract. Any Lens can resolve these refs.
 """

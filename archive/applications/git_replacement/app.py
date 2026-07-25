@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pond_git import PondGit
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prototype"))
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 
 
 def get_repo():

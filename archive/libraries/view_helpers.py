@@ -22,7 +22,7 @@ import os
 from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prototype"))
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 
 # ---------------------------------------------------------------------------
 # Sharded Tree — fixes Friction 2 (O(N) tree per commit)

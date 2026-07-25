@@ -283,6 +283,7 @@ only makes sense with `pond-feature-store` or `pond-semantic` present
 |---|---|---|
 | `README.md` | Project overview, hypothesis, status | You are new to Pond |
 | `DESIGN_GOALS.md` (this file) | Six design principles + repo map | You are starting any work on Pond |
+| `REPO_ORGANIZATION.md` | Folder rules, naming conventions, promotion process, no lens-to-lens inheritance | You are adding files, moving code, or promoting from pond-labs |
 | `SDK_SPEC.md` | Authoritative SDK contract (settles all 10 validation ambiguities) | You are building a Lens or modifying the SDK |
 | `PACKAGES.md` | Package boundaries and removability discipline | You are adding or modifying a package |
 | `worklog.md` | Append-only research log | You need to know what previous agents did |

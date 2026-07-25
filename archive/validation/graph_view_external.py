@@ -1,7 +1,7 @@
 """
 GraphView — external validation of Pond SDK (Task 12).
 
-Built from SDK_SPEC.md and pond-core/pond_minimal.py ONLY.
+Built from SDK_SPEC.md and pond-core/kernel.py ONLY.
 Does NOT import pond-sdk (built from spec, not copied).
 
 Design choice (per task instructions, option (b)):
@@ -47,14 +47,14 @@ import hashlib
 from typing import Any, Optional
 
 # Make pond-core importable. The spec (§1.1) shows
-# `from pond_minimal import PondMinimal` — implying pond-core is on
+# `from kernel import PondMinimal` — implying pond-core is on
 # the path. We add it explicitly here.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _POND_CORE = os.path.normpath(os.path.join(_HERE, "..", "pond-core"))
 if _POND_CORE not in sys.path:
     sys.path.insert(0, _POND_CORE)
 
-from pond_minimal import PondMinimal  # noqa: E402
+from kernel import PondMinimal  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ def _ensure_tombstone_blob(kernel: PondMinimal) -> None:
     """Write the tombstone marker blob if it doesn't already exist.
 
     The kernel's `reference()` checks that the target hash refers to an
-    existing blob (pond_minimal.py line 155-156). SDK_SPEC.md §4.5 and
+    existing blob (kernel.py line 155-156). SDK_SPEC.md §4.5 and
     RFC-0008 §6 both show `drop_name(kernel, name) ->
     kernel.reference(name, TOMBSTONE_HASH)` — but neither tells you to
     write the marker blob first. On a fresh kernel the example code in

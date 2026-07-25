@@ -23,7 +23,7 @@ import hashlib
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prototype"))
-from pond_minimal import PondMinimal, hash_bytes
+from kernel import PondMinimal, hash_bytes
 from views_minimal import write_tree, read_tree, write_commit, read_commit
 
 

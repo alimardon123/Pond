@@ -6,9 +6,9 @@ This file was authored by a fresh agent who had never seen Pond before.
 Allowed inputs:
   - RFC-0013 (the contract)
   - RFC-0012 (the architecture)
-  - pond-core/pond_minimal.py (the ~140-LOC kernel)
+  - pond-core/kernel.py (the ~140-LOC kernel)
   - POND.md (the one-page summary)
-  - lens_sdk.py — consulted ONLY for the Lens class import path
+  - keyvalue_lens.py — consulted ONLY for the Lens class import path
     and `Lens(kernel, name)` constructor signature.
 
 It was NOT allowed to read any existing Lens implementation, test,
@@ -67,8 +67,8 @@ for _p in (_POND_SDK, _POND_CORE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from lens_sdk import Lens                       # noqa: E402
-from pond_minimal import PondMinimal            # noqa: E402
+from keyvalue_lens import Lens                       # noqa: E402
+from kernel import PondMinimal            # noqa: E402
 
 
 # ===========================================================================

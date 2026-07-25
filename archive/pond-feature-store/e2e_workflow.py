@@ -51,9 +51,9 @@ for _pkg in ("pond-core", "pond-sdk", "pond-semantic", "pond-arrow"):
     sys.path.insert(0, os.path.join(_REPO_ROOT, _pkg))
 sys.path.insert(0, _HERE)
 
-from pond_minimal import PondMinimal
+from kernel import PondMinimal
 from feature_store import FeatureStore
-from lens_sdk import View, CrossLens
+from keyvalue_lens import View, CrossLens
 
 
 # ---------------------------------------------------------------------------

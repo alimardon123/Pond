@@ -55,8 +55,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "pond-sdk"))
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from pond_minimal import PondMinimal
-from lens_sdk import View
+from kernel import PondMinimal
+from keyvalue_lens import View
 
 
 # ---------------------------------------------------------------------------
@@ -404,14 +404,14 @@ class ArrowLens(Lens):
             index_entries[full_key] = snapshot_h
 
         # Build Prolly tree (same pattern as base class create_index)
-        from prolly_view import ProllyTree
+        from prolly_tree import ProllyTree
         tree_root = ProllyTree.build(self.kernel, index_entries)
         self.kernel.reference(f"{self.name}__index__{index_name}", tree_root)
         return tree_root
 
     def _build_prolly_empty(self) -> str:
         """Build an empty Prolly tree and return its root hash."""
-        from prolly_view import ProllyTree
+        from prolly_tree import ProllyTree
         return ProllyTree.build(self.kernel, {})
 
     def find_by_arrow(self, index_name: str, index_key: str) -> Optional[dict]:
@@ -423,7 +423,7 @@ class ArrowLens(Lens):
         A future optimization would store per-row blobs or use a
         multi-valued index with row-primary-key references.
         """
-        from prolly_view import ProllyTree
+        from prolly_tree import ProllyTree
         from maintenance import resolve_active
         ref_name = f"{self.name}__index__{index_name}"
         tree_root = resolve_active(self.kernel, ref_name)

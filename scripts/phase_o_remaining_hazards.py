@@ -29,7 +29,7 @@ import random
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-core"))
 sys.path.insert(0, SCRIPT_DIR)
-from pond_minimal import PondMinimal  # noqa: E402
+from kernel import PondMinimal  # noqa: E402
 from phase_l_hazard_simulator import HazardSimulator, HazardConfig  # noqa: E402
 
 PASS = 0

@@ -23,8 +23,8 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 
-from pond_minimal import PondMinimal
-from lens_sdk import Lens
+from kernel import PondMinimal
+from keyvalue_lens import Lens
 
 # Real format libraries
 import pyarrow as pa
@@ -350,7 +350,7 @@ def run_falsification():
         if isinstance(decoded, dict) and "region" in decoded:
             index_entries[f"_index/by_region/{decoded['region']}"] = bh
 
-    from prolly_view import ProllyTree
+    from prolly_tree import ProllyTree
     if index_entries:
         tree_root = ProllyTree.build(kernel, index_entries)
         kernel.reference("workspace__index__by_region", tree_root)
