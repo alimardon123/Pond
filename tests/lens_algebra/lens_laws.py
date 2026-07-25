@@ -520,9 +520,16 @@ def _test_default_view_passes_laws():
 
 
 def _test_indexed_view_passes_laws():
-    """Smoke test: the IndexedLens class should also pass all 6 laws."""
+    """Smoke test: KeyValueLens + CollectionMetadata index should pass all 6 laws.
+
+    This replaces the old IndexedLens test. IndexedLens is deprecated;
+    new code uses KeyValueLens + CollectionMetadata (data-side indexing).
+    """
     import shutil
-    from extensions.indexing.auto_index import IndexedLens
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lenses", "keyvalue"))
+    _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-sdk"))
+    from keyvalue_lens import KeyValueLens as Lens
 
     bench_dir = "/tmp/pond_view_laws_indexed_test"
     if os.path.exists(bench_dir):
@@ -530,19 +537,19 @@ def _test_indexed_view_passes_laws():
     os.makedirs(bench_dir)
     kernel = PondMinimal(bench_dir)
 
-    lens = IndexedLens(kernel, "lawtest_idx")
-    # Register an index to exercise the materialization path
-    lens.register_index("by_value", lambda d: str(d.get("value", 0)), mode="eager")
+    lens = Lens(kernel, "lawtest_idx")
 
-    # For Law 4: treat the index as a materialization
+    # For Law 4: build an index via CollectionMetadata and treat it as
+    # a materialization. The build_mat function builds the index and
+    # returns a deterministic artifact (the index tree root hash).
     def build_mat(name: str) -> bytes:
         if name == "by_value":
-            # Force a rebuild and return the tree root hash bytes
-            idx = lens._auto_indexes.get("by_value")
-            if idx is None:
-                return b""
-            lens._rebuild_index(idx)
-            return (idx.tree_root or "").encode()
+            from collection_metadata import CollectionMetadata
+            meta = CollectionMetadata(kernel)
+            root = meta.build_index("lawtest_idx", "by_value",
+                     extractor=lambda d: str(d.get("value", 0)),
+                     scan_fn=lambda: ((k, lens.get(k)) for k in lens.keys()))
+            return (root or "").encode()
         return b""
 
     contract = LensContract(
@@ -569,8 +576,8 @@ def _test_indexed_view_passes_laws():
     kernel.close()
     shutil.rmtree(bench_dir, ignore_errors=True)
 
-    assert report.all_passed, "IndexedLens should pass all 6 laws"
-    print("PASS: IndexedLens satisfies all 6 View algebra laws")
+    assert report.all_passed, "KeyValueLens + CollectionMetadata should pass all 6 laws"
+    print("PASS: KeyValueLens + CollectionMetadata satisfies all 6 View algebra laws")
 
 
 def _run_all_tests():

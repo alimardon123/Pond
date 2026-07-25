@@ -59,18 +59,18 @@ def make_default_view_contract(kernel) -> tuple:
 
 
 def make_indexed_view_contract(kernel) -> tuple:
-    """Contract for IndexedLens with an eager index as materialization."""
-    from extensions.indexing.auto_index import IndexedLens
-    lens = IndexedLens(kernel, "ci_indexed")
-    lens.register_index("by_value", lambda d: str(d.get("value", 0)), mode="eager")
+    """Contract for KeyValueLens + CollectionMetadata index (replaces deprecated IndexedLens)."""
+    from keyvalue_lens import KeyValueLens
+    from collection_metadata import CollectionMetadata
+    lens = KeyValueLens(kernel, "ci_indexed")
 
     def build_mat(name: str) -> bytes:
         if name == "by_value":
-            idx = lens._auto_indexes.get("by_value")
-            if idx is None:
-                return b""
-            lens._rebuild_index(idx)
-            return (idx.tree_root or "").encode()
+            meta = CollectionMetadata(kernel)
+            root = meta.build_index("ci_indexed", "by_value",
+                     extractor=lambda d: str(d.get("value", 0)),
+                     scan_fn=lambda: ((k, lens.get(k)) for k in lens.keys()))
+            return (root or "").encode()
         return b""
 
     return lens, LensContract(
@@ -110,26 +110,29 @@ def make_semantic_view_contract(kernel) -> tuple:
 
 
 def make_multikey_view_contract(kernel) -> tuple:
-    """Contract for IndexedLens with a multi-key (list-returning) extractor.
+    """Contract for KeyValueLens + CollectionMetadata with multi-key indexes.
 
-    Tests Phase B.3 multikey index support: extractor returns a list of
-    tags, and the row is indexed under each tag.
+    Tests multi-key index support: extractor returns a list of tags,
+    and the row is indexed under each tag. Uses CollectionMetadata
+    (data-side) instead of the deprecated IndexedLens.
     """
-    from extensions.indexing.auto_index import IndexedLens
-    lens = IndexedLens(kernel, "ci_multikey")
-    lens.register_index("by_tag",
-                         lambda d: d.get("tags", []),
-                         mode="eager")
-    lens.register_index("by_id",
-                         lambda d: str(d.get("id", 0)),
-                         mode="eager")
+    from keyvalue_lens import KeyValueLens
+    from collection_metadata import CollectionMetadata
+    lens = KeyValueLens(kernel, "ci_multikey")
 
     def build_mat(name: str) -> bytes:
-        idx = lens._auto_indexes.get(name)
-        if idx is None:
+        meta = CollectionMetadata(kernel)
+        if name == "by_tag":
+            root = meta.build_index("ci_multikey", "by_tag",
+                     extractor=lambda d: d.get("tags", []),
+                     scan_fn=lambda: ((k, lens.get(k)) for k in lens.keys()))
+        elif name == "by_id":
+            root = meta.build_index("ci_multikey", "by_id",
+                     extractor=lambda d: str(d.get("id", 0)),
+                     scan_fn=lambda: ((k, lens.get(k)) for k in lens.keys()))
+        else:
             return b""
-        lens._rebuild_index(idx)
-        return (idx.tree_root or "").encode()
+        return (root or "").encode()
 
     return lens, LensContract(
         name="ci_multikey",
