@@ -1058,20 +1058,171 @@ class PondLakehouse:
         """Point lookup: O(log N) via the ProllyTreeIndex."""
         return self.lens.range_point_lookup(name, key)
 
-    def query(self, sql: str, table_name: Optional[str] = None) -> pa.Table:
+    def query(self, sql: str, table_name: Optional[str] = None,
+              use_pruning: bool = True) -> pa.Table:
         """Run a SQL query against a Pond-hosted table.
 
         If table_name is provided, the table is registered with DuckDB
         as a named relation. The SQL can then reference it by name.
 
+        PREDICATE + PROJECTION PUSHDOWN:
+        When use_pruning is True (default) and the SQL contains a WHERE
+        clause with simple column-op-value predicates, the query method
+        automatically:
+          1. Extracts WHERE predicates from the SQL
+          2. Uses read_with_pruning to skip non-matching row groups
+          3. Uses read_columns for projection pushdown (only needed columns)
+          4. Registers the pruned+projected table with DuckDB
+          5. Executes the SQL on the reduced dataset
+
+        This combines Vortex-style predicate pushdown (skip row groups
+        via zone maps) with projection pushdown (read only needed columns
+        from Parquet). For selective queries on wide tables, this can
+        reduce I/O by 10-100x.
+
         Example:
             lh.create_table("users", users_data)
-            result = lh.query("SELECT COUNT(*) FROM users", table_name="users")
+            result = lh.query("SELECT COUNT(*) FROM users WHERE age > 30",
+                              table_name="users")
+
+        Args:
+            sql: the SQL query string
+            table_name: name of the table to register
+            use_pruning: if True, attempt predicate + projection pushdown.
+                If False, read the full table (no pruning).
         """
         if table_name:
-            table = self.lens.read_table(table_name)
+            if use_pruning:
+                table = self._read_with_pushdown(sql, table_name)
+            else:
+                table = self.lens.read_table(table_name)
             self.duckdb.register(table_name, table)
         return self.duckdb.execute(sql).to_arrow_table()
+
+    def _read_with_pushdown(self, sql: str, table_name: str) -> pa.Table:
+        """Read a table with predicate + projection pushdown.
+
+        Extracts WHERE predicates and SELECT columns from the SQL, then
+        uses read_with_pruning + read_columns to minimize I/O.
+        Falls back to full read_table if extraction fails.
+        """
+        try:
+            # Extract predicates from WHERE clause
+            predicates = self._extract_predicates(sql)
+
+            # Extract projected columns from SELECT clause
+            columns = self._extract_columns(sql)
+
+            if predicates:
+                # Use pruning: read only row groups that might match
+                table = self.lens.read_with_pruning(
+                    table_name,
+                    predicates=predicates,
+                )
+                # Apply projection on the pruned result.
+                # MUST include WHERE columns so DuckDB can evaluate the filter.
+                if columns and columns != ["*"]:
+                    # Add predicate columns to the projection
+                    pred_cols = [p[0] for p in predicates]
+                    all_cols = list(set(columns + pred_cols))
+                    available = [c for c in all_cols if c in table.column_names]
+                    if available:
+                        table = table.select(available)
+                return table
+            elif columns and columns != ["*"]:
+                # No WHERE but projection pushdown
+                return self.lens.read_columns(table_name, columns)
+            else:
+                # No pushdown possible — full read
+                return self.lens.read_table(table_name)
+        except Exception:
+            # Any failure in pushdown → fall back to full read
+            return self.lens.read_table(table_name)
+
+    @staticmethod
+    def _extract_predicates(sql: str) -> list:
+        """Extract simple column-op-value predicates from a SQL WHERE clause.
+
+        Supports: =, !=, <, <=, >, >= on simple column comparisons.
+        Returns a list of (column, op, value) tuples.
+
+        Does NOT handle:
+          - Joins (predicates on joined tables)
+          - Subqueries
+          - Complex expressions (functions, arithmetic)
+          - IN with lists (future work)
+        """
+        import re
+
+        predicates = []
+
+        # Find WHERE clause (case-insensitive)
+        where_match = re.search(r'\bWHERE\b\s+(.+?)(?:\bGROUP\b|\bORDER\b|\bLIMIT\b|$)',
+                                sql, re.IGNORECASE | re.DOTALL)
+        if not where_match:
+            return predicates
+
+        where_clause = where_match.group(1).strip()
+
+        # Split on AND (case-insensitive)
+        parts = re.split(r'\s+AND\s+', where_clause, flags=re.IGNORECASE)
+
+        # Pattern: column OP value
+        # Supports: =, !=, <, <=, >, >=
+        pattern = r'(\w+)\s*(=|!=|<=|>=|<|>)\s*'
+        pattern += r"(?:'([^']*)'|(\d+\.?\d*))"  # string or number
+
+        for part in parts:
+            match = re.match(pattern, part.strip(), re.IGNORECASE)
+            if match:
+                col, op, str_val, num_val = match.groups()
+                if str_val is not None:
+                    value = str_val
+                elif num_val is not None:
+                    value = float(num_val) if '.' in num_val else int(num_val)
+                else:
+                    continue
+                predicates.append((col, op, value))
+
+        return predicates
+
+    @staticmethod
+    def _extract_columns(sql: str) -> list:
+        """Extract projected column names from a SQL SELECT clause.
+
+        Returns ["*"] for SELECT * or if extraction fails.
+        Returns a list of column names for SELECT col1, col2, ...
+        """
+        import re
+
+        # Find SELECT ... FROM
+        select_match = re.match(r'\s*SELECT\s+(.+?)\s+FROM\s+',
+                                sql, re.IGNORECASE | re.DOTALL)
+        if not select_match:
+            return ["*"]
+
+        cols_str = select_match.group(1).strip()
+
+        # SELECT *
+        if cols_str == "*":
+            return ["*"]
+
+        # SELECT COUNT(*), SUM(col), etc. — don't project (need all columns for aggregation)
+        if re.search(r'\b(COUNT|SUM|AVG|MIN|MAX)\s*\(', cols_str, re.IGNORECASE):
+            return ["*"]
+
+        # Split on commas, extract column names
+        parts = [p.strip() for p in cols_str.split(",")]
+        columns = []
+        for part in parts:
+            # Handle "column" or "table.column" or "column AS alias"
+            col_match = re.match(r'(?:\w+\.)?(\w+)(?:\s+AS\s+\w+)?$', part, re.IGNORECASE)
+            if col_match:
+                columns.append(col_match.group(1))
+            else:
+                return ["*"]  # can't parse — read all columns
+
+        return columns if columns else ["*"]
 
     def query_at(self, sql: str, table_name: str, commit_hash: str) -> pa.Table:
         """Time travel: query a table at a specific commit."""
