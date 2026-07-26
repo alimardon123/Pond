@@ -115,8 +115,7 @@ def bench_query(label, lens, kernel, collection, predicates, row_filter, t_full)
 
     # Count how many blobs were read (via stats)
     zm_index = ZoneMapIndex(kernel)
-    zm_base = zm_index._get_base(collection)
-    total_zms = sum(1 for k in zm_base.read_all().keys() if not k.startswith("_"))
+    total_zms = zm_index.count_zone_maps(collection)
 
     # Count non-pruned by re-running with PruningReader stats
     from pruning import PruningPredicate, ColumnPredicate

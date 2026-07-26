@@ -461,13 +461,12 @@ class LakehouseLens(PondLens):
         except ImportError:
             pass
 
-        # Clear old zone maps for this collection (overwrite semantics)
+        # Clear old zone maps for this collection (overwrite semantics).
+        # Uses the public clear_zone_maps() API instead of reaching into
+        # zm_index._get_base(name).
         if zm_index is not None:
             try:
-                zm_base = zm_index._get_base(name)
-                for k in zm_base.read_all().keys():
-                    if k.startswith(_RG_PREFIX):
-                        zm_base.stage_delete(k)
+                zm_index.clear_zone_maps(name)
             except Exception:
                 pass  # clearing is best-effort
 
@@ -817,7 +816,7 @@ class LakehouseLens(PondLens):
             snapshot_root = commit.get("snapshot")
             if snapshot_root is None:
                 base = ProllyLensBase(self.kernel, name)
-                state = base._read_state_from_commit(commit_hash)
+                state = base.read_state_at_commit(commit_hash)
             else:
                 state = ProllyTree.read_all(self.kernel, snapshot_root)
         else:
@@ -1269,18 +1268,17 @@ class LakehouseLens(PondLens):
         )
 
     def _infer_columns(self, name: str, zm_index) -> list[str]:
-        """Infer column names from the first zone map of a collection."""
+        """Infer column names from the first zone map of a collection.
+
+        Uses the public iter_zone_maps() API instead of reaching into
+        zm_index._get_base(name).
+        """
         try:
-            zm_base = zm_index._get_base(name)
-            state = zm_base.read_all()
-            for k in sorted(state.keys()):
-                if k.startswith(_RG_PREFIX):
-                    zm_blob_hash = state[k]
-                    zm_dict = json.loads(self.kernel.read_blob(zm_blob_hash))
-                    if "column_chunks" in zm_dict:
-                        return list(zm_dict["column_chunks"].get(
-                            "column_chunks", {}).keys())
-                    return list(zm_dict.get("min", {}).keys())
+            for _rg_key, zm_dict in zm_index.iter_zone_maps(name):
+                if "column_chunks" in zm_dict:
+                    return list(zm_dict["column_chunks"].get(
+                        "column_chunks", {}).keys())
+                return list(zm_dict.get("min", {}).keys())
         except Exception:
             pass
         return []
@@ -1353,11 +1351,8 @@ class LakehouseLens(PondLens):
                 from pruning import ZoneMap
                 zm_index = CollectionMetadata(self.kernel).zm_index
                 if zm_index is not None:
-                    # Clear old zone maps for this collection
-                    zm_base = zm_index._get_base(name)
-                    for k in zm_base.read_all().keys():
-                        if k.startswith(_RG_PREFIX):
-                            zm_base.stage_delete(k)
+                    # Clear old zone maps for this collection (public API)
+                    zm_index.clear_zone_maps(name)
             except ImportError:
                 zm_index = None
 
@@ -1458,7 +1453,6 @@ class LakehouseLens(PondLens):
         """
         if ProllyLensBase is None:
             raise ImportError("LakehouseLens requires prolly_tree.py")
-        from binary_encoding import BinaryProllyTree as _BPT
 
         base = ProllyLensBase(self.kernel, name)
         n_rows = table.num_rows
@@ -1480,25 +1474,14 @@ class LakehouseLens(PondLens):
                 rg_key = f"{_RG_PREFIX}{max_pk}"
                 base.stage(rg_key, parquet_hash)
 
-        # Build the merged state and create a merge commit with 2 parents
-        full_state = base._compute_full_state(first_parent)
-        for k, h in base._staged_add.items():
-            full_state[k] = h
-        for k in base._staged_del:
-            full_state.pop(k, None)
-        tree_root = ProllyTree.build(self.kernel, full_state)
-
-        commit_data = _BPT.encode_commit(
-            first_parent, tree_root, {}, [], tree_root,
-            message, time.time(), base._commit_index,
-            second_parent=second_parent)
-        commit_hash = self.kernel.write(commit_data)
-        self.kernel.reference(self._head_ref(name), commit_hash)
-        self.kernel.reference(f"collections/{name}/snapshot", commit_hash)
-
-        base._staged_add.clear()
-        base._staged_del.clear()
-        base._commit_index += 1
+        # Create a 2-parent merge commit with the staged row groups.
+        # Uses the public create_merge_commit() API instead of reaching
+        # into _compute_full_state, _staged_add, _staged_del, _commit_index.
+        commit_hash = base.create_merge_commit(
+            parent=first_parent,
+            second_parent=second_parent,
+            message=message,
+        )
         self._cached_tables.pop(f"{name}:{commit_hash}", None)
         self._notify_indexers(name)
         return commit_hash
@@ -1536,7 +1519,7 @@ class LakehouseLens(PondLens):
         if snapshot_root is None:
             # Delta-only commit — walk to find the snapshot
             base = ProllyLensBase(self.kernel, name)
-            state = base._read_state_from_commit(commit_hash)
+            state = base.read_state_at_commit(commit_hash)
         else:
             state = ProllyTree.read_all(self.kernel, snapshot_root)
 

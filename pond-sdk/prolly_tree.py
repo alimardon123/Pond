@@ -713,8 +713,24 @@ class ProllyLensBase:
             return {}
         return self._read_state_from_commit(from_hash)
 
+    def read_state_at_commit(self, commit_hash: str) -> dict[str, str]:
+        """Read the full key→blob_hash state at a specific commit.
+
+        PUBLIC accessor for historical state. Walks the commit chain
+        from `commit_hash` back to the most recent snapshot, applying
+        deltas in reverse order. This is the public replacement for
+        the previous `_read_state_from_commit` reach-through.
+
+        Args:
+            commit_hash: the commit to read state at
+
+        Returns:
+            dict mapping key → blob_hash at that commit.
+        """
+        return self._read_state_from_commit(commit_hash)
+
     def _read_state_from_commit(self, commit_hash: str) -> dict[str, str]:
-        """Read the full state at a specific commit."""
+        """Read the full state at a specific commit. (Private alias.)"""
         deltas = []
         current = commit_hash
         while current:
@@ -739,7 +755,78 @@ class ProllyLensBase:
         return state
 
     def _read_state_at(self, commit_hash: str) -> dict[str, str]:
+        """Backward-compat alias for read_state_at_commit."""
         return self._read_state_from_commit(commit_hash)
+
+    def create_merge_commit(self, parent: Optional[str],
+                              second_parent: str,
+                              message: str = "") -> str:
+        """Create a 2-parent merge commit with the currently-staged changes.
+
+        This is the PUBLIC replacement for the previous pattern of lenses
+        reaching into `_compute_full_state`, `_staged_add`, `_staged_del`,
+        and `_commit_index` to build a custom merge commit.
+
+        The merge semantics:
+          1. Start from the full state at `parent` (the commit being
+             merged INTO — usually current HEAD).
+          2. Apply staged additions (keys → blob hashes from stage()).
+          3. Apply staged deletions (keys from stage_delete()).
+          4. Build a Prolly tree from the resulting state.
+          5. Write a snapshot commit with BOTH parents:
+               parent: the commit being merged INTO
+               second_parent: the commit being merged FROM
+          6. Update HEAD + snapshot pointer.
+          7. Clear staging + bump commit index.
+
+        Note: this is NOT a 3-way merge. It does not consult
+        second_parent's state — it just records it as a parent for
+        DAG topology. The caller is responsible for computing the
+        merged content (via stage()/stage_delete() on this base).
+
+        Args:
+            parent: the commit being merged INTO (usually current HEAD).
+                None for a root commit (no first parent).
+            second_parent: the commit being merged FROM. Must not be None.
+            message: commit message.
+
+        Returns:
+            The new commit hash.
+        """
+        if not second_parent:
+            raise ValueError("second_parent is required for a merge commit")
+        if not self.has_staged():
+            raise ValueError("Nothing to commit — call stage()/stage_delete() first")
+
+        from binary_encoding import BinaryProllyTree as _BPT
+
+        # Compute the merged state: parent's state + staged adds - staged dels
+        full_state = self._compute_full_state(parent)
+        for k, h in self._staged_add.items():
+            full_state[k] = h
+        for k in self._staged_del:
+            full_state.pop(k, None)
+        tree_root = ProllyTree.build(self.kernel, full_state)
+
+        commit_data = _BPT.encode_commit(
+            parent, tree_root, {}, [], tree_root,
+            message or f"merge commit (second_parent={second_parent[:8]})",
+            time.time(), self._commit_index,
+            second_parent=second_parent)
+        commit_hash = self.kernel.write(commit_data)
+
+        # Update HEAD + snapshot pointer (merge always creates a snapshot)
+        self.kernel.reference(f"collections/{self.name}/HEAD", commit_hash)
+        self.kernel.reference(self._snapshot_ref, commit_hash)
+        if self._active_branch:
+            self.kernel.reference(self._active_branch, commit_hash)
+        self._delta_count_since_snapshot = 0
+
+        # Clear staging + bump commit index
+        self._staged_add.clear()
+        self._staged_del.clear()
+        self._commit_index += 1
+        return commit_hash
 
     def _resolve_prefix(self, prefix: str) -> str:
         current = self.kernel.resolve(f"collections/{self.name}/HEAD")

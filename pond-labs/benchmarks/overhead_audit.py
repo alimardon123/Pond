@@ -280,10 +280,7 @@ def test_binary_data():
         has_zm = zm_index.has_zone_maps("videos")
         if has_zm:
             # Zone maps may exist but with no min/max (binary data can't compute stats)
-            base = zm_index._get_base("videos")
-            state = base.read_all()
-            for k, h in state.items():
-                zm_dict = json.loads(kernel.read_blob(h))
+            for _k, zm_dict in zm_index.iter_zone_maps("videos"):
                 if zm_dict.get("min"):
                     print(f"  [WARN] Zone map has min values for binary data: {zm_dict['min']}")
                 else:

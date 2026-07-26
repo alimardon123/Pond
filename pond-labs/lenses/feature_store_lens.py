@@ -500,25 +500,14 @@ class FeatureStoreLens(PondLens):
                 rg_key = f"{_FS_RG_PREFIX}{max_pk}"
                 base.stage(rg_key, parquet_hash)
 
-        # Build merged state and create 2-parent merge commit
-        full_state = base._compute_full_state(first_parent)
-        for k, h in base._staged_add.items():
-            full_state[k] = h
-        for k in base._staged_del:
-            full_state.pop(k, None)
-        tree_root = ProllyTree.build(self.kernel, full_state)
-
-        commit_data = BinaryProllyTree.encode_commit(
-            first_parent, tree_root, {}, [], tree_root,
-            message, time.time(), base._commit_index,
-            second_parent=second_parent)
-        commit_hash = self.kernel.write(commit_data)
-        self.kernel.reference(self._head_ref(name), commit_hash)
-        self.kernel.reference(f"collections/{name}/snapshot", commit_hash)
-
-        base._staged_add.clear()
-        base._staged_del.clear()
-        base._commit_index += 1
+        # Create a 2-parent merge commit with the staged row groups.
+        # Uses the public create_merge_commit() API instead of reaching
+        # into _compute_full_state, _staged_add, _staged_del, _commit_index.
+        commit_hash = base.create_merge_commit(
+            parent=first_parent,
+            second_parent=second_parent,
+            message=message,
+        )
         return commit_hash
 
     def _read_all_row_groups(self, name: str, commit_hash: str) -> pa.Table:
@@ -532,7 +521,7 @@ class FeatureStoreLens(PondLens):
             if snapshot_root is None:
                 # Delta-only commit — walk to find snapshot
                 base = ProllyLensBase(self.kernel, name)
-                state = base._read_state_from_commit(commit_hash)
+                state = base.read_state_at_commit(commit_hash)
             else:
                 state = ProllyTree.read_all(self.kernel, snapshot_root)
         else:

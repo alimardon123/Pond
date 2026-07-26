@@ -226,13 +226,11 @@ class PruningReader:
         # Count total zone maps (for pruned_row_groups stat). When a
         # predicate is active, scan_with_pruning yields only non-pruned
         # row groups, so we need the total count separately.
+        # Uses the public count_zone_maps() API instead of reaching into
+        # zm_index._get_base(collection).
         if self.predicate is not None:
             try:
-                base = self.zm_index._get_base(self.collection)
-                total_zone_maps = sum(
-                    1 for k in base.read_all().keys()
-                    if not k.startswith("_")
-                )
+                total_zone_maps = self.zm_index.count_zone_maps(self.collection)
             except Exception:
                 total_zone_maps = None
         else:

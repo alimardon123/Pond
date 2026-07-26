@@ -2404,3 +2404,95 @@ Stage Summary:
   * C4 — extensions hard-code PyArrow (needs callback refactor)
   * C11 — broad except Exception: pass (needs specific exception types)
   * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)
+
+---
+Task ID: design-review-fixes-phase5
+Agent: main
+Task: Phase H (M16) — add public APIs to replace private reach-throughs
+
+Work Log:
+- Audited all private-API reach-throughs in the lens layer. Found 3 categories:
+  1. zm_index._get_base(name) — reach into ZoneMapIndex's internal ProllyLensBase cache
+     (3 sites in lakehouse_lens.py, 1 in pruning_reader.py, 2 in benchmarks)
+  2. base._compute_full_state, base._staged_add, base._staged_del, base._commit_index —
+     reach into ProllyLensBase's staging internals to build a custom merge commit
+     (1 site in lakehouse_lens.py:_write_merge_via_prolly, 1 in feature_store_lens.py)
+  3. base._read_state_from_commit(commit_hash) — reach into ProllyLensBase to read
+     historical state (2 sites in lakehouse_lens.py, 1 in feature_store_lens.py)
+  Note: KeyValueLens._get_base and VectorLens._get_base are NOT reach-throughs —
+  they are the lenses' OWN private cache methods (legitimate).
+- Added 3 public methods to ZoneMapIndex (zone_map_index.py):
+  * clear_zone_maps(collection) — stage deletion of ALL zone maps for a collection.
+    Replaces the lens pattern of reaching into _get_base + iterating read_all() +
+    calling stage_delete() per key.
+  * count_zone_maps(collection) — count zone map entries. Replaces the
+    pruning_reader pattern of reaching into _get_base + summing over read_all().
+  * iter_zone_maps(collection) — yield (row_group_key, zm_dict) tuples. Replaces
+    the _infer_columns pattern of reaching into _get_base + iterating read_all() +
+    json.loads() per entry.
+  * Updated rebuild_zone_maps to use clear_zone_maps (was duplicating the logic).
+- Added 2 public methods to ProllyLensBase (prolly_tree.py):
+  * read_state_at_commit(commit_hash) — public accessor for historical state.
+    Replaces _read_state_from_commit. The private method is kept as an alias
+    for backward compat.
+  * create_merge_commit(parent, second_parent, message) — create a 2-parent
+    merge commit with currently-staged changes. Handles all the staging
+    internals (_compute_full_state, _staged_add, _staged_del, _commit_index,
+    HEAD ref update, snapshot ref update, staging clear, commit index bump).
+    Replaces the lens pattern of reaching into all 4 private attributes to
+    build a custom merge commit.
+- Updated LakehouseLens (lakehouse_lens.py):
+  * _range_write_generic: zm_index._get_base(name) → zm_index.clear_zone_maps(name)
+  * _infer_columns: zm_index._get_base(name) + manual iteration → zm_index.iter_zone_maps(name)
+  * _write_via_prolly: zm_index._get_base(name) → zm_index.clear_zone_maps(name)
+  * _write_merge_via_prolly: 18 lines of _compute_full_state + _staged_add +
+    _staged_del + _commit_index + manual commit encoding → base.create_merge_commit(...)
+  * 2 sites of base._read_state_from_commit → base.read_state_at_commit
+  * Removed unused `from binary_encoding import BinaryProllyTree as _BPT` import
+    in _write_merge_via_prolly (no longer needed)
+- Updated FeatureStoreLens (feature_store_lens.py):
+  * _write_merge: 18 lines of private-API reach-through → base.create_merge_commit(...)
+  * _read_all_row_groups: base._read_state_from_commit → base.read_state_at_commit
+- Updated PruningReader (pruning_reader.py):
+  * scan(): zm_index._get_base + manual count → zm_index.count_zone_maps(collection)
+- Updated benchmarks (overhead_audit.py, pruning_benchmark.py):
+  * zm_index._get_base + manual iteration → zm_index.iter_zone_maps / count_zone_maps
+
+Stage Summary:
+- 32/32 tests pass (no new tests — refactor preserved behavior).
+- Encoded pruning benchmark preserved: 2.97x faster than whole-blob.
+- All 8 private-API reach-throughs in the lens layer are eliminated:
+  * 3 zm_index._get_base sites in lakehouse_lens.py → clear_zone_maps / iter_zone_maps
+  * 1 zm_index._get_base site in pruning_reader.py → count_zone_maps
+  * 1 _compute_full_state + _staged_add + _staged_del + _commit_index site in
+    lakehouse_lens.py → create_merge_commit
+  * 1 same site in feature_store_lens.py → create_merge_commit
+  * 2 _read_state_from_commit sites in lakehouse_lens.py → read_state_at_commit
+  * 1 _read_state_from_commit site in feature_store_lens.py → read_state_at_commit
+  * 2 _get_base sites in pond-labs benchmarks → iter_zone_maps / count_zone_maps
+- The lens layer is now robust to future changes in ZoneMapIndex's internal
+  cache layout and ProllyLensBase's staging internals. If we change how
+  ProllyLensBase stores staged changes (e.g., switch from dict to a tree),
+  only ProllyLensBase.create_merge_commit needs to update — the lenses don't.
+- Files changed:
+  * pond-sdk/extensions/physical_structures/zone_map_index.py
+    (+ clear_zone_maps, count_zone_maps, iter_zone_maps; refactored rebuild_zone_maps)
+  * pond-sdk/prolly_tree.py
+    (+ read_state_at_commit, create_merge_commit; kept _read_state_from_commit
+    as private alias for backward compat)
+  * lenses/lakehouse/lakehouse_lens.py
+    (3 _get_base sites → public APIs; 1 merge commit site → create_merge_commit;
+    2 _read_state_from_commit sites → read_state_at_commit; removed unused import)
+  * pond-labs/lenses/feature_store_lens.py
+    (1 merge commit site → create_merge_commit; 1 _read_state_from_commit → read_state_at_commit)
+  * pond-sdk/extensions/physical_structures/pruning_reader.py
+    (1 _get_base site → count_zone_maps)
+  * pond-labs/benchmarks/overhead_audit.py (1 _get_base site → iter_zone_maps)
+  * pond-labs/benchmarks/pruning_benchmark.py (1 _get_base site → count_zone_maps)
+- Remaining review findings (C3, C4, C11, M13, M14) are documented in
+  docs/DESIGN_REVIEW_2026_07_26.md. Estimated 1 more day of refactoring.
+  The biggest remaining items are:
+  * C3 — rename duplicate ZoneMap classes (needs careful coordination)
+  * C4 — extensions hard-code PyArrow (needs callback refactor)
+  * C11 — broad except Exception: pass (needs specific exception types)
+  * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)

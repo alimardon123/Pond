@@ -287,6 +287,48 @@ class ZoneMapIndex:
     # Maintenance
     # ------------------------------------------------------------------
 
+    def clear_zone_maps(self, collection: str) -> int:
+        """Stage deletion of ALL zone maps for a collection.
+
+        Used by lenses at write time to implement "overwrite semantics"
+        — when a table is rewritten, old zone maps become stale and must
+        be cleared before new ones are added. The deletion is staged on
+        the zone-map ProllyLensBase; the caller is responsible for
+        calling commit_zone_maps(collection) afterwards to persist it.
+
+        This is the PUBLIC replacement for the previous pattern of
+        reaching into `zm_index._get_base(collection)` from lens code.
+        Lenses should call this method instead.
+
+        Args:
+            collection: collection name
+
+        Returns:
+            Number of zone map entries staged for deletion.
+        """
+        base = self._get_base(collection)
+        existing = base.read_all()
+        count = 0
+        for k in existing.keys():
+            if not k.startswith("_"):
+                base.stage_delete(k)
+                count += 1
+        return count
+
+    def count_zone_maps(self, collection: str) -> int:
+        """Count the number of zone map entries for a collection.
+
+        Public accessor for the size of the zone-map tree. Used by
+        PruningReader to compute pruned_row_groups stats without
+        reaching into _get_base.
+        """
+        base = self._get_base(collection)
+        try:
+            state = base.read_all()
+            return sum(1 for k in state.keys() if not k.startswith("_"))
+        except Exception:
+            return 0
+
     def rebuild_zone_maps(self, collection: str,
                           scan_fn: Iterator[tuple[str, bytes, int]],
                           columns: Optional[list[str]] = None) -> str:
@@ -296,10 +338,7 @@ class ZoneMapIndex:
         existing zone maps (clears old ones first).
         """
         # Clear existing zone maps
-        base = ProllyLensBase(self.kernel, f"{collection}__zone_maps")
-        existing = base.read_all()
-        for k in existing.keys():
-            base.stage_delete(k)
+        self.clear_zone_maps(collection)
 
         return self.build_zone_maps_from_scan(collection, scan_fn, columns)
 
@@ -316,3 +355,25 @@ class ZoneMapIndex:
     def has_zone_maps(self, collection: str) -> bool:
         """Check if a collection has zone maps."""
         return self.kernel.resolve(self._zm_ref(collection)) is not None
+
+    def iter_zone_maps(self, collection: str
+                        ) -> Iterator[tuple[str, dict]]:
+        """Iterate over all (row_group_key, zone_map_dict) for a collection.
+
+        PUBLIC accessor for walking the zone-map tree. Used by lenses
+        that need to enumerate zone maps (e.g., to infer a collection's
+        schema) without reaching into _get_base.
+
+        Yields:
+            Tuples of (row_group_key, zone_map_dict) in sorted key order.
+            zone_map_dict includes 'min', 'max', 'null_count', 'blob_hash',
+            and optionally 'column_chunks'.
+        """
+        base = self._get_base(collection)
+        state = base.read_all()
+        for k in sorted(state.keys()):
+            if k.startswith("_"):
+                continue
+            zm_blob_hash = state[k]
+            zm_dict = json.loads(self.kernel.read_blob(zm_blob_hash))
+            yield (k, zm_dict)
