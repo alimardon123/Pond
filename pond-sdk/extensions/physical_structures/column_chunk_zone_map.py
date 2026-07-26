@@ -134,24 +134,33 @@ class ColumnChunkZoneMap:
 
     def to_dict(self) -> dict:
         """Serialize for storage in ProllyTreeIndex."""
-        return {
+        out = {
             "row_group_key": self.row_group_key,
             "column_chunks": {
                 col: [s.to_dict() for s in chunks]
                 for col, chunks in self.column_chunks.items()
             },
         }
+        # Preserve encoding metadata sidecar (set by EncodedChunkStorage)
+        encoding_meta = getattr(self, "_encoding_meta", None)
+        if encoding_meta is not None:
+            out["_encoding_meta"] = encoding_meta
+        return out
 
     @classmethod
     def from_dict(cls, d: dict) -> "ColumnChunkZoneMap":
         """Deserialize from a dict."""
-        return cls(
+        cczm = cls(
             row_group_key=d.get("row_group_key", ""),
             column_chunks={
                 col: [ColumnChunkStats.from_dict(s) for s in chunks]
                 for col, chunks in d.get("column_chunks", {}).items()
             },
         )
+        # Restore encoding metadata sidecar (if present)
+        if "_encoding_meta" in d:
+            cczm._encoding_meta = d["_encoding_meta"]
+        return cczm
 
     def prune_column_chunks(self, column: str, op: str,
                             value: Any) -> list[int]:

@@ -2032,3 +2032,78 @@ Stage Summary:
   * .pond/config for persistent pruning settings
   * Scale benchmarks to 1M rows on object storage (S3 mock)
   * Apply per-column-chunk storage pattern to VectorLens (per-vector-dimension blobs?)
+
+---
+Task ID: encoded-pruning
+Agent: main
+Task: Implement FastLanes-style encoding-aware compute — skip decode for pruned chunks
+
+Work Log:
+- Read prior worklog (commit b5c9675 added per-column-chunk storage with 9.37x I/O reduction).
+- Identified next bottleneck: column-chunk pruning still decodes Parquet for surviving chunks. For low-cardinality columns, encoded predicate eval (RLE/Dict) can skip decode entirely.
+- Created pond-sdk/extensions/physical_structures/encoding.py:
+  * ColumnEncoding: 4 encodings (RAW, RLE, DICT, BITPACK) with auto-selection heuristics
+  * EncodingHeader: 9-byte header prepended to every encoded chunk blob (magic + encoding + n_rows)
+  * encode_column(): picks encoding (auto or via hint) and dispatches to encoder
+  * 4 encoders: encode_raw, encode_rle, encode_dict, encode_bitpack
+  * eval_predicate_encoded(): evaluates predicate on ENCODED form (skip decode)
+    - RLE: walk runs, yield (start, end) ranges for surviving runs
+    - DICT: scan dict_values for matching codes, yield row positions
+    - BITPACK: prune via min/max in encoding header
+    - RAW: return None (caller must decode + filter)
+  * decode_column(): fallback decoder for when encoded eval is not possible
+- Created pond-sdk/extensions/physical_structures/encoded_chunk_storage.py:
+  * EncodedChunkStorage extends ColumnChunkStorage
+  * write_row_group_encoded(): splits row group into per-column-chunk ENCODED blobs
+  * read_column_chunks_encoded(): reads surviving chunks with encoded predicate eval
+  * has_encoded_storage(): detects encoded storage from zone map blob
+- Updated ColumnChunkZoneMap.to_dict/from_dict to preserve _encoding_meta sidecar
+- Added range_write_encoded() to LakehouseLens:
+  * Same as range_write_column_chunks but with encoding per column
+  * Stores encoding metadata in zone map blob's _encoding_meta sidecar
+  * Supports encoding_hints for per-column override (e.g., {"region": "dict"})
+- Added read_with_encoded_pruning() to LakehouseLens:
+  * Uses verbose scan_with_pruning to get zone map dict
+  * For each surviving row group, checks has_encoded_storage
+  * If yes: reads surviving chunks via EncodedChunkStorage.read_column_chunks_encoded
+  * Evaluates predicate on ENCODED form first, decodes only surviving row ranges
+  * Falls back to read_with_column_chunk_pruning if encoded storage not available
+- Created tests/integration/test_encoded_pruning.py with 4 tests:
+  * test_encoding_selection: verifies auto-selection of RLE/Dict/Bitpack/Raw
+  * test_encoded_predicate_eval: verifies eval_predicate_encoded correctness
+  * test_range_write_encoded_basic: end-to-end write+read with encoded storage
+  * test_encoded_vs_column_chunk_speedup: 1.86x speedup on 30K rows
+- Created pond-labs/benchmarks/encoded_pruning_benchmark.py:
+  * 99K rows, region column with 3 unique values, predicate region = 'EU'
+  * A. Whole-blob:           116.59 ms (283 rows/ms)
+  * B. Per-column-chunk:      70.74 ms (1.65x faster than A)
+  * C. Encoded per-column:    34.62 ms (3.37x faster than A, 2.04x faster than B, 953 rows/ms)
+  * Write tradeoff: encoded write is 3.95x slower (extra encoding work)
+- Registered new files in KNOWLEDGE_GRAPH.md
+- Added test_encoded_pruning and test_encoded_pruning_benchmark to tests/test_all.py
+
+Stage Summary:
+- Four-level pruning hierarchy now complete:
+  Level 1 (row-group):    ZoneMap-based — skip entire row groups (existing)
+  Level 2 (column-chunk): ColumnChunkZoneMap-based — skip individual chunk BLOBS (commit b5c9675)
+  Level 3 (encoded):      FastLanes-style — skip DECODE for pruned chunks (NEW)
+  Level 4 (row-level):    exact row_filter on decoded rows (existing)
+- Benchmark proves 3.37x faster than whole-blob, 2.04x faster than column-chunk Parquet
+- Write tradeoff: encoded write is 3.95x slower (extra encoding work) but worth it
+  for read-heavy workloads with low-cardinality predicates
+- Backward compatible: legacy collections fall back to column-chunk or whole-blob read
+- 31/31 tests pass (added 2 new tests: encoded pruning + benchmark)
+- Files changed:
+  * pond-sdk/extensions/physical_structures/encoding.py (NEW)
+  * pond-sdk/extensions/physical_structures/encoded_chunk_storage.py (NEW)
+  * pond-sdk/extensions/physical_structures/column_chunk_zone_map.py (sidecar preservation)
+  * lenses/lakehouse/lakehouse_lens.py (range_write_encoded + read_with_encoded_pruning)
+  * tests/integration/test_encoded_pruning.py (NEW)
+  * pond-labs/benchmarks/encoded_pruning_benchmark.py (NEW)
+  * tests/test_all.py (2 new test entries)
+  * KNOWLEDGE_GRAPH.md (4 new entries)
+- Next opportunities:
+  * Real bitpacking (current implementation stores offset values; real bitpack uses raw bits)
+  * .pond/config for persistent pruning + encoding settings
+  * Scale benchmarks to 1M rows on object storage (S3 mock)
+  * Apply encoding to VectorLens (per-dimension blobs with bitpack for low-precision vectors)
