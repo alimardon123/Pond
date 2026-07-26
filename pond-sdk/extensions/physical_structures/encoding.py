@@ -548,3 +548,108 @@ def decode_column(blob_bytes: bytes) -> list:
         return [v + offset for v in packed]
     else:
         raise ValueError(f"Unknown encoding: {header.encoding}")
+
+
+def decode_surviving_values(blob_bytes: bytes,
+                             surviving_ranges: list[tuple[int, int]]) -> list:
+    """Decode only the values in surviving_ranges from an encoded chunk blob.
+
+    This is the FastLanes-style optimization: instead of decoding the entire
+    chunk to a list and then slicing, we walk the encoded form and yield
+    only the values that fall in surviving_ranges. For RLE, we walk runs
+    and only materialize the ones that overlap a surviving range. For
+    DICT, we walk codes and only materialize the ones in a surviving range.
+
+    For BITPACK and RAW, we still decode the whole chunk and slice (no
+    shortcut — BITPACK's win is in min/max pruning at the chunk level,
+    not in selective decode).
+
+    Args:
+        blob_bytes: the encoded chunk blob (header + payload)
+        surviving_ranges: list of (start, end) row ranges (end exclusive)
+
+    Returns:
+        List of decoded values from the surviving ranges, in order.
+    """
+    if not surviving_ranges:
+        return []
+
+    header = EncodingHeader.from_bytes(blob_bytes[:EncodingHeader.SIZE])
+    payload = blob_bytes[EncodingHeader.SIZE:]
+
+    if header.encoding == ColumnEncoding.RLE:
+        # Walk runs; for each run, check if it overlaps any surviving range.
+        # If yes, materialize only the overlapping rows.
+        runs = json.loads(payload)
+        result = []
+        pos = 0
+        ranges_iter = iter(surviving_ranges)
+        try:
+            cur_start, cur_end = next(ranges_iter)
+        except StopIteration:
+            return []
+
+        for run_value, run_length in runs:
+            run_end = pos + run_length
+            # Skip surviving ranges that end before this run starts
+            while cur_end <= pos:
+                try:
+                    cur_start, cur_end = next(ranges_iter)
+                except StopIteration:
+                    return result
+            # Process all surviving ranges that overlap this run
+            while cur_start < run_end:
+                if cur_end <= pos:
+                    try:
+                        cur_start, cur_end = next(ranges_iter)
+                    except StopIteration:
+                        return result
+                    continue
+                # Compute overlap
+                overlap_start = max(cur_start, pos)
+                overlap_end = min(cur_end, run_end)
+                if overlap_end > overlap_start:
+                    offset = overlap_start - pos
+                    n = overlap_end - overlap_start
+                    result.extend([run_value] * n)
+                if cur_end <= run_end:
+                    try:
+                        cur_start, cur_end = next(ranges_iter)
+                    except StopIteration:
+                        return result
+                else:
+                    break  # next run will handle the rest
+            pos = run_end
+        return result
+
+    elif header.encoding == ColumnEncoding.DICT:
+        # Walk codes; for each code, check if its position is in any
+        # surviving range. If yes, materialize dict_values[code].
+        data = json.loads(payload)
+        dict_values = data["dict"]
+        codes = data["codes"]
+        result = []
+        ranges_iter = iter(surviving_ranges)
+        try:
+            cur_start, cur_end = next(ranges_iter)
+        except StopIteration:
+            return []
+
+        for pos, code in enumerate(codes):
+            # Advance past ranges that end before this position
+            while cur_end <= pos:
+                try:
+                    cur_start, cur_end = next(ranges_iter)
+                except StopIteration:
+                    return result
+            if cur_start <= pos < cur_end:
+                result.append(dict_values[code])
+        return result
+
+    else:
+        # BITPACK or RAW — no shortcut, decode and slice
+        all_values = decode_column(blob_bytes)
+        result = []
+        for s, e in surviving_ranges:
+            result.extend(all_values[s:e])
+        return result

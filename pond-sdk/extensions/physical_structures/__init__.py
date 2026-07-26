@@ -36,8 +36,14 @@ Usage:
 Available types:
   - BloomFilter: probabilistic membership test
   - Statistics: column-level min/max/null_count
-  - ZoneMap: per-chunk min/max for range pruning
-  - IndexStructure: Prolly tree index (wrapper around indexing.py)
+  - ZoneMap (legacy): per-chunk min/max as a PhysicalStructure
+  - PruningPredicate / ColumnPredicate / ZoneMap (in pruning.py):
+    Vortex-style row-group zone maps + predicate evaluation
+  - ZoneMapIndex: ProllyTreeIndex of zone maps
+  - PruningReader: generic reader with three-level pruning
+  - ColumnChunkZoneMap / ColumnChunkStorage: per-column-chunk blobs
+  - ColumnEncoding / EncodingHeader / EncodedChunkStorage:
+    FastLanes-style structural encodings
 
 Future types (implement PhysicalStructure):
   - HNSW: vector ANN index
@@ -45,6 +51,14 @@ Future types (implement PhysicalStructure):
   - Histogram: value distribution
   - Sketch: HLL, count-min
 """
+
+# Module-level constants shared across the pruning infrastructure.
+# Importing code should use these instead of magic numbers.
+DEFAULT_CHUNK_SIZE = 1000
+"""Default rows per column chunk. Used by ColumnChunkZoneMap.build,
+ColumnChunkStorage, EncodedChunkStorage, PruningReader.scan, and
+LakehouseLens.range_write_*. Mismatched chunk_size between write and
+read silently corrupts column-chunk pruning."""
 
 from extensions.physical_structures.base import PhysicalStructure
 from extensions.physical_structures.bloom_filter import BloomFilter
@@ -56,4 +70,6 @@ __all__ = [
     "BloomFilter",
     "Statistics",
     "ZoneMap",
+    "DEFAULT_CHUNK_SIZE",
 ]
+

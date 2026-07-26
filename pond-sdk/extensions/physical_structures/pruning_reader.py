@@ -118,7 +118,7 @@ class PruningReader:
             decode_fn: function that takes data blob bytes → row or list of rows.
             row_filter: optional function(row) → bool for exact row-level filtering.
             start_key: optional lower bound on row group keys.
-            end_key: optional upper bound (documentation only).
+            end_key: optional upper bound on row group keys (inclusive).
             columns: optional list of column names for column-chunk pruning.
                 If provided AND the zone map has column_chunks, the reader
                 will skip column chunks within surviving row groups that
@@ -178,8 +178,12 @@ class PruningReader:
                     cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
                     for col, (op, val) in cc_predicates.items():
                         chunks = cczm.prune_column_chunks(col, op, val)
-                        if chunks:  # may be empty if column has no chunks
-                            surviving_chunks_per_col[col] = set(chunks)
+                        # None means no stats for this column — caller must
+                        # fall back to reading all chunks (i.e., do not
+                        # prune at chunk level). [] means no chunks match.
+                        if chunks is None:
+                            continue  # skip column-chunk pruning for this col
+                        surviving_chunks_per_col[col] = set(chunks)
                 except ImportError:
                     cczm = None  # column_chunk_zone_map not available
 
@@ -256,40 +260,6 @@ class PruningReader:
             self.stats["data_blobs_read"] += 1
             yield data_blob_hash
 
-    def scan_column_chunks(self, row_group_key: str,
-                           column: str, op: str, value: Any
-                           ) -> Optional[list[int]]:
-        """Get surviving column chunk indices for a specific row group.
-
-        After row-group pruning, call this for each surviving row group
-        to find which column chunks within it might match the predicate.
-        Only read those chunks from the data blob.
-
-        Args:
-            row_group_key: the ProllyTreeIndex key (e.g., "rg/999")
-            column: column name
-            op: comparison operator
-            value: comparison value
-
-        Returns:
-            List of surviving chunk indices, or None if no column-chunk
-            stats are available (read all chunks).
-        """
-        zm_dict = self.zm_index.get_zone_map(self.collection, row_group_key)
-        if zm_dict is None or "column_chunks" not in zm_dict:
-            return None  # no column-chunk stats — read all
-
-        try:
-            from column_chunk_zone_map import ColumnChunkZoneMap
-            cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
-            surviving = cczm.prune_column_chunks(column, op, value)
-            total_chunks = len(cczm.column_chunks.get(column, []))
-            pruned = total_chunks - len(surviving)
-            self.stats["column_chunks_pruned"] += pruned
-            return surviving
-        except ImportError:
-            return None  # column_chunk_zone_map not available
-
     def get_stats(self) -> dict:
         """Get pruning statistics from the last scan.
 
@@ -299,21 +269,7 @@ class PruningReader:
               - pruned_row_groups: row groups skipped (NOT counted in total)
               - data_blobs_read: data blobs actually read from kernel
               - rows_yielded: rows yielded after filtering
+              - column_chunks_pruned: column chunks skipped via column-chunk
+                zone-map pruning
         """
         return self.stats.copy()
-
-    def get_pruning_ratio(self) -> float:
-        """Get the fraction of row groups that were pruned (0.0 to 1.0).
-
-        Returns 0.0 if no zone maps exist or no scan has been done.
-        """
-        # We need the total zone-map count to compute this
-        tree_root = self.kernel.resolve(self.zm_index._zm_ref(self.collection))
-        if not tree_root:
-            return 0.0
-        state = ProllyTree.read_all(self.kernel, tree_root)
-        total = len([k for k in state.keys() if not k.startswith("_")])
-        if total == 0:
-            return 0.0
-        pruned = total - self.stats["data_blobs_read"]
-        return pruned / total

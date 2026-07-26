@@ -57,7 +57,7 @@ from column_chunk_zone_map import ColumnChunkZoneMap, ColumnChunkStats
 from column_chunk_storage import ColumnChunkStorage
 from encoding import (
     ColumnEncoding, EncodingHeader, encode_column,
-    eval_predicate_encoded, decode_column,
+    eval_predicate_encoded, decode_column, decode_surviving_values,
 )
 
 
@@ -102,6 +102,10 @@ class EncodedChunkStorage(ColumnChunkStorage):
         n_rows = table.num_rows
         cczm = ColumnChunkZoneMap(row_group_key=row_group_key)
         chunk_hashes_per_col: dict[str, list[str]] = {}
+        # Sidecar: col_name → list of encoding_meta dicts (one per chunk).
+        # Collected during the main encode loop so we don't pay for a
+        # second encode pass.
+        encoding_meta_per_col: dict[str, list[dict]] = {}
 
         import pyarrow.compute as pc
 
@@ -109,6 +113,7 @@ class EncodedChunkStorage(ColumnChunkStorage):
             column = table[col_name]
             chunk_hashes: list[str] = []
             chunk_stats: list[ColumnChunkStats] = []
+            chunk_enc_metas: list[dict] = []
             hint = encoding_hints.get(col_name, "auto")
 
             for start in range(0, n_rows, chunk_size):
@@ -116,10 +121,11 @@ class EncodedChunkStorage(ColumnChunkStorage):
                 chunk = column.slice(start, end - start)
                 values = chunk.to_pylist()
 
-                # Encode the chunk
+                # Encode the chunk — enc_meta is reused (no second encode)
                 encoded_bytes, enc_meta = encode_column(values, hint=hint)
                 chunk_blob_hash = self.kernel.write(encoded_bytes)
                 chunk_hashes.append(chunk_blob_hash)
+                chunk_enc_metas.append(enc_meta)
 
                 # Build chunk stats with encoding info
                 stats = ColumnChunkStats(
@@ -138,17 +144,13 @@ class EncodedChunkStorage(ColumnChunkStorage):
                 except Exception:
                     pass
 
-                # Augment with encoding metadata
-                # We piggyback on the ColumnChunkStats dataclass by
-                # attaching extra attributes via to_dict (which only
-                # serializes known fields, so we use a sidecar dict
-                # in the zone map blob — see _write_zone_map_with_encoding)
                 chunk_stats.append(stats)
 
             cczm.column_chunks[col_name] = chunk_stats
             chunk_hashes_per_col[col_name] = chunk_hashes
+            encoding_meta_per_col[col_name] = chunk_enc_metas
 
-        # Build manifest blob: includes chunk blob hashes + encoding info
+        # Build manifest blob: includes chunk blob hashes per column
         manifest = {
             "row_group_key": row_group_key,
             "row_count": n_rows,
@@ -159,36 +161,12 @@ class EncodedChunkStorage(ColumnChunkStorage):
                                      default=str).encode()
         manifest_blob_hash = self.kernel.write(manifest_bytes)
 
-        # Attach encoding metadata to cczm via a sidecar dict
-        # (the ColumnChunkStats dataclass is shared with non-encoded
-        # storage; we don't want to bloat it with encoding-only fields.
-        # Instead, we'll attach encoding info when serializing cczm.)
-        cczm._encoding_meta = self._build_encoding_meta(table, chunk_size,
-                                                         encoding_hints)
+        # Attach encoding metadata sidecar (collected during main loop —
+        # no second encode pass). The sidecar is preserved through
+        # ColumnChunkZoneMap.to_dict/from_dict.
+        cczm._encoding_meta = encoding_meta_per_col
 
         return manifest_blob_hash, cczm
-
-    def _build_encoding_meta(self, table, chunk_size: int,
-                              encoding_hints: dict) -> dict:
-        """Build a sidecar dict mapping (col, chunk_index) → encoding meta.
-
-        This is used at zone-map-write time to embed encoding info in
-        the zone map blob alongside the ColumnChunkStats.
-        """
-        meta: dict[str, list[dict]] = {}
-        n_rows = table.num_rows
-        for col_name in table.column_names:
-            column = table[col_name]
-            hint = encoding_hints.get(col_name, "auto")
-            chunks_meta = []
-            for start in range(0, n_rows, chunk_size):
-                end = min(start + chunk_size, n_rows)
-                chunk = column.slice(start, end - start)
-                values = chunk.to_pylist()
-                _, enc_meta = encode_column(values, hint=hint)
-                chunks_meta.append(enc_meta)
-            meta[col_name] = chunks_meta
-        return meta
 
     def read_column_chunks_encoded(
             self,
@@ -255,16 +233,18 @@ class EncodedChunkStorage(ColumnChunkStorage):
                             # Chunk fully pruned by encoded eval
                             chunks_result.append((stats.chunk_index, []))
                             continue
-                        # Decode only surviving ranges
-                        all_values = decode_column(blob_bytes)
-                        surviving_values = []
-                        for s, e in surviving_ranges:
-                            surviving_values.extend(all_values[s:e])
+                        # Decode only surviving ranges DIRECTLY from the
+                        # encoded form (no full decode + slice). This is
+                        # the real FastLanes win — RLE/DICT yield values
+                        # without materializing the whole chunk.
+                        surviving_values = decode_surviving_values(
+                            blob_bytes, surviving_ranges)
                         chunks_result.append(
                             (stats.chunk_index, surviving_values))
                         continue
 
-                # Fallback: decode the whole chunk
+                # Fallback: decode the whole chunk (no predicate for this
+                # column, or encoding doesn't support encoded eval)
                 values = decode_column(blob_bytes)
                 chunks_result.append((stats.chunk_index, values))
 
@@ -277,13 +257,12 @@ class EncodedChunkStorage(ColumnChunkStorage):
         """Check if a zone map blob indicates encoded chunk storage.
 
         Returns True if column_chunks stats have blob_hash fields AND
-        the zone map blob includes _encoding_meta sidecar.
+        the zone map blob includes the _encoding_meta sidecar attached
+        by write_row_group_encoded.
         """
         if not ColumnChunkStorage.has_column_chunk_storage(zm_dict):
             return False
-        # Check for encoding meta sidecar (attached by write_row_group_encoded)
+        # The _encoding_meta sidecar is attached by write_row_group_encoded
+        # only. Plain column-chunk storage does not set it.
         cczm_dict = zm_dict["column_chunks"]
-        return "_encoding_meta" in cczm_dict or \
-               any("encoding" in chunk for chunks in
-                   cczm_dict.get("column_chunks", {}).values()
-                   for chunk in chunks)
+        return "_encoding_meta" in cczm_dict

@@ -243,7 +243,3 @@ class PruningPredicate:
             return True  # all predicates cannot match → prune
         else:
             return False  # unknown combine — can't prune
-
-    def might_match(self, zm: ZoneMap) -> bool:
-        """Inverse of can_prune. Returns True if the row group might match."""
-        return not self.can_prune(zm)

@@ -1052,11 +1052,18 @@ class LakehouseLens(PondLens):
             surviving_chunks: Optional[set[int]] = None
             if cc_predicates:
                 for col, (op, val) in cc_predicates.items():
-                    chunks = set(cczm.prune_column_chunks(col, op, val))
+                    chunks = cczm.prune_column_chunks(col, op, val)
+                    # None means no stats for this column — caller must
+                    # fall back to reading all chunks. Skip the column
+                    # (don't include in the intersection) so we don't
+                    # silently drop rows.
+                    if chunks is None:
+                        continue
+                    chunk_set = set(chunks)
                     if surviving_chunks is None:
-                        surviving_chunks = chunks
+                        surviving_chunks = chunk_set
                     else:
-                        surviving_chunks &= chunks
+                        surviving_chunks &= chunk_set
                 if surviving_chunks is not None and not surviving_chunks:
                     continue  # all chunks pruned — skip row group
 
@@ -1165,22 +1172,49 @@ class LakehouseLens(PondLens):
                 name, predicate, verbose=True):
 
             # If encoded storage is not active for this row group,
-            # fall back to the regular column-chunk path.
+            # fall back to the appropriate path:
+            #   - If column-chunk storage is active, use read_column_chunks
+            #     via read_with_column_chunk_pruning (which knows how to
+            #     read the manifest).
+            #   - Otherwise, decode as a plain Parquet blob.
             if not EncodedChunkStorage.has_encoded_storage(zm_dict):
-                # Delegate to the existing path for this row group
-                # (read whole blob, decode, filter)
-                actual_data_hash = zm_dict.get("blob_hash", manifest_hash)
-                data_bytes = self.kernel.read_blob(actual_data_hash)
-                # If this is a manifest, decode all chunks; if it's a
-                # plain Parquet blob, decode directly.
-                try:
-                    table = self._decode_table(data_bytes)
-                    for row in table.to_pylist():
+                if ColumnChunkStorage.has_column_chunk_storage(zm_dict):
+                    # Delegate to the column-chunk read path for this row group.
+                    # We can't easily call read_with_column_chunk_pruning here
+                    # because it iterates ALL row groups. Instead, reconstruct
+                    # via the storage extension.
+                    from column_chunk_zone_map import ColumnChunkZoneMap
+                    cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
+                    col_arrays = storage.read_column_chunks(
+                        cczm, columns, None,  # None = read all chunks
+                        decode_fn=self._decode_table,
+                    )
+                    if not col_arrays:
+                        continue
+                    arrays = []
+                    col_names_out = []
+                    for col_name in columns:
+                        if col_name in col_arrays and col_arrays[col_name]:
+                            arrays.append(
+                                pa.concat_arrays(col_arrays[col_name]))
+                            col_names_out.append(col_name)
+                    if not arrays:
+                        continue
+                    chunk_table = pa.Table.from_arrays(arrays, names=col_names_out)
+                    for row in chunk_table.to_pylist():
                         if row_filter is None or row_filter(row):
                             all_rows.append(row)
-                except Exception:
-                    # Manifest — skip for now (rare mixed-mode case)
-                    pass
+                else:
+                    # Plain Parquet blob (range_write / _write_via_prolly)
+                    actual_data_hash = zm_dict.get("blob_hash", manifest_hash)
+                    data_bytes = self.kernel.read_blob(actual_data_hash)
+                    try:
+                        table = self._decode_table(data_bytes)
+                        for row in table.to_pylist():
+                            if row_filter is None or row_filter(row):
+                                all_rows.append(row)
+                    except Exception:
+                        pass  # undecodable blob — skip
                 continue
 
             # Encoded storage active — read only surviving chunks,
@@ -1521,14 +1555,128 @@ class LakehouseLens(PondLens):
 
         tables = []
         for k in rg_keys:
-            parquet_hash = state[k]
-            parquet_bytes = self.kernel.read_blob(parquet_hash)
-            tables.append(self._decode_table(parquet_bytes))
+            blob_hash = state[k]
+            blob_bytes = self.kernel.read_blob(blob_hash)
+            # Detect manifest blobs (from range_write_column_chunks /
+            # range_write_encoded) by their JSON structure. A manifest
+            # has keys "row_group_key", "row_count", "chunk_size",
+            # "column_chunks". A Parquet blob starts with b"PAR1".
+            table_from_blob = self._decode_blob_to_table(blob_bytes, name, k)
+            if table_from_blob is not None:
+                tables.append(table_from_blob)
 
         try:
             return pa.concat_tables(tables, promote_options="default")
         except TypeError:
             return pa.concat_tables(tables)
+
+    def _decode_blob_to_table(self, blob_bytes: bytes,
+                               collection: str,
+                               rg_key: str) -> Optional[pa.Table]:
+        """Decode a row-group blob to a PyArrow Table.
+
+        Handles three storage modes:
+          1. Plain Parquet blob (from range_write / _write_via_prolly)
+          2. Manifest blob (from range_write_column_chunks) — JSON listing
+             per-column-chunk blob hashes
+          3. Encoded manifest blob (from range_write_encoded) — same JSON
+             structure but chunk blobs are FastLanes-encoded
+
+        Returns None if the blob cannot be decoded (e.g., undecodable).
+        """
+        # Try Parquet first (cheap probe: magic bytes)
+        if blob_bytes[:4] == b"PAR1":
+            try:
+                return self._decode_table(blob_bytes)
+            except Exception:
+                return None
+
+        # Try JSON manifest
+        try:
+            manifest = json.loads(blob_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None  # not Parquet, not JSON — give up
+
+        if not isinstance(manifest, dict) or "column_chunks" not in manifest:
+            return None  # JSON but not a manifest — give up
+
+        # Manifest: read all chunk blobs for all columns, reassemble.
+        # Detect encoded storage by checking the first chunk blob's header
+        # (magic bytes b"PND1" = encoded, b"PAR1" = Parquet).
+        try:
+            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
+            from column_chunk_storage import ColumnChunkStorage
+            from column_chunk_zone_map import ColumnChunkZoneMap, ColumnChunkStats
+            from encoding import EncodingHeader
+        except ImportError:
+            return None
+
+        # Peek at the first chunk blob to detect encoding
+        first_col = next(iter(manifest["column_chunks"]))
+        first_chunk_hash = manifest["column_chunks"][first_col][0]
+        first_chunk_bytes = self.kernel.read_blob(first_chunk_hash)
+        is_encoded = first_chunk_bytes[:4] == b"PND1"
+
+        # Build a synthetic cczm from the manifest
+        cczm = ColumnChunkZoneMap(row_group_key=rg_key)
+        for col_name, chunk_hashes in manifest["column_chunks"].items():
+            chunk_stats = []
+            for i, h in enumerate(chunk_hashes):
+                chunk_stats.append(ColumnChunkStats(
+                    chunk_index=i,
+                    row_count=0,  # not used for full read
+                    blob_hash=h,
+                ))
+            cczm.column_chunks[col_name] = chunk_stats
+
+        col_names = list(manifest["column_chunks"].keys())
+
+        if is_encoded:
+            # Use EncodedChunkStorage to read encoded chunk blobs
+            try:
+                from encoded_chunk_storage import EncodedChunkStorage
+                from encoding import decode_column
+                enc_storage = EncodedChunkStorage(self.kernel)
+                col_data = enc_storage.read_column_chunks_encoded(
+                    cczm, col_names, None,  # None = read all chunks
+                    predicates=None,  # no predicate eval — full read
+                )
+            except ImportError:
+                return None
+
+            arrays = []
+            col_names_out = []
+            for col_name in col_names:
+                if col_name in col_data and col_data[col_name]:
+                    # col_data[col_name] is list of (chunk_index, values)
+                    all_values = []
+                    for ci, vals in col_data[col_name]:
+                        all_values.extend(vals)
+                    if all_values:
+                        arrays.append(pa.array(all_values))
+                        col_names_out.append(col_name)
+            if not arrays:
+                return None
+            return pa.Table.from_arrays(arrays, names=col_names_out)
+        else:
+            # Plain Parquet column-chunk storage
+            storage = ColumnChunkStorage(self.kernel)
+            col_arrays = storage.read_column_chunks(
+                cczm, col_names, None,
+                decode_fn=self._decode_table,
+            )
+            if not col_arrays:
+                return None
+
+            arrays = []
+            col_names_out = []
+            for col_name in col_names:
+                if col_name in col_arrays and col_arrays[col_name]:
+                    arrays.append(pa.concat_arrays(col_arrays[col_name]))
+                    col_names_out.append(col_name)
+            if not arrays:
+                return None
+            return pa.Table.from_arrays(arrays, names=col_names_out)
 
     @staticmethod
     def _encode_table(table: pa.Table) -> bytes:
@@ -1542,76 +1690,6 @@ class LakehouseLens(PondLens):
         """Decode Parquet bytes into a PyArrow Table."""
         reader = pa.BufferReader(parquet_bytes)
         return pq.read_table(reader)
-
-    # ==================================================================
-    # Generic row-level interface (for CollectionIndexer compatibility)
-    #
-    # These methods allow CollectionIndexer to work with LakehouseLens by
-    # providing a universal row-iteration interface. Each row is identified
-    # by a _rowid (UUIDv7, auto-generated if not present in the data).
-    #
-    # NOTE: LakehouseLens is NOT bound to a single collection (unlike
-    # KeyValueLens which takes a name in __init__). The _scan_rows and
-    # _get_row methods use self._indexed_collection, which is set by
-    # CollectionIndexer when it registers an index for a specific collection.
-    # ==================================================================
-
-    def _is_tabular(self) -> bool:
-        """LakehouseLens is a tabular lens."""
-        return True
-
-    def _scan_rows(self):
-        """Yield (rowid, row_dict) for every row in the indexed collection.
-
-        Reads all row groups from the ProllyTreeIndex for the collection
-        specified by self._indexed_collection, converts to Python dicts,
-        and yields each with its _rowid.
-        """
-        from uuid7 import uuidv7
-
-        collection = getattr(self, '_indexed_collection', None)
-        if collection is None:
-            return  # No collection bound — nothing to scan
-
-        table = self.read_table(collection)
-        if table.num_rows == 0:
-            return
-
-        rowid_col = "_rowid"
-        has_rowid = rowid_col in table.column_names
-
-        rows = table.to_pylist()
-        for row in rows:
-            if has_rowid and row.get(rowid_col):
-                rowid = str(row[rowid_col])
-            else:
-                # Generate a _rowid for this scan. In production, _rowid
-                # would be assigned at write time and stored in the Parquet
-                # row group as a hidden column.
-                rowid = uuidv7()
-            yield rowid, row
-
-    def _get_row(self, rowid: str):
-        """Get a single row by its _rowid from the indexed collection.
-
-        Scans the collection for a matching _rowid column. If no _rowid
-        column exists, returns None.
-        """
-        collection = getattr(self, '_indexed_collection', None)
-        if collection is None:
-            return None
-
-        table = self.read_table(collection)
-        rowid_col = "_rowid"
-        if rowid_col not in table.column_names:
-            return None
-
-        import pyarrow.compute as pc
-        mask = pc.equal(table[rowid_col], rowid)
-        filtered = table.filter(mask)
-        if filtered.num_rows == 0:
-            return None
-        return filtered.to_pylist()[0]
 
     def compact_zone_maps(self, collection: str) -> int:
         """Remove stale zone maps for a collection.
@@ -1762,8 +1840,17 @@ class PondLakehouse:
         """Read a table with predicate + projection pushdown.
 
         Extracts WHERE predicates and SELECT columns from the SQL, then
-        uses read_with_pruning + read_columns to minimize I/O.
-        Falls back to full read_table if extraction fails.
+        uses the best available pruning read path:
+          1. read_with_encoded_pruning (FastLanes-style) — fastest
+          2. read_with_column_chunk_pruning — per-column-chunk I/O
+          3. read_with_pruning — row-group pruning only
+          4. read_table — full read (fallback)
+
+        Each path falls back to the next if the storage mode is not
+        available for this collection (e.g., legacy range_write data
+        uses path 3 or 4; range_write_encoded data uses path 1).
+
+        Falls back to full read_table if predicate extraction fails.
         """
         try:
             # Extract predicates from WHERE clause
@@ -1773,10 +1860,15 @@ class PondLakehouse:
             columns = self._extract_columns(sql)
 
             if predicates:
-                # Use pruning: read only row groups that might match
-                table = self.lens.read_with_pruning(
+                # Try the fastest path first; each path falls back
+                # internally if the storage mode is not available.
+                # read_with_encoded_pruning falls back to
+                # read_with_column_chunk_pruning which falls back to
+                # read_with_pruning which falls back to read_table.
+                table = self.lens.read_with_encoded_pruning(
                     table_name,
                     predicates=predicates,
+                    row_filter=None,  # let DuckDB evaluate the predicate
                 )
                 # Apply projection on the pruned result.
                 # MUST include WHERE columns so DuckDB can evaluate the filter.
@@ -1794,8 +1886,12 @@ class PondLakehouse:
             else:
                 # No pushdown possible — full read
                 return self.lens.read_table(table_name)
+        except (ImportError, KeyError, AttributeError):
+            # Missing extension or column — fall back to full read
+            return self.lens.read_table(table_name)
         except Exception:
-            # Any failure in pushdown → fall back to full read
+            # Any other failure in pushdown → fall back to full read.
+            # (Catches parser bugs, predicate evaluation errors, etc.)
             return self.lens.read_table(table_name)
 
     @staticmethod

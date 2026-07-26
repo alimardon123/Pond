@@ -13,7 +13,7 @@ This is FULLY GENERIC because:
   - The zone map format is lens-agnostic (JSON dict of column → min/max)
   - The pruning layer never touches the data bytes — only the zone maps
   - KeyValueLens: zone map = min/max of JSON fields per blob
-  - LakehouseLens: zone map = Parquet row-group statistics
+  - LakehouseLens-style tabular lens: zone map = Parquet row-group statistics
   - VectorLens: zone map = bounding box of vectors
 
 The zone map blob contains:
@@ -168,7 +168,7 @@ class ZoneMapIndex:
 
         Tries PyArrow (Parquet) first, then JSON, then gives up.
         """
-        # Try Parquet (LakehouseLens data)
+        # Try Parquet (tabular lens data, e.g., LakehouseLens)
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
@@ -234,9 +234,8 @@ class ZoneMapIndex:
             collection: collection name
             predicate: PruningPredicate to evaluate. If None, no pruning
                 (yield all data blob hashes).
-            start_key: optional lower bound on row group keys
-            end_key: optional upper bound (used for documentation;
-                actual row-level filtering is the caller's job)
+            start_key: optional lower bound on row group keys (inclusive)
+            end_key: optional upper bound on row group keys (inclusive)
             verbose: if True, yield (row_group_key, data_blob_hash, zm_dict)
                 tuples instead of just data_blob_hash strings. The verbose
                 form lets the caller do column-chunk pruning without a
@@ -259,6 +258,10 @@ class ZoneMapIndex:
         # Apply lower bound if specified
         if start_key is not None:
             zm_keys = [k for k in zm_keys if k >= start_key]
+
+        # Apply upper bound if specified (was previously ignored — bug fix M3)
+        if end_key is not None:
+            zm_keys = [k for k in zm_keys if k <= end_key]
 
         for zm_key in zm_keys:
             zm_blob_hash = state[zm_key]

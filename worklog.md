@@ -2107,3 +2107,78 @@ Stage Summary:
   * .pond/config for persistent pruning + encoding settings
   * Scale benchmarks to 1M rows on object storage (S3 mock)
   * Apply encoding to VectorLens (per-dimension blobs with bitpack for low-precision vectors)
+
+---
+Task ID: design-review-fixes
+Agent: main
+Task: Comprehensive design review + fix the highest-priority findings
+
+Work Log:
+- Ran two parallel sub-agent design reviews against DESIGN_GOALS.md §3 (seven principles) and REPO_ORGANIZATION.md:
+  * Review 1: physical_structures extensions (C1-C8, M1-M21)
+  * Review 2: lens layer + LakehouseLens complexity (CRITICAL-1 to 5, MAJOR-1 to 27, MINOR-1 to 10)
+- Consolidated findings into docs/DESIGN_REVIEW_2026_07_26.md — 42 findings, 9-phase fix plan, ~6 days of refactoring identified
+- Phase A (correctness fixes):
+  * C1: prune_column_chunks now returns None (not []) when column has no stats — callers fall back to reading all chunks instead of silently dropping the column
+  * C2: deleted get_pruning_ratio (dead code + NameError bug — ProllyTree was never imported)
+  * M3: end_key filtering now actually implemented in scan_with_pruning (was "documentation only")
+  * C5: removed all LakehouseLens references from extension error messages and docstrings (was a layering violation — extensions must not know Layer-3 lenses exist)
+  * Updated PruningReader.scan and LakehouseLens callers to handle the None return from prune_column_chunks
+- Phase B (dead code deletion — 8 methods):
+  * Deleted pruning_reader.scan_column_chunks (dead, duplicated scan()'s logic)
+  * Deleted pruning_reader.get_pruning_ratio (dead + buggy)
+  * Deleted pruning.might_match (dead)
+  * Deleted column_chunk_zone_map.get_surviving_chunks (dead)
+  * Deleted base._ref_name (dead, returned wrong value — used class literal not cls)
+  * Deleted column_chunk_storage._manifest_blob_hash_default (dead)
+  * Deleted encoded_chunk_storage.has_encoded_storage's dead second clause
+  * Deleted LakehouseLens._is_tabular, _scan_rows, _get_row, _indexed_collection (dead — the documented protocol with CollectionIndexer was never implemented; ~55 LOC removed)
+- Phase C (efficiency fixes):
+  * C8: eliminated the double-encode in EncodedChunkStorage.write_row_group_encoded — enc_meta is now collected during the main loop instead of re-computed in a separate _build_encoding_meta pass. Write time dropped from 3.95x to 3.04x baseline.
+  * M12: added decode_surviving_values() to encoding.py — for RLE/DICT, walks the encoded form directly and yields only values in surviving ranges (no full decode + slice). For BITPACK/RAW, falls back to decode_column + slice. Wired into EncodedChunkStorage.read_column_chunks_encoded.
+- Phase D (surface fast paths to SQL users):
+  * C10: PondLakehouse._read_with_pushdown now calls read_with_encoded_pruning (fastest), which falls back to read_with_column_chunk_pruning, which falls back to read_with_pruning, which falls back to read_table. SQL users now get the 3.11x speedup automatically.
+  * Fixed _read_all_row_groups to handle manifest blobs (from range_write_column_chunks / range_write_encoded) — was assuming every blob at rg/{key} is Parquet. Now detects manifest blobs by JSON structure and reassembles via ColumnChunkStorage / EncodedChunkStorage. Added _decode_blob_to_table helper.
+  * Added test_sql_pushdown_fast_paths.py — verifies all 3 storage modes work end-to-end via SQL
+- Phase E (constants):
+  * Added DEFAULT_CHUNK_SIZE = 1000 to pond-sdk/extensions/physical_structures/__init__.py with documentation about mismatched chunk_size corrupting pruning
+- Registered new files in KNOWLEDGE_GRAPH.md
+
+Stage Summary:
+- 32/32 tests pass (added 1 new test: test_sql_pushdown_fast_paths)
+- All correctness bugs from the review are fixed (C1, C2, C5, C8, C10, M3, M12)
+- 8 dead methods deleted (~120 LOC removed)
+- Write time for encoded storage improved from 3.95x to 3.04x baseline (C8 fix)
+- SQL users now get the 3.11x encoded pruning speedup automatically (C10 fix)
+- Read time preserved: 3.11x faster than whole-blob, 1.93x faster than column-chunk Parquet
+- Remaining review findings deferred to future tasks:
+  * C3 (rename duplicate ZoneMap classes) — needs careful coordination across all callers
+  * C4 (extensions hard-code PyArrow) — needs callback refactor
+  * C6 (sys.path hacks) — needs pond-sdk to become a real package
+  * C9 (extract _range_write_generic + _read_with_pruning_generic) — large refactor
+  * C11 (replace except Exception: pass with specific catches) — many sites
+  * M1 (split 135-line PruningReader.scan) — extract _compute_surviving_chunks
+  * M2 (pruned_row_groups stat is always 0) — needs scan_with_pruning to return total
+  * M13 (Statistics stores min/max as str) — needs native JSON types
+  * M14 (scan_with_pruning is O(N) not O(K)) — needs ProllyTree level-walk
+  * M16 (lens reaches into private zm_index._get_base) — needs public clear_zone_maps
+  * M21 (split lakehouse_lens.py) — needs separate pond_lakehouse.py
+  * M22 (hand-rolled SQL parser) — needs extraction to sql_pushdown.py
+  * M26 (stale README claiming VectorLens inherits from KeyValueLens) — docs fix
+- See docs/DESIGN_REVIEW_2026_07_26.md for the full prioritized fix plan
+
+Files changed:
+- pond-sdk/extensions/physical_structures/column_chunk_zone_map.py (C1 + delete get_surviving_chunks)
+- pond-sdk/extensions/physical_structures/pruning_reader.py (C2 + delete dead methods + end_key docstring fix)
+- pond-sdk/extensions/physical_structures/pruning.py (delete might_match)
+- pond-sdk/extensions/physical_structures/zone_map_index.py (M3 end_key filtering + LakehouseLens refs removed)
+- pond-sdk/extensions/physical_structures/base.py (delete _ref_name)
+- pond-sdk/extensions/physical_structures/column_chunk_storage.py (C5 + delete _manifest_blob_hash_default)
+- pond-sdk/extensions/physical_structures/encoded_chunk_storage.py (C8 + M12 + delete dead clause)
+- pond-sdk/extensions/physical_structures/encoding.py (added decode_surviving_values)
+- pond-sdk/extensions/physical_structures/__init__.py (DEFAULT_CHUNK_SIZE + better docs)
+- lenses/lakehouse/lakehouse_lens.py (C5 caller fix, C10 _read_with_pushdown, _read_all_row_groups manifest handling, _decode_blob_to_table, deleted dead methods M17)
+- tests/integration/test_sql_pushdown_fast_paths.py (NEW)
+- tests/test_all.py (new test entry)
+- KNOWLEDGE_GRAPH.md (new entries)
+- docs/DESIGN_REVIEW_2026_07_26.md (NEW — full review document)

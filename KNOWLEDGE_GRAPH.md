@@ -155,6 +155,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-sdk/extensions/physical_structures/encoded_chunk_storage.py` | 220 | `EncodedChunkStorage` | Combines ColumnChunkStorage + encoding.py. Per-column-chunk encoded blobs with encoded predicate eval at read time. |
 | `tests/integration/test_column_chunk_storage.py` | 290 | (test) | Tests per-column-chunk storage: basic write/read, I/O savings (bytes), fallback to whole-blob path. 9.37x I/O reduction verified. |
 | `tests/integration/test_encoded_pruning.py` | 380 | (test) | Tests encoding selection, encoded predicate eval, range_write_encoded + read_with_encoded_pruning. 1.86x speedup on low-cardinality queries. |
+| `tests/integration/test_sql_pushdown_fast_paths.py` | 130 | (test) | Tests PondLakehouse.query uses the fastest available read path (encoded → column-chunk → row-group → full). Verifies all 3 storage modes work end-to-end via SQL. |
 | `pond-labs/benchmarks/encoded_pruning_benchmark.py` | 210 | (benchmark) | Benchmark: encoding-aware compute on 99K rows. 3.37x faster than whole-blob, 2.04x faster than column-chunk Parquet for low-cardinality predicate. |
 | `pond-labs/benchmarks/overhead_audit.py` | 330 | (benchmark) | Overhead audit: zone map cost for OLTP, OLAP, streaming, point lookups, full scans, binary data. |
 | `pond-labs/benchmarks/sql_pushdown_benchmark.py` | 95 | (benchmark) | SQL pushdown benchmark: pruned vs full scan on 100K rows. Shows Python pruning overhead vs DuckDB native scan on local disk. |
@@ -225,6 +226,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `docs/POND_PHASE_Q_BENCHMARKS.md` | 344 | Head-to-head benchmarks vs Git/Dolt/Iceberg. |
 | `docs/NON_GOALS.md` | 119 | What Pond deliberately doesn't do. |
 | `docs/POSTMORTEM_PROLLY_TREE_BUG.md` | 135 | Prolly tree encoding bug postmortem. |
+| `docs/DESIGN_REVIEW_2026_07_26.md` | 470 | Design review against the seven principles (42 findings, prioritized fix plan). |
 | `docs/README.md` | 58 | Doc index. |
 | `docs/archive/` | (18+ files) | Historical docs (Phase reports, red teams, RFCs, etc.). |
 

@@ -45,11 +45,6 @@ class PhysicalStructure:
 
     type_name: str = "physical_structure"  # override in subclass
 
-    @staticmethod
-    def _ref_name(collection: str) -> str:
-        """The kernel reference name for this structure."""
-        return f"__{PhysicalStructure.type_name}/{collection}"
-
     @classmethod
     def ref_name(cls, collection: str) -> str:
         """The kernel reference name for this structure type + collection."""

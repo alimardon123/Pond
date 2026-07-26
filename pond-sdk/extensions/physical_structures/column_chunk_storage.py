@@ -72,11 +72,6 @@ class ColumnChunkStorage:
     def __init__(self, kernel: PondMinimal):
         self.kernel = kernel
 
-    @staticmethod
-    def _manifest_blob_hash_default() -> Optional[str]:
-        """Sentinel — no manifest (used when storage mode is not active)."""
-        return None
-
     def write_row_group_column_chunks(
             self,
             table,
@@ -90,10 +85,10 @@ class ColumnChunkStorage:
             row_group_key: the ProllyTreeIndex key for this row group
                 (e.g., "rg/999")
             chunk_size: rows per column chunk (default 1000)
-            encode_fn: optional function(column_table) -> bytes for
-                encoding each chunk. Defaults to Parquet encoding via
-                LakehouseLens._encode_table (the caller is expected to
-                pass this in).
+            encode_fn: REQUIRED function(column_table) -> bytes that
+                encodes a single-column PyArrow Table to your preferred
+                format (e.g., Parquet). There is no default — the lens
+                must supply its own encoder.
 
         Returns:
             Tuple of (manifest_blob_hash, ColumnChunkZoneMap).
@@ -103,7 +98,9 @@ class ColumnChunkStorage:
         """
         if encode_fn is None:
             raise ValueError(
-                "encode_fn is required (e.g., lens._encode_table)")
+                "encode_fn is required — pass a function(table) -> bytes "
+                "that encodes a single-column PyArrow Table to your "
+                "preferred format (e.g., Parquet).")
 
         n_rows = table.num_rows
         cczm = ColumnChunkZoneMap(row_group_key=row_group_key)
@@ -180,7 +177,8 @@ class ColumnChunkStorage:
             PyArrow Table containing all rows from all chunks.
         """
         if decode_fn is None:
-            raise ValueError("decode_fn is required (e.g., lens._decode_table)")
+            raise ValueError("decode_fn is required — pass a function(bytes) "
+                             "-> PyArrow Table that decodes your format.")
 
         manifest_bytes = self.kernel.read_blob(manifest_blob_hash)
         manifest = json.loads(manifest_bytes)

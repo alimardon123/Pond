@@ -163,7 +163,7 @@ class ColumnChunkZoneMap:
         return cczm
 
     def prune_column_chunks(self, column: str, op: str,
-                            value: Any) -> list[int]:
+                            value: Any) -> Optional[list[int]]:
         """Find which chunk indices MIGHT match a predicate.
 
         Returns the indices of chunks that cannot be pruned (might match).
@@ -175,11 +175,17 @@ class ColumnChunkZoneMap:
             value: comparison value
 
         Returns:
-            List of chunk indices that might match (0-based).
+            List of chunk indices that might match (0-based), or None if
+            this ColumnChunkZoneMap has no stats for the requested column
+            (in which case the caller should fall back to reading all
+            chunks). Returning None is important — returning [] would
+            silently drop the column.
         """
         if column not in self.column_chunks:
-            # No stats for this column — can't prune, return all chunks
-            return list(range(len(self.column_chunks.get(column, []))))
+            # No stats for this column — caller must fall back to
+            # reading all chunks. Returning [] would be wrong: callers
+            # treat [] as "no surviving chunks" and skip the column.
+            return None
 
         surviving = []
         for chunk in self.column_chunks[column]:
@@ -216,19 +222,3 @@ class ColumnChunkZoneMap:
             return not (v_max < chunk.min or v_min > chunk.max)
         else:
             return True  # unknown op — can't prune
-
-    def get_surviving_chunks(self, predicates: list[tuple[str, str, Any]]
-                             ) -> dict[str, list[int]]:
-        """Get surviving chunk indices for all predicate columns.
-
-        Args:
-            predicates: list of (column, op, value) tuples
-
-        Returns:
-            Dict of column → list of surviving chunk indices.
-            Only includes columns that have predicates.
-        """
-        result = {}
-        for col, op, val in predicates:
-            result[col] = self.prune_column_chunks(col, op, val)
-        return result

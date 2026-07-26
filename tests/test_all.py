@@ -124,6 +124,10 @@ def test_encoded_pruning_benchmark():
     ok, output = _run_script("pond-labs/benchmarks/encoded_pruning_benchmark.py")
     assert ok, f"Encoded pruning benchmark failed:\n{output[-500:]}"
 
+def test_sql_pushdown_fast_paths():
+    ok, output = _run_script("tests/integration/test_sql_pushdown_fast_paths.py")
+    assert ok, f"SQL pushdown fast-paths test failed:\n{output[-500:]}"
+
 def test_kv_pruning_and_projection():
     ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
     assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"
