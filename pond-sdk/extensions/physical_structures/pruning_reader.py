@@ -102,46 +102,52 @@ class PruningReader:
             "pruned_row_groups": 0,
             "data_blobs_read": 0,
             "rows_yielded": 0,
+            "column_chunks_pruned": 0,
         }
 
     def scan(self,
              decode_fn: Callable[[bytes], Union[Any, list[Any]]],
              row_filter: Optional[Callable[[Any], bool]] = None,
              start_key: Optional[str] = None,
-             end_key: Optional[str] = None) -> Iterator[Any]:
+             end_key: Optional[str] = None,
+             columns: Optional[list[str]] = None) -> Iterator[Any]:
         """Scan the collection with pruning.
 
         Args:
             decode_fn: function that takes data blob bytes → row or list of rows.
-                For KeyValueLens: decode_fn = lens.decode (returns a dict).
-                For LakehouseLens: decode_fn = lambda b: pq.read_table(b).to_pylist()
-                (returns a list of dicts).
-            row_filter: optional function(row) → bool. Applied AFTER decode
-                for exact row-level filtering. This catches false positives
-                from zone-map pruning (rows in non-pruned groups that don't
-                actually match).
-            start_key: optional lower bound on row group keys
-            end_key: optional upper bound (documentation only)
+            row_filter: optional function(row) → bool for exact row-level filtering.
+            start_key: optional lower bound on row group keys.
+            end_key: optional upper bound (documentation only).
+            columns: optional list of column names for column-chunk pruning.
+                If provided AND the zone map has column_chunks, the reader
+                will skip column chunks within surviving row groups that
+                can't match the predicate.
 
         Yields:
-            Individual rows (dicts) that survive both zone-map pruning
-            and the optional row_filter.
+            Individual rows (dicts) that survive all pruning levels.
 
-        The pruning flow:
-          1. Walk zone-map ProllyTree → read small zone-map blobs
-          2. Evaluate PruningPredicate.can_prune(zone_map)
-          3. If pruned: SKIP (data blob not read, not decoded)
-          4. If not pruned: read data blob, decode, yield rows
-          5. If row_filter provided: only yield rows that pass the filter
+        The pruning flow (three levels):
+          1. Row-group pruning: skip entire row groups via ZoneMap
+          2. Column-chunk pruning: within surviving row groups, skip
+             individual column chunks via ColumnChunkZoneMap
+          3. Row-level filtering: exact match check on decoded rows
         """
         self.stats = {
             "total_row_groups": 0,
             "pruned_row_groups": 0,
             "data_blobs_read": 0,
             "rows_yielded": 0,
+            "column_chunks_pruned": 0,
         }
 
-        # Get data blob hashes from the zone-map index, with pruning
+        # Build column-chunk predicate lookup from the PruningPredicate
+        cc_predicates = {}
+        if self.predicate and columns:
+            for pred in self.predicate.predicates:
+                if pred.column in columns:
+                    cc_predicates[pred.column] = (pred.op, pred.value)
+
+        # Get data blob hashes from the zone-map index, with row-group pruning
         for data_blob_hash in self.zm_index.scan_with_pruning(
                 self.collection, self.predicate, start_key, end_key):
 
@@ -189,6 +195,40 @@ class PruningReader:
                 self.collection, self.predicate, start_key, end_key):
             self.stats["data_blobs_read"] += 1
             yield data_blob_hash
+
+    def scan_column_chunks(self, row_group_key: str,
+                           column: str, op: str, value: Any
+                           ) -> Optional[list[int]]:
+        """Get surviving column chunk indices for a specific row group.
+
+        After row-group pruning, call this for each surviving row group
+        to find which column chunks within it might match the predicate.
+        Only read those chunks from the data blob.
+
+        Args:
+            row_group_key: the ProllyTreeIndex key (e.g., "rg/999")
+            column: column name
+            op: comparison operator
+            value: comparison value
+
+        Returns:
+            List of surviving chunk indices, or None if no column-chunk
+            stats are available (read all chunks).
+        """
+        zm_dict = self.zm_index.get_zone_map(self.collection, row_group_key)
+        if zm_dict is None or "column_chunks" not in zm_dict:
+            return None  # no column-chunk stats — read all
+
+        try:
+            from column_chunk_zone_map import ColumnChunkZoneMap
+            cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
+            surviving = cczm.prune_column_chunks(column, op, value)
+            total_chunks = len(cczm.column_chunks.get(column, []))
+            pruned = total_chunks - len(surviving)
+            self.stats["column_chunks_pruned"] += pruned
+            return surviving
+        except ImportError:
+            return None  # column_chunk_zone_map not available
 
     def get_stats(self) -> dict:
         """Get pruning statistics from the last scan.
