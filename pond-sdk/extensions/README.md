@@ -12,7 +12,7 @@ Lens SDK (Lens, ProllyLensBase, IndexedLens) — core, no extensions
     ↓
 extensions/                    ← YOU ARE HERE
 ├── semantic/                  — Semantic model adapters (Ossie, Cube, dbt)
-└── physical_structures/       — Acceleration structures (Bloom, Stats, ZoneMap)
+└── physical_structures/       — Acceleration structures (Bloom, Stats, pruning)
     ↓
 Applications
 ```
@@ -60,26 +60,29 @@ Available types:
 |---|---|---|---|
 | Bloom filter | `BloomFilter` | "Is X in the set?" | O(1) (may have false positives) |
 | Statistics | `Statistics` | "Can I skip this column range?" | O(1) (can_prune) |
-| Zone map | `ZoneMap` | "Which chunks might contain [min, max]?" | O(chunks) |
+| Zone map | `ZoneMap` (in `pruning.py`) | "Which row groups might match this predicate?" | O(row groups) |
 
 The Prolly tree index (`IndexedLens` in `pond-sdk/auto_index.py`) is also
 a Physical Structure, but it's built into the SDK core because every Lens
 uses it — like LLVM's default optimization passes. Future index types
 (HNSW, Trie, etc.) would be added as extensions here.
 
+Note: an earlier `ZoneMap` PhysicalStructure (in `zone_map.py`) was
+deleted as dead code — see `docs/DESIGN_REVIEW_2026_07_26.md` (C3).
+The active `ZoneMap` is the `@dataclass` in `pruning.py`, used by
+`ZoneMapIndex` and `PruningReader` for Vortex-style predicate pushdown.
+
 Usage:
 ```python
-from extensions.physical_structures import BloomFilter, Statistics, ZoneMap
+from extensions.physical_structures import BloomFilter, Statistics
 
 # Build (any Lens can build)
 BloomFilter.build(kernel, "users", ["user_1", "user_2", "user_3"])
 Statistics.build(kernel, "users", table_data)
-ZoneMap.build(kernel, "events", {"chunk_0": [1,2,3], "chunk_1": [4,5,6]})
 
-# Query (any Lens can query — Track 2 proved cross-Lense sharing)
+# Query (any Lens can query — Track 2 proved cross-Lens sharing)
 BloomFilter.query(kernel, "users", "user_2")  # → True
 Statistics.can_prune(stats, "age", 999)       # → True (skip)
-ZoneMap.query(kernel, "events", 5, 7)         # → ["chunk_1"]
 ```
 
 ## Extension registry

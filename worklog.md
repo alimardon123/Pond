@@ -2572,3 +2572,72 @@ Stage Summary:
   * C3 — rename duplicate ZoneMap classes (needs careful coordination)
   * C4 — extensions hard-code PyArrow (needs callback refactor)
   * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)
+
+---
+Task ID: design-review-fixes-phase7
+Agent: main
+Task: Phase I (C3) — rename/delete duplicate ZoneMap classes
+
+Work Log:
+- Audited the two ZoneMap classes:
+  * pruning.py:ZoneMap — @dataclass with min/max/null_count/row_count/
+    column_chunks fields. ACTIVE: used by zone_map_index.py, pruning_reader.py,
+    collection_metadata.py, lakehouse_lens.py, feature_store_lens.py, tests.
+  * zone_map.py:ZoneMap — subclass of PhysicalStructure. DEAD: only callers
+    were __init__.py re-exports, extensions/__init__.py re-exports, its own
+    docstring (self-reference), and README/docs examples. No production code,
+    no tests, no benchmarks imported it directly.
+- Verified the legacy ZoneMap was truly dead:
+  * grep for "from zone_map import" → 0 matches in production/test code
+  * grep for "zone_map.ZoneMap" → 0 matches in production/test code
+  * Only references were in __init__.py re-exports and docstrings
+- Deleted pond-sdk/extensions/physical_structures/zone_map.py (106 LOC).
+- Updated pond-sdk/extensions/physical_structures/__init__.py:
+  * Removed `from extensions.physical_structures.zone_map import ZoneMap`
+  * Removed `ZoneMap` from __all__
+  * Updated docstring to remove ZoneMap from the "Available types" list
+  * Added a NOTE explaining that pruning.ZoneMap is the active class
+    (a @dataclass, not a PhysicalStructure) and that the legacy
+    zone_map.py:ZoneMap was deleted as dead code (C3)
+- Updated pond-sdk/extensions/__init__.py:
+  * Removed ZoneMap from the usage example in the docstring
+- Updated pond-sdk/extensions/physical_structures/README.md:
+  * Removed ZoneMap from the PhysicalStructure type hierarchy diagram
+  * Added ColumnChunkZoneMap, ColumnChunkStorage, EncodedChunkStorage to the
+    pruning infrastructure branch (were missing)
+  * Removed zone_map.py from the Files table
+  * Added column_chunk_storage.py, encoding.py, encoded_chunk_storage.py to
+    the Files table (were missing)
+  * Removed ZoneMap from the Naming convention table (no longer a
+    PhysicalStructure type)
+  * Removed ZoneMap from the Usage example
+  * Added a NOTE explaining the deletion
+- Updated pond-sdk/extensions/README.md:
+  * Updated the Zone map row to point to pruning.py (was ambiguous)
+  * Added a NOTE explaining the deletion
+  * Removed ZoneMap from the Usage example
+  * Updated the folder description to say "pruning" instead of "ZoneMap"
+
+Stage Summary:
+- 33/33 tests pass (no new tests — refactor preserved behavior).
+- Encoded pruning benchmark preserved: 3.23x faster than whole-blob.
+- The duplicate ZoneMap confusion is eliminated. There is now only ONE
+  ZoneMap class (pruning.py:ZoneMap), and it's the active one. The legacy
+  PhysicalStructure subclass that was causing confusion (which ZoneMap did
+  the caller mean?) is gone.
+- Net code reduction: -106 LOC (zone_map.py deleted).
+- Files changed:
+  * pond-sdk/extensions/physical_structures/zone_map.py (DELETED — 106 LOC)
+  * pond-sdk/extensions/physical_structures/__init__.py (removed ZoneMap
+    import + export; updated docstring)
+  * pond-sdk/extensions/__init__.py (removed ZoneMap from usage example)
+  * pond-sdk/extensions/physical_structures/README.md (updated type
+    hierarchy, files table, naming convention, usage example; added NOTE)
+  * pond-sdk/extensions/README.md (updated zone map row, usage example,
+    folder description; added NOTE)
+- Remaining review findings (C4, M13, M14) are documented in
+  docs/DESIGN_REVIEW_2026_07_26.md. Estimated 0.5 more day of refactoring.
+  The biggest remaining items are:
+  * C4 — extensions hard-code PyArrow (needs callback refactor)
+  * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)
+  * M13 — Statistics.can_prune stores min/max as str (needs native JSON types)

@@ -31,7 +31,7 @@ Usage:
     from extensions.semantic.ossie import SemanticLens, OssieAdapter
 
     # Physical Structure extensions
-    from extensions.physical_structures import BloomFilter, Statistics, ZoneMap
+    from extensions.physical_structures import BloomFilter, Statistics
 
     # Extension registry
     from extensions import list_extensions, load_extension
