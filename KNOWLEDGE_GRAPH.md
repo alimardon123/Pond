@@ -106,6 +106,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-sdk/extensions/physical_structures/pruning.py` | 180 | `ZoneMap`, `PruningPredicate`, `ColumnPredicate` | Vortex-style predicate pushdown. Zone maps (min/max/null_count per row group) + pruning predicates. Skip row groups without decoding. |
 | `pond-sdk/extensions/physical_structures/zone_map_index.py` | 280 | `ZoneMapIndex` | ProllyTreeIndex of zone maps. Stores min/max/null_count per data blob. Enables Vortex-style pruning without decoding. |
 | `pond-sdk/extensions/physical_structures/pruning_reader.py` | 200 | `PruningReader` | Generic pruning reader. Reads zone maps first, skips non-matching data blobs without decoding. Works with ANY lens/format. |
+| `pond-sdk/extensions/physical_structures/column_chunk_zone_map.py` | 180 | `ColumnChunkZoneMap`, `ColumnChunkStats` | Per-column-chunk zone maps for finer-grained pruning within surviving row groups. |
 | `pond-sdk/extensions/physical_structures/__init__.py` | 52 | — | Physical Structure extension package. |
 | `pond-sdk/extensions/physical_structures/base.py` | 105 | `PhysicalStructure` | Abstract base: build, load, exists, delete, query. |
 | `pond-sdk/extensions/physical_structures/bloom_filter.py` | 120 | `BloomFilter` | Probabilistic membership test (O(1)). |

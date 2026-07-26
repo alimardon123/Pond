@@ -73,6 +73,7 @@ contract (Track 2 proved it works).
 | `pruning.py` | `ZoneMap`, `ColumnPredicate`, `PruningPredicate` | Vortex-style pruning data structures. |
 | `zone_map_index.py` | `ZoneMapIndex` | ProllyTreeIndex of zone maps. Stores min/max per data blob. |
 | `pruning_reader.py` | `PruningReader` | Generic reader with zone-map pruning. Skips blobs without decoding. |
+| `column_chunk_zone_map.py` | `ColumnChunkZoneMap`, `ColumnChunkStats` | Per-column-chunk zone maps for finer-grained pruning within surviving row groups. |
 
 ## Usage
 
