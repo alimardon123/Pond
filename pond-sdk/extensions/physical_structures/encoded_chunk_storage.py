@@ -75,17 +75,22 @@ class EncodedChunkStorage(ColumnChunkStorage):
 
     def write_row_group_encoded(
             self,
-            table,
+            table_or_source,
             row_group_key: str,
             chunk_size: int = 1000,
             encoding_hints: Optional[dict[str, str]] = None) -> tuple[str, ColumnChunkZoneMap]:
         """Split a row group into per-column-chunk ENCODED blobs.
 
+        Format-agnostic (design review C4 fix): accepts either a PyArrow
+        Table (auto-wrapped) or any ColumnSource. Each chunk is encoded
+        with the best (or hinted) FastLanes-style encoding.
+
         Like ColumnChunkStorage.write_row_group_column_chunks, but each
         chunk blob is encoded with the best (or hinted) encoding.
 
         Args:
-            table: PyArrow Table (a single row group)
+            table_or_source: PyArrow Table OR ColumnSource (a single row
+                group's worth of data)
             row_group_key: the ProllyTreeIndex key for this row group
             chunk_size: rows per column chunk (default 1000)
             encoding_hints: optional dict {column_name: "auto"|"rle"|"dict"|"bitpack"|"raw"}
@@ -99,7 +104,10 @@ class EncodedChunkStorage(ColumnChunkStorage):
         if encoding_hints is None:
             encoding_hints = {}
 
-        n_rows = table.num_rows
+        from column_source import as_column_source, compute_list_stats
+        source = as_column_source(table_or_source)
+
+        n_rows = source.num_rows()
         cczm = ColumnChunkZoneMap(row_group_key=row_group_key)
         chunk_hashes_per_col: dict[str, list[str]] = {}
         # Sidecar: col_name → list of encoding_meta dicts (one per chunk).
@@ -107,10 +115,7 @@ class EncodedChunkStorage(ColumnChunkStorage):
         # second encode pass.
         encoding_meta_per_col: dict[str, list[dict]] = {}
 
-        import pyarrow.compute as pc
-
-        for col_name in table.column_names:
-            column = table[col_name]
+        for col_name in source.column_names():
             chunk_hashes: list[str] = []
             chunk_stats: list[ColumnChunkStats] = []
             chunk_enc_metas: list[dict] = []
@@ -118,8 +123,7 @@ class EncodedChunkStorage(ColumnChunkStorage):
 
             for start in range(0, n_rows, chunk_size):
                 end = min(start + chunk_size, n_rows)
-                chunk = column.slice(start, end - start)
-                values = chunk.to_pylist()
+                values = source.column_slice(col_name, start, end)
 
                 # Encode the chunk — enc_meta is reused (no second encode)
                 encoded_bytes, enc_meta = encode_column(values, hint=hint)
@@ -127,22 +131,16 @@ class EncodedChunkStorage(ColumnChunkStorage):
                 chunk_hashes.append(chunk_blob_hash)
                 chunk_enc_metas.append(enc_meta)
 
-                # Build chunk stats with encoding info
+                # Build chunk stats with encoding info (format-agnostic)
+                mn, mx, null_count = compute_list_stats(values)
                 stats = ColumnChunkStats(
                     chunk_index=len(chunk_stats),
                     row_count=end - start,
                     blob_hash=chunk_blob_hash,
+                    min=mn,
+                    max=mx,
+                    null_count=null_count,
                 )
-
-                # Min/max/null_count (for row-group zone map compat)
-                try:
-                    null_count = pc.sum(pc.is_null(chunk)).as_py()
-                    stats.null_count = null_count
-                    if null_count < len(chunk):
-                        stats.min = pc.min(chunk).as_py()
-                        stats.max = pc.max(chunk).as_py()
-                except Exception:
-                    pass
 
                 chunk_stats.append(stats)
 

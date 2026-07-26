@@ -74,14 +74,20 @@ class ColumnChunkStorage:
 
     def write_row_group_column_chunks(
             self,
-            table,
+            table_or_source,
             row_group_key: str,
             chunk_size: int = 1000,
             encode_fn=None) -> tuple[str, ColumnChunkZoneMap]:
         """Split a row group into per-column-chunk blobs and store them.
 
+        Format-agnostic (design review C4 fix): accepts either a PyArrow
+        Table (auto-wrapped) or any ColumnSource. Each chunk is encoded
+        via `encode_fn`, which receives a single-column PyArrow Table
+        (constructed from the source's column_slice) and returns bytes.
+
         Args:
-            table: PyArrow Table (a single row group)
+            table_or_source: PyArrow Table OR ColumnSource (a single row
+                group's worth of data)
             row_group_key: the ProllyTreeIndex key for this row group
                 (e.g., "rg/999")
             chunk_size: rows per column chunk (default 1000)
@@ -102,47 +108,45 @@ class ColumnChunkStorage:
                 "that encodes a single-column PyArrow Table to your "
                 "preferred format (e.g., Parquet).")
 
-        n_rows = table.num_rows
+        from column_source import as_column_source, compute_list_stats
+        import pyarrow as pa
+        source = as_column_source(table_or_source)
+
+        n_rows = source.num_rows()
         cczm = ColumnChunkZoneMap(row_group_key=row_group_key)
 
         # column_name → list of chunk blob hashes (one per chunk)
         chunk_hashes_per_col: dict[str, list[str]] = {}
 
-        for col_name in table.column_names:
-            column = table[col_name]
+        for col_name in source.column_names():
             chunk_hashes: list[str] = []
             chunk_stats: list[ColumnChunkStats] = []
 
             for start in range(0, n_rows, chunk_size):
                 end = min(start + chunk_size, n_rows)
-                chunk = column.slice(start, end - start)
+                values = source.column_slice(col_name, start, end)
 
-                # Wrap the single column as a one-column Table for encoding
-                import pyarrow as pa
-                chunk_table = pa.Table.from_arrays([chunk], names=[col_name])
+                # Wrap the single column as a one-column Table for encoding.
+                # (encode_fn expects a PyArrow Table; this is the encoding
+                # contract, separate from the ColumnSource contract.)
+                chunk_table = pa.Table.from_arrays(
+                    [pa.array(values)], names=[col_name])
 
                 # Encode + write the chunk as its own blob
                 chunk_bytes = encode_fn(chunk_table)
                 chunk_blob_hash = self.kernel.write(chunk_bytes)
                 chunk_hashes.append(chunk_blob_hash)
 
-                # Compute stats for this chunk
+                # Compute stats for this chunk (format-agnostic)
+                mn, mx, null_count = compute_list_stats(values)
                 stats = ColumnChunkStats(
                     chunk_index=len(chunk_stats),
                     row_count=end - start,
                     blob_hash=chunk_blob_hash,
+                    min=mn,
+                    max=mx,
+                    null_count=null_count,
                 )
-
-                # Compute min/max/null_count using PyArrow
-                try:
-                    import pyarrow.compute as pc
-                    null_count = pc.sum(pc.is_null(chunk)).as_py()
-                    stats.null_count = null_count
-                    if null_count < len(chunk):
-                        stats.min = pc.min(chunk).as_py()
-                        stats.max = pc.max(chunk).as_py()
-                except Exception:
-                    pass  # type doesn't support min/max
 
                 chunk_stats.append(stats)
 

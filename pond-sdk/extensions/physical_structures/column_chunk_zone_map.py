@@ -86,45 +86,42 @@ class ColumnChunkZoneMap:
     column_chunks: dict[str, list[ColumnChunkStats]] = field(default_factory=dict)
 
     @classmethod
-    def build(cls, table, row_group_key: str,
+    def build(cls, table_or_source, row_group_key: str,
               chunk_size: int = 1000) -> "ColumnChunkZoneMap":
-        """Build a ColumnChunkZoneMap from a PyArrow Table.
+        """Build a ColumnChunkZoneMap from a PyArrow Table or ColumnSource.
 
-        Splits each column into chunks of `chunk_size` rows and computes
-        min/max/null_count per chunk.
+        Format-agnostic (design review C4 fix): accepts either a PyArrow
+        Table (auto-wrapped) or any ColumnSource. Splits each column into
+        chunks of `chunk_size` rows and computes min/max/null_count per
+        chunk using the source's column_slice + compute_list_stats.
 
         Args:
-            table: PyArrow Table (a single row group)
+            table_or_source: PyArrow Table OR ColumnSource (a single row
+                group's worth of data)
             row_group_key: the ProllyTreeIndex key for this row group
             chunk_size: rows per column chunk (default 1000)
         """
-        import pyarrow.compute as pc
+        from column_source import as_column_source, compute_list_stats
+        source = as_column_source(table_or_source)
 
         cczm = cls(row_group_key=row_group_key)
-        n_rows = table.num_rows
+        n_rows = source.num_rows()
 
-        for col_name in table.column_names:
-            column = table[col_name]
+        for col_name in source.column_names():
             chunks = []
 
             for start in range(0, n_rows, chunk_size):
                 end = min(start + chunk_size, n_rows)
-                chunk = column.slice(start, end - start)
+                values = source.column_slice(col_name, start, end)
 
+                mn, mx, null_count = compute_list_stats(values)
                 stats = ColumnChunkStats(
                     chunk_index=len(chunks),
                     row_count=end - start,
+                    min=mn,
+                    max=mx,
+                    null_count=null_count,
                 )
-
-                null_count = pc.sum(pc.is_null(chunk)).as_py()
-                stats.null_count = null_count
-
-                if null_count < len(chunk):
-                    try:
-                        stats.min = pc.min(chunk).as_py()
-                        stats.max = pc.max(chunk).as_py()
-                    except Exception:
-                        pass  # type doesn't support min/max
 
                 chunks.append(stats)
 

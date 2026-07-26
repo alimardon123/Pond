@@ -132,6 +132,10 @@ def test_best_effort():
     ok, output = _run_script("tests/integration/test_best_effort.py")
     assert ok, f"Best-effort helper tests failed:\n{output[-500:]}"
 
+def test_column_source():
+    ok, output = _run_script("tests/integration/test_column_source.py")
+    assert ok, f"ColumnSource tests failed:\n{output[-500:]}"
+
 def test_kv_pruning_and_projection():
     ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
     assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"

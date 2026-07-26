@@ -69,36 +69,40 @@ class ZoneMap:
     column_chunks: Optional[dict] = None  # ColumnChunkZoneMap.to_dict() for finer pruning
 
     @classmethod
-    def build(cls, table, columns: Optional[list[str]] = None) -> "ZoneMap":
-        """Build a ZoneMap from a PyArrow Table.
+    def build(cls, table_or_source, columns: Optional[list[str]] = None
+              ) -> "ZoneMap":
+        """Build a ZoneMap from a PyArrow Table or a ColumnSource.
+
+        Format-agnostic (design review C4 fix): accepts either a PyArrow
+        Table (auto-wrapped for backward compat) or any ColumnSource
+        implementation (e.g., ListColumnSource for list-of-dicts data,
+        PyArrowColumnSource for PyArrow, or a custom adapter for any
+        other format).
 
         Args:
-            table: PyArrow Table (a single row group)
-            columns: columns to compute stats for. If None, uses all columns.
+            table_or_source: PyArrow Table OR ColumnSource (a single row
+                group's worth of data)
+            columns: columns to compute stats for. If None, uses all
+                columns from the source.
 
         Returns:
             ZoneMap with min/max/null_count for each column.
         """
-        import pyarrow.compute as pc
+        from column_source import as_column_source
+        source = as_column_source(table_or_source)
 
         if columns is None:
-            columns = table.column_names
+            columns = source.column_names()
 
-        zm = cls(row_count=table.num_rows)
+        zm = cls(row_count=source.num_rows())
         for col in columns:
-            if col not in table.column_names:
+            if col not in source.column_names():
                 continue
-            column = table[col]
-            # Min/max (skip if all null)
-            null_count = pc.sum(pc.is_null(column)).as_py()
+            mn, mx, null_count = source.column_stats(col)
             zm.null_count[col] = null_count
-            if null_count < table.num_rows:
-                try:
-                    zm.min[col] = pc.min(column).as_py()
-                    zm.max[col] = pc.max(column).as_py()
-                except Exception:
-                    # Some types (lists, structs) don't support min/max
-                    pass
+            if mn is not None:
+                zm.min[col] = mn
+                zm.max[col] = mx
         return zm
 
     def to_dict(self) -> dict:

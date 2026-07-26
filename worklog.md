@@ -2641,3 +2641,77 @@ Stage Summary:
   * C4 — extensions hard-code PyArrow (needs callback refactor)
   * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)
   * M13 — Statistics.can_prune stores min/max as str (needs native JSON types)
+
+---
+Task ID: design-review-fixes-phase8
+Agent: main
+Task: Phase C (C4) — make extensions truly format-agnostic via ColumnSource
+
+Work Log:
+- Created pond-sdk/extensions/physical_structures/column_source.py (175 LOC):
+  * ColumnSource Protocol — minimal interface for format-agnostic column
+    data access: column_names(), num_rows(), column_slice(name, start, end),
+    column_stats(name) → (min, max, null_count)
+  * PyArrowColumnSource — wraps a pa.Table, uses pc.min/pc.max for efficient
+    stats without materializing the column
+  * ListColumnSource — wraps a list[dict] (what KeyValueLens produces);
+    also useful for tests without PyArrow installed
+  * as_column_source(table_or_source) — coerces a PyArrow Table (auto-wrapped)
+    or passes through an existing ColumnSource; raises TypeError for others
+  * compute_list_stats(values) — helper for (min, max, null_count) from a
+    plain Python list; handles nulls, empty lists, mixed types
+- Refactored 4 build() methods to accept either PyArrow Table (auto-wrapped
+  for backward compat) OR any ColumnSource:
+  * pruning.py:ZoneMap.build — uses source.column_stats() per column
+  * column_chunk_zone_map.py:ColumnChunkZoneMap.build — uses
+    source.column_slice() + compute_list_stats() per chunk
+  * column_chunk_storage.py:ColumnChunkStorage.write_row_group_column_chunks —
+    uses source.column_slice() for chunk values, then encodes via encode_fn
+    (encode_fn still receives a PyArrow Table — that's the encoding contract,
+    separate from the ColumnSource contract)
+  * encoded_chunk_storage.py:EncodedChunkStorage.write_row_group_encoded —
+    uses source.column_slice() for chunk values, then encodes via
+    encode_column() (FastLanes-style)
+- All 4 methods now have docstrings saying "Format-agnostic (design review
+  C4 fix): accepts either a PyArrow Table (auto-wrapped) or any ColumnSource."
+- Created tests/integration/test_column_source.py (180 LOC):
+  * test_list_column_source_basic — builds ZoneMap from list-of-dicts (no PyArrow)
+  * test_list_column_source_chunked — builds ColumnChunkZoneMap from list-of-dicts
+  * test_matches_pyarrow — verifies ListColumnSource and PyArrowColumnSource
+    produce identical zone maps for the same data
+  * test_as_column_source_auto_wrap — verifies backward compat (PyArrow Table
+    auto-wrapped, ColumnSource passes through, others raise TypeError)
+  * test_compute_list_stats — edge cases (nulls, empty, strings, mixed types)
+  * test_format_agnostic_end_to_end — builds zone maps from list-of-dicts,
+    stores in kernel, reads back, verifies pruning works (2/3 row groups
+    pruned for predicate age >= 40)
+- Registered new files in KNOWLEDGE_GRAPH.md.
+
+Stage Summary:
+- 34/34 tests pass (added 1 new test for ColumnSource).
+- Encoded pruning benchmark preserved: 3.02x faster than whole-blob.
+- The pruning infrastructure is now TRULY format-agnostic. A KeyValueLens
+  producing JSON, a VectorLens producing binary, or any future lens can
+  implement ColumnSource and use ZoneMap.build / ColumnChunkZoneMap.build /
+  ColumnChunkStorage / EncodedChunkStorage without PyArrow.
+- Backward compat preserved: all existing callers passing PyArrow Tables
+  keep working unchanged (auto-wrapped via as_column_source).
+- The docstrings no longer lie — "format-agnostic" is now true.
+- Files changed:
+  * pond-sdk/extensions/physical_structures/column_source.py (NEW — 175 LOC)
+  * pond-sdk/extensions/physical_structures/pruning.py (ZoneMap.build refactored)
+  * pond-sdk/extensions/physical_structures/column_chunk_zone_map.py
+    (ColumnChunkZoneMap.build refactored)
+  * pond-sdk/extensions/physical_structures/column_chunk_storage.py
+    (write_row_group_column_chunks refactored)
+  * pond-sdk/extensions/physical_structures/encoded_chunk_storage.py
+    (write_row_group_encoded refactored)
+  * tests/integration/test_column_source.py (NEW — 180 LOC)
+  * tests/test_all.py (1 new test entry)
+  * KNOWLEDGE_GRAPH.md (2 new entries)
+- Remaining review findings (M13, M14) are documented in
+  docs/DESIGN_REVIEW_2026_07_26.md. These are lower priority:
+  * M13 — Statistics.can_prune stores min/max as str (needs native JSON types)
+  * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)
+- All CRITICAL and most MAJOR findings from the design review are now fixed.
+  The codebase is in good shape for the next feature work.
