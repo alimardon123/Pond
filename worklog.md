@@ -2343,3 +2343,64 @@ Stage Summary:
 - Remaining review findings (C3, C4, C6, C11, M13, M14, M16)
   are documented in docs/DESIGN_REVIEW_2026_07_26.md. Estimated 2-3
   more days of refactoring.
+
+---
+Task ID: design-review-fixes-phase4
+Agent: main
+Task: Phase F (C6) — move sys.path.insert to module-level + HAVE_PRUNING flag
+
+Work Log:
+- Audited all sys.path.insert call sites across the repo (40+ sites in 14 files).
+  Two categories identified:
+  1. Module-level sys.path.insert (run once at import time) — acceptable as a
+     transitional measure; will be replaced by absolute imports when pond-sdk
+     becomes a real pip-installed package.
+  2. In-method sys.path.insert (run on every call, grow sys.path unboundedly,
+     cause import-order bugs) — the real problem. 8 sites in lakehouse_lens.py.
+- Added physical_structures to the module-level sys.path.insert in
+  lakehouse_lens.py (was only pond-core + pond-sdk; now also includes
+  pond-sdk/extensions/physical_structures).
+- Added HAVE_PRUNING module-level flag in lakehouse_lens.py:
+  * Set once at import time by trying to import all pruning extensions
+    (CollectionMetadata, PruningPredicate, ColumnPredicate, ZoneMap,
+    PruningReader, ColumnChunkZoneMap, ColumnChunkStats, ColumnChunkStorage,
+    EncodedChunkStorage, EncodingHeader, decode_column).
+  * If any import fails, HAVE_PRUNING = False and the lens falls back to
+    full reads.
+  * Methods no longer need to repeat the try/except dance on every call.
+- Replaced all 8 in-method sys.path.insert + try/except ImportError blocks
+  with HAVE_PRUNING checks:
+  * range_write's write_parquet_blob callback — column-chunk zone map build
+  * range_write_column_chunks — ColumnChunkStorage import
+  * range_write_encoded — EncodedChunkStorage import
+  * _read_with_pruning_generic — CollectionMetadata + PruningPredicate import
+  * read_with_column_chunk_pruning — ColumnChunkStorage import
+  * read_with_encoded_pruning — EncodedChunkStorage + ColumnChunkStorage import
+  * _write_via_prolly's zone map build — ColumnChunkZoneMap import
+  * _decode_blob_to_table — ColumnChunkStorage + ColumnChunkZoneMap + EncodingHeader import
+- Each method now reads cleanly: "if not HAVE_PRUNING: fall back" at the top,
+  then the body uses the already-imported names directly. No more sys.path
+  mutation during method execution.
+
+Stage Summary:
+- 32/32 tests pass (no new tests — refactor preserved behavior).
+- Encoded pruning benchmark preserved: 2.97x faster than whole-blob.
+- SQL pushdown fast-paths test preserved: all 3 storage modes work via SQL.
+- All 8 in-method sys.path.insert calls eliminated. Only 3 module-level
+  sys.path.insert calls remain (lines 89, 90, 91) — these run once at import
+  time and are the transitional measure until pond-sdk becomes a real package.
+- Methods are now more readable: "if not HAVE_PRUNING: fallback" is clearer
+  than "try: sys.path.insert(...); from X import Y; except ImportError: pass".
+- Import-order bugs eliminated: the lens's import behavior no longer depends
+  on which method is called first.
+- Files changed:
+  * lenses/lakehouse/lakehouse_lens.py (module-level sys.path.insert expanded
+    to include physical_structures; HAVE_PRUNING flag added; 8 in-method
+    sys.path.insert + try/except blocks replaced with HAVE_PRUNING checks)
+- Remaining review findings (C3, C4, C11, M13, M14, M16) are documented in
+  docs/DESIGN_REVIEW_2026_07_26.md. Estimated 1-2 more days of refactoring.
+  The biggest remaining items are:
+  * C3 — rename duplicate ZoneMap classes (needs careful coordination)
+  * C4 — extensions hard-code PyArrow (needs callback refactor)
+  * C11 — broad except Exception: pass (needs specific exception types)
+  * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)

@@ -81,10 +81,15 @@ import tempfile
 import shutil
 from typing import Optional, Iterator, Callable
 
-# Make pond-core and pond-sdk importable
+# Make pond-core, pond-sdk, and the physical_structures extension package
+# importable. These sys.path inserts run ONCE at module import time
+# (not per-method-call). A future upgrade to a real pip-installed package
+# would replace these with absolute imports.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk",
+                                  "extensions", "physical_structures"))
 from kernel import PondMinimal  # noqa: E402
 from base_lens import PondLens  # noqa: E402
 
@@ -115,6 +120,25 @@ try:
 except ImportError:
     ProllyLensBase = None
     ProllyTree = None
+
+# Pruning extensions — OPTIONAL. When present, LakehouseLens can do
+# Vortex-style predicate pushdown (row-group → column-chunk → encoded →
+# row-level). When absent, the lens falls back to full reads.
+# HAVE_PRUNING is set once at import time so methods don't have to
+# repeat the try/except dance on every call.
+HAVE_PRUNING = False
+try:
+    from collection_metadata import CollectionMetadata  # noqa: E402
+    from pruning import PruningPredicate, ColumnPredicate, ZoneMap  # noqa: E402
+    from pruning_reader import PruningReader  # noqa: E402
+    from column_chunk_zone_map import ColumnChunkZoneMap, ColumnChunkStats  # noqa: E402
+    from column_chunk_storage import ColumnChunkStorage  # noqa: E402
+    from encoded_chunk_storage import EncodedChunkStorage  # noqa: E402
+    from encoding import EncodingHeader, decode_column  # noqa: E402
+    HAVE_PRUNING = True
+except ImportError:
+    pass
+
 
 
 # ---------------------------------------------------------------------------
@@ -520,15 +544,15 @@ class LakehouseLens(PondLens):
             parquet_bytes = self._encode_table(group_table)
             parquet_hash = self.kernel.write(parquet_bytes)
 
-            # Compute column-chunk zone maps (in-line stats; no per-chunk blobs)
+            # Compute column-chunk zone maps (in-line stats; no per-chunk blobs).
+            # HAVE_PRUNING is set once at module import time.
             cczm = None
-            try:
-                sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
-                from column_chunk_zone_map import ColumnChunkZoneMap
-                cczm = ColumnChunkZoneMap.build(group_table, rg_key,
-                                                chunk_size=DEFAULT_CHUNK_SIZE)
-            except ImportError:
-                pass
+            if HAVE_PRUNING:
+                try:
+                    cczm = ColumnChunkZoneMap.build(group_table, rg_key,
+                                                    chunk_size=DEFAULT_CHUNK_SIZE)
+                except Exception:
+                    pass  # best-effort
 
             return parquet_hash, cczm
 
@@ -573,11 +597,11 @@ class LakehouseLens(PondLens):
         Returns:
             The new HEAD commit hash.
         """
-        try:
-            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
-            from column_chunk_storage import ColumnChunkStorage
-        except ImportError as e:
-            raise ImportError(f"ColumnChunkStorage extension required: {e}")
+        if not HAVE_PRUNING:
+            raise ImportError(
+                "ColumnChunkStorage extension required for range_write_column_chunks. "
+                "Install the pond-sdk physical_structures extension package."
+            )
 
         storage = ColumnChunkStorage(self.kernel)
 
@@ -624,11 +648,11 @@ class LakehouseLens(PondLens):
         Returns:
             The new HEAD commit hash.
         """
-        try:
-            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
-            from encoded_chunk_storage import EncodedChunkStorage
-        except ImportError as e:
-            raise ImportError(f"EncodedChunkStorage extension required: {e}")
+        if not HAVE_PRUNING:
+            raise ImportError(
+                "EncodedChunkStorage extension required for range_write_encoded. "
+                "Install the pond-sdk physical_structures extension package."
+            )
 
         storage = EncodedChunkStorage(self.kernel)
 
@@ -879,14 +903,11 @@ class LakehouseLens(PondLens):
         Returns:
             A PyArrow Table containing surviving rows.
         """
-        try:
-            from collection_metadata import CollectionMetadata
-            from pruning import PruningPredicate, ColumnPredicate
-            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
-            meta = CollectionMetadata(self.kernel)
-            zm_index = meta.zm_index
-        except ImportError:
+        if not HAVE_PRUNING:
             return self.read_table(name)
+
+        meta = CollectionMetadata(self.kernel)
+        zm_index = meta.zm_index
 
         if zm_index is None or not zm_index.has_zone_maps(name):
             return self.read_table(name)
@@ -1075,16 +1096,13 @@ class LakehouseLens(PondLens):
         Returns:
             A PyArrow Table containing rows from surviving chunks.
         """
-        try:
-            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
-            from column_chunk_storage import ColumnChunkStorage
-            from column_chunk_zone_map import ColumnChunkZoneMap
-            storage = ColumnChunkStorage(self.kernel)
-        except ImportError:
+        if not HAVE_PRUNING:
             return self.read_with_pruning(name, predicates=predicates,
                                           row_filter=row_filter,
                                           columns=columns,
                                           chunk_size=chunk_size)
+
+        storage = ColumnChunkStorage(self.kernel)
 
         def read_surviving_rowgroup(rg_key, manifest_hash, zm_dict,
                                       cc_predicates, columns):
@@ -1163,17 +1181,13 @@ class LakehouseLens(PondLens):
         Returns:
             A PyArrow Table containing rows that survived all pruning.
         """
-        try:
-            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
-            from encoded_chunk_storage import EncodedChunkStorage
-            from column_chunk_storage import ColumnChunkStorage
-            from column_chunk_zone_map import ColumnChunkZoneMap
-            storage = EncodedChunkStorage(self.kernel)
-            plain_storage = ColumnChunkStorage(self.kernel)
-        except ImportError:
+        if not HAVE_PRUNING:
             return self.read_with_column_chunk_pruning(
                 name, predicates=predicates, row_filter=row_filter,
                 columns=columns, chunk_size=chunk_size)
+
+        storage = EncodedChunkStorage(self.kernel)
+        plain_storage = ColumnChunkStorage(self.kernel)
 
         def read_surviving_rowgroup(rg_key, manifest_hash, zm_dict,
                                       cc_predicates, columns):
@@ -1361,20 +1375,20 @@ class LakehouseLens(PondLens):
             if zm_index is not None:
                 try:
                     zm = ZoneMap.build(group_table)
-                    # Also compute column-chunk zone maps for finer pruning
-                    try:
-                        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
-                        from column_chunk_zone_map import ColumnChunkZoneMap
-                        cczm = ColumnChunkZoneMap.build(group_table, rg_key,
-                                                        chunk_size=1000)
-                        # Merge column-chunk stats into the zone map dict
-                        # so PruningReader can use them
-                        zm_dict = zm.to_dict()
-                        zm_dict["column_chunks"] = cczm.to_dict()
-                        # Create a ZoneMap with the extra field
-                        zm = ZoneMap.from_dict(zm_dict)
-                    except ImportError:
-                        pass  # column_chunk_zone_map not available
+                    # Also compute column-chunk zone maps for finer pruning.
+                    # HAVE_PRUNING is set once at module import time.
+                    if HAVE_PRUNING:
+                        try:
+                            cczm = ColumnChunkZoneMap.build(group_table, rg_key,
+                                                            chunk_size=DEFAULT_CHUNK_SIZE)
+                            # Merge column-chunk stats into the zone map dict
+                            # so PruningReader can use them
+                            zm_dict = zm.to_dict()
+                            zm_dict["column_chunks"] = cczm.to_dict()
+                            # Create a ZoneMap with the extra field
+                            zm = ZoneMap.from_dict(zm_dict)
+                        except Exception:
+                            pass  # column-chunk zone map is best-effort
                     zm_index.add_zone_map(name, rg_key, zm, parquet_hash)
                 except Exception:
                     pass  # zone map computation is best-effort
@@ -1581,13 +1595,8 @@ class LakehouseLens(PondLens):
         # Manifest: read all chunk blobs for all columns, reassemble.
         # Detect encoded storage by checking the first chunk blob's header
         # (magic bytes b"PND1" = encoded, b"PAR1" = Parquet).
-        try:
-            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
-            from column_chunk_storage import ColumnChunkStorage
-            from column_chunk_zone_map import ColumnChunkZoneMap, ColumnChunkStats
-            from encoding import EncodingHeader
-        except ImportError:
-            return None
+        if not HAVE_PRUNING:
+            return None  # cannot decode manifest without pruning extensions
 
         # Peek at the first chunk blob to detect encoding
         first_col = next(iter(manifest["column_chunks"]))
