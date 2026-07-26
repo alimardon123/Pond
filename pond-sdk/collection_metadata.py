@@ -96,11 +96,23 @@ class CollectionMetadata:
 
     # Patterns that indicate object storage (not local disk)
     _OBJECT_STORE_PATTERNS = ["s3://", "gs://", "azure://", "abfs://",
-                               "wasb://", "http://", "https://"]
+                               "wasb://", "http://", "https://",
+                               "nfs://", "/mnt/nfs/", "/mnt/shared/",
+                               "/net/"]
 
-    def __init__(self, kernel: PondMinimal):
+    def __init__(self, kernel: PondMinimal, force_pruning: Optional[bool] = None):
+        """Create a CollectionMetadata manager.
+
+        Args:
+            kernel: the PondMinimal kernel instance
+            force_pruning: override auto-detection.
+                None = auto (object store → on, local → off)
+                True = always prune
+                False = never prune
+        """
         self.kernel = kernel
         self._is_object_store = self._detect_object_store()
+        self._force_pruning = force_pruning
 
         # Lazy-init sub-managers (only if extensions are available)
         self._zm_index: Optional[ZoneMapIndex] = None
@@ -130,15 +142,21 @@ class CollectionMetadata:
     def should_prune(self, explicit: Optional[bool] = None) -> bool:
         """Decide whether to use pruning for a read operation.
 
+        Priority (highest first):
+          1. explicit argument (caller's per-call override)
+          2. force_pruning (set at construction time)
+          3. auto-detection (object store → True, local → False)
+
         Args:
-            explicit: caller's explicit choice. If None, auto-decide
-                based on storage type (object store → True, local → False).
+            explicit: caller's explicit choice for this call.
 
         Returns:
             True if pruning should be used, False otherwise.
         """
         if explicit is not None:
             return explicit
+        if self._force_pruning is not None:
+            return self._force_pruning
         return self._is_object_store
 
     @property

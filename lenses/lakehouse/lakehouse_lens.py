@@ -1102,9 +1102,19 @@ class PondLakehouse:
       - Range read/write for operational workloads
     """
 
-    def __init__(self, base_dir: str):
+    def __init__(self, base_dir: str, force_pruning: Optional[bool] = None):
+        """Create a PondLakehouse.
+
+        Args:
+            base_dir: filesystem path or object store URL for the kernel.
+            force_pruning: override auto-detection for predicate pushdown.
+                None = auto (S3→on, local→off)
+                True = always prune
+                False = never prune
+        """
         self.kernel = PondMinimal(base_dir)
         self.lens = LakehouseLens(self.kernel)
+        self._force_pruning = force_pruning
         self.duckdb = duckdb.connect()
 
     def create_table(self, name: str, data: pa.Table) -> str:
@@ -1160,14 +1170,17 @@ class PondLakehouse:
                 True=force on, False=force off.
         """
         if table_name:
-            # Auto-decide pruning based on storage type
+            # Auto-decide pruning based on storage type or force_pruning override
             if use_pruning is None:
-                try:
-                    from collection_metadata import CollectionMetadata
-                    meta = CollectionMetadata(self.kernel)
-                    use_pruning = meta.should_prune()
-                except Exception:
-                    use_pruning = False  # default: no pruning if detection fails
+                if self._force_pruning is not None:
+                    use_pruning = self._force_pruning
+                else:
+                    try:
+                        from collection_metadata import CollectionMetadata
+                        meta = CollectionMetadata(self.kernel)
+                        use_pruning = meta.should_prune()
+                    except Exception:
+                        use_pruning = False  # default: no pruning if detection fails
 
             if use_pruning:
                 table = self._read_with_pushdown(sql, table_name)
