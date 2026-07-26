@@ -453,6 +453,120 @@ class LakehouseLens(PondLens):
         self._notify_indexers(name)
         return commit_hash
 
+    def range_write_column_chunks(self, name: str, table: pa.Table,
+                                   key_col: str,
+                                   row_group_size: int = DEFAULT_RANGE_ROW_GROUP_SIZE,
+                                   chunk_size: int = 1000) -> str:
+        """Write a table with per-column-chunk storage.
+
+        Like range_write, but each row group is further split into
+        per-column-chunk Parquet blobs. Each blob is a single-column,
+        single-chunk Parquet file stored as its own content-addressed
+        blob in the kernel.
+
+        This enables TRUE I/O savings on object storage:
+          - Column-chunk pruning skips actual kernel.read_blob() calls
+            (not just row_filter work)
+          - Skip 4/5 chunks = skip 4/5 of bytes per column
+          - Each chunk is independently addressable for parallel reads
+
+        The data ProllyTreeIndex maps f"rg/{max_pk}" → manifest_blob_hash.
+        The manifest is a small JSON blob listing all chunk blob hashes
+        per column. This preserves read_table() compatibility.
+
+        The zone map blob's column_chunks stats are augmented with
+        blob_hash fields so PruningReader can fetch surviving chunk
+        blobs directly without reading the manifest.
+
+        Args:
+            name: collection name
+            table: the rows to write
+            key_col: the column whose values become the row-group keys
+            row_group_size: rows per row group (default 10_000)
+            chunk_size: rows per column chunk (default 1000)
+
+        Returns:
+            The new HEAD commit hash.
+        """
+        if ProllyLensBase is None:
+            raise ImportError("range_write_column_chunks requires prolly_tree.py")
+
+        if key_col not in table.column_names:
+            raise KeyError(f"key column '{key_col}' not in table columns {table.column_names}")
+
+        try:
+            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
+            from column_chunk_storage import ColumnChunkStorage
+            from column_chunk_zone_map import ColumnChunkZoneMap
+        except ImportError as e:
+            raise ImportError(f"ColumnChunkStorage extension required: {e}")
+
+        from collection_metadata import CollectionMetadata
+        from pruning import ZoneMap
+
+        base = ProllyLensBase(self.kernel, name)
+        storage = ColumnChunkStorage(self.kernel)
+        zm_index = CollectionMetadata(self.kernel).zm_index
+
+        # Clear old zone maps for this collection (overwrite semantics)
+        if zm_index is not None:
+            zm_base = zm_index._get_base(name)
+            for k in zm_base.read_all().keys():
+                if k.startswith(_RG_PREFIX):
+                    zm_base.stage_delete(k)
+
+        # Sort by key_col so row groups are contiguous key ranges
+        sorted_table = table.sort_by(key_col)
+        n_rows = sorted_table.num_rows
+        if n_rows == 0:
+            return base.commit("range_write_column_chunks: empty table")
+
+        key_array = sorted_table.column(key_col).to_pylist()
+
+        # Stage each row group as a MANIFEST blob (not a Parquet blob).
+        # The manifest lists chunk blob hashes per column.
+        for start in range(0, n_rows, row_group_size):
+            end = min(start + row_group_size, n_rows)
+            group_table = sorted_table.slice(start, end - start)
+            max_pk = key_array[end - 1]
+            rg_key = f"{_RG_PREFIX}{max_pk}"
+
+            # Split the row group into per-column-chunk blobs.
+            # Returns (manifest_blob_hash, cczm_with_blob_hashes).
+            manifest_hash, cczm = storage.write_row_group_column_chunks(
+                group_table, rg_key, chunk_size=chunk_size,
+                encode_fn=self._encode_table,
+            )
+            base.stage(rg_key, manifest_hash)
+
+            # Build the row-group zone map (existing path) and merge in
+            # the column-chunk stats (which now have blob_hash fields).
+            if zm_index is not None:
+                try:
+                    zm = ZoneMap.build(group_table)
+                    zm_dict = zm.to_dict()
+                    zm_dict["column_chunks"] = cczm.to_dict()
+                    zm = ZoneMap.from_dict(zm_dict)
+                    zm_index.add_zone_map(name, rg_key, zm, manifest_hash)
+                except Exception:
+                    pass  # zone map is best-effort
+
+        commit_hash = base.commit(
+            f"range_write_column_chunks: {n_rows} rows in "
+            f"{(n_rows + row_group_size - 1) // row_group_size} row groups "
+            f"(chunk_size={chunk_size})"
+        )
+
+        if zm_index is not None:
+            try:
+                zm_index.commit_zone_maps(name, f"zone maps for {name}")
+            except Exception:
+                pass
+
+        self._cached_tables.pop(f"{name}:{commit_hash}", None)
+        self._notify_indexers(name)
+        return commit_hash
+
     def range_read(self, name: str,
                    start_key: Optional[str] = None,
                    end_key: Optional[str] = None) -> pa.Table:
@@ -727,6 +841,165 @@ class LakehouseLens(PondLens):
 
         # Convert list of dicts back to PyArrow Table
         return pa.Table.from_pylist(rows)
+
+    def read_with_column_chunk_pruning(self, name: str,
+                                        predicates: Optional[list] = None,
+                                        row_filter: Optional[Callable] = None,
+                                        columns: Optional[list[str]] = None,
+                                        chunk_size: int = 1000) -> pa.Table:
+        """Read with per-column-chunk storage (TRUE I/O savings).
+
+        Like read_with_pruning, but uses per-column-chunk storage
+        (written by range_write_column_chunks). For each surviving row
+        group, only the surviving chunk BLOBS are fetched from the kernel
+        — not the whole row group blob.
+
+        This delivers real I/O savings on object storage:
+          - Skip 4/5 chunks = skip 4/5 of kernel.read_blob() calls
+          - Skip 4/5 of bytes per column
+          - Each chunk is a separate content-addressed blob
+
+        Falls back to read_with_pruning if column-chunk storage is not
+        available for this collection (e.g., written via range_write
+        without the column_chunks mode).
+
+        Args:
+            name: collection name (must have zone maps)
+            predicates: list of (column, op, value) tuples for pruning
+            row_filter: optional function(row_dict) -> bool for exact
+                row-level filtering after pruning
+            columns: list of columns to read. If None, reads ALL columns
+                from surviving chunks. If specified, only those columns
+                are read (projection pushdown + column-chunk pruning).
+            chunk_size: rows per column chunk (must match the chunk_size
+                used at write time)
+
+        Returns:
+            A PyArrow Table containing rows from surviving chunks.
+        """
+        try:
+            from collection_metadata import CollectionMetadata
+            from pruning import PruningPredicate, ColumnPredicate
+            from pruning_reader import PruningReader
+            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
+            from column_chunk_storage import ColumnChunkStorage
+            from column_chunk_zone_map import ColumnChunkZoneMap
+            meta = CollectionMetadata(self.kernel)
+            zm_index = meta.zm_index
+        except ImportError:
+            return self.read_with_pruning(name, predicates=predicates,
+                                          row_filter=row_filter,
+                                          columns=columns,
+                                          chunk_size=chunk_size)
+
+        if zm_index is None or not zm_index.has_zone_maps(name):
+            return self.read_table(name)
+
+        # Build pruning predicate
+        predicate = None
+        if predicates:
+            col_preds = [ColumnPredicate(column=c, op=o, value=v)
+                         for c, o, v in predicates]
+            predicate = PruningPredicate(col_preds, combine="and")
+
+        reader = PruningReader(self.kernel, zm_index, name, predicate)
+        storage = ColumnChunkStorage(self.kernel)
+
+        # Build column-chunk predicate lookup
+        cc_predicates = {}
+        if predicate:
+            for pred in predicate.predicates:
+                cc_predicates[pred.column] = (pred.op, pred.value)
+
+        # Determine which columns to read
+        # Default: all columns from the schema (look at first zone map)
+        if columns is None:
+            columns = self._infer_columns(name, zm_index)
+
+        # Walk surviving row groups via the verbose pruning scan
+        all_rows: list[dict] = []
+
+        for rg_key, manifest_hash, zm_dict in zm_index.scan_with_pruning(
+                name, predicate, verbose=True):
+
+            # If column-chunk storage is not active for this row group,
+            # fall back to the regular pruning path (read whole blob).
+            if not ColumnChunkStorage.has_column_chunk_storage(zm_dict):
+                data_bytes = self.kernel.read_blob(manifest_hash)
+                # manifest_hash here is actually the data blob hash
+                # (set by add_zone_map — same hash stored in zone map)
+                # Re-derive via zone map's blob_hash field
+                actual_data_hash = zm_dict.get("blob_hash", manifest_hash)
+                data_bytes = self.kernel.read_blob(actual_data_hash)
+                table = self._decode_table(data_bytes)
+                for row in table.to_pylist():
+                    if row_filter is None or row_filter(row):
+                        all_rows.append(row)
+                continue
+
+            # Column-chunk storage active — read only surviving chunks
+            cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
+
+            # Compute surviving chunk indices (intersection across
+            # predicate columns — same logic as PruningReader.scan)
+            surviving_chunks: Optional[set[int]] = None
+            if cc_predicates:
+                for col, (op, val) in cc_predicates.items():
+                    chunks = set(cczm.prune_column_chunks(col, op, val))
+                    if surviving_chunks is None:
+                        surviving_chunks = chunks
+                    else:
+                        surviving_chunks &= chunks
+                if surviving_chunks is not None and not surviving_chunks:
+                    continue  # all chunks pruned — skip row group
+
+            # Read surviving chunk blobs for each requested column
+            col_arrays = storage.read_column_chunks(
+                cczm, columns, surviving_chunks,
+                decode_fn=self._decode_table,
+            )
+
+            if not col_arrays:
+                continue  # no chunks read (e.g., column missing)
+
+            # Reassemble rows: concatenate arrays per column, then build
+            # a PyArrow Table, then convert to row dicts for row_filter.
+            arrays = []
+            col_names_out = []
+            for col_name in columns:
+                if col_name in col_arrays and col_arrays[col_name]:
+                    arrays.append(pa.concat_arrays(col_arrays[col_name]))
+                    col_names_out.append(col_name)
+
+            if not arrays:
+                continue
+
+            chunk_table = pa.Table.from_arrays(arrays, names=col_names_out)
+            for row in chunk_table.to_pylist():
+                if row_filter is None or row_filter(row):
+                    all_rows.append(row)
+
+        if not all_rows:
+            return pa.table({})
+
+        return pa.Table.from_pylist(all_rows)
+
+    def _infer_columns(self, name: str, zm_index) -> list[str]:
+        """Infer column names from the first zone map of a collection."""
+        try:
+            zm_base = zm_index._get_base(name)
+            state = zm_base.read_all()
+            for k in sorted(state.keys()):
+                if k.startswith(_RG_PREFIX):
+                    zm_blob_hash = state[k]
+                    zm_dict = json.loads(self.kernel.read_blob(zm_blob_hash))
+                    if "column_chunks" in zm_dict:
+                        return list(zm_dict["column_chunks"].get(
+                            "column_chunks", {}).keys())
+                    return list(zm_dict.get("min", {}).keys())
+        except Exception:
+            pass
+        return []
 
     # ==================================================================
     # Internal helpers: row group storage via ProllyTreeIndex.

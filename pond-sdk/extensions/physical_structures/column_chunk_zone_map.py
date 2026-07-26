@@ -47,6 +47,7 @@ class ColumnChunkStats:
     null_count: int = 0
     row_count: int = 0
     chunk_index: int = 0  # 0-based index within the row group
+    blob_hash: Optional[str] = None  # set when chunk is stored as a separate blob
 
     def to_dict(self) -> dict:
         return {
@@ -55,6 +56,7 @@ class ColumnChunkStats:
             "null_count": self.null_count,
             "row_count": self.row_count,
             "chunk_index": self.chunk_index,
+            "blob_hash": self.blob_hash,
         }
 
     @classmethod
@@ -65,6 +67,7 @@ class ColumnChunkStats:
             null_count=d.get("null_count", 0),
             row_count=d.get("row_count", 0),
             chunk_index=d.get("chunk_index", 0),
+            blob_hash=d.get("blob_hash"),
         )
 
 

@@ -149,6 +149,9 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/benchmarks/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/benchmarks/pruning_benchmark.py` | 200 | (benchmark) | Benchmark: Vortex-style pruning effectiveness. 100K rows, measures blob skip rate and speedup for 1-50% selectivity queries. |
 | `pond-labs/benchmarks/column_chunk_pruning_benchmark.py` | 175 | (benchmark) | Benchmark: column-chunk pruning (3rd level). 50K rows in 1 row group, shows 49/50 chunks pruned for selective predicates. |
+| `pond-labs/benchmarks/column_chunk_storage_benchmark.py` | 175 | (benchmark) | Benchmark: per-column-chunk storage. 50K rows in 1 row group, 9.37x I/O reduction (1090KB → 116KB) for selective predicate; 31.76x with projection. |
+| `pond-sdk/extensions/physical_structures/column_chunk_storage.py` | 280 | `ColumnChunkStorage` | Per-column-chunk storage: splits row groups into single-column Parquet blobs. True I/O savings on object storage (skip 4/5 chunks = skip 4/5 of bytes per column). |
+| `tests/integration/test_column_chunk_storage.py` | 290 | (test) | Tests per-column-chunk storage: basic write/read, I/O savings (bytes), fallback to whole-blob path. 9.37x I/O reduction verified. |
 | `pond-labs/benchmarks/overhead_audit.py` | 330 | (benchmark) | Overhead audit: zone map cost for OLTP, OLAP, streaming, point lookups, full scans, binary data. |
 | `pond-labs/benchmarks/sql_pushdown_benchmark.py` | 95 | (benchmark) | SQL pushdown benchmark: pruned vs full scan on 100K rows. Shows Python pruning overhead vs DuckDB native scan on local disk. |
 | `pond-labs/benchmarks/incremental_refresh_benchmark.py` | 100 | (benchmark) | Benchmark: O(changed) incremental refresh vs O(N) full rebuild. 27.9x speedup for 0.1% change rate. |

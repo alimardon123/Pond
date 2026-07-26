@@ -1970,3 +1970,65 @@ Stage Summary:
   * Separate column-chunk blobs for true I/O savings on object storage
   * .pond/config for persistent pruning settings
   * Scale benchmarks to 1M rows
+
+---
+Task ID: cc-storage
+Agent: main
+Task: Implement per-column-chunk storage for real I/O savings on object storage
+
+Work Log:
+- Read prior worklog (commit c566ee3 wired column-chunk pruning into PruningReader.scan()).
+- Identified that column-chunk pruning gave only 1.10x speedup because the whole row group is one Parquet blob — pruning skips row_filter work but not I/O.
+- Added blob_hash field to ColumnChunkStats so chunk blob hashes are tracked in the zone map blob.
+- Created pond-sdk/extensions/physical_structures/column_chunk_storage.py with ColumnChunkStorage class:
+  * write_row_group_column_chunks(): splits a row group into per-column-chunk Parquet blobs, returns (manifest_blob_hash, cczm_with_blob_hashes)
+  * read_column_chunks(): reads only specified column chunks for surviving chunk indices
+  * read_full_row_group(): reassembles full row group from chunk blobs (for read_table compatibility)
+  * has_column_chunk_storage(): checks if a zone map blob indicates column-chunk storage
+- Added range_write_column_chunks() to LakehouseLens:
+  * Splits each row group into N_cols × N_chunks separate Parquet blobs
+  * Each blob is single-column + single-chunk (content-addressed)
+  * Stores a manifest blob at rg/{max_pk} listing chunk blob hashes per column
+  * Augments zone map blob's column_chunks stats with blob_hash fields
+  * Preserves read_table() compatibility (manifest lets reader reconstruct)
+- Added read_with_column_chunk_pruning() to LakehouseLens:
+  * Uses verbose scan_with_pruning to get zone map dict alongside blob hash
+  * For each surviving row group, checks has_column_chunk_storage
+  * If yes: computes surviving chunk indices (intersection across predicate columns), reads only surviving chunk blobs for each requested column, reassembles rows
+  * If no: falls back to whole-blob read (backward compatible)
+- Created tests/integration/test_column_chunk_storage.py with 3 tests:
+  * test_column_chunk_storage_basic: verifies blob_hash fields, pruning correctness, projection
+  * test_column_chunk_storage_io_savings: instruments kernel.read_blob to count bytes — verified 2.32x reduction (55,762 → 23,998 bytes) for predicate age >= 2500
+  * test_column_chunk_storage_fallback: verifies fallback when collection written with regular range_write
+- Created pond-labs/benchmarks/column_chunk_storage_benchmark.py:
+  * 50K rows in 1 row group, 10 chunks of 5000 rows, 3 columns
+  * Predicate age >= 45000 → only last chunk survives
+  * Scenario A (whole-blob): 1,089,749 bytes, 6 reads, 60.39 ms
+  * Scenario B (per-column-chunk): 116,322 bytes, 11 reads, 10.16 ms → 9.37x I/O reduction
+  * Scenario C (per-column-chunk + projection): 34,307 bytes, 6 reads, 4.53 ms → 31.76x I/O reduction
+  * Write tradeoff: per-column-chunk write is actually FASTER (0.71x) due to smaller Parquet files
+- Registered new files in KNOWLEDGE_GRAPH.md
+- Added test_column_chunk_storage and test_column_chunk_storage_benchmark to tests/test_all.py
+
+Stage Summary:
+- Three-level pruning hierarchy now delivers TRUE I/O savings (not just CPU savings):
+  Level 1 (row-group):   ZoneMap-based — skip entire row groups (existing)
+  Level 2 (column-chunk): ColumnChunkZoneMap-based — skip individual chunk BLOBS (new)
+  Level 3 (row-level):   exact row_filter on decoded rows (existing)
+- Benchmark proves 9.37x I/O reduction for selective predicates, 31.76x with projection
+- Write path is FASTER with per-column-chunk storage (smaller Parquet files)
+- Backward compatible: legacy collections fall back to whole-blob read
+- 29/29 tests pass (added 2 new tests: storage + benchmark)
+- Files changed:
+  * pond-sdk/extensions/physical_structures/column_chunk_zone_map.py (blob_hash field)
+  * pond-sdk/extensions/physical_structures/column_chunk_storage.py (NEW)
+  * lenses/lakehouse/lakehouse_lens.py (range_write_column_chunks + read_with_column_chunk_pruning)
+  * tests/integration/test_column_chunk_storage.py (NEW)
+  * pond-labs/benchmarks/column_chunk_storage_benchmark.py (NEW)
+  * tests/test_all.py (2 new test entries)
+  * KNOWLEDGE_GRAPH.md (3 new entries)
+- Next opportunities:
+  * Encoding-aware compute (FastLanes-style) — skip decompression for pruned chunks
+  * .pond/config for persistent pruning settings
+  * Scale benchmarks to 1M rows on object storage (S3 mock)
+  * Apply per-column-chunk storage pattern to VectorLens (per-vector-dimension blobs?)

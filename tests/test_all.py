@@ -108,6 +108,14 @@ def test_column_chunk_pruning_benchmark():
     ok, output = _run_script("pond-labs/benchmarks/column_chunk_pruning_benchmark.py")
     assert ok, f"Column-chunk pruning benchmark failed:\n{output[-500:]}"
 
+def test_column_chunk_storage():
+    ok, output = _run_script("tests/integration/test_column_chunk_storage.py")
+    assert ok, f"Column-chunk storage tests failed:\n{output[-500:]}"
+
+def test_column_chunk_storage_benchmark():
+    ok, output = _run_script("pond-labs/benchmarks/column_chunk_storage_benchmark.py")
+    assert ok, f"Column-chunk storage benchmark failed:\n{output[-500:]}"
+
 def test_kv_pruning_and_projection():
     ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
     assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"
