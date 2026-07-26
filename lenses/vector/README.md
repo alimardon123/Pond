@@ -4,9 +4,11 @@ The **VectorLens** — the vector database lens for Pond.
 
 ## What it is
 
-A vector database built on the KeyValueLens. Vectors are stored as
+A vector database built on `PondLens`. Vectors are stored as
 **packed binary** (`struct.pack`) rather than JSON, for efficiency.
-The overridden `encode` / `decode` methods own the wire format:
+The lens owns its storage code (no lens-to-lens inheritance per
+`REPO_ORGANIZATION.md §4`) and uses `ProllyTreeIndex` as its
+storage backend. The encode / decode methods own the wire format:
 
 ```
 +-------------------+-----------------------------+
@@ -28,7 +30,7 @@ sees the decoded value, not the lens key) can still pull it out.
 - `search(query, k=5)` — k-nearest-neighbours (L2 / Euclidean, linear scan)
 - `get(id)` / `delete(id)`
 - `list_vectors()` / `count()`
-- Branching, merge, history (inherited from KeyValueLens, re-exposed
+- Branching, merge, history (inherited from `PondLens`, re-exposed
   with domain-friendly names)
 
 ## Indexing
@@ -48,13 +50,14 @@ reading the same collection sees them.
 
 ## Architecture
 
-Extends `KeyValueLens` (which lives in `pond-sdk/`, not in `lenses/`),
-so this is NOT lens-to-lens inheritance between production lenses — it
-inherits SDK infrastructure, not another production lens. The packed
-binary encoding is the only lens-specific logic.
+Extends `PondLens` directly (from `pond-sdk/base_lens.py`) per the
+"no lens-to-lens inheritance" rule in `REPO_ORGANIZATION.md §4`.
+The packed binary encoding is the lens-specific logic; everything
+else (branching, history, ProllyTreeIndex storage) is shared
+infrastructure from `pond-sdk`.
 
 ## Dependencies
 
 - `pond-core/` (kernel)
-- `pond-sdk/` (KeyValueLens, CollectionMetadata)
+- `pond-sdk/` (PondLens, ProllyLensBase, CollectionMetadata)
 - Python stdlib only

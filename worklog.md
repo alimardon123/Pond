@@ -2182,3 +2182,90 @@ Files changed:
 - tests/test_all.py (new test entry)
 - KNOWLEDGE_GRAPH.md (new entries)
 - docs/DESIGN_REVIEW_2026_07_26.md (NEW — full review document)
+
+---
+Task ID: design-review-fixes-phase2
+Agent: main
+Task: Phase E (extract scaffolds) + M1 (split PruningReader.scan) + M2 (pruned_row_groups stat) + M26 (stale docs)
+
+Work Log:
+- Phase E (C9 — extract shared scaffolds):
+  * Added LakehouseLens._range_write_generic — handles all the boilerplate
+    (validate, open ProllyLensBase + ZoneMapIndex, clear old zone maps, sort,
+    iterate row groups, build zone maps, commit, invalidate cache, notify
+    indexers). Each write method provides only a ~10-line write_one_rowgroup
+    callback. range_write / range_write_column_chunks / range_write_encoded
+    are now ~20 lines each instead of ~100.
+  * Added LakehouseLens._read_with_pruning_generic — handles all the
+    boilerplate (build predicate, build cc_predicates, infer columns,
+    iterate verbose scan, apply row_filter, return pa.Table). Each read
+    method provides only a read_surviving_rowgroup callback.
+  * Added LakehouseLens._compute_surviving_chunks — extracted the
+    intersection-across-predicate-columns logic. Shared between
+    read_with_column_chunk_pruning and read_with_encoded_pruning.
+  * Added DEFAULT_CHUNK_SIZE constant to lakehouse_lens.py (mirrors the
+    one in physical_structures/__init__.py; documented as must-match).
+  * All three read methods + all three write methods now use the shared
+    scaffolds. Net code reduction: ~150 LOC across the six methods.
+
+- Phase E (M1 — split PruningReader.scan):
+  * Added PruningReader._INITIAL_STATS class constant — single source of
+    truth for the stats schema (was duplicated in __init__ and scan()).
+  * Extracted _compute_surviving_chunks(zm_dict, cc_predicates) — handles
+    column-chunk pruning logic (deserialize cczm, intersect across
+    predicate columns, track stats).
+  * Extracted _slice_rows_by_chunks(rows, surviving_chunks, chunk_size) —
+    slices decoded rows to surviving chunk ranges.
+  * scan() itself went from 135 lines to ~55 lines. The three pruning
+    levels are now clearly labeled: Level 1 (row-group, in scan_with_pruning),
+    Level 2 (column-chunk, in _compute_surviving_chunks),
+    Level 3 (row-level, in the yield loop).
+
+- Phase A (M2 — pruned_row_groups stat):
+  * The stat was always 0 because scan_with_pruning yields only non-pruned
+    row groups. Now scan() counts total zone maps separately and computes
+    pruned_row_groups = total - total_row_groups after the scan.
+  * get_stats() now returns accurate pruned_row_groups when a predicate
+    is active. (Without a predicate, pruned_row_groups remains 0 — correct,
+    since nothing is pruned.)
+
+- Phase I (M26 — stale docs):
+  * Fixed lenses/vector/README.md — was claiming VectorLens extends
+    KeyValueLens and that KeyValueLens lives in pond-sdk/. Both wrong:
+    VectorLens extends PondLens directly; KeyValueLens lives in
+    lenses/keyvalue/.
+  * Fixed REPO_ORGANIZATION.md §2.2 — removed keyvalue_lens.py from
+    pond-sdk contents; added a note that it lives in lenses/keyvalue/.
+    Also added uuid7.py and collection_metadata.py to the pond-sdk list.
+  * Fixed REPO_ORGANIZATION.md §2.3 — added lenses/keyvalue/ to the
+    production lenses list (was missing entirely).
+  * Fixed pond-sdk/base_lens.py:9 docstring — was mentioning "Lens"
+    (back-compat alias); now lists KeyValueLens, LakehouseLens,
+    VectorLens, FeatureStoreLens by their real names.
+
+Stage Summary:
+- 32/32 tests pass (no new tests added in this phase — refactor preserved
+  behavior).
+- Encoded pruning benchmark preserved: 3.18x faster than whole-blob,
+  2.05x faster than column-chunk Parquet (was 3.11x / 1.93x before —
+  slight improvement from the cleaner code paths).
+- Code reduction: ~150 LOC across the six write/read methods in
+  LakehouseLens. scan() itself went from 135 lines to ~55.
+- Stats bug fixed: pruned_row_groups now reports the correct count
+  (was always 0).
+- Stale documentation fixed in 4 files (VectorLens README,
+  REPO_ORGANIZATION.md §2.2 and §2.3, base_lens.py docstring).
+- Files changed:
+  * lenses/lakehouse/lakehouse_lens.py (_range_write_generic +
+    _read_with_pruning_generic + _compute_surviving_chunks + DEFAULT_CHUNK_SIZE
+    + all three write methods reduced to callbacks + all three read methods
+    reduced to callbacks)
+  * pond-sdk/extensions/physical_structures/pruning_reader.py
+    (_INITIAL_STATS + _compute_surviving_chunks + _slice_rows_by_chunks
+    + scan() simplified + M2 fix)
+  * lenses/vector/README.md (M26 fix)
+  * REPO_ORGANIZATION.md §2.2 + §2.3 (M26 fix)
+  * pond-sdk/base_lens.py docstring (M26 fix)
+- Remaining review findings (C3, C4, C6, C11, M13, M14, M16, M21, M22)
+  are documented in docs/DESIGN_REVIEW_2026_07_26.md with a fix plan.
+  Estimated 3-4 more days of refactoring.

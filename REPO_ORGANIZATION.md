@@ -40,10 +40,14 @@ pond_repo/
 - The universal storage backend (`prolly_tree.py` → `ProllyLensBase`, `ProllyTree`)
 - Binary encoding (`binary_encoding.py`)
 - Tombstone helpers (`maintenance.py`)
-- App-facing KV lens (`keyvalue_lens.py` → `KeyValueLens`, `KeylessLens`, `CrossLens`)
+- UUIDv7 generation (`uuid7.py`)
 - Lazy row query API (`row_query.py` → `LensQuery`)
-- Collection metadata (`collection.py`)
+- Collection metadata (`collection.py`, `collection_metadata.py`)
 - Extensions subdirectory (see §3 below)
+
+**Note:** `KeyValueLens` lives in `lenses/keyvalue/keyvalue_lens.py` (a
+production lens package, see §2.3), NOT in `pond-sdk/`. Earlier
+versions of this document incorrectly listed it under pond-sdk.
 
 **Rule:** pond-sdk depends only on pond-core. No lens-to-lens imports.
 
@@ -57,7 +61,11 @@ pond_repo/
 ### 2.3 `lenses/` — Production-ready Lens implementations
 
 **Contains:** Lenses that are production-quality and ready for use.
-**Current:** `lenses/lakehouse/` (LakehouseLens), `lenses/vector/` (VectorLens)
+**Current:**
+- `lenses/keyvalue/` (`KeyValueLens`, `KeylessLens`, `CrossLens`)
+- `lenses/lakehouse/` (`LakehouseLens`)
+- `lenses/vector/` (`VectorLens`)
+
 **Rule:**
 - Each lens in its own subdirectory: `lenses/{lens_name}/`
 - Main file: `lenses/{lens_name}/{lens_name}_lens.py`

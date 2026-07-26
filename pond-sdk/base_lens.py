@@ -6,9 +6,10 @@ This is NOT a format-aware base class. Per the design goals:
   - ProllyTreeIndex (prolly_tree.py:ProllyLensBase) is the universal
     storage backend for key-value collections. It supports OLTP, OLAP,
     streaming, and point-lookup workloads.
-  - App-facing lenses (Lens, LakehouseLens, FeatureStoreLens) inherit
-    from PondLens and add their OWN read/write APIs. The base class
-    does NOT decide what to write — each lens decides for itself.
+  - App-facing lenses (KeyValueLens, LakehouseLens, VectorLens,
+    FeatureStoreLens) inherit from PondLens and add their OWN
+    read/write APIs. The base class does NOT decide what to write —
+    each lens decides for itself.
   - LakehouseLens ADDS range reads/writes on top of the prolly tree
     as a lens-specific extension. Other lenses do not get them.
 
