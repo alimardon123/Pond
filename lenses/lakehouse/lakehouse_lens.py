@@ -1131,39 +1131,44 @@ class PondLakehouse:
         return self.lens.range_point_lookup(name, key)
 
     def query(self, sql: str, table_name: Optional[str] = None,
-              use_pruning: bool = True) -> pa.Table:
+              use_pruning: Optional[bool] = None) -> pa.Table:
         """Run a SQL query against a Pond-hosted table.
 
         If table_name is provided, the table is registered with DuckDB
         as a named relation. The SQL can then reference it by name.
 
         PREDICATE + PROJECTION PUSHDOWN:
-        When use_pruning is True (default) and the SQL contains a WHERE
-        clause with simple column-op-value predicates, the query method
-        automatically:
+        When pruning is enabled and the SQL contains a WHERE clause with
+        simple column-op-value predicates, the query method automatically:
           1. Extracts WHERE predicates from the SQL
           2. Uses read_with_pruning to skip non-matching row groups
           3. Uses read_columns for projection pushdown (only needed columns)
           4. Registers the pruned+projected table with DuckDB
           5. Executes the SQL on the reduced dataset
 
-        This combines Vortex-style predicate pushdown (skip row groups
-        via zone maps) with projection pushdown (read only needed columns
-        from Parquet). For selective queries on wide tables, this can
-        reduce I/O by 10-100x.
-
-        Example:
-            lh.create_table("users", users_data)
-            result = lh.query("SELECT COUNT(*) FROM users WHERE age > 30",
-                              table_name="users")
+        OBJECT-STORE-AWARE PRUNING:
+        If use_pruning is None (default), pruning is auto-enabled when
+        the kernel is backed by object storage (S3, GCS, etc.) — network
+        RTT savings dwarf Python overhead. For local disk, pruning defaults
+        to off (DuckDB native scan is faster for local data).
+        Pass use_pruning=True/False to override.
 
         Args:
             sql: the SQL query string
             table_name: name of the table to register
-            use_pruning: if True, attempt predicate + projection pushdown.
-                If False, read the full table (no pruning).
+            use_pruning: None=auto (object store→on, local→off),
+                True=force on, False=force off.
         """
         if table_name:
+            # Auto-decide pruning based on storage type
+            if use_pruning is None:
+                try:
+                    from collection_metadata import CollectionMetadata
+                    meta = CollectionMetadata(self.kernel)
+                    use_pruning = meta.should_prune()
+                except Exception:
+                    use_pruning = False  # default: no pruning if detection fails
+
             if use_pruning:
                 table = self._read_with_pushdown(sql, table_name)
             else:

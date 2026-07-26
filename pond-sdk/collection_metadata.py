@@ -82,14 +82,64 @@ class CollectionMetadata:
     This class does NOT know what format the data is in (JSON, Parquet,
     binary). It works through callbacks (scan_fn, decode_fn) provided
     by the lens.
+
+    OBJECT-STORE-AWARE PRUNING:
+    When the kernel's base_dir indicates object storage (S3, GCS, Azure
+    Blob, or any network-backed path), pruning is automatically enabled
+    because the network RTT savings dwarf Python overhead. When the
+    kernel is local-disk-backed, pruning defaults to off (DuckDB native
+    scan is faster for local data).
+
+    Detection: checks kernel.base_dir for S3/network patterns.
+    Override: pass use_pruning=True/False explicitly to read_with_pruning.
     """
+
+    # Patterns that indicate object storage (not local disk)
+    _OBJECT_STORE_PATTERNS = ["s3://", "gs://", "azure://", "abfs://",
+                               "wasb://", "http://", "https://"]
 
     def __init__(self, kernel: PondMinimal):
         self.kernel = kernel
+        self._is_object_store = self._detect_object_store()
 
         # Lazy-init sub-managers (only if extensions are available)
         self._zm_index: Optional[ZoneMapIndex] = None
         self._indexer: Optional[CollectionIndexer] = None
+
+    def _detect_object_store(self) -> bool:
+        """Detect if the kernel is backed by object storage (S3, etc.).
+
+        Returns True if the base_dir looks like a network/object store path.
+        Returns False for local filesystem paths.
+        """
+        base_dir = getattr(self.kernel, 'base_dir', '')
+        if not base_dir:
+            return False
+        base_lower = base_dir.lower()
+        return any(base_lower.startswith(p) for p in self._OBJECT_STORE_PATTERNS)
+
+    @property
+    def is_object_store(self) -> bool:
+        """True if the kernel is backed by object storage (S3, GCS, etc.).
+
+        When True, pruning is auto-enabled (network RTT savings dwarf
+        Python overhead). When False (local disk), pruning defaults to off.
+        """
+        return self._is_object_store
+
+    def should_prune(self, explicit: Optional[bool] = None) -> bool:
+        """Decide whether to use pruning for a read operation.
+
+        Args:
+            explicit: caller's explicit choice. If None, auto-decide
+                based on storage type (object store → True, local → False).
+
+        Returns:
+            True if pruning should be used, False otherwise.
+        """
+        if explicit is not None:
+            return explicit
+        return self._is_object_store
 
     @property
     def zm_index(self) -> Optional[ZoneMapIndex]:
