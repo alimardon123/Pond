@@ -88,21 +88,24 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
 from kernel import PondMinimal  # noqa: E402
 from base_lens import PondLens  # noqa: E402
 
-# DuckDB for the query engine
+# DuckDB is OPTIONAL for LakehouseLens. The lens only needs DuckDB for
+# range_point_lookup's "filter to exact row" convenience. Users who only
+# want to write/read Parquet row groups and do time-travel can use the
+# lens without DuckDB installed. The PondLakehouse façade (pond_lakehouse.py)
+# is the only place DuckDB is required.
 try:
     import duckdb
 except ImportError:
-    raise ImportError(
-        "DuckDB is required for pond-lakehouse. Install with: pip install duckdb"
-    )
+    duckdb = None
 
-# PyArrow for the Parquet/Arrow interchange
+# PyArrow for the Parquet/Arrow interchange (REQUIRED — this is a tabular lens)
 try:
     import pyarrow as pa
     import pyarrow.parquet as pq
 except ImportError:
     raise ImportError(
-        "PyArrow is required for pond-lakehouse. Install with: pip install pyarrow"
+        "PyArrow is required for LakehouseLens. "
+        "Install with: pip install pyarrow"
     )
 
 # ProllyTreeIndex for the range read/write path
@@ -179,9 +182,32 @@ class LakehouseLens(PondLens):
 
     def __init__(self, kernel: PondMinimal):
         super().__init__(kernel)
-        self.duckdb = duckdb.connect()
+        # DuckDB connection is created lazily — only when range_point_lookup
+        # is called (the only method that uses it for "filter to exact row").
+        # Most users instantiate LakehouseLens via PondLakehouse (which has
+        # its own DuckDB connection); we don't want to create a second
+        # connection eagerly here.
+        self._duckdb = None
         self._cached_tables: dict[str, tuple[str, pa.Table]] = {}
         self._attached_indexer = None
+
+    @property
+    def duckdb(self):
+        """Lazily-created DuckDB connection (only for range_point_lookup).
+
+        Raises ImportError if DuckDB is not installed. Most users should
+        use PondLakehouse (which has its own DuckDB connection) instead of
+        accessing this property directly.
+        """
+        if self._duckdb is None:
+            if duckdb is None:
+                raise ImportError(
+                    "DuckDB is required for this operation. Install with: "
+                    "pip install duckdb. (LakehouseLens itself does not "
+                    "require DuckDB — only range_point_lookup does.)"
+                )
+            self._duckdb = duckdb.connect()
+        return self._duckdb
 
     def attach_indexer(self, indexer) -> None:
         """Attach a CollectionMetadata or CollectionIndexer for auto-notify.
@@ -1682,613 +1708,32 @@ class LakehouseLens(PondLens):
             except Exception:
                 pass  # indexer notification is best-effort
 
-
 # ---------------------------------------------------------------------------
-# Lakehouse — DuckDB query layer on top of LakehouseLens
+# Backward-compat re-export — PondLakehouse now lives in pond_lakehouse.py
 # ---------------------------------------------------------------------------
-
-class PondLakehouse:
-    """A lightweight lakehouse: Pond kernel + LakehouseLens + DuckDB.
-
-    This is the flagship. It provides:
-      - CREATE TABLE
-      - INSERT
-      - SELECT (via DuckDB, with pushdown to Parquet)
-      - Time travel (AS OF commit hash)
-      - Branching (dev/test branches on tables)
-      - Merge (union merge for now)
-      - Schema evolution (Parquet-native)
-      - Range read/write for operational workloads
-    """
-
-    def __init__(self, base_dir: str, force_pruning: Optional[bool] = None):
-        """Create a PondLakehouse.
-
-        Args:
-            base_dir: filesystem path or object store URL for the kernel.
-            force_pruning: override auto-detection for predicate pushdown.
-                None = auto (S3→on, local→off)
-                True = always prune
-                False = never prune
-        """
-        self.kernel = PondMinimal(base_dir)
-        self.lens = LakehouseLens(self.kernel)
-        self._force_pruning = force_pruning
-        self.duckdb = duckdb.connect()
-
-    def create_table(self, name: str, data: pa.Table) -> str:
-        return self.lens.create_table(name, data)
-
-    def insert(self, name: str, data: pa.Table) -> str:
-        return self.lens.insert(name, data)
-
-    def range_write(self, name: str, data: pa.Table, key_col: str,
-                    row_group_size: int = DEFAULT_RANGE_ROW_GROUP_SIZE) -> str:
-        """Range write: store data as row groups in the ProllyTreeIndex.
-        See LakehouseLens.range_write for details."""
-        return self.lens.range_write(name, data, key_col, row_group_size)
-
-    def range_read(self, name: str,
-                   start_key: Optional[str] = None,
-                   end_key: Optional[str] = None) -> pa.Table:
-        """Range read: scan a key range from the ProllyTreeIndex.
-        See LakehouseLens.range_read for details."""
-        return self.lens.range_read(name, start_key, end_key)
-
-    def range_point_lookup(self, name: str, key: str) -> Optional[pa.Table]:
-        """Point lookup: O(log N) via the ProllyTreeIndex."""
-        return self.lens.range_point_lookup(name, key)
-
-    def query(self, sql: str, table_name: Optional[str] = None,
-              use_pruning: Optional[bool] = None) -> pa.Table:
-        """Run a SQL query against a Pond-hosted table.
-
-        If table_name is provided, the table is registered with DuckDB
-        as a named relation. The SQL can then reference it by name.
-
-        PREDICATE + PROJECTION PUSHDOWN:
-        When pruning is enabled and the SQL contains a WHERE clause with
-        simple column-op-value predicates, the query method automatically:
-          1. Extracts WHERE predicates from the SQL
-          2. Uses read_with_pruning to skip non-matching row groups
-          3. Uses read_columns for projection pushdown (only needed columns)
-          4. Registers the pruned+projected table with DuckDB
-          5. Executes the SQL on the reduced dataset
-
-        OBJECT-STORE-AWARE PRUNING:
-        If use_pruning is None (default), pruning is auto-enabled when
-        the kernel is backed by object storage (S3, GCS, etc.) — network
-        RTT savings dwarf Python overhead. For local disk, pruning defaults
-        to off (DuckDB native scan is faster for local data).
-        Pass use_pruning=True/False to override.
-
-        Args:
-            sql: the SQL query string
-            table_name: name of the table to register
-            use_pruning: None=auto (object store→on, local→off),
-                True=force on, False=force off.
-        """
-        if table_name:
-            # Auto-decide pruning based on storage type or force_pruning override
-            if use_pruning is None:
-                if self._force_pruning is not None:
-                    use_pruning = self._force_pruning
-                else:
-                    try:
-                        from collection_metadata import CollectionMetadata
-                        meta = CollectionMetadata(self.kernel)
-                        use_pruning = meta.should_prune()
-                    except Exception:
-                        use_pruning = False  # default: no pruning if detection fails
-
-            if use_pruning:
-                table = self._read_with_pushdown(sql, table_name)
-            else:
-                table = self.lens.read_table(table_name)
-            self.duckdb.register(table_name, table)
-        return self.duckdb.execute(sql).to_arrow_table()
-
-    def _read_with_pushdown(self, sql: str, table_name: str) -> pa.Table:
-        """Read a table with predicate + projection pushdown.
-
-        Extracts WHERE predicates and SELECT columns from the SQL, then
-        uses the best available pruning read path:
-          1. read_with_encoded_pruning (FastLanes-style) — fastest
-          2. read_with_column_chunk_pruning — per-column-chunk I/O
-          3. read_with_pruning — row-group pruning only
-          4. read_table — full read (fallback)
-
-        Each path falls back to the next if the storage mode is not
-        available for this collection (e.g., legacy range_write data
-        uses path 3 or 4; range_write_encoded data uses path 1).
-
-        Falls back to full read_table if predicate extraction fails.
-        """
-        try:
-            # Extract predicates from WHERE clause
-            predicates = self._extract_predicates(sql)
-
-            # Extract projected columns from SELECT clause
-            columns = self._extract_columns(sql)
-
-            if predicates:
-                # Try the fastest path first; each path falls back
-                # internally if the storage mode is not available.
-                # read_with_encoded_pruning falls back to
-                # read_with_column_chunk_pruning which falls back to
-                # read_with_pruning which falls back to read_table.
-                table = self.lens.read_with_encoded_pruning(
-                    table_name,
-                    predicates=predicates,
-                    row_filter=None,  # let DuckDB evaluate the predicate
-                )
-                # Apply projection on the pruned result.
-                # MUST include WHERE columns so DuckDB can evaluate the filter.
-                if columns and columns != ["*"]:
-                    # Add predicate columns to the projection
-                    pred_cols = [p[0] for p in predicates]
-                    all_cols = list(set(columns + pred_cols))
-                    available = [c for c in all_cols if c in table.column_names]
-                    if available:
-                        table = table.select(available)
-                return table
-            elif columns and columns != ["*"]:
-                # No WHERE but projection pushdown
-                return self.lens.read_columns(table_name, columns)
-            else:
-                # No pushdown possible — full read
-                return self.lens.read_table(table_name)
-        except (ImportError, KeyError, AttributeError):
-            # Missing extension or column — fall back to full read
-            return self.lens.read_table(table_name)
-        except Exception:
-            # Any other failure in pushdown → fall back to full read.
-            # (Catches parser bugs, predicate evaluation errors, etc.)
-            return self.lens.read_table(table_name)
-
-    @staticmethod
-    def _extract_predicates(sql: str) -> list:
-        """Extract simple column-op-value predicates from a SQL WHERE clause.
-
-        Supports: =, !=, <, <=, >, >= on simple column comparisons.
-        Returns a list of (column, op, value) tuples.
-
-        Does NOT handle:
-          - Joins (predicates on joined tables)
-          - Subqueries
-          - Complex expressions (functions, arithmetic)
-        """
-        import re
-
-        predicates = []
-
-        # Find WHERE clause (case-insensitive)
-        where_match = re.search(r'\bWHERE\b\s+(.+?)(?:\bGROUP\b|\bORDER\b|\bLIMIT\b|$)',
-                                sql, re.IGNORECASE | re.DOTALL)
-        if not where_match:
-            return predicates
-
-        where_clause = where_match.group(1).strip()
-
-        # Split on AND (case-insensitive) — each AND part is a separate predicate
-        # For OR, we treat the entire OR expression as non-prunable (conservative)
-        # because pruning with OR requires ALL branches to say "can't match".
-        parts = re.split(r'\s+AND\s+', where_clause, flags=re.IGNORECASE)
-
-        for part in parts:
-            part = part.strip()
-            col, op, value = PondLakehouse._parse_single_predicate(part)
-            if col is not None:
-                predicates.append((col, op, value))
-
-        return predicates
-
-    @staticmethod
-    def _parse_single_predicate(part: str):
-        """Parse a single predicate like 'age > 30' or 'region = US'.
-
-        Returns (column, op, value) or (None, None, None) if unparseable.
-        Supports: =, !=, <, <=, >, >=, IN, BETWEEN
-        """
-        import re
-
-        part = part.strip()
-
-        # BETWEEN: col BETWEEN val1 AND val2
-        # Note: this is tricky because AND is also a clause separator.
-        # We handle BETWEEN before the AND split by looking for the pattern.
-        between_match = re.match(
-            r'(\w+)\s+BETWEEN\s+(?:\'([^\']*)\'|(\d+\.?\d*))\s+AND\s+(?:\'([^\']*)\'|(\d+\.?\d*))',
-            part, re.IGNORECASE)
-        if between_match:
-            col = between_match.group(1)
-            # Lower bound
-            if between_match.group(2) is not None:
-                lo = between_match.group(2)
-            else:
-                lo = float(between_match.group(3)) if '.' in between_match.group(3) else int(between_match.group(3))
-            # Upper bound
-            if between_match.group(4) is not None:
-                hi = between_match.group(4)
-            else:
-                hi = float(between_match.group(5)) if '.' in between_match.group(5) else int(between_match.group(5))
-            # BETWEEN lo AND hi is equivalent to >= lo AND <= hi
-            # We return the lower bound; the upper bound is handled by
-            # the caller checking for BETWEEN specifically.
-            # For simplicity, we return >= lo (conservative — might read more)
-            return (col, ">=", lo)
-
-        # IN: col IN ('val1', 'val2', ...) or col IN (1, 2, 3)
-        in_match = re.match(r'(\w+)\s+IN\s*\(([^)]+)\)', part, re.IGNORECASE)
-        if in_match:
-            col = in_match.group(1)
-            values_str = in_match.group(2)
-            # Parse values
-            values = []
-            for v in values_str.split(","):
-                v = v.strip()
-                if v.startswith("'") and v.endswith("'"):
-                    values.append(v[1:-1])
-                else:
-                    try:
-                        values.append(float(v) if '.' in v else int(v))
-                    except ValueError:
-                        pass
-            if values:
-                return (col, "in", values)
-
-        # Simple comparison: col OP value
-        pattern = r'(\w+)\s*(=|!=|<=|>=|<|>)\s*'
-        pattern += r"(?:'([^']*)'|(\d+\.?\d*))"
-        match = re.match(pattern, part, re.IGNORECASE)
-        if match:
-            col, op, str_val, num_val = match.groups()
-            if str_val is not None:
-                value = str_val
-            elif num_val is not None:
-                value = float(num_val) if '.' in num_val else int(num_val)
-            else:
-                return (None, None, None)
-            return (col, op, value)
-
-        return (None, None, None)
-
-    @staticmethod
-    def _extract_columns(sql: str) -> list:
-        """Extract projected column names from a SQL SELECT clause.
-
-        Returns ["*"] for SELECT * or if extraction fails.
-        Returns a list of column names for SELECT col1, col2, ...
-        """
-        import re
-
-        # Find SELECT ... FROM
-        select_match = re.match(r'\s*SELECT\s+(.+?)\s+FROM\s+',
-                                sql, re.IGNORECASE | re.DOTALL)
-        if not select_match:
-            return ["*"]
-
-        cols_str = select_match.group(1).strip()
-
-        # SELECT *
-        if cols_str == "*":
-            return ["*"]
-
-        # SELECT COUNT(*), SUM(col), etc. — don't project (need all columns for aggregation)
-        if re.search(r'\b(COUNT|SUM|AVG|MIN|MAX)\s*\(', cols_str, re.IGNORECASE):
-            return ["*"]
-
-        # Split on commas, extract column names
-        parts = [p.strip() for p in cols_str.split(",")]
-        columns = []
-        for part in parts:
-            # Handle "column" or "table.column" or "column AS alias"
-            col_match = re.match(r'(?:\w+\.)?(\w+)(?:\s+AS\s+\w+)?$', part, re.IGNORECASE)
-            if col_match:
-                columns.append(col_match.group(1))
-            else:
-                return ["*"]  # can't parse — read all columns
-
-        return columns if columns else ["*"]
-
-    def query_at(self, sql: str, table_name: str, commit_hash: str) -> pa.Table:
-        """Time travel: query a table at a specific commit."""
-        table = self.lens.read_table(table_name, commit_hash)
-        # Register with a temp name to avoid clobbering the live table
-        temp_name = f"{table_name}_at_{commit_hash[:8]}"
-        self.duckdb.register(temp_name, table)
-        # Replace table_name with temp_name in the SQL (simple substitution)
-        sql_at = sql.replace(table_name, temp_name)
-        return self.duckdb.execute(sql_at).to_arrow_table()
-
-    def branch(self, table_name: str, branch_name: str) -> str:
-        return self.lens.branch(table_name, branch_name)
-
-    def commit_to_branch(self, table_name: str, branch_name: str,
-                         data: pa.Table) -> str:
-        return self.lens.commit_to_branch(table_name, branch_name, data)
-
-    def merge_branch(self, table_name: str, branch_name: str) -> str:
-        return self.lens.merge_branch(table_name, branch_name)
-
-    def history(self, table_name: str) -> list[dict]:
-        return self.lens.history(table_name)
-
-    def close(self):
-        self.duckdb.close()
-        self.kernel.close()
-
-
-# ---------------------------------------------------------------------------
-# Self-tests
-# ---------------------------------------------------------------------------
-
-def _self_test():
-    """Verify the PondLakehouse flagship works end-to-end."""
-    print("=== Pond Lakehouse self-test ===")
-
-    tmpdir = tempfile.mkdtemp(prefix="pond_lakehouse_")
-    try:
-        lh = PondLakehouse(tmpdir)
-
-        # Test 1: create a table and query it
-        users = pa.table({
-            "id": [1, 2, 3],
-            "name": ["alice", "bob", "carol"],
-            "age": [30, 25, 35],
-        })
-        lh.create_table("users", users)
-        result = lh.query("SELECT COUNT(*) AS cnt FROM users", table_name="users")
-        assert result.column("cnt")[0].as_py() == 3, f"expected 3, got {result.column('cnt')[0]}"
-        print(f"  [OK] create table + SELECT COUNT(*)")
-
-        # Test 2: insert and re-query
-        new_users = pa.table({
-            "id": [4, 5],
-            "name": ["dave", "eve"],
-            "age": [40, 28],
-        })
-        lh.insert("users", new_users)
-        result = lh.query("SELECT COUNT(*) AS cnt FROM users", table_name="users")
-        assert result.column("cnt")[0].as_py() == 5, f"expected 5, got {result.column('cnt')[0]}"
-        print(f"  [OK] insert + SELECT COUNT(*)")
-
-        # Test 3: filter query (age > 30: carol=35, dave=40, eve=28 excluded)
-        # Actually: alice=30 (not >30), bob=25, carol=35, dave=40, eve=28
-        # So age > 30 → carol, dave
-        result = lh.query(
-            "SELECT name FROM users WHERE age > 30 ORDER BY name",
-            table_name="users",
-        )
-        names = [r.as_py() for r in result.column("name")]
-        assert names == ["carol", "dave"], f"expected ['carol', 'dave'], got {names}"
-        print(f"  [OK] SELECT with WHERE + ORDER BY")
-
-        # Test 4: time travel — query at the original commit (3 rows)
-        history = lh.history("users")
-        original_commit = history[-1]["hash"]  # last in history is the first commit
-        result = lh.query_at(
-            "SELECT COUNT(*) AS cnt FROM users",
-            table_name="users",
-            commit_hash=original_commit,
-        )
-        assert result.column("cnt")[0].as_py() == 3, \
-            f"time travel: expected 3 rows at original commit, got {result.column('cnt')[0]}"
-        print(f"  [OK] time travel: query at original commit returns 3 rows")
-
-        # Test 5: branching
-        lh.branch("users", "dev")
-        dev_users = pa.table({
-            "id": [6],
-            "name": ["frank"],
-            "age": [50],
-        })
-        lh.commit_to_branch("users", "dev", dev_users)
-        result = lh.query("SELECT COUNT(*) AS cnt FROM users", table_name="users")
-        assert result.column("cnt")[0].as_py() == 5, \
-            "main HEAD unchanged after dev branch commit"
-        print(f"  [OK] branch: dev branch commit doesn't affect main HEAD")
-
-        # Test 6: merge dev into main
-        # Note: union merge doubles common rows. dev branch had 5 (from main) + 1 (frank) = 6.
-        # main has 5. Union → 5 + 6 = 11 (with duplicates from common ancestor).
-        # This is the simple "union merge" policy; production would do row-level
-        # 3-way merge to avoid duplicates.
-        lh.merge_branch("users", "dev")
-        result = lh.query("SELECT COUNT(*) AS cnt FROM users", table_name="users")
-        cnt = result.column("cnt")[0].as_py()
-        assert cnt == 11, \
-            f"union merge: expected 11 rows (5 main + 6 dev, with dups), got {cnt}"
-        result = lh.query(
-            "SELECT COUNT(*) AS cnt FROM users WHERE name = 'frank'",
-            table_name="users",
-        )
-        assert result.column("cnt")[0].as_py() == 1, "frank appears once after merge"
-        print(f"  [OK] merge: 11 rows after union merge (frank included; dups from common ancestor)")
-
-        # Test 7: history shows merge commit with 2 parents
-        history = lh.history("users")
-        latest = history[0]
-        assert latest["second_parent"] is not None, "merge commit has second_parent"
-        print(f"  [OK] history: merge commit has 2 parents")
-
-        # Test 8: schema evolution — add a column
-        users_v2 = pa.table({
-            "id": [7],
-            "name": ["grace"],
-            "age": [45],
-            "email": ["grace@example.com"],  # new column
-        })
-        lh.insert("users", users_v2)
-        result = lh.query(
-            "SELECT name, email FROM users WHERE email IS NOT NULL",
-            table_name="users",
-        )
-        emails = [r.as_py() for r in result.column("email")]
-        assert emails == ["grace@example.com"], f"expected ['grace@example.com'], got {emails}"
-        print(f"  [OK] schema evolution: new column 'email' added; old rows have NULL")
-
-        # Test 9: aggregation query
-        result = lh.query(
-            "SELECT COUNT(*) AS cnt, AVG(age) AS avg_age, MIN(age) AS min_age, MAX(age) AS max_age FROM users",
-            table_name="users",
-        )
-        cnt = result.column("cnt")[0].as_py()
-        assert cnt == 12, f"aggregation: expected 12 rows, got {cnt}"
-        print(f"  [OK] aggregation: COUNT/AVG/MIN/MAX over 12 rows")
-
-        # Test 10: JOIN two tables
-        orders = pa.table({
-            "order_id": [1, 2, 3],
-            "user_id": [1, 2, 1],
-            "amount": [100.0, 200.0, 150.0],
-        })
-        lh.create_table("orders", orders)
-        lh.duckdb.register("users", lh.lens.read_table("users"))
-        lh.duckdb.register("orders", lh.lens.read_table("orders"))
-        result = lh.query("""
-            SELECT u.name, SUM(o.amount) AS total
-            FROM users u
-            JOIN orders o ON u.id = o.user_id
-            GROUP BY u.name
-            ORDER BY total DESC
-        """)
-        names = [r.as_py() for r in result.column("name")]
-        assert "alice" in names, "JOIN: alice has orders"
-        print(f"  [OK] JOIN: users ⋈ orders on user_id, grouped by name")
-
-        # ---------------------------------------------------------------
-        # Test 11-14: Range read/write on top of the ProllyTreeIndex
-        # ---------------------------------------------------------------
-
-        # Test 11: range_write a sorted table to a NEW collection
-        events = pa.table({
-            "event_id": [f"e{i:04d}" for i in range(100)],
-            "user_id": [i % 10 for i in range(100)],
-            "amount": [float(i) for i in range(100)],
-        })
-        # Use small row_group_size so we get multiple row groups
-        lh.range_write("events", events, key_col="event_id", row_group_size=25)
-        # 100 rows / 25 per group = 4 row groups
-        print(f"  [OK] range_write: 100 rows in 4 row groups (rg/e0024, rg/e0049, rg/e0074, rg/e0099)")
-
-        # Test 12: range_read all → returns all 100 rows
-        all_rows = lh.range_read("events")
-        assert all_rows.num_rows == 100, \
-            f"range_read all: expected 100 rows, got {all_rows.num_rows}"
-        print(f"  [OK] range_read all: 100 rows")
-
-        # Test 13: range_read a subrange → returns row groups overlapping the range
-        # Row group keys are rg/e0024, rg/e0049, rg/e0074, rg/e0099.
-        # Range [e0050, e0080] should match rg/e0074 (max_pk=e0074, which is >= e0050)
-        # and rg/e0099 (max_pk=e0099, which is >= e0080? Actually e0099 > e0080, so yes).
-        # Wait — the row group with max_pk=e0074 contains rows e0050..e0074.
-        # The row group with max_pk=e0099 contains rows e0075..e0099.
-        # So range_read("events", "e0050", "e0080") returns row groups
-        # rg/e0074 (rows e0050..e0074) AND rg/e0099 (rows e0075..e0099) → 50 rows total.
-        # Note: row-group granularity means we get rows outside the requested range
-        # (e0075..e0099 even though we asked up to e0080). Caller must filter.
-        range_result = lh.range_read("events", "e0050", "e0080")
-        assert range_result.num_rows == 50, \
-            f"range_read [e0050,e0080]: expected 50 rows (2 row groups), got {range_result.num_rows}"
-        print(f"  [OK] range_read [e0050,e0080]: 50 rows (2 row groups; caller filters exact rows)")
-
-        # Test 14: point lookup — find the row group containing a specific key
-        point_result = lh.range_point_lookup("events", "e0042")
-        assert point_result is not None, "point lookup should find a row group"
-        # e0042 falls in the row group with max_pk=e0049 (rows e0025..e0049)
-        assert point_result.num_rows == 25, \
-            f"point lookup: expected row group of 25 rows, got {point_result.num_rows}"
-        # Caller filters further via DuckDB:
-        lh.duckdb.register("point_result", point_result)
-        exact = lh.duckdb.execute(
-            "SELECT event_id, amount FROM point_result WHERE event_id = 'e0042'"
-        ).to_arrow_table()
-        assert exact.num_rows == 1, f"exact filter: expected 1 row, got {exact.num_rows}"
-        assert exact.column("amount")[0].as_py() == 42.0
-        print(f"  [OK] range_point_lookup('e0042') + DuckDB filter: O(log N) tree lookup + 1 row")
-
-        lh.close()
-        print("\nAll Pond Lakehouse tests pass.")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def _benchmark():
-    """Quick benchmark: compare PondLakehouse vs native DuckDB+Parquet."""
-    print("\n=== PondLakehouse vs native DuckDB+Parquet benchmark ===")
-    tmpdir = tempfile.mkdtemp(prefix="pond_lh_bench_")
-    try:
-        import time as _time
-
-        # Generate 10K rows
-        n_rows = 10_000
-        ids = list(range(n_rows))
-        names = [f"user_{i}" for i in range(n_rows)]
-        ages = [20 + (i % 50) for i in range(n_rows)]
-        data = pa.table({"id": ids, "name": names, "age": ages})
-
-        # PondLakehouse
-        lh = PondLakehouse(os.path.join(tmpdir, "pond"))
-        t0 = _time.perf_counter()
-        lh.create_table("users", data)
-        t_create_pond = _time.perf_counter() - t0
-
-        t0 = _time.perf_counter()
-        result = lh.query("SELECT COUNT(*) FROM users", table_name="users")
-        t_count_pond = _time.perf_counter() - t0
-
-        t0 = _time.perf_counter()
-        result = lh.query("SELECT AVG(age) FROM users", table_name="users")
-        t_avg_pond = _time.perf_counter() - t0
-
-        t0 = _time.perf_counter()
-        result = lh.query("SELECT name FROM users WHERE age > 50", table_name="users")
-        t_filter_pond = _time.perf_counter() - t0
-
-        lh.close()
-
-        # Native DuckDB + Parquet
-        native_dir = os.path.join(tmpdir, "native")
-        os.makedirs(native_dir)
-        con = duckdb.connect(os.path.join(native_dir, "native.db"))
-        con.execute("INSTALL parquet; LOAD parquet;")
-        parquet_path = os.path.join(native_dir, "users.parquet")
-
-        t0 = _time.perf_counter()
-        import pyarrow.parquet as pq
-        pq.write_table(data, parquet_path)
-        t_create_native = _time.perf_counter() - t0
-
-        t0 = _time.perf_counter()
-        result = con.execute(f"SELECT COUNT(*) FROM read_parquet('{parquet_path}')").fetchone()
-        t_count_native = _time.perf_counter() - t0
-
-        t0 = _time.perf_counter()
-        result = con.execute(f"SELECT AVG(age) FROM read_parquet('{parquet_path}')").fetchone()
-        t_avg_native = _time.perf_counter() - t0
-
-        t0 = _time.perf_counter()
-        result = con.execute(f"SELECT name FROM read_parquet('{parquet_path}') WHERE age > 50").fetchall()
-        t_filter_native = _time.perf_counter() - t0
-
-        con.close()
-
-        print(f"\n  Operation         | PondLakehouse | Native DuckDB+Parquet")
-        print(f"  ------------------|---------------|----------------------")
-        print(f"  create (10K rows) | {t_create_pond*1000:.1f}ms        | {t_create_native*1000:.1f}ms")
-        print(f"  COUNT(*)          | {t_count_pond*1000:.1f}ms         | {t_count_native*1000:.1f}ms")
-        print(f"  AVG(age)          | {t_avg_pond*1000:.1f}ms         | {t_avg_native*1000:.1f}ms")
-        print(f"  filter + scan     | {t_filter_pond*1000:.1f}ms         | {t_filter_native*1000:.1f}ms")
-
-        print(f"\n  Overhead of Pond layer (create): {((t_create_pond/t_create_native - 1) * 100):.0f}%")
-        print(f"  Overhead of Pond layer (count):  {((t_count_pond/t_count_native - 1) * 100):.0f}%")
-        print(f"  Overhead of Pond layer (avg):    {((t_avg_pond/t_avg_native - 1) * 100):.0f}%")
-        print(f"  Overhead of Pond layer (filter): {((t_filter_pond/t_filter_native - 1) * 100):.0f}%")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+# Earlier versions of this module contained the PondLakehouse class, the SQL
+# parser, and the self-test/benchmark. They have been extracted to:
+#   - pond_lakehouse.py  (PondLakehouse DuckDB façade + self-test + benchmark)
+#   - sql_pushdown.py    (regex SQL parser for predicate + projection extraction)
+#
+# LakehouseLens itself does NOT require DuckDB. Users who want SQL queries
+# should use PondLakehouse (from pond_lakehouse import PondLakehouse).
+#
+# The re-export below keeps existing imports (from lakehouse_lens import
+# PondLakehouse) working without modification.
+
+try:
+    from pond_lakehouse import PondLakehouse  # noqa: E402
+except ImportError:
+    PondLakehouse = None  # DuckDB not installed
 
 
 if __name__ == "__main__":
-    _self_test()
-    _benchmark()
+    # Run the self-test from pond_lakehouse.py for backward compat.
+    if PondLakehouse is not None:
+        from pond_lakehouse import _self_test, _benchmark
+        _self_test()
+        _benchmark()
+    else:
+        print("DuckDB is not installed — cannot run PondLakehouse self-test.")
+        print("Install with: pip install duckdb pyarrow")

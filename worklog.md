@@ -2269,3 +2269,77 @@ Stage Summary:
 - Remaining review findings (C3, C4, C6, C11, M13, M14, M16, M21, M22)
   are documented in docs/DESIGN_REVIEW_2026_07_26.md with a fix plan.
   Estimated 3-4 more days of refactoring.
+
+---
+Task ID: design-review-fixes-phase3
+Agent: main
+Task: Phase G — split lakehouse_lens.py (M21 + M22 + M20)
+
+Work Log:
+- Created lenses/lakehouse/sql_pushdown.py (170 LOC):
+  * extract_predicates(sql) — parses WHERE clause, returns list of
+    (column, op, value) tuples. Supports =, !=, <, <=, >, >=, IN, BETWEEN.
+    Does NOT handle OR, joins, subqueries (returns [] for those — caller
+    falls back to full read).
+  * extract_columns(sql) — parses SELECT clause, returns list of column
+    names or ["*"] for SELECT * / unparseable / aggregations.
+  * Standalone module so it can be tested in isolation. A future upgrade
+    to sqlglot would replace this whole module.
+- Created lenses/lakehouse/pond_lakehouse.py (507 LOC):
+  * PondLakehouse class — DuckDB façade over LakehouseLens.
+  * _read_with_pushdown now calls sql_pushdown.extract_predicates /
+    extract_columns (was inline before).
+  * _self_test and _benchmark moved here (was in lakehouse_lens.py).
+  * This is the ONLY place DuckDB is required.
+- Trimmed lenses/lakehouse/lakehouse_lens.py (2295 → 1740 lines, -555 LOC):
+  * Removed PondLakehouse class (was lines 1716-2020).
+  * Removed _self_test (was lines 2026-2215).
+  * Removed _benchmark (was lines 2217-2290).
+  * Removed _extract_predicates, _parse_single_predicate, _extract_columns
+    (were PondLakehouse static methods).
+  * Added backward-compat re-export: `from pond_lakehouse import PondLakehouse`
+    so existing `from lakehouse_lens import PondLakehouse` imports keep working.
+  * Added backward-compat `__main__` that runs _self_test + _benchmark from
+    pond_lakehouse.py.
+- Made LakehouseLens DuckDB-optional (M20 + M7):
+  * duckdb import is now try/except — sets duckdb = None if not installed.
+    Was: raise ImportError. Now: LakehouseLens can be instantiated without
+    DuckDB installed.
+  * __init__ no longer creates a DuckDB connection eagerly. Was:
+    self.duckdb = duckdb.connect(). Now: self._duckdb = None.
+  * Added duckdb property that lazily creates the connection on first
+    access (only range_point_lookup uses it). Raises ImportError with a
+    clear message if DuckDB is not installed.
+  * Net effect: a user who only wants to write/read Parquet row groups
+    and do time-travel can use LakehouseLens without DuckDB installed.
+    Only PondLakehouse (the SQL façade) requires DuckDB.
+- Registered new files in KNOWLEDGE_GRAPH.md.
+- Updated the lakehouse_lens.py entry to reflect the new structure
+  (was "LakehouseLens, PondLakehouse" — now "LakehouseLens" only,
+  with a note about the three pruning read paths).
+
+Stage Summary:
+- 32/32 tests pass (no new tests — refactor preserved behavior).
+- Encoded pruning benchmark preserved: 2.97x faster than whole-blob,
+  ~2x faster than column-chunk Parquet (slight variance from prior runs).
+- LakehouseLens is now DuckDB-optional — can be instantiated without
+  DuckDB installed (only needs PyArrow). This fixes the M20/M7 issue
+  where the lens was un-importable without DuckDB.
+- lakehouse_lens.py is now 1740 lines (was 2295) — closer to KeyValueLens
+  (694) and FeatureStoreLens (742). Still larger because of the three
+  write modes + three read modes + manifest handling, but the structure
+  is now clear: lens in lakehouse_lens.py, façade in pond_lakehouse.py,
+  SQL parser in sql_pushdown.py.
+- Backward compat preserved: all existing imports
+  (from lakehouse_lens import PondLakehouse) keep working via re-export.
+- Files changed:
+  * lenses/lakehouse/sql_pushdown.py (NEW — 170 LOC)
+  * lenses/lakehouse/pond_lakehouse.py (NEW — 507 LOC)
+  * lenses/lakehouse/lakehouse_lens.py (trimmed 2295 → 1740 LOC;
+    duckdb made optional + lazy; PondLakehouse class + _self_test +
+    _benchmark + SQL parser methods removed; backward-compat re-export
+    added)
+  * KNOWLEDGE_GRAPH.md (3 new entries; 1 updated entry)
+- Remaining review findings (C3, C4, C6, C11, M13, M14, M16)
+  are documented in docs/DESIGN_REVIEW_2026_07_26.md. Estimated 2-3
+  more days of refactoring.
