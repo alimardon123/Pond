@@ -94,8 +94,31 @@ class FeatureStoreLens(PondLens):
 
     def __init__(self, kernel: PondMinimal):
         super().__init__(kernel)
-        # DuckDB for ad-hoc queries (optional — only used by some methods)
         self._duckdb = None
+        self._attached_indexer = None
+
+    def attach_indexer(self, indexer) -> None:
+        """Attach a CollectionMetadata or CollectionIndexer for auto-notify.
+
+        After attaching, every commit (ingest, ingest_to_branch, merge_branch)
+        auto-notifies the indexer. EAGER indexes refresh immediately; LAZY
+        indexes accumulate staleness.
+
+        Usage:
+            meta = CollectionMetadata(kernel)
+            meta.register_eager_index('features', 'by_user', extractor, scan_fn)
+            lens.attach_indexer(meta)
+            lens.ingest('features', data)  # auto-refreshes
+        """
+        self._attached_indexer = indexer
+
+    def _notify_indexers(self, collection: str) -> None:
+        """Notify attached indexer after a commit. Best-effort."""
+        if self._attached_indexer is not None:
+            try:
+                self._attached_indexer.notify_write(collection)
+            except Exception:
+                pass
 
     @property
     def duckdb(self):
@@ -192,8 +215,10 @@ class FeatureStoreLens(PondLens):
         else:
             combined = data
 
-        return self._write_row_groups(collection, combined, key_col,
+        commit_hash = self._write_row_groups(collection, combined, key_col,
                                        message=message or f"ingest {data.num_rows} rows")
+        self._notify_indexers(collection)
+        return commit_hash
 
     # ------------------------------------------------------------------
     # Point-in-time join (prevents label leakage)
@@ -337,9 +362,11 @@ class FeatureStoreLens(PondLens):
         except TypeError:
             combined = pa.concat_tables([existing, data])
 
-        return self._write_row_groups_to_branch(collection, branch_name, combined,
+        commit_hash = self._write_row_groups_to_branch(collection, branch_name, combined,
                                                   key_col,
                                                   message=message or f"branch {branch_name}: ingest {data.num_rows} rows")
+        self._notify_indexers(collection)
+        return commit_hash
 
     def merge_branch(self, collection: str, branch_name: str) -> str:
         """Merge a branch into HEAD. Union merge with 2-parent commit.
@@ -359,8 +386,10 @@ class FeatureStoreLens(PondLens):
         except TypeError:
             merged = pa.concat_tables([head_data, branch_data])
 
-        return self._write_merge(collection, merged, head, branch_head,
+        commit_hash = self._write_merge(collection, merged, head, branch_head,
                                   message=f"merge branch {branch_name}")
+        self._notify_indexers(collection)
+        return commit_hash
 
     # ------------------------------------------------------------------
     # History (inherited from PondLens — handles binary commits natively)
