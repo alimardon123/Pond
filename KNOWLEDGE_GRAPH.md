@@ -92,6 +92,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `tests/integration/test_index_modes.py` | 220 | (tests) | Test: EAGER/LAZY index modes + O(changed) incremental refresh via commit-diff + is_index_stale. |
 | `pond-sdk/maintenance.py` | 315 | `drop_name`, `is_dropped`, `resolve_active`, `compact_tombstones` | Tombstone helpers (RFC-0008: deletion as data). |
 | `pond-sdk/collection_metadata.py` | 343 | `CollectionMetadata` | Data-side metadata manager. Manages zone maps, indexes, and (future) bloom filters for collections. Lens-agnostic — works through callbacks. |
+| `pond-sdk/best_effort.py` | 95 | `best_effort, warn_best_effort` | Tiny helper for best-effort operations. Catches specific recoverable exceptions (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError) and logs them via the `pond.best_effort` logger. Replaces the `except Exception: pass` anti-pattern. Enable with `POND_DEBUG=1`. |
 | `pond-sdk/uuid7.py` | 180 | `uuidv7`, `uuidv7_monotonic`, `uuidv7_timestamp` | UUIDv7 time-ordered UUID generation for distributed row identification (_rowid). |
 | `tests/lens_algebra/run_lens_laws_ci.py` | 267 | (CI runner) | CI runner for Lens contracts. |
 | `pond-sdk/__init__.py` | 0 | Package marker. |
@@ -158,6 +159,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `tests/integration/test_column_chunk_storage.py` | 290 | (test) | Tests per-column-chunk storage: basic write/read, I/O savings (bytes), fallback to whole-blob path. 9.37x I/O reduction verified. |
 | `tests/integration/test_encoded_pruning.py` | 380 | (test) | Tests encoding selection, encoded predicate eval, range_write_encoded + read_with_encoded_pruning. 1.86x speedup on low-cardinality queries. |
 | `tests/integration/test_sql_pushdown_fast_paths.py` | 130 | (test) | Tests PondLakehouse.query uses the fastest available read path (encoded → column-chunk → row-group → full). Verifies all 3 storage modes work end-to-end via SQL. |
+| `tests/integration/test_best_effort.py` | 130 | (test) | Tests the best_effort helper: success path, recoverable exceptions (KeyError/ValueError/ImportError/TypeError), non-recoverable exceptions re-raised (RuntimeError/KeyboardInterrupt), DEBUG logging via POND_DEBUG=1. |
 | `pond-labs/benchmarks/encoded_pruning_benchmark.py` | 210 | (benchmark) | Benchmark: encoding-aware compute on 99K rows. 3.37x faster than whole-blob, 2.04x faster than column-chunk Parquet for low-cardinality predicate. |
 | `pond-labs/benchmarks/overhead_audit.py` | 330 | (benchmark) | Overhead audit: zone map cost for OLTP, OLAP, streaming, point lookups, full scans, binary data. |
 | `pond-labs/benchmarks/sql_pushdown_benchmark.py` | 95 | (benchmark) | SQL pushdown benchmark: pruned vs full scan on 100K rows. Shows Python pruning overhead vs DuckDB native scan on local disk. |
@@ -286,6 +288,7 @@ implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 | **Tiered Commit** | Delta commits (O(1) write) + snapshot commits (O(changed_chunks)) + snapshot pointer. | `pond-sdk/prolly_tree.py` |
 | **Tombstone** | Deletion as data: `Ref(name, TOMBSTONE_HASH)`. RFC-0008. | `pond-sdk/maintenance.py` |
 | `pond-sdk/collection_metadata.py` | 343 | `CollectionMetadata` | Data-side metadata manager. Manages zone maps, indexes, and (future) bloom filters for collections. Lens-agnostic — works through callbacks. |
+| `pond-sdk/best_effort.py` | 95 | `best_effort, warn_best_effort` | Tiny helper for best-effort operations. Catches specific recoverable exceptions (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError) and logs them via the `pond.best_effort` logger. Replaces the `except Exception: pass` anti-pattern. Enable with `POND_DEBUG=1`. |
 | **Manifest** | Sidecar listing blob hashes in a pack. Enables physical reachability (1000x GC speedup). | `docs/POND_FORMAL_ALGEBRAS.md` §10 |
 | **Transport Layer** | Compress → encrypt → checksum. Between kernel and Lens. | `services/transport/` |
 | **Schema Registry** | Versioned schemas on Names substrate. Backward/forward compat. | `services/schema/` |

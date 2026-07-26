@@ -159,8 +159,14 @@ class PondLakehouse:
                         from collection_metadata import CollectionMetadata
                         meta = CollectionMetadata(self.kernel)
                         use_pruning = meta.should_prune()
-                    except Exception:
-                        use_pruning = False  # default: no pruning if detection fails
+                    except (ImportError, AttributeError, ValueError) as exc:
+                        # Pruning auto-detection failed (extension missing,
+                        # kernel error, etc.). Default to no pruning.
+                        import logging
+                        logging.getLogger("pond.best_effort").debug(
+                            "pruning auto-detection failed: %s: %s",
+                            type(exc).__name__, exc)
+                        use_pruning = False
 
             if use_pruning:
                 table = self._read_with_pushdown(sql, table_name)
@@ -222,9 +228,14 @@ class PondLakehouse:
         except (ImportError, KeyError, AttributeError):
             # Missing extension or column — fall back to full read
             return self.lens.read_table(table_name)
-        except Exception:
+        except Exception as exc:
             # Any other failure in pushdown → fall back to full read.
+            # Logged at DEBUG so users can diagnose slow queries.
             # (Catches parser bugs, predicate evaluation errors, etc.)
+            import logging
+            logging.getLogger("pond.best_effort").debug(
+                "SQL pushdown failed for %r — falling back to full read: %s: %s",
+                sql, type(exc).__name__, exc)
             return self.lens.read_table(table_name)
 
     def query_at(self, sql: str, table_name: str, commit_hash: str) -> pa.Table:

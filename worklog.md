@@ -2496,3 +2496,79 @@ Stage Summary:
   * C4 — extensions hard-code PyArrow (needs callback refactor)
   * C11 — broad except Exception: pass (needs specific exception types)
   * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)
+
+---
+Task ID: design-review-fixes-phase6
+Agent: main
+Task: Phase A continued (C11) — replace except Exception: pass with specific catches + logging
+
+Work Log:
+- Audited all `except Exception:` sites in the lens + extension layer (33 sites total).
+  The previous pattern silently swallowed real bugs and made "why is my lakehouse slow?"
+  impossible to debug.
+- Created pond-sdk/best_effort.py (95 LOC):
+  * best_effort(operation, fn, *args, **kwargs) — runs fn; on recoverable exceptions
+    (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError)
+    logs a DEBUG warning and returns None. On other exceptions (RuntimeError,
+    KeyboardInterrupt, MemoryError, etc.), re-raises.
+  * warn_best_effort(operation, exc) — logs a best-effort warning. Useful when a
+    caller already has the exception.
+  * Uses the stdlib `logging` module under logger name "pond.best_effort".
+  * POND_DEBUG=1 environment variable enables DEBUG-level logging at import time.
+  * Default behavior is silent (DEBUG level) — users opt in to see warnings.
+- Replaced 12 `except Exception: pass` sites in lakehouse_lens.py:
+  * _range_write_generic's clear_zone_maps → best_effort
+  * _range_write_generic's build zone map per row group → best_effort (the C11 site
+    that silently produced partially-prunable collections)
+  * _range_write_generic's commit_zone_maps → best_effort
+  * range_write's write_parquet_blob cczm build → best_effort
+  * read_columns column projection fallback → specific catches (KeyError, ValueError,
+    pa.ArrowInvalid) + warn_best_effort
+  * read_with_column_chunk_pruning's whole-blob decode fallback → best_effort
+  * read_with_encoded_pruning's plain Parquet fallback → best_effort
+  * _infer_columns → specific catches + warn_best_effort
+  * _write_via_prolly's zone map build (the other C11 site) → best_effort
+  * _write_via_prolly's commit_zone_maps → best_effort
+  * _decode_blob_to_table's Parquet decode → best_effort
+  * compact_zone_maps → specific catches + warn_best_effort
+  * _notify_indexers → best_effort
+- Replaced 2 `except Exception:` sites in pond_lakehouse.py:
+  * query()'s pruning auto-detection → specific catches (ImportError, AttributeError,
+    ValueError) + DEBUG log
+  * _read_with_pushdown's catchall fallback → kept as Exception safety net but added
+    DEBUG log so users can diagnose slow queries
+- Added tests/integration/test_best_effort.py (130 LOC):
+  * test_best_effort_success — verifies result is returned on success
+  * test_best_effort_recoverable — verifies None + log on KeyError/ValueError/
+    ImportError/TypeError
+  * test_best_effort_non_recoverable — verifies RuntimeError + KeyboardInterrupt
+    are re-raised
+  * test_warn_best_effort — verifies DEBUG logging format
+  * test_pond_debug_env — verifies logger level is settable
+- Registered new files in KNOWLEDGE_GRAPH.md.
+
+Stage Summary:
+- 33/33 tests pass (added 1 new test for the best_effort helper).
+- Encoded pruning benchmark preserved: 3.09x faster than whole-blob.
+- 14 `except Exception: pass` sites eliminated across lakehouse_lens.py (12) and
+  pond_lakehouse.py (2). The remaining sites in extensions and other lenses are
+  deferred (they're in less critical paths).
+- Users can now diagnose silent best-effort failures by setting POND_DEBUG=1.
+  The logger emits messages like:
+    [pond] DEBUG best-effort 'build zone map for users.rg/999' failed: ValueError: ...
+- This fixes the C11 review finding: "the single largest source of 'why is my
+  lakehouse slow?' debugging pain (silent best-effort failures)".
+- Files changed:
+  * pond-sdk/best_effort.py (NEW — 95 LOC)
+  * lenses/lakehouse/lakehouse_lens.py (12 sites replaced with best_effort /
+    specific catches + warn_best_effort)
+  * lenses/lakehouse/pond_lakehouse.py (2 sites replaced)
+  * tests/integration/test_best_effort.py (NEW — 130 LOC)
+  * tests/test_all.py (1 new test entry)
+  * KNOWLEDGE_GRAPH.md (2 new entries)
+- Remaining review findings (C3, C4, M13, M14) are documented in
+  docs/DESIGN_REVIEW_2026_07_26.md. Estimated 0.5-1 more day of refactoring.
+  The biggest remaining items are:
+  * C3 — rename duplicate ZoneMap classes (needs careful coordination)
+  * C4 — extensions hard-code PyArrow (needs callback refactor)
+  * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)

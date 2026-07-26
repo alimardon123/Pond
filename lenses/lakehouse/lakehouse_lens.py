@@ -92,6 +92,7 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk",
                                   "extensions", "physical_structures"))
 from kernel import PondMinimal  # noqa: E402
 from base_lens import PondLens  # noqa: E402
+from best_effort import best_effort, warn_best_effort  # noqa: E402
 
 # DuckDB is OPTIONAL for LakehouseLens. The lens only needs DuckDB for
 # range_point_lookup's "filter to exact row" convenience. Users who only
@@ -463,12 +464,11 @@ class LakehouseLens(PondLens):
 
         # Clear old zone maps for this collection (overwrite semantics).
         # Uses the public clear_zone_maps() API instead of reaching into
-        # zm_index._get_base(name).
+        # zm_index._get_base(name). Best-effort — failures are logged via
+        # the pond.best_effort logger (enable with POND_DEBUG=1).
         if zm_index is not None:
-            try:
-                zm_index.clear_zone_maps(name)
-            except Exception:
-                pass  # clearing is best-effort
+            best_effort(f"clear zone maps for {name}",
+                        zm_index.clear_zone_maps, name)
 
         # Sort by key_col so row groups are contiguous key ranges
         sorted_table = table.sort_by(key_col)
@@ -489,26 +489,31 @@ class LakehouseLens(PondLens):
             data_blob_hash, cczm = write_one_rowgroup(group_table, rg_key)
             base.stage(rg_key, data_blob_hash)
 
-            # Build zone map for this row group (best-effort)
+            # Build zone map for this row group (best-effort — failures
+            # are logged via pond.best_effort, NOT silently swallowed).
+            # A failure here means the row group won't have a zone map,
+            # so it won't be prunable. That's correct behavior (no false
+            # negatives) but the user should know.
             if zm_index is not None:
-                try:
-                    zm = ZoneMap.build(group_table)
-                    if cczm is not None:
+                def _build_and_add_zm(_gt=group_table, _rk=rg_key,
+                                       _cczm=cczm, _dbh=data_blob_hash,
+                                       _zm_index=zm_index, _name=name):
+                    zm = ZoneMap.build(_gt)
+                    if _cczm is not None:
                         zm_dict = zm.to_dict()
-                        zm_dict["column_chunks"] = cczm.to_dict()
+                        zm_dict["column_chunks"] = _cczm.to_dict()
                         zm = ZoneMap.from_dict(zm_dict)
-                    zm_index.add_zone_map(name, rg_key, zm, data_blob_hash)
-                except Exception:
-                    pass  # zone map is best-effort
+                    _zm_index.add_zone_map(_name, _rk, zm, _dbh)
+                best_effort(f"build zone map for {name}.{rg_key}",
+                            _build_and_add_zm)
 
         n_groups = (n_rows + row_group_size - 1) // row_group_size
         commit_hash = base.commit(f"{commit_message}: {n_rows} rows in {n_groups} row groups")
 
         if zm_index is not None:
-            try:
-                zm_index.commit_zone_maps(name, f"zone maps for {name}")
-            except Exception:
-                pass
+            best_effort(f"commit zone maps for {name}",
+                        zm_index.commit_zone_maps, name,
+                        f"zone maps for {name}")
 
         self._cached_tables.pop(f"{name}:{commit_hash}", None)
         self._notify_indexers(name)
@@ -547,11 +552,10 @@ class LakehouseLens(PondLens):
             # HAVE_PRUNING is set once at module import time.
             cczm = None
             if HAVE_PRUNING:
-                try:
-                    cczm = ColumnChunkZoneMap.build(group_table, rg_key,
-                                                    chunk_size=DEFAULT_CHUNK_SIZE)
-                except Exception:
-                    pass  # best-effort
+                cczm = best_effort(
+                    f"build column-chunk zone map for {rg_key}",
+                    ColumnChunkZoneMap.build, group_table, rg_key,
+                    chunk_size=DEFAULT_CHUNK_SIZE)
 
             return parquet_hash, cczm
 
@@ -846,9 +850,13 @@ class LakehouseLens(PondLens):
             try:
                 table = pq.read_table(reader, columns=columns)
                 tables.append(table)
-            except Exception:
-                # If column projection fails (e.g., column not found),
-                # read the full table and project afterwards
+            except (KeyError, ValueError, pa.ArrowInvalid) as exc:
+                # Column projection failed (e.g., column not found, schema
+                # mismatch). Fall back to full read + project afterwards.
+                # Logged at DEBUG so users can diagnose slow reads.
+                warn_best_effort(
+                    f"column projection for {columns} failed — falling back to full read",
+                    exc)
                 full = self._decode_table(parquet_bytes)
                 available = [c for c in columns if c in full.column_names]
                 if available:
@@ -1110,11 +1118,12 @@ class LakehouseLens(PondLens):
             if not ColumnChunkStorage.has_column_chunk_storage(zm_dict):
                 actual_data_hash = zm_dict.get("blob_hash", manifest_hash)
                 data_bytes = self.kernel.read_blob(actual_data_hash)
-                try:
-                    table = self._decode_table(data_bytes)
-                    return table.to_pylist()
-                except Exception:
+                decoded = best_effort(
+                    f"decode whole blob for {rg_key} (column-chunk fallback)",
+                    self._decode_table, data_bytes)
+                if decoded is None:
                     return []
+                return decoded.to_pylist()
 
             # Column-chunk storage active — read only surviving chunks
             cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
@@ -1217,11 +1226,12 @@ class LakehouseLens(PondLens):
                     # Plain Parquet blob (range_write / _write_via_prolly)
                     actual_data_hash = zm_dict.get("blob_hash", manifest_hash)
                     data_bytes = self.kernel.read_blob(actual_data_hash)
-                    try:
-                        table = self._decode_table(data_bytes)
-                        return table.to_pylist()
-                    except Exception:
+                    decoded = best_effort(
+                        f"decode plain Parquet blob for {rg_key}",
+                        self._decode_table, data_bytes)
+                    if decoded is None:
                         return []  # undecodable blob — skip
+                    return decoded.to_pylist()
 
             # Encoded storage active — read surviving chunks with encoded
             # predicate eval where possible.
@@ -1271,7 +1281,8 @@ class LakehouseLens(PondLens):
         """Infer column names from the first zone map of a collection.
 
         Uses the public iter_zone_maps() API instead of reaching into
-        zm_index._get_base(name).
+        zm_index._get_base(name). Best-effort — returns [] if the zone
+        maps can't be read (e.g., extension not installed, kernel error).
         """
         try:
             for _rg_key, zm_dict in zm_index.iter_zone_maps(name):
@@ -1279,8 +1290,8 @@ class LakehouseLens(PondLens):
                     return list(zm_dict["column_chunks"].get(
                         "column_chunks", {}).keys())
                 return list(zm_dict.get("min", {}).keys())
-        except Exception:
-            pass
+        except (KeyError, ValueError, AttributeError, ImportError) as exc:
+            warn_best_effort(f"infer columns for {name}", exc)
         return []
 
     # ==================================================================
@@ -1366,38 +1377,37 @@ class LakehouseLens(PondLens):
             rg_key = f"{_RG_PREFIX}{max_pk}"
             base.stage(rg_key, parquet_hash)
 
-            # Compute and store zone map for this row group
+            # Compute and store zone map for this row group (best-effort).
+            # Failures are logged via pond.best_effort, NOT silently swallowed.
             if zm_index is not None:
-                try:
-                    zm = ZoneMap.build(group_table)
+                def _build_zm(_gt=group_table, _rk=rg_key, _ph=parquet_hash,
+                               _zm_index=zm_index, _name=name):
+                    zm = ZoneMap.build(_gt)
                     # Also compute column-chunk zone maps for finer pruning.
                     # HAVE_PRUNING is set once at module import time.
                     if HAVE_PRUNING:
-                        try:
-                            cczm = ColumnChunkZoneMap.build(group_table, rg_key,
-                                                            chunk_size=DEFAULT_CHUNK_SIZE)
+                        cczm = best_effort(
+                            f"build column-chunk zone map for {_name}.{_rk}",
+                            ColumnChunkZoneMap.build, _gt, _rk,
+                            chunk_size=DEFAULT_CHUNK_SIZE)
+                        if cczm is not None:
                             # Merge column-chunk stats into the zone map dict
                             # so PruningReader can use them
                             zm_dict = zm.to_dict()
                             zm_dict["column_chunks"] = cczm.to_dict()
-                            # Create a ZoneMap with the extra field
                             zm = ZoneMap.from_dict(zm_dict)
-                        except Exception:
-                            pass  # column-chunk zone map is best-effort
-                    zm_index.add_zone_map(name, rg_key, zm, parquet_hash)
-                except Exception:
-                    pass  # zone map computation is best-effort
+                    _zm_index.add_zone_map(_name, _rk, zm, _ph)
+                best_effort(f"build zone map for {name}.{rg_key}", _build_zm)
 
         n_groups = (n_rows + row_group_size - 1) // row_group_size
         commit_hash = base.commit(message or f"write: {n_rows} rows in {n_groups} row groups")
         self._cached_tables.pop(f"{name}:{commit_hash}", None)
 
-        # Commit zone maps (if built)
+        # Commit zone maps (if built) — best-effort
         if zm_index is not None:
-            try:
-                zm_index.commit_zone_maps(name, f"zone maps for {name}")
-            except Exception:
-                pass  # zone map commit is best-effort
+            best_effort(f"commit zone maps for {name}",
+                        zm_index.commit_zone_maps, name,
+                        f"zone maps for {name}")
 
         self._notify_indexers(name)
         return commit_hash
@@ -1561,10 +1571,12 @@ class LakehouseLens(PondLens):
         """
         # Try Parquet first (cheap probe: magic bytes)
         if blob_bytes[:4] == b"PAR1":
-            try:
-                return self._decode_table(blob_bytes)
-            except Exception:
-                return None
+            decoded = best_effort(
+                f"decode Parquet blob for {collection}.{rg_key}",
+                self._decode_table, blob_bytes)
+            if decoded is not None:
+                return decoded
+            return None
 
         # Try JSON manifest
         try:
@@ -1682,7 +1694,8 @@ class LakehouseLens(PondLens):
             if meta.has_zone_maps(collection):
                 return meta.compact_zone_maps(collection)
             return 0
-        except Exception:
+        except (ImportError, KeyError, AttributeError, ValueError) as exc:
+            warn_best_effort(f"compact zone maps for {collection}", exc)
             return 0
 
     def _notify_indexers(self, collection: str) -> None:
@@ -1692,13 +1705,12 @@ class LakehouseLens(PondLens):
         For LAZY indexes: staleness accumulates (refreshed on next lookup).
         For MANUAL indexes: no-op.
 
-        Called automatically after every commit. Best-effort.
+        Called automatically after every commit. Best-effort — failures
+        are logged via pond.best_effort, NOT silently swallowed.
         """
         if self._attached_indexer is not None:
-            try:
-                self._attached_indexer.notify_write(collection)
-            except Exception:
-                pass  # indexer notification is best-effort
+            best_effort(f"notify indexer for {collection}",
+                        self._attached_indexer.notify_write, collection)
 
 # ---------------------------------------------------------------------------
 # Backward-compat re-export — PondLakehouse now lives in pond_lakehouse.py
