@@ -653,7 +653,9 @@ class LakehouseLens(PondLens):
 
     def read_with_pruning(self, name: str,
                           predicates: Optional[list] = None,
-                          row_filter: Optional[Callable] = None) -> pa.Table:
+                          row_filter: Optional[Callable] = None,
+                          columns: Optional[list[str]] = None,
+                          chunk_size: int = 1000) -> pa.Table:
         """Read a table with Vortex-style predicate pushdown.
 
         Reads zone maps first (small, cheap), evaluates the pruning
@@ -670,10 +672,18 @@ class LakehouseLens(PondLens):
             row_filter: optional function(row_dict) -> bool for exact
                 row-level filtering after pruning. This catches false
                 positives from zone-map pruning.
+            columns: optional list of column names to enable column-chunk
+                pruning. When provided, the reader uses per-column-chunk
+                zone maps to skip individual column chunks within
+                surviving row groups. Must be a subset of the predicate
+                columns to have any effect.
+            chunk_size: rows per column chunk (must match the chunk_size
+                used at write time when building ColumnChunkZoneMap).
+                Default 1000.
 
         Returns:
             A PyArrow Table containing rows from non-pruned row groups
-            (optionally filtered by row_filter).
+            (optionally filtered by row_filter and column-chunk pruning).
         """
         try:
             from collection_metadata import CollectionMetadata
@@ -706,8 +716,11 @@ class LakehouseLens(PondLens):
             table = self._decode_table(data_bytes)
             return table.to_pylist()
 
-        # Scan with pruning
-        rows = list(reader.scan(decode_fn=decode_parquet, row_filter=row_filter))
+        # Scan with pruning (column-chunk pruning active if columns is set)
+        rows = list(reader.scan(decode_fn=decode_parquet,
+                                row_filter=row_filter,
+                                columns=columns,
+                                chunk_size=chunk_size))
 
         if not rows:
             return pa.table({})

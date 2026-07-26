@@ -219,7 +219,8 @@ class ZoneMapIndex:
     def scan_with_pruning(self, collection: str,
                           predicate: Optional[PruningPredicate] = None,
                           start_key: Optional[str] = None,
-                          end_key: Optional[str] = None) -> Iterator[str]:
+                          end_key: Optional[str] = None,
+                          verbose: bool = False) -> Iterator:
         """Scan data blob hashes, skipping row groups that can be pruned.
 
         This is the core of Vortex-style pushdown for Pond:
@@ -236,10 +237,15 @@ class ZoneMapIndex:
             start_key: optional lower bound on row group keys
             end_key: optional upper bound (used for documentation;
                 actual row-level filtering is the caller's job)
+            verbose: if True, yield (row_group_key, data_blob_hash, zm_dict)
+                tuples instead of just data_blob_hash strings. The verbose
+                form lets the caller do column-chunk pruning without a
+                second zone-map lookup.
 
         Yields:
             data_blob_hash strings for row groups that MIGHT match.
-            The caller reads + decodes only these blobs.
+            OR (if verbose=True) tuples of (row_group_key, data_blob_hash,
+            zm_dict). The caller reads + decodes only these blobs.
         """
         # Use ProllyLensBase to read the current state (handles commit→snapshot)
         base = self._get_base(collection)
@@ -254,11 +260,7 @@ class ZoneMapIndex:
         if start_key is not None:
             zm_keys = [k for k in zm_keys if k >= start_key]
 
-        pruned_count = 0
-        total_count = 0
-
         for zm_key in zm_keys:
-            total_count += 1
             zm_blob_hash = state[zm_key]
 
             # Read the zone map blob (small — just min/max/null_count)
@@ -268,17 +270,15 @@ class ZoneMapIndex:
             if predicate is not None:
                 zm = ZoneMap.from_dict(zm_dict)
                 if predicate.can_prune(zm):
-                    pruned_count += 1
                     continue  # SKIP — data blob not read, not decoded
 
             # Yield the DATA blob hash (not the zone-map blob hash)
             # The zone map dict includes "blob_hash" pointing to the data
-            yield zm_dict.get("blob_hash", zm_blob_hash)
-
-        # Log pruning stats (for debugging/performance analysis)
-        if predicate is not None and total_count > 0:
-            # Could log: pruned {pruned_count}/{total_count} row groups
-            pass
+            data_blob_hash = zm_dict.get("blob_hash", zm_blob_hash)
+            if verbose:
+                yield (zm_key, data_blob_hash, zm_dict)
+            else:
+                yield data_blob_hash
 
     # ------------------------------------------------------------------
     # Maintenance

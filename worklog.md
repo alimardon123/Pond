@@ -1926,3 +1926,47 @@ The overclaim is retracted. The whitepaper is rigorous. The benchmarks are direc
 Honest verdict: Pond is a hypothesis that has survived internal falsification (Phases K-P) and is ready for external falsification (Phase Q). It has NOT been falsified. It has NOT been validated. It is ready to be attacked.
 
 The user's feedback was correct: I was overselling. Phase Q corrects that. The architecture is frozen. The validation is in progress. The next step is sending the review packet to actual experts.
+
+---
+Task ID: cc-pruning-scan
+Agent: main
+Task: Wire column-chunk pruning into PruningReader.scan() — complete the three-level pruning hierarchy
+
+Work Log:
+- Read /home/z/my-project/worklog.md and /home/z/my-project/pond_repo/worklog.md to understand prior work (commit cfea44a added scan_column_chunks method but the main scan() path didn't actually use cc_predicates).
+- Verified all 26 tests pass before changes.
+- Added `verbose=True` mode to ZoneMapIndex.scan_with_pruning() — yields (row_group_key, data_blob_hash, zm_dict) tuples so PruningReader can do column-chunk pruning without a second zone-map lookup.
+- Rewrote PruningReader.scan() to:
+  * Use verbose scan to get zm_dict alongside blob hash
+  * Build surviving_chunks_per_col by calling cczm.prune_column_chunks for each predicate column
+  * Take INTERSECTION across all predicate columns (predicates are ANDed)
+  * Track column_chunks_pruned in stats (per column)
+  * Defensively skip whole row group if intersection is empty
+  * After decode, slice rows to surviving chunk ranges (ci * chunk_size to (ci+1) * chunk_size) before applying row_filter
+- Added `columns` and `chunk_size` parameters to LakehouseLens.read_with_pruning() — callers opt in to column-chunk pruning by passing columns=[...]
+- Added test_column_chunk_pruning() to tests/integration/test_lakehouse_pruning.py — 5000 rows in 1 row group, 5 column chunks, verifies 4/5 chunks pruned for predicate age >= 4500
+- Added pond-labs/benchmarks/column_chunk_pruning_benchmark.py — 50K rows in 1 row group, 50 chunks, shows 49/50 chunks pruned, 1.10x speedup (modest because whole blob is one Parquet row group; future win = separate column-chunk blobs for object-storage I/O savings)
+- Registered new benchmark in KNOWLEDGE_GRAPH.md
+- Added test_column_chunk_pruning_benchmark to tests/test_all.py
+
+Stage Summary:
+- Three-level pruning hierarchy is now fully wired end-to-end:
+  Level 1 (row-group): ZoneMap-based, skip entire row groups without decoding
+  Level 2 (column-chunk): ColumnChunkZoneMap-based, skip individual chunks within surviving row groups
+  Level 3 (row-level): exact row_filter on decoded rows
+- PruningReader.scan() now actually USES the `columns` parameter (previously documented but unused)
+- 27/27 tests pass (added 1 new test for column-chunk pruning benchmark)
+- All existing pruning tests still pass (no regressions)
+- Files changed:
+  * pond-sdk/extensions/physical_structures/zone_map_index.py (scan_with_pruning verbose mode)
+  * pond-sdk/extensions/physical_structures/pruning_reader.py (scan() rewritten with column-chunk pruning)
+  * lenses/lakehouse/lakehouse_lens.py (read_with_pruning gains columns/chunk_size params)
+  * tests/integration/test_lakehouse_pruning.py (new test_column_chunk_pruning)
+  * pond-labs/benchmarks/column_chunk_pruning_benchmark.py (new)
+  * tests/test_all.py (new test entry)
+  * KNOWLEDGE_GRAPH.md (new benchmark registered)
+- Next opportunities:
+  * Encoding-aware compute (FastLanes-style structural encodings) — skip decompression for pruned chunks
+  * Separate column-chunk blobs for true I/O savings on object storage
+  * .pond/config for persistent pruning settings
+  * Scale benchmarks to 1M rows

@@ -104,6 +104,10 @@ def test_lakehouse_pruning():
     ok, output = _run_script("tests/integration/test_lakehouse_pruning.py")
     assert ok, f"Lakehouse pruning tests failed:\n{output[-500:]}"
 
+def test_column_chunk_pruning_benchmark():
+    ok, output = _run_script("pond-labs/benchmarks/column_chunk_pruning_benchmark.py")
+    assert ok, f"Column-chunk pruning benchmark failed:\n{output[-500:]}"
+
 def test_kv_pruning_and_projection():
     ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
     assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"

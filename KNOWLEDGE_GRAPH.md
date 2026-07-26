@@ -148,6 +148,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/demos/interop_demo.py` | 359 | (demo) | **Killer demo:** bidirectional Feature Store ↔ Lakehouse interop (12/12 pass). |
 | `pond-labs/benchmarks/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/benchmarks/pruning_benchmark.py` | 200 | (benchmark) | Benchmark: Vortex-style pruning effectiveness. 100K rows, measures blob skip rate and speedup for 1-50% selectivity queries. |
+| `pond-labs/benchmarks/column_chunk_pruning_benchmark.py` | 175 | (benchmark) | Benchmark: column-chunk pruning (3rd level). 50K rows in 1 row group, shows 49/50 chunks pruned for selective predicates. |
 | `pond-labs/benchmarks/overhead_audit.py` | 330 | (benchmark) | Overhead audit: zone map cost for OLTP, OLAP, streaming, point lookups, full scans, binary data. |
 | `pond-labs/benchmarks/sql_pushdown_benchmark.py` | 95 | (benchmark) | SQL pushdown benchmark: pruned vs full scan on 100K rows. Shows Python pruning overhead vs DuckDB native scan on local disk. |
 | `pond-labs/benchmarks/incremental_refresh_benchmark.py` | 100 | (benchmark) | Benchmark: O(changed) incremental refresh vs O(N) full rebuild. 27.9x speedup for 0.1% change rate. |

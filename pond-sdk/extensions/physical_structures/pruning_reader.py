@@ -110,7 +110,8 @@ class PruningReader:
              row_filter: Optional[Callable[[Any], bool]] = None,
              start_key: Optional[str] = None,
              end_key: Optional[str] = None,
-             columns: Optional[list[str]] = None) -> Iterator[Any]:
+             columns: Optional[list[str]] = None,
+             chunk_size: int = 1000) -> Iterator[Any]:
         """Scan the collection with pruning.
 
         Args:
@@ -121,7 +122,11 @@ class PruningReader:
             columns: optional list of column names for column-chunk pruning.
                 If provided AND the zone map has column_chunks, the reader
                 will skip column chunks within surviving row groups that
-                can't match the predicate.
+                can't match the predicate. Rows from pruned chunks are
+                never yielded (even before row_filter runs).
+            chunk_size: rows per column chunk (must match the chunk_size
+                used at write time when building ColumnChunkZoneMap).
+                Default 1000.
 
         Yields:
             Individual rows (dicts) that survive all pruning levels.
@@ -140,19 +145,68 @@ class PruningReader:
             "column_chunks_pruned": 0,
         }
 
-        # Build column-chunk predicate lookup from the PruningPredicate
+        # Build column-chunk predicate lookup from the PruningPredicate.
+        # Map: column_name → (op, value) for each predicate column.
         cc_predicates = {}
         if self.predicate and columns:
             for pred in self.predicate.predicates:
                 if pred.column in columns:
                     cc_predicates[pred.column] = (pred.op, pred.value)
 
-        # Get data blob hashes from the zone-map index, with row-group pruning
-        for data_blob_hash in self.zm_index.scan_with_pruning(
-                self.collection, self.predicate, start_key, end_key):
+        # Use verbose scan so we get the zone-map dict alongside the blob
+        # hash — this avoids a second zone-map lookup when we want to do
+        # column-chunk pruning on surviving row groups.
+        for row_group_key, data_blob_hash, zm_dict in self.zm_index.scan_with_pruning(
+                self.collection, self.predicate, start_key, end_key,
+                verbose=True):
 
             self.stats["total_row_groups"] += 1
             self.stats["data_blobs_read"] += 1
+
+            # Compute surviving chunk indices (if column-chunk stats exist
+            # and we have predicates on at least one column).
+            #
+            # surviving_chunks maps column_name → set of chunk indices that
+            # MIGHT match. We take the INTERSECTION across all predicate
+            # columns: a chunk survives only if it might match for ALL
+            # predicates. (We are ANDing the predicates.)
+            surviving_chunks_per_col: dict[str, set[int]] = {}
+            cczm = None
+            if cc_predicates and "column_chunks" in zm_dict:
+                try:
+                    from column_chunk_zone_map import ColumnChunkZoneMap
+                    cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
+                    for col, (op, val) in cc_predicates.items():
+                        chunks = cczm.prune_column_chunks(col, op, val)
+                        if chunks:  # may be empty if column has no chunks
+                            surviving_chunks_per_col[col] = set(chunks)
+                except ImportError:
+                    cczm = None  # column_chunk_zone_map not available
+
+            # Compute the set of chunk indices that survive ALL predicates
+            # (intersection across columns). If empty intersection, the
+            # whole row group can be skipped — but row-group pruning should
+            # have caught that already via the row-group ZoneMap. We still
+            # check defensively.
+            surviving_chunk_indices: Optional[set[int]] = None
+            if cczm is not None and surviving_chunks_per_col:
+                surviving_chunk_indices = None
+                for col, chunks in surviving_chunks_per_col.items():
+                    if surviving_chunk_indices is None:
+                        surviving_chunk_indices = set(chunks)
+                    else:
+                        surviving_chunk_indices &= chunks
+                # Track pruned chunks (per column, for stats)
+                for col, chunks in surviving_chunks_per_col.items():
+                    total_chunks = len(cczm.column_chunks.get(col, []))
+                    pruned = total_chunks - len(chunks)
+                    self.stats["column_chunks_pruned"] += pruned
+
+                # If the intersection is empty, skip this row group entirely.
+                # (Defensive — row-group pruning should already have caught
+                # this, but column-chunk pruning can be stricter.)
+                if surviving_chunk_indices is not None and not surviving_chunk_indices:
+                    continue
 
             # Read the data blob (this is the expensive part — large blob)
             data_bytes = self.kernel.read_blob(data_blob_hash)
@@ -168,17 +222,23 @@ class PruningReader:
             else:
                 rows = [decoded]
 
+            # If column-chunk pruning is active, slice the decoded rows to
+            # only those that fall in surviving chunks. Each chunk holds
+            # chunk_size consecutive rows starting at chunk_index * chunk_size.
+            if surviving_chunk_indices is not None and len(rows) > 0:
+                surviving_rows = []
+                for ci in sorted(surviving_chunk_indices):
+                    start = ci * chunk_size
+                    end = min(start + chunk_size, len(rows))
+                    if start < end:
+                        surviving_rows.extend(rows[start:end])
+                rows = surviving_rows
+
             # Apply exact row-level filter if provided
             for row in rows:
                 if row_filter is None or row_filter(row):
                     self.stats["rows_yielded"] += 1
                     yield row
-
-        # Track pruned count (total - read)
-        # Note: scan_with_pruning handles the pruning internally;
-        # we only see non-pruned blobs. To get the total, we'd need
-        # to count zone-map entries separately.
-        # For now, pruned = total_zone_maps - data_blobs_read
 
     def scan_blob_hashes(self,
                          start_key: Optional[str] = None,
