@@ -423,6 +423,17 @@ class LakehouseLens(PondLens):
             if zm_index is not None:
                 try:
                     zm = ZoneMap.build(group_table)
+                    # Also compute column-chunk zone maps for finer pruning
+                    try:
+                        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
+                        from column_chunk_zone_map import ColumnChunkZoneMap
+                        cczm = ColumnChunkZoneMap.build(group_table, rg_key,
+                                                        chunk_size=1000)
+                        zm_dict = zm.to_dict()
+                        zm_dict["column_chunks"] = cczm.to_dict()
+                        zm = ZoneMap.from_dict(zm_dict)
+                    except ImportError:
+                        pass
                     zm_index.add_zone_map(name, rg_key, zm, parquet_hash)
                 except Exception:
                     pass
@@ -794,6 +805,20 @@ class LakehouseLens(PondLens):
             if zm_index is not None:
                 try:
                     zm = ZoneMap.build(group_table)
+                    # Also compute column-chunk zone maps for finer pruning
+                    try:
+                        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk", "extensions", "physical_structures"))
+                        from column_chunk_zone_map import ColumnChunkZoneMap
+                        cczm = ColumnChunkZoneMap.build(group_table, rg_key,
+                                                        chunk_size=1000)
+                        # Merge column-chunk stats into the zone map dict
+                        # so PruningReader can use them
+                        zm_dict = zm.to_dict()
+                        zm_dict["column_chunks"] = cczm.to_dict()
+                        # Create a ZoneMap with the extra field
+                        zm = ZoneMap.from_dict(zm_dict)
+                    except ImportError:
+                        pass  # column_chunk_zone_map not available
                     zm_index.add_zone_map(name, rg_key, zm, parquet_hash)
                 except Exception:
                     pass  # zone map computation is best-effort

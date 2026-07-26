@@ -58,11 +58,15 @@ class ZoneMap:
     statistics. The key insight: if a filter asks for age > 30, and the
     zone map says max(age) = 25 for this row group, the entire row group
     can be skipped without reading or decoding any data.
+
+    Optionally stores column_chunks: per-column-chunk zone maps for
+    finer-grained pruning within a surviving row group.
     """
     min: dict[str, Any] = field(default_factory=dict)      # column → min value
-    max: dict[str, dict] = field(default_factory=dict)     # column → max value
+    max: dict[str, Any] = field(default_factory=dict)       # column → max value
     null_count: dict[str, int] = field(default_factory=dict)  # column → null count
     row_count: int = 0
+    column_chunks: Optional[dict] = None  # ColumnChunkZoneMap.to_dict() for finer pruning
 
     @classmethod
     def build(cls, table, columns: Optional[list[str]] = None) -> "ZoneMap":
@@ -99,12 +103,15 @@ class ZoneMap:
 
     def to_dict(self) -> dict:
         """Serialize to a dict for storage in ProllyTreeIndex."""
-        return {
+        d = {
             "min": self.min,
-            "max": dict(self.max) if isinstance(self.max, dict) else self.max,
+            "max": self.max,
             "null_count": self.null_count,
             "row_count": self.row_count,
         }
+        if self.column_chunks is not None:
+            d["column_chunks"] = self.column_chunks
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "ZoneMap":
@@ -114,6 +121,7 @@ class ZoneMap:
             max=d.get("max", {}),
             null_count=d.get("null_count", {}),
             row_count=d.get("row_count", 0),
+            column_chunks=d.get("column_chunks"),
         )
 
 
