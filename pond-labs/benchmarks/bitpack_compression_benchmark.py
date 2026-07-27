@@ -101,14 +101,16 @@ def benchmark_predicate_eval():
     print(f"    {elapsed_us:.2f} µs per eval (O(1) — reads 16 bytes from sub-header)")
     print(f"    {N_RUNS:,} evals in {(elapsed_us * N_RUNS / 1_000_000):.2f}s")
 
-    # Predicate: value > 5000 (in range — cannot prune, returns (0, n_rows))
+    # Predicate: value > 5000 (in range — vectorized scan yields matching positions)
     t0 = time.perf_counter()
     for _ in range(N_RUNS):
         ranges, _ = eval_predicate_encoded(encoded, "x", ">", 5_000)
     elapsed_us = (time.perf_counter() - t0) * 1_000_000 / N_RUNS
-    assert ranges == [(0, 10_000)], f"Should return full range, got {ranges}"
-    print(f"\n  Predicate 'x > 5000' (in range, cannot prune):")
-    print(f"    {elapsed_us:.2f} µs per eval (O(1) — still just reads sub-header)")
+    assert ranges == [(5001, 10_000)], f"Should return matching range, got {ranges}"
+    print(f"\n  Predicate 'x > 5000' (in range, vectorized scan):")
+    print(f"    {elapsed_us:.2f} µs per eval (numpy vectorized — scan + compare + coalesce)")
+    print(f"    {N_RUNS:,} evals in {(elapsed_us * N_RUNS / 1_000_000):.2f}s")
+    print(f"    Returns [(5001, 10000)] — 4999 surviving rows (Vortex-style: no full decode)")
 
 
 def benchmark_decode_speed():
