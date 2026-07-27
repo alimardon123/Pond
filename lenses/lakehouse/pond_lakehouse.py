@@ -66,6 +66,14 @@ from lakehouse_lens import (  # noqa: E402
 )
 from sql_pushdown import extract_predicates, extract_columns  # noqa: E402
 
+# PondConfig for persistent pruning + encoding settings
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
+try:
+    from pond_config import PondConfig  # noqa: E402
+    HAVE_CONFIG = True
+except ImportError:
+    HAVE_CONFIG = False
+
 
 class PondLakehouse:
     """A lightweight lakehouse: Pond kernel + LakehouseLens + DuckDB.
@@ -84,17 +92,35 @@ class PondLakehouse:
     def __init__(self, base_dir: str, force_pruning: Optional[bool] = None):
         """Create a PondLakehouse.
 
+        Automatically loads `.pond/config` from `base_dir` if it exists.
+        The config provides persistent pruning + encoding settings that
+        override the defaults. Explicit `force_pruning` takes precedence
+        over the config.
+
         Args:
             base_dir: filesystem path or object store URL for the kernel.
             force_pruning: override auto-detection for predicate pushdown.
-                None = auto (S3→on, local→off)
+                None = use .pond/config or auto (S3→on, local→off)
                 True = always prune
                 False = never prune
         """
         self.kernel = PondMinimal(base_dir)
         self.lens = LakehouseLens(self.kernel)
-        self._force_pruning = force_pruning
         self.duckdb = duckdb.connect()
+
+        # Load persistent config from .pond/config
+        if HAVE_CONFIG:
+            self.config = PondConfig.load_for_kernel(base_dir)
+        else:
+            self.config = None
+
+        # force_pruning parameter takes precedence over config
+        if force_pruning is not None:
+            self._force_pruning = force_pruning
+        elif self.config is not None and self.config.pruning_force:
+            self._force_pruning = True
+        else:
+            self._force_pruning = None
 
     def create_table(self, name: str, data: pa.Table) -> str:
         return self.lens.create_table(name, data)
@@ -103,10 +129,36 @@ class PondLakehouse:
         return self.lens.insert(name, data)
 
     def range_write(self, name: str, data: pa.Table, key_col: str,
-                    row_group_size: int = DEFAULT_RANGE_ROW_GROUP_SIZE) -> str:
+                    row_group_size: int = None) -> str:
         """Range write: store data as row groups in the ProllyTreeIndex.
-        See LakehouseLens.range_write for details."""
+
+        Uses row_group_size from .pond/config if available, else the default.
+        """
+        if row_group_size is None:
+            row_group_size = (self.config.row_group_size if self.config
+                              else DEFAULT_RANGE_ROW_GROUP_SIZE)
         return self.lens.range_write(name, data, key_col, row_group_size)
+
+    def range_write_encoded(self, name: str, data: pa.Table, key_col: str,
+                             row_group_size: int = None,
+                             chunk_size: int = None,
+                             encoding_hints: Optional[dict] = None) -> str:
+        """Encoded range write: per-column-chunk encoded blobs.
+
+        Uses chunk_size and encoding_hints from .pond/config if not
+        provided explicitly. This is the recommended write path for
+        production — it enables Vortex-style predicate pushdown.
+        """
+        if row_group_size is None:
+            row_group_size = (self.config.row_group_size if self.config
+                              else DEFAULT_RANGE_ROW_GROUP_SIZE)
+        if chunk_size is None:
+            chunk_size = (self.config.chunk_size if self.config else 1000)
+        if encoding_hints is None and self.config is not None:
+            encoding_hints = self.config.get_encoding_hints(
+                data.column_names)
+        return self.lens.range_write_encoded(
+            name, data, key_col, row_group_size, chunk_size, encoding_hints)
 
     def range_read(self, name: str,
                    start_key: Optional[str] = None,
@@ -150,18 +202,25 @@ class PondLakehouse:
                 True=force on, False=force off.
         """
         if table_name:
-            # Auto-decide pruning based on storage type or force_pruning override
+            # Auto-decide pruning based on config, storage type, or force override
             if use_pruning is None:
                 if self._force_pruning is not None:
                     use_pruning = self._force_pruning
+                elif self.config is not None:
+                    # Use PondConfig's should_prune with storage auto-detection
+                    try:
+                        from collection_metadata import CollectionMetadata
+                        meta = CollectionMetadata(self.kernel)
+                        is_obj_store = meta.should_prune()
+                    except Exception:
+                        is_obj_store = False
+                    use_pruning = self.config.should_prune(is_object_store=is_obj_store)
                 else:
                     try:
                         from collection_metadata import CollectionMetadata
                         meta = CollectionMetadata(self.kernel)
                         use_pruning = meta.should_prune()
                     except (ImportError, AttributeError, ValueError) as exc:
-                        # Pruning auto-detection failed (extension missing,
-                        # kernel error, etc.). Default to no pruning.
                         import logging
                         logging.getLogger("pond.best_effort").debug(
                             "pruning auto-detection failed: %s: %s",
