@@ -1639,10 +1639,17 @@ class LakehouseLens(PondLens):
         if not HAVE_PRUNING:
             return None  # cannot decode manifest without pruning extensions
 
-        # Peek at the first chunk blob to detect encoding
+        # Peek at the first chunk blob to detect encoding.
+        # The blob may be compressed (starts with compression byte, not PND1).
+        # Decompress first, then check for PND1 magic.
         first_col = next(iter(manifest["column_chunks"]))
         first_chunk_hash = manifest["column_chunks"][first_col][0]
-        first_chunk_bytes = self.kernel.read_blob(first_chunk_hash)
+        first_chunk_raw = self.kernel.read_blob(first_chunk_hash)
+        try:
+            from compression import decompress_blob
+            first_chunk_bytes = decompress_blob(first_chunk_raw)
+        except ImportError:
+            first_chunk_bytes = first_chunk_raw
         is_encoded = first_chunk_bytes[:4] == b"PND1"
 
         # Build a synthetic cczm from the manifest

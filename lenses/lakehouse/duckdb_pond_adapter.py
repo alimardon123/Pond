@@ -55,6 +55,7 @@ from encoding import (
     _numpy_unpack_bitpack, _decode_value_binary,
     eval_predicate_encoded, decode_surviving_values,
 )
+from compression import compress_blob, decompress_blob
 
 
 class PondDuckDBAdapter:
@@ -153,7 +154,7 @@ class PondDuckDBAdapter:
                     blob_hash = chunk_stats.get("blob_hash")
                     if blob_hash is None:
                         continue
-                    blob_bytes = self.kernel.read_blob(blob_hash)
+                    blob_bytes = decompress_blob(self.kernel.read_blob(blob_hash))
 
                     # Evaluate predicate on encoded bytes — Vortex-style
                     result = eval_predicate_encoded(
@@ -185,7 +186,7 @@ class PondDuckDBAdapter:
                     if blob_hash is None:
                         continue
 
-                    blob_bytes = self.kernel.read_blob(blob_hash)
+                    blob_bytes = decompress_blob(self.kernel.read_blob(blob_hash))
                     arr = self._decode_to_numpy(blob_bytes)
                     col_arrays[col_name].append(arr)
 

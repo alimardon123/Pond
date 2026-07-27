@@ -59,6 +59,7 @@ from encoding import (
     ColumnEncoding, EncodingHeader, encode_column,
     eval_predicate_encoded, decode_column, decode_surviving_values,
 )
+from compression import compress_blob, decompress_blob
 
 
 class EncodedChunkStorage(ColumnChunkStorage):
@@ -127,7 +128,12 @@ class EncodedChunkStorage(ColumnChunkStorage):
 
                 # Encode the chunk — enc_meta is reused (no second encode)
                 encoded_bytes, enc_meta = encode_column(values, hint=hint)
-                chunk_blob_hash = self.kernel.write(encoded_bytes)
+                # Compress the encoded bytes before writing to the kernel.
+                # This is a LENS-LEVEL responsibility (not kernel).
+                # The compression layer is transparent: readers decompress
+                # before parsing PND1. Compresses with zstd by default.
+                compressed_bytes = compress_blob(encoded_bytes)
+                chunk_blob_hash = self.kernel.write(compressed_bytes)
                 chunk_hashes.append(chunk_blob_hash)
                 chunk_enc_metas.append(enc_meta)
 
@@ -241,7 +247,7 @@ class EncodedChunkStorage(ColumnChunkStorage):
                 if stats.blob_hash is None:
                     return {}  # fall back to caller
 
-                blob_bytes = self.kernel.read_blob(stats.blob_hash)
+                blob_bytes = decompress_blob(self.kernel.read_blob(stats.blob_hash))
 
                 # VORTEX DESIGN: If this is the predicate column, evaluate
                 # the predicate on its encoded form to get surviving_ranges.
@@ -252,7 +258,7 @@ class EncodedChunkStorage(ColumnChunkStorage):
                 if pred_col_name is not None:
                     # Get surviving_ranges from the PREDICATE column's blob
                     pred_stats = cczm.column_chunks[pred_col_name][stats.chunk_index]
-                    pred_blob_bytes = self.kernel.read_blob(pred_stats.blob_hash)
+                    pred_blob_bytes = decompress_blob(self.kernel.read_blob(pred_stats.blob_hash))
                     op, val = pred_lookup[pred_col_name]
                     encoded_result = eval_predicate_encoded(
                         pred_blob_bytes, pred_col_name, op, val)
