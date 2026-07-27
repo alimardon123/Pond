@@ -173,14 +173,28 @@ class EncodedChunkStorage(ColumnChunkStorage):
             surviving_chunk_indices: Optional[set[int]] = None,
             predicates: Optional[list[tuple[str, str, Any]]] = None,
             ) -> dict[str, list[list[Any]]]:
-        """Read column chunks with encoding-aware predicate eval.
+        """Read column chunks with encoding-aware predicate eval — Vortex-style.
 
-        For each surviving chunk:
-          1. Peek at the encoding header
-          2. If encoding supports direct predicate eval AND we have a
-             predicate for this column, evaluate it on the encoded form
-          3. If predicate prunes all rows in the chunk, skip the chunk
-          4. Otherwise, decode only the surviving row ranges
+        The Vortex design: evaluate the predicate on the PREDICATE COLUMN's
+        encoded form to determine which ROW POSITIONS survive. Then read ALL
+        columns (including non-predicate columns) at those same surviving
+        positions. This guarantees all columns have the same number of values
+        (the surviving rows) — no misalignment.
+
+        Flow:
+          1. Find the predicate column (first column in `predicates` that
+             exists in the chunk's column_chunks).
+          2. For each surviving chunk:
+             a. Evaluate the predicate on the predicate column's encoded form
+                → surviving_ranges (list of (start, end) row positions)
+             b. If no surviving ranges: skip the chunk (all rows pruned)
+             c. For ALL requested columns: decode only the values at the
+                surviving_ranges positions
+          3. If no predicates: decode full chunks for all columns (standard path)
+
+        This is GENERIC: works for any data format, any column layout, any
+        predicate. The predicate column determines which rows survive; all
+        other columns are projected to those same rows.
 
         Args:
             cczm: ColumnChunkZoneMap for the row group
@@ -191,9 +205,9 @@ class EncodedChunkStorage(ColumnChunkStorage):
                 predicate eval. If None, decode full chunks.
 
         Returns:
-            Dict of column_name → list of (chunk_index, surviving_rows)
-            pairs. surviving_rows is a list of values (decoded only for
-            the rows that survived encoded predicate eval).
+            Dict of column_name → list of (chunk_index, surviving_values)
+            pairs. All columns have the same number of values per chunk
+            (the surviving rows).
         """
         result: dict[str, list[tuple[int, list[Any]]]] = {}
 
@@ -202,6 +216,15 @@ class EncodedChunkStorage(ColumnChunkStorage):
         if predicates:
             for col, op, val in predicates:
                 pred_lookup[col] = (op, val)
+
+        # Determine which column drives the predicate eval (if any).
+        # The first predicate column that exists in cczm.column_chunks
+        # determines the surviving row positions for ALL columns.
+        pred_col_name: Optional[str] = None
+        for col in columns:
+            if col in pred_lookup and col in cczm.column_chunks:
+                pred_col_name = col
+                break
 
         for col_name in columns:
             if col_name not in cczm.column_chunks:
@@ -220,29 +243,42 @@ class EncodedChunkStorage(ColumnChunkStorage):
 
                 blob_bytes = self.kernel.read_blob(stats.blob_hash)
 
-                # Try encoded predicate eval
-                if col_name in pred_lookup:
-                    op, val = pred_lookup[col_name]
+                # VORTEX DESIGN: If this is the predicate column, evaluate
+                # the predicate on its encoded form to get surviving_ranges.
+                # If this is NOT the predicate column but we have a predicate,
+                # we need to read at the SAME surviving_ranges as the
+                # predicate column. We get those ranges by evaluating the
+                # predicate on the predicate column's blob.
+                if pred_col_name is not None:
+                    # Get surviving_ranges from the PREDICATE column's blob
+                    pred_stats = cczm.column_chunks[pred_col_name][stats.chunk_index]
+                    pred_blob_bytes = self.kernel.read_blob(pred_stats.blob_hash)
+                    op, val = pred_lookup[pred_col_name]
                     encoded_result = eval_predicate_encoded(
-                        blob_bytes, col_name, op, val)
+                        pred_blob_bytes, pred_col_name, op, val)
+
                     if encoded_result is not None:
                         surviving_ranges, _ = encoded_result
                         if not surviving_ranges:
-                            # Chunk fully pruned by encoded eval
+                            # Chunk fully pruned by encoded eval — ALL columns
+                            # get 0 values for this chunk (keeps alignment)
                             chunks_result.append((stats.chunk_index, []))
                             continue
-                        # Decode only surviving ranges DIRECTLY from the
-                        # encoded form (no full decode + slice). This is
-                        # the real FastLanes win — RLE/DICT yield values
-                        # without materializing the whole chunk.
+
+                        # Decode THIS column at the surviving_ranges positions.
+                        # For the predicate column: decode_surviving_values
+                        #   yields the matching values directly.
+                        # For non-predicate columns: decode_surviving_values
+                        #   yields the values at the same row positions.
+                        # Both produce the same number of values → aligned.
                         surviving_values = decode_surviving_values(
                             blob_bytes, surviving_ranges)
                         chunks_result.append(
                             (stats.chunk_index, surviving_values))
                         continue
 
-                # Fallback: decode the whole chunk (no predicate for this
-                # column, or encoding doesn't support encoded eval)
+                # No predicate for any column in this chunk, or encoded eval
+                # not supported — decode the whole chunk.
                 values = decode_column(blob_bytes)
                 chunks_result.append((stats.chunk_index, values))
 

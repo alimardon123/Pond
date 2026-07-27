@@ -1271,37 +1271,32 @@ class LakehouseLens(PondLens):
             if not col_data:
                 return None
 
-            # Reassemble rows: each column has a list of (chunk_index, values)
-            # Group by chunk_index, then build a pa.Table from the values.
-            # NOTE: When predicates are active, the predicate column may have
-            # fewer values than non-predicate columns (the vectorized scan
-            # yields only matching positions). To keep columns aligned, we
-            # build row dicts here — the Arrow-native fast path (pa.concat_tables)
-            # is used for column-chunk and plain-Parquet paths where all columns
-            # have the same length. The encoded path with predicates falls back
-            # to from_pylist (slower but correct).
-            chunks_per_col: dict[int, dict[str, list]] = {}
+            # Reassemble rows: each column has a list of (chunk_index, values).
+            # All columns have the SAME number of values per chunk (the
+            # surviving rows) because read_column_chunks_encoded evaluates
+            # the predicate on the predicate column and reads ALL columns
+            # at the same surviving positions. So we can build pa.Table
+            # directly from column arrays — Arrow-native, no list[dict]
+            # round-trip.
+            col_arrays_out: dict[str, list] = {}
             for col_name, chunk_list in col_data.items():
-                for ci, values in chunk_list:
-                    if ci not in chunks_per_col:
-                        chunks_per_col[ci] = {}
-                    chunks_per_col[ci][col_name] = values
+                for _ci, values in chunk_list:
+                    if col_name not in col_arrays_out:
+                        col_arrays_out[col_name] = []
+                    col_arrays_out[col_name].extend(values)
 
-            rows = []
-            for ci in sorted(chunks_per_col.keys()):
-                col_data_for_chunk = chunks_per_col[ci]
-                if not col_data_for_chunk:
-                    continue
-                n_rows = max(len(v) for v in col_data_for_chunk.values())
-                for i in range(n_rows):
-                    row = {}
-                    for col_name, values in col_data_for_chunk.items():
-                        row[col_name] = values[i] if i < len(values) else None
-                    rows.append(row)
-
-            if not rows:
+            if not col_arrays_out:
                 return None
-            return pa.Table.from_pylist(rows)
+
+            arrays = []
+            col_names_out = []
+            for col_name in columns:
+                if col_name in col_arrays_out and col_arrays_out[col_name]:
+                    arrays.append(pa.array(col_arrays_out[col_name]))
+                    col_names_out.append(col_name)
+            if not arrays:
+                return None
+            return pa.Table.from_arrays(arrays, names=col_names_out)
 
         return self._read_with_pruning_generic(
             name, predicates, row_filter, columns, chunk_size,
