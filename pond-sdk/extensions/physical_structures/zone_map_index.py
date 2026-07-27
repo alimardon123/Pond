@@ -85,6 +85,11 @@ class ZoneMapIndex:
     def __init__(self, kernel: PondMinimal):
         self.kernel = kernel
         self._bases: dict[str, ProllyLensBase] = {}
+        # Populated by scan_with_pruning — total zone maps examined
+        # (pruned + non-pruned) in the last scan. Callers (e.g.,
+        # PruningReader) can read this to compute pruned_row_groups
+        # without a second walk of the zone map tree.
+        self.last_scan_total: int = 0
 
     def _get_base(self, collection: str) -> ProllyLensBase:
         """Get or create the ProllyLensBase for a collection's zone maps."""
@@ -262,6 +267,11 @@ class ZoneMapIndex:
         # Apply upper bound if specified (was previously ignored — bug fix M3)
         if end_key is not None:
             zm_keys = [k for k in zm_keys if k <= end_key]
+
+        # Track total examined (pruned + non-pruned) so callers can compute
+        # pruned count without a second walk of the zone map tree.
+        # See PruningReader.scan (eliminates the count_zone_maps double-walk).
+        self.last_scan_total = len(zm_keys)
 
         for zm_key in zm_keys:
             zm_blob_hash = state[zm_key]

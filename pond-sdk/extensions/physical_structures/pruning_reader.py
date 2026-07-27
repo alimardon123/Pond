@@ -223,22 +223,12 @@ class PruningReader:
                 if pred.column in columns:
                     cc_predicates[pred.column] = (pred.op, pred.value)
 
-        # Count total zone maps (for pruned_row_groups stat). When a
-        # predicate is active, scan_with_pruning yields only non-pruned
-        # row groups, so we need the total count separately.
-        # Uses the public count_zone_maps() API instead of reaching into
-        # zm_index._get_base(collection).
-        if self.predicate is not None:
-            try:
-                total_zone_maps = self.zm_index.count_zone_maps(self.collection)
-            except Exception:
-                total_zone_maps = None
-        else:
-            total_zone_maps = None  # no predicate → no pruning
-
         # Use verbose scan so we get the zone-map dict alongside the blob
         # hash — this avoids a second zone-map lookup when we want to do
         # column-chunk pruning on surviving row groups.
+        # The scan also populates zm_index.last_scan_total (the count of
+        # ALL zone maps examined, pruned + non-pruned) so we can compute
+        # pruned_row_groups without a second walk of the zone map tree.
         for row_group_key, data_blob_hash, zm_dict in self.zm_index.scan_with_pruning(
                 self.collection, self.predicate, start_key, end_key,
                 verbose=True):
@@ -279,10 +269,11 @@ class PruningReader:
                     self.stats["rows_yielded"] += 1
                     yield row
 
-        # After the scan, compute pruned_row_groups = total - read
-        if total_zone_maps is not None:
+        # After the scan, compute pruned_row_groups from the single-walk
+        # total that scan_with_pruning populated on the zm_index.
+        if self.predicate is not None:
             self.stats["pruned_row_groups"] = (
-                total_zone_maps - self.stats["total_row_groups"]
+                self.zm_index.last_scan_total - self.stats["total_row_groups"]
             )
 
     def scan_blob_hashes(self,

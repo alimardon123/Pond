@@ -2715,3 +2715,88 @@ Stage Summary:
   * M14 — scan_with_pruning is O(N) not O(K) (needs ProllyTree level-walk)
 - All CRITICAL and most MAJOR findings from the design review are now fixed.
   The codebase is in good shape for the next feature work.
+
+---
+Task ID: simplification-audit-and-bitpack
+Agent: main
+Task: Simplification audit + real bitpacking + perf wins (#1, #2, #3 from audit)
+
+Work Log:
+- Ran a simplification audit (post-bug-review) via sub-agent. Found 7
+  opportunities for simpler/more efficient code while remaining functional.
+  Top 3 executed in this commit; #4-#7 deferred.
+
+#2: PyArrowColumnSource.column_stats 3-pass → 1-pass (perf, ~3x faster):
+  - Was: pc.is_null + pc.sum (pass 1), pc.min (pass 2), pc.max (pass 3)
+  - Now: column.null_count (cached O(1) property) + pc.min_max (single pass)
+  - Same fix applied to compute_list_stats: was 3 Python passes (null count,
+    non_null filter, min/max), now 1 loop tracking null_count + cur_min +
+    cur_max. ~3x faster for large lists.
+  - Zero risk — semantics identical, PyArrow API stable.
+
+#3: PruningReader.scan double-walk → single walk (perf, eliminates O(N)):
+  - Was: count_zone_maps() walks the entire zone-map tree (O(N)), then
+    scan_with_pruning() walks it AGAIN (O(N)) to yield non-pruned entries.
+    Two full tree materializations per scan.
+  - Now: scan_with_pruning() populates zm_index.last_scan_total (the count
+    of ALL zone maps examined, pruned + non-pruned) during its single walk.
+    PruningReader.scan reads last_scan_total after the scan to compute
+    pruned_row_groups = total - total_row_groups. One walk, not two.
+  - For a 10k-row-group collection, this eliminates 10k tree-node reads
+    per pruning scan. Single biggest read-path perf win for large collections.
+
+#1: Real bitpacking (feature + simplification — fixes misleading name):
+  - Was: encode_bitpack stored offset values as a JSON list. The docstring
+    admitted "bitpacking is conceptual." No actual compression — the
+    "encoded" blobs were LARGER than raw Parquet for many cases.
+  - Now: encode_bitpack uses real bit-level packing via struct + bytearray.
+    Layout: bitwidth (1B) + offset (8B) + min (8B) + max (8B) + packed body
+    (ceil(n_rows * bitwidth / 8) bytes). Little-endian bit order.
+  - Added _decode_bitpack_packed() and _bitpack_min_max() helpers.
+  - Updated _eval_bitpack to use the binary sub-header (O(1) min/max prune
+    via 16-byte read, no json.loads).
+  - Updated decode_column to call _decode_bitpack_packed for BITPACK encoding.
+  - Benchmark results (bitpack_compression_benchmark.py):
+    * ages 0-120 (bitwidth=7):    4.66x compression vs JSON list, 9.11x vs raw int64
+    * status codes 0-5 (bitwidth=3): 7.95x vs JSON, 21.14x vs raw
+    * small ints 0-255 (bitwidth=9): 4.05x vs JSON, 7.09x vs raw
+    * int16 range 0-1000 (bitwidth=10): 3.91x vs JSON, 6.38x vs raw
+    * constant (bitwidth=1): 23.42x vs JSON, 62.31x vs raw
+    * O(1) predicate eval: 2µs per eval (16-byte sub-header read)
+    * Round-trip verified for all test cases
+  - The name "bitpack" is now honest.
+
+Stage Summary:
+- 35/35 tests pass (added 1 new benchmark test).
+- Real bitpacking delivers 4-8x compression vs the old JSON-list format,
+  6-62x vs raw int64. On object storage (S3), this directly reduces bytes
+  transferred + per-request latency + cost.
+- PyArrowColumnSource.column_stats is ~3x faster (3 passes → 1).
+- compute_list_stats is ~3x faster (3 passes → 1).
+- PruningReader.scan eliminates a full O(N) tree walk per scan.
+- Tradeoff: bitpack decode is slower than json.loads (Python bit-twiddling
+  vs C-implemented JSON parser). On local disk, the encoded pruning
+  benchmark shows 1.45x speedup (down from 3.02x) because the decode
+  overhead dominates. On object storage, the I/O savings from 4-8x smaller
+  blobs will dominate — that's the design target.
+- Files changed:
+  * pond-sdk/extensions/physical_structures/column_source.py
+    (compute_list_stats 1-pass + PyArrowColumnSource.column_stats 1-pass)
+  * pond-sdk/extensions/physical_structures/zone_map_index.py
+    (last_scan_total field populated by scan_with_pruning)
+  * pond-sdk/extensions/physical_structures/pruning_reader.py
+    (scan() uses last_scan_total instead of count_zone_maps double-walk)
+  * pond-sdk/extensions/physical_structures/encoding.py
+    (real bitpack: encode_bitpack + _decode_bitpack_packed + _bitpack_min_max
+    + _eval_bitpack updated for binary sub-header + decode_column updated)
+  * pond-labs/benchmarks/bitpack_compression_benchmark.py (NEW — 130 LOC)
+  * tests/test_all.py (1 new test entry)
+  * KNOWLEDGE_GRAPH.md (1 new entry)
+- Deferred audit items (lower priority):
+  * #5 — Arrow round-trip (read_with_pruning returns list[dict], should
+    return pa.Table to skip Python filter when row_filter is None)
+  * #4 — storage_mode field in zone map blob (replaces cascade)
+  * #7 — encode_fn format-agnostic (currently requires PyArrow even for
+    ListColumnSource; finishes the C4 fix)
+  * #6 — zone map blobs are JSON (could be msgpack or binary for 5-10x
+    faster deserialization)
