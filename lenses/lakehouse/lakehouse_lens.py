@@ -890,9 +890,14 @@ class LakehouseLens(PondLens):
           - Infer columns if not provided
           - Walk surviving row groups via verbose scan
           - For each row group, call read_surviving_rowgroup(rg_key,
-            manifest_hash, zm_dict, cc_predicates, columns) → list[dict]
-          - Apply row_filter and accumulate rows
-          - Return pa.Table from_pylist(all_rows)
+            manifest_hash, zm_dict, cc_predicates, columns) → pa.Table
+            or None (skip this row group)
+          - When row_filter is None (common case — SQL pushdown where
+            DuckDB does the filter): concat tables via pa.concat_tables
+            (no Python object allocation — Arrow-native fast path)
+          - When row_filter is provided: convert to list[dict], apply
+            filter, reconstruct via from_pylist (slower but supports
+            arbitrary Python lambdas)
 
         Falls back to read_table if pruning extensions are missing or no
         zone maps exist for the collection.
@@ -904,8 +909,9 @@ class LakehouseLens(PondLens):
             columns: list of columns to read (None = all)
             chunk_size: rows per column chunk (must match write time)
             read_surviving_rowgroup: callable(rg_key, manifest_hash,
-                zm_dict, cc_predicates, columns) → list[dict]. Returns
-                rows from this row group that survived pruning.
+                zm_dict, cc_predicates, columns) → pa.Table or None.
+                Returns the surviving rows as a PyArrow Table, or None
+                to skip this row group.
 
         Returns:
             A PyArrow Table containing surviving rows.
@@ -936,25 +942,43 @@ class LakehouseLens(PondLens):
         if columns is None:
             columns = self._infer_columns(name, zm_index)
 
-        # Walk surviving row groups via the verbose pruning scan
-        all_rows: list[dict] = []
+        # Walk surviving row groups via the verbose pruning scan.
+        # Collect pa.Tables (Arrow-native fast path) when row_filter is None;
+        # collect list[dict] when row_filter is provided (Python filter path).
+        tables: list[pa.Table] = []
+        all_rows: list[dict] = [] if row_filter is not None else None
 
         for rg_key, manifest_hash, zm_dict in zm_index.scan_with_pruning(
                 name, predicate, verbose=True):
 
-            # Delegate to the storage-specific reader
-            rows = read_surviving_rowgroup(
+            # Delegate to the storage-specific reader → pa.Table or None
+            table = read_surviving_rowgroup(
                 rg_key, manifest_hash, zm_dict, cc_predicates, columns)
 
-            # Apply row_filter and accumulate
-            for row in rows:
-                if row_filter is None or row_filter(row):
-                    all_rows.append(row)
+            if table is None or table.num_rows == 0:
+                continue  # skip empty row groups
 
-        if not all_rows:
-            return pa.table({})
+            if row_filter is None:
+                # Arrow-native fast path — no Python object allocation
+                tables.append(table)
+            else:
+                # Python filter path — convert to list[dict], filter, accumulate
+                for row in table.to_pylist():
+                    if row_filter(row):
+                        all_rows.append(row)
 
-        return pa.Table.from_pylist(all_rows)
+        # Construct the result Table
+        if row_filter is None:
+            if not tables:
+                return pa.table({})
+            try:
+                return pa.concat_tables(tables, promote_options="default")
+            except TypeError:
+                return pa.concat_tables(tables)
+        else:
+            if not all_rows:
+                return pa.table({})
+            return pa.Table.from_pylist(all_rows)
 
     @staticmethod
     def _compute_surviving_chunks(cczm, cc_predicates: dict
@@ -1122,24 +1146,24 @@ class LakehouseLens(PondLens):
                     f"decode whole blob for {rg_key} (column-chunk fallback)",
                     self._decode_table, data_bytes)
                 if decoded is None:
-                    return []
-                return decoded.to_pylist()
+                    return None
+                return decoded
 
             # Column-chunk storage active — read only surviving chunks
             cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
             surviving_chunks = self._compute_surviving_chunks(cczm, cc_predicates)
             if surviving_chunks is not None and not surviving_chunks:
-                return []  # all chunks pruned — skip row group
+                return None  # all chunks pruned — skip row group
 
             col_arrays = storage.read_column_chunks(
                 cczm, columns, surviving_chunks,
                 decode_fn=self._decode_table,
             )
             if not col_arrays:
-                return []
+                return None
 
-            # Reassemble rows: concatenate arrays per column, build Table,
-            # convert to row dicts.
+            # Reassemble rows: concatenate arrays per column, build Table.
+            # Return pa.Table directly (Arrow-native — no list[dict] round-trip).
             arrays = []
             col_names_out = []
             for col_name in columns:
@@ -1147,10 +1171,9 @@ class LakehouseLens(PondLens):
                     arrays.append(pa.concat_arrays(col_arrays[col_name]))
                     col_names_out.append(col_name)
             if not arrays:
-                return []
+                return None
 
-            chunk_table = pa.Table.from_arrays(arrays, names=col_names_out)
-            return chunk_table.to_pylist()
+            return pa.Table.from_arrays(arrays, names=col_names_out)
 
         return self._read_with_pruning_generic(
             name, predicates, row_filter, columns, chunk_size,
@@ -1211,7 +1234,7 @@ class LakehouseLens(PondLens):
                         decode_fn=self._decode_table,
                     )
                     if not col_arrays:
-                        return []
+                        return None
                     arrays = []
                     col_names_out = []
                     for col_name in columns:
@@ -1219,9 +1242,8 @@ class LakehouseLens(PondLens):
                             arrays.append(pa.concat_arrays(col_arrays[col_name]))
                             col_names_out.append(col_name)
                     if not arrays:
-                        return []
-                    chunk_table = pa.Table.from_arrays(arrays, names=col_names_out)
-                    return chunk_table.to_pylist()
+                        return None
+                    return pa.Table.from_arrays(arrays, names=col_names_out)
                 else:
                     # Plain Parquet blob (range_write / _write_via_prolly)
                     actual_data_hash = zm_dict.get("blob_hash", manifest_hash)
@@ -1230,15 +1252,15 @@ class LakehouseLens(PondLens):
                         f"decode plain Parquet blob for {rg_key}",
                         self._decode_table, data_bytes)
                     if decoded is None:
-                        return []  # undecodable blob — skip
-                    return decoded.to_pylist()
+                        return None  # undecodable blob — skip
+                    return decoded
 
             # Encoded storage active — read surviving chunks with encoded
             # predicate eval where possible.
             cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
             surviving_chunks = self._compute_surviving_chunks(cczm, cc_predicates)
             if surviving_chunks is not None and not surviving_chunks:
-                return []  # all chunks pruned — skip row group
+                return None  # all chunks pruned — skip row group
 
             # read_column_chunks_encoded evaluates predicates on the
             # encoded form and decodes only surviving ranges.
@@ -1247,10 +1269,17 @@ class LakehouseLens(PondLens):
                 predicates=predicates,  # pass-through for encoded eval
             )
             if not col_data:
-                return []
+                return None
 
             # Reassemble rows: each column has a list of (chunk_index, values)
-            # Group by chunk_index, then iterate rows within each chunk.
+            # Group by chunk_index, then build a pa.Table from the values.
+            # NOTE: When predicates are active, the predicate column may have
+            # fewer values than non-predicate columns (the vectorized scan
+            # yields only matching positions). To keep columns aligned, we
+            # build row dicts here — the Arrow-native fast path (pa.concat_tables)
+            # is used for column-chunk and plain-Parquet paths where all columns
+            # have the same length. The encoded path with predicates falls back
+            # to from_pylist (slower but correct).
             chunks_per_col: dict[int, dict[str, list]] = {}
             for col_name, chunk_list in col_data.items():
                 for ci, values in chunk_list:
@@ -1263,14 +1292,16 @@ class LakehouseLens(PondLens):
                 col_data_for_chunk = chunks_per_col[ci]
                 if not col_data_for_chunk:
                     continue
-                # All columns should have the same number of values per chunk
                 n_rows = max(len(v) for v in col_data_for_chunk.values())
                 for i in range(n_rows):
                     row = {}
                     for col_name, values in col_data_for_chunk.items():
                         row[col_name] = values[i] if i < len(values) else None
                     rows.append(row)
-            return rows
+
+            if not rows:
+                return None
+            return pa.Table.from_pylist(rows)
 
         return self._read_with_pruning_generic(
             name, predicates, row_filter, columns, chunk_size,
