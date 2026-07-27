@@ -144,6 +144,10 @@ def test_generic_pruning_demo():
     ok, output = _run_script("pond-labs/demos/generic_pruning_demo.py")
     assert ok, f"Generic pruning demo failed:\n{output[-500:]}"
 
+def test_vector_pruning_demo():
+    ok, output = _run_script("pond-labs/demos/vector_pruning_demo.py")
+    assert ok, f"Vector pruning demo failed:\n{output[-500:]}"
+
 def test_kv_pruning_and_projection():
     ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
     assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"
