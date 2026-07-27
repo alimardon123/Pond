@@ -395,6 +395,46 @@ def _bitpack_min_max(payload: bytes) -> tuple:
     return (vmin, vmax)
 
 
+def _decode_bitpack_ranges(payload: bytes,
+                             ranges: list[tuple[int, int]]) -> list:
+    """Decode only the values at positions in `ranges` from a bitpack blob.
+
+    Vortex-style selective decode: instead of decoding the entire packed
+    body to a list and then slicing, we extract only the bits at the
+    surviving positions. For selective predicates (few surviving rows),
+    this is much faster than full decode + slice.
+
+    Args:
+        payload: the bitpack payload (after the 9-byte EncodingHeader).
+            Layout: bitwidth(1B) + offset(8B) + min(8B) + max(8B) + packed body.
+        ranges: list of (start, end) row ranges (end exclusive).
+
+    Returns:
+        List of decoded values from the surviving ranges, in order.
+    """
+    import struct
+    if not ranges or len(payload) < 25:
+        return []
+
+    bitwidth, offset, _vmin, _vmax = struct.unpack("<Bqqq", payload[:25])
+    if bitwidth == 0:
+        return []
+    packed = payload[25:]
+
+    result = []
+    for start, end in ranges:
+        for pos in range(start, end):
+            bit_pos = pos * bitwidth
+            v = 0
+            for i in range(bitwidth):
+                byte_idx = (bit_pos + i) >> 3
+                bit_idx = (bit_pos + i) & 7
+                if byte_idx < len(packed) and (packed[byte_idx] >> bit_idx) & 1:
+                    v |= (1 << i)
+            result.append(v + offset)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Master encoder — picks encoding and dispatches
 # ---------------------------------------------------------------------------
@@ -534,14 +574,21 @@ def _eval_dict(payload: bytes, op: str, value: Any
 
 def _eval_bitpack(payload: bytes, op: str, value: Any
                   ) -> tuple[list[tuple[int, int]], dict]:
-    """Evaluate predicate on bitpack-encoded data.
+    """Evaluate predicate on bitpack-encoded data — Vortex-style.
 
-    Bitpack stores min/max in the sub-header (bytes 9-25 of payload).
-    If the predicate can be fully pruned by min/max (e.g., value > max
-    → no matches), return []. Otherwise, return [(0, n_rows)] — caller
-    must decode.
+    Two levels of pruning:
+      1. O(1) min/max prune: if the predicate can't possibly match any
+         value in [vmin, vmax], return [] immediately. No scanning.
+      2. O(N) vectorized scan: walk the packed bytes, extract each N-bit
+         value, compare to the predicate, yield only MATCHING ranges.
+         This is the Vortex insight — evaluate the predicate directly on
+         the encoded form without decoding to a full Python list. Only
+         matching positions are yielded, and only those are decoded
+         later by decode_surviving_values.
 
-    This is O(1) — we read 16 bytes from the sub-header, no decoding.
+    For selective predicates (e.g., "value == K" where K is rare), this
+    avoids materializing the full decoded list — a significant win when
+    the chunk is large and the predicate is selective.
     """
     vmin, vmax = _bitpack_min_max(payload)
     if vmin is None or vmax is None:
@@ -549,13 +596,13 @@ def _eval_bitpack(payload: bytes, op: str, value: Any
         return [(0, 0)], {"encoding": "bitpack", "pruned_by_minmax": False,
                            "n_surviving_rows": 0}
 
-    # Compute n_rows from the packed body size + bitwidth (also O(1))
     import struct
     bitwidth = struct.unpack("<B", payload[:1])[0]
+    offset = struct.unpack("<q", payload[1:9])[0]
     packed_size = len(payload) - 25  # subtract sub-header (1+8+8+8)
     n_rows = (packed_size * 8) // bitwidth if bitwidth > 0 else 0
 
-    # Try to fully prune using min/max
+    # Level 1: O(1) min/max prune
     if op == ">" and vmax <= value:
         return [], {"encoding": "bitpack", "pruned_by_minmax": True,
                     "n_surviving_rows": 0}
@@ -572,12 +619,60 @@ def _eval_bitpack(payload: bytes, op: str, value: Any
         return [], {"encoding": "bitpack", "pruned_by_minmax": True,
                     "n_surviving_rows": 0}
 
-    # Can't fully prune — caller must decode and filter
-    return [(0, n_rows)], {
+    # Level 2: vectorized scan on packed bytes.
+    # Walk the packed body, extract each N-bit value, compare to the
+    # predicate, coalesce consecutive matches into ranges. This is the
+    # Vortex way — never decode the full chunk, only yield matching ranges.
+    packed = payload[25:]
+    packed_value = value - offset  # values are stored offset-shifted
+
+    surviving = []
+    range_start = None
+    bit_pos = 0
+    for pos in range(n_rows):
+        # Extract N bits at bit_pos (little-endian bit order)
+        v = 0
+        for i in range(bitwidth):
+            byte_idx = (bit_pos + i) >> 3
+            bit_idx = (bit_pos + i) & 7
+            if byte_idx < len(packed) and (packed[byte_idx] >> bit_idx) & 1:
+                v |= (1 << i)
+        bit_pos += bitwidth
+
+        # Compare extracted value to predicate (on the offset-shifted form)
+        matches = False
+        if op == "=":
+            matches = (v == packed_value)
+        elif op == "!=":
+            matches = (v != packed_value)
+        elif op == "<":
+            matches = (v < packed_value)
+        elif op == "<=":
+            matches = (v <= packed_value)
+        elif op == ">":
+            matches = (v > packed_value)
+        elif op == ">=":
+            matches = (v >= packed_value)
+
+        if matches:
+            if range_start is None:
+                range_start = pos
+        else:
+            if range_start is not None:
+                surviving.append((range_start, pos))
+                range_start = None
+    if range_start is not None:
+        surviving.append((range_start, n_rows))
+
+    n_surviving = sum(e - s for s, e in surviving)
+    return surviving, {
         "encoding": "bitpack",
         "pruned_by_minmax": False,
+        "pruned_by_vectorized": True,
         "min": vmin, "max": vmax,
-        "n_surviving_rows": n_rows,
+        "n_rows": n_rows,
+        "n_surviving_rows": n_surviving,
+        "n_surviving_ranges": len(surviving),
     }
 
 
@@ -640,15 +735,14 @@ def decode_surviving_values(blob_bytes: bytes,
                              surviving_ranges: list[tuple[int, int]]) -> list:
     """Decode only the values in surviving_ranges from an encoded chunk blob.
 
-    This is the FastLanes-style optimization: instead of decoding the entire
+    This is the FastLanes/Vortex-style optimization: instead of decoding the entire
     chunk to a list and then slicing, we walk the encoded form and yield
     only the values that fall in surviving_ranges. For RLE, we walk runs
     and only materialize the ones that overlap a surviving range. For
     DICT, we walk codes and only materialize the ones in a surviving range.
-
-    For BITPACK and RAW, we still decode the whole chunk and slice (no
-    shortcut — BITPACK's win is in min/max pruning at the chunk level,
-    not in selective decode).
+    For BITPACK, we extract only the bits at the surviving positions —
+    this is the Vortex insight: evaluate the predicate on the encoded form
+    (via _eval_bitpack's vectorized scan), then decode only the matches.
 
     Args:
         blob_bytes: the encoded chunk blob (header + payload)
@@ -732,8 +826,15 @@ def decode_surviving_values(blob_bytes: bytes,
                 result.append(dict_values[code])
         return result
 
+    elif header.encoding == ColumnEncoding.BITPACK:
+        # Vortex-style selective decode: extract only the bits at positions
+        # in surviving_ranges, NOT the whole packed body. For selective
+        # predicates (few surviving ranges), this is much faster than
+        # full decode + slice because we skip the non-matching positions.
+        return _decode_bitpack_ranges(payload, surviving_ranges)
+
     else:
-        # BITPACK or RAW — no shortcut, decode and slice
+        # RAW — no shortcut, decode and slice
         all_values = decode_column(blob_bytes)
         result = []
         for s, e in surviving_ranges:

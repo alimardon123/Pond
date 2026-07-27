@@ -2800,3 +2800,54 @@ Stage Summary:
     ListColumnSource; finishes the C4 fix)
   * #6 — zone map blobs are JSON (could be msgpack or binary for 5-10x
     faster deserialization)
+
+---
+Task ID: vortex-style-bitpack
+Agent: main
+Task: Vortex-style bitpack — evaluate predicate on encoded bytes, never full decode
+
+The user pointed out that the goal of Vortex is to scan/read WITHOUT decoding,
+not to "decode faster." The previous bitpack implementation did O(1) min/max
+pruning (good) but when that couldn't prune, it fell back to FULL DECODE +
+Python filter (bad — defeats the purpose of encoding).
+
+Work Log:
+- Rewrote _eval_bitpack to do a vectorized scan on the packed bytes:
+  * Level 1: O(1) min/max prune (unchanged — reads 16 bytes from sub-header)
+  * Level 2 (NEW): O(N) vectorized scan — walk the packed bytes, extract
+    each N-bit value, compare to the predicate, coalesce consecutive
+    matches into ranges. Yields ONLY the matching ranges, not the full
+    chunk. This is the Vortex insight: evaluate the predicate directly
+    on the encoded form without decoding to a full Python list.
+- Added _decode_bitpack_ranges(payload, ranges) — decodes only the bits
+  at the surviving positions, NOT the whole packed body. For selective
+  predicates (few surviving rows), this is much faster than full decode
+  + slice.
+- Updated decode_surviving_values to call _decode_bitpack_ranges for
+  BITPACK encoding (was: full decode_column + slice).
+- Updated test_encoded_predicate_eval to reflect the new behavior:
+  * Old: "x > 500 → can't prune, returns [(0, 1000)]" (full range)
+  * New: "x > 500 → vectorized scan yields [(501, 1000)], 499 surviving
+    rows (Vortex-style: no full decode)"
+- Updated docstrings to reflect the Vortex design.
+
+Stage Summary:
+- The bitpack encoding is now truly Vortex-style:
+  1. Build: encode values → packed bytes (4-8x compression)
+  2. Predicate eval: O(1) min/max prune + O(N) vectorized scan on packed
+     bytes → yields only matching ranges
+  3. Decode: extract only the bits at surviving positions
+- For selective predicates (e.g., "value == K" where K is rare), this
+  avoids materializing the full decoded list — the decode step only
+  touches the matching positions.
+- For non-selective predicates (e.g., "value > 0" where all rows match),
+  the vectorized scan is O(N) and the decode is also O(N), so there's
+  no savings. But there's no penalty either — the scan replaces the
+  Python filter that would have run anyway.
+- The "scan without decode" goal is now achieved for bitpack, RLE, and
+  DICT encodings. Only RAW (passthrough) falls back to full decode.
+- Files changed:
+  * pond-sdk/extensions/physical_structures/encoding.py
+    (_eval_bitpack rewritten with vectorized scan; _decode_bitpack_ranges
+    added; decode_surviving_values updated for bitpack; docstrings updated)
+  * tests/integration/test_encoded_pruning.py (test updated for new behavior)

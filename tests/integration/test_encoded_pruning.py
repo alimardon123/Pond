@@ -148,18 +148,22 @@ def test_encoded_predicate_eval():
     values = list(range(1000))
     encoded, _ = encode_bitpack(values)
 
-    # Predicate value > 500 → can't fully prune (max=999 > 500)
-    # But min/max in header tells us range overlaps
+    # Predicate value > 500 → can't fully prune by min/max (max=999 > 500),
+    # but the vectorized scan yields only the matching positions (501-999).
+    # This is the Vortex design: evaluate the predicate directly on the
+    # encoded bytes, never decode the full chunk.
     result = eval_predicate_encoded(encoded, "x", ">", 500)
     ranges, meta = result
-    assert ranges == [(0, 1000)]  # can't prune — caller must decode
-    print(f"  [OK] BITPACK: x > 500 → can't prune (range overlap)")
+    assert ranges == [(501, 1000)], f"Expected [(501, 1000)], got {ranges}"
+    assert meta["n_surviving_rows"] == 499
+    print(f"  [OK] BITPACK: x > 500 → vectorized scan yields {len(ranges)} range(s), "
+          f"{meta['n_surviving_rows']} surviving rows (Vortex-style: no full decode)")
 
-    # Predicate value > 9999 → fully pruned by min/max
+    # Predicate value > 9999 → fully pruned by min/max (O(1), no scan)
     result = eval_predicate_encoded(encoded, "x", ">", 9999)
     ranges, meta = result
     assert ranges == []  # fully pruned
-    print(f"  [OK] BITPACK: x > 9999 → fully pruned by min/max")
+    print(f"  [OK] BITPACK: x > 9999 → fully pruned by min/max (O(1))")
 
     # Predicate value < 0 → fully pruned by min/max
     result = eval_predicate_encoded(encoded, "x", "<", 0)
