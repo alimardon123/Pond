@@ -156,6 +156,10 @@ def test_scale_1m_benchmark():
     ok, output = _run_script("pond-labs/benchmarks/scale_1m_benchmark.py")
     assert ok, f"1M scale benchmark failed:\n{output[-500:]}"
 
+def test_duckdb_adapter_demo():
+    ok, output = _run_script("pond-labs/demos/duckdb_adapter_demo.py")
+    assert ok, f"DuckDB adapter demo failed:\n{output[-500:]}"
+
 def test_kv_pruning_and_projection():
     ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
     assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"
