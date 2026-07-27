@@ -223,6 +223,50 @@ class PondConfig:
         """
         return cls.load(os.path.join(base_dir, ".pond", "config"))
 
+    @classmethod
+    def load_for_collection(cls, base_dir: str,
+                              collection: str) -> "PondConfig":
+        """Load config for a specific collection.
+
+        Per-collection overrides live at:
+          .pond/config/collections/{collection}.json
+
+        Falls back to the global .pond/config, then defaults.
+
+        Args:
+            base_dir: kernel base_dir
+            collection: collection name
+
+        Returns:
+            PondConfig — per-collection override merged over global config.
+        """
+        # Start with global config
+        config = cls.load_for_kernel(base_dir)
+
+        # Override with per-collection config if it exists
+        coll_path = os.path.join(base_dir, ".pond", "config",
+                                  "collections", f"{collection}.json")
+        if os.path.exists(coll_path):
+            with open(coll_path) as f:
+                coll_override = cls.from_dict(json.load(f))
+            # Merge: per-collection values override global
+            if coll_override._pruning_enabled != cls.DEFAULTS["pruning_enabled"]:
+                config._pruning_enabled = coll_override._pruning_enabled
+            if coll_override._pruning_force != cls.DEFAULTS["pruning_force"]:
+                config._pruning_force = coll_override._pruning_force
+            if coll_override._encoding_auto_select != cls.DEFAULTS["encoding_auto_select"]:
+                config._encoding_auto_select = coll_override._encoding_auto_select
+            if coll_override._encoding_default != cls.DEFAULTS["encoding_default"]:
+                config._encoding_default = coll_override._encoding_default
+            if coll_override._chunk_size != cls.DEFAULTS["chunk_size"]:
+                config._chunk_size = coll_override._chunk_size
+            if coll_override._row_group_size != cls.DEFAULTS["row_group_size"]:
+                config._row_group_size = coll_override._row_group_size
+            if coll_override._bitpack_max_bitwidth != cls.DEFAULTS["bitpack_max_bitwidth"]:
+                config._bitpack_max_bitwidth = coll_override._bitpack_max_bitwidth
+
+        return config
+
     def should_prune(self, is_object_store: bool = False) -> bool:
         """Decide whether to enable pruning based on config + storage type.
 
