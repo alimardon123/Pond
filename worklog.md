@@ -2851,3 +2851,67 @@ Stage Summary:
     (_eval_bitpack rewritten with vectorized scan; _decode_bitpack_ranges
     added; decode_surviving_values updated for bitpack; docstrings updated)
   * tests/integration/test_encoded_pruning.py (test updated for new behavior)
+
+---
+Task ID: generic-design-vision-and-format-agnostic
+Agent: main
+Task: Fix encoded path column alignment + format-agnostic encode_fn + document generic vision
+
+Work Log:
+- Fixed encoded path column alignment (Vortex design):
+  * Bug: read_column_chunks_encoded evaluated the predicate per-column.
+    Predicate column got N surviving values; non-predicate columns got
+    ALL values → misaligned columns. Only worked for single-column reads.
+  * Fix: the PREDICATE COLUMN determines which ROW POSITIONS survive.
+    ALL columns are read at those same surviving positions. Guarantees
+    all columns have the same number of values per chunk — no misalignment.
+  * This is GENERIC: works for any data format, any column layout, any
+    predicate. A Notebook lens, Feature Store lens, Git lens, or Vector
+    lens can use the encoded pruning infrastructure and all columns will
+    be correctly aligned.
+- Made encode_fn/decode_fn format-agnostic (#7 from audit):
+  * encode_fn: was Callable[[pa.Table], bytes] → now Callable[[str, list], bytes]
+    (column name + values list — no PyArrow dependency)
+  * decode_fn: was Callable[[bytes], pa.Table] → now Callable[[bytes], list]
+    (returns list of values for one column — no PyArrow dependency)
+  * read_column_chunks returns dict[str, list[list]] instead of dict[str, list[pa.Array]]
+  * read_full_row_group returns dict[str, list] instead of pa.Table
+  * LakehouseLens provides its own Parquet encode/decode wrappers
+  * The storage layer NEVER touches PyArrow — the lens owns the format
+  * This means a KeyValueLens (JSON), VectorLens (binary), Notebook lens
+    (rich text), or Git lens (diffs) can use the FULL pruning infrastructure
+    without ANY PyArrow dependency
+- Created docs/GENERIC_DESIGN_VISION.md (110 LOC):
+  * Documents the promise: any app built on Pond gets infinite storage +
+    versioning + branching + pruning + encoding on object stores
+  * Documents the ColumnSource protocol (format-agnostic column data access)
+  * Documents the encode_fn/decode_fn contract (lens owns the format)
+  * Documents the 4-level pruning hierarchy (works for ANY format)
+  * Documents the Vortex-style scan (evaluate predicate without decoding)
+  * Documents object-store awareness (per-column-chunk blobs, encoded blobs)
+  * References the seven design principles
+
+Stage Summary:
+- All tests pass (test_lakehouse_pruning, test_column_chunk_storage,
+  test_encoded_pruning, test_sql_pushdown_fast_paths, test_column_source,
+  test_best_effort, test_bitpack_compression_benchmark).
+- The pruning infrastructure is now FULLY format-agnostic:
+  * ColumnSource protocol — any lens can produce columnar data
+  * encode_fn(col_name, values) — any lens can encode its own format
+  * decode_fn(bytes) — any lens can decode its own format
+  * Vortex-style scan — predicate evaluated on encoded bytes, not decoded
+  * Column alignment — predicate column determines surviving rows, all
+    columns read at those same positions
+- Any app built on Pond (Notebooks, Feature Stores, Git, Vectors, Music,
+  Video) can now use the FULL pruning + encoding infrastructure with
+  different data structures and layouts, on any object store.
+- Files changed:
+  * pond-sdk/extensions/physical_structures/encoded_chunk_storage.py
+    (read_column_chunks_encoded rewritten for column alignment)
+  * pond-sdk/extensions/physical_structures/column_chunk_storage.py
+    (encode_fn/decode_fn contracts changed to format-agnostic)
+  * lenses/lakehouse/lakehouse_lens.py (all callers updated to provide
+    Parquet encode/decode wrappers; read_surviving_rowgroup callbacks
+    updated to use list-based decode + pa.array reconstruction)
+  * docs/GENERIC_DESIGN_VISION.md (NEW — 110 LOC)
+  * KNOWLEDGE_GRAPH.md (1 new entry)

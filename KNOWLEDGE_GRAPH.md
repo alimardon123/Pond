@@ -234,6 +234,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `docs/NON_GOALS.md` | 119 | What Pond deliberately doesn't do. |
 | `docs/POSTMORTEM_PROLLY_TREE_BUG.md` | 135 | Prolly tree encoding bug postmortem. |
 | `docs/DESIGN_REVIEW_2026_07_26.md` | 470 | Design review against the seven principles (42 findings, prioritized fix plan). |
+| `docs/GENERIC_DESIGN_VISION.md` | 110 | The promise: any app built on Pond gets infinite storage + versioning + branching + pruning + encoding on object stores. Documents the ColumnSource protocol, format-agnostic encode_fn/decode_fn, and the Vortex-style scan hierarchy. |
 | `docs/README.md` | 58 | Doc index. |
 | `docs/archive/` | (18+ files) | Historical docs (Phase reports, red teams, RFCs, etc.). |
 
