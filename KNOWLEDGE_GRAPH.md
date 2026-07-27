@@ -93,6 +93,8 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-sdk/maintenance.py` | 315 | `drop_name`, `is_dropped`, `resolve_active`, `compact_tombstones` | Tombstone helpers (RFC-0008: deletion as data). |
 | `pond-sdk/collection_metadata.py` | 343 | `CollectionMetadata` | Data-side metadata manager. Manages zone maps, indexes, and (future) bloom filters for collections. Lens-agnostic — works through callbacks. |
 | `pond-sdk/best_effort.py` | 95 | `best_effort, warn_best_effort` | Tiny helper for best-effort operations. Catches specific recoverable exceptions (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError) and logs them via the `pond.best_effort` logger. Replaces the `except Exception: pass` anti-pattern. Enable with `POND_DEBUG=1`. |
+| `pond-sdk/pond_config.py` | 195 | `PondConfig` | Persistent pruning + encoding settings via `.pond/config` JSON file. Configures pruning (auto/true/false + force), encoding (auto-select or default), chunk_size, row_group_size, bitpack_max_bitwidth. `should_prune()` decides based on storage type. `load_for_kernel()` finds config in base_dir. |
+| `tests/integration/test_pond_config.py` | 130 | (test) | Tests PondConfig: defaults, save/load round-trip, should_prune (auto/true/false/force), encoding hints, validation, load_for_kernel. |
 | `pond-sdk/uuid7.py` | 180 | `uuidv7`, `uuidv7_monotonic`, `uuidv7_timestamp` | UUIDv7 time-ordered UUID generation for distributed row identification (_rowid). |
 | `tests/lens_algebra/run_lens_laws_ci.py` | 267 | (CI runner) | CI runner for Lens contracts. |
 | `pond-sdk/__init__.py` | 0 | Package marker. |
@@ -296,6 +298,8 @@ implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 | **Tombstone** | Deletion as data: `Ref(name, TOMBSTONE_HASH)`. RFC-0008. | `pond-sdk/maintenance.py` |
 | `pond-sdk/collection_metadata.py` | 343 | `CollectionMetadata` | Data-side metadata manager. Manages zone maps, indexes, and (future) bloom filters for collections. Lens-agnostic — works through callbacks. |
 | `pond-sdk/best_effort.py` | 95 | `best_effort, warn_best_effort` | Tiny helper for best-effort operations. Catches specific recoverable exceptions (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError) and logs them via the `pond.best_effort` logger. Replaces the `except Exception: pass` anti-pattern. Enable with `POND_DEBUG=1`. |
+| `pond-sdk/pond_config.py` | 195 | `PondConfig` | Persistent pruning + encoding settings via `.pond/config` JSON file. Configures pruning (auto/true/false + force), encoding (auto-select or default), chunk_size, row_group_size, bitpack_max_bitwidth. `should_prune()` decides based on storage type. `load_for_kernel()` finds config in base_dir. |
+| `tests/integration/test_pond_config.py` | 130 | (test) | Tests PondConfig: defaults, save/load round-trip, should_prune (auto/true/false/force), encoding hints, validation, load_for_kernel. |
 | **Manifest** | Sidecar listing blob hashes in a pack. Enables physical reachability (1000x GC speedup). | `docs/POND_FORMAL_ALGEBRAS.md` §10 |
 | **Transport Layer** | Compress → encrypt → checksum. Between kernel and Lens. | `services/transport/` |
 | **Schema Registry** | Versioned schemas on Names substrate. Backward/forward compat. | `services/schema/` |
