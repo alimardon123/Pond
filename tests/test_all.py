@@ -164,6 +164,10 @@ def test_polars_adapter_demo():
     ok, output = _run_script("pond-labs/demos/polars_adapter_demo.py")
     assert ok, f"Polars adapter demo failed:\n{output[-500:]}"
 
+def test_jupyter_notebook_demo():
+    ok, output = _run_script("pond-labs/demos/jupyter_notebook_demo.py")
+    assert ok, f"Jupyter notebook demo failed:\n{output[-500:]}"
+
 def test_kv_pruning_and_projection():
     ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
     assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"
