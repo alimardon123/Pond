@@ -149,6 +149,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 |---|---|---|---|
 | `pond-labs/lenses/feature_store_lens.py` | 584 | `FeatureStoreLens` | Versioned ML feature store: point-in-time joins, online/offline serving, schema evolution, branching. |
 | `pond-labs/demos/interop_demo.py` | 359 | (demo) | **Killer demo:** bidirectional Feature Store ↔ Lakehouse interop (12/12 pass). |
+| `pond-labs/demos/generic_pruning_demo.py` | 210 | (demo) | **Generic pruning demo:** JSON data (list-of-dicts, no PyArrow) uses the FULL pruning infrastructure with a JSON encode_fn. Proves ANY workload gets predicate pushdown + column-chunk storage for free. |
 | `pond-labs/benchmarks/loc_benchmark.py` | 469 | (benchmark) | LOC saved: 81% reduction (120 → 23 LOC) vs building from scratch. |
 | `pond-labs/benchmarks/pruning_benchmark.py` | 200 | (benchmark) | Benchmark: Vortex-style pruning effectiveness. 100K rows, measures blob skip rate and speedup for 1-50% selectivity queries. |
 | `pond-labs/benchmarks/column_chunk_pruning_benchmark.py` | 175 | (benchmark) | Benchmark: column-chunk pruning (3rd level). 50K rows in 1 row group, shows 49/50 chunks pruned for selective predicates. |
