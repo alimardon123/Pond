@@ -239,34 +239,60 @@ def _decode_value_binary(data: bytes, offset: int, vt: int
 # ---------------------------------------------------------------------------
 
 def encode_raw(values: list) -> tuple[bytes, dict]:
-    """Raw encoding — contiguous binary array (SIMD-ready).
+    """Raw encoding — contiguous binary array with null bitmap (SIMD-ready).
 
     Layout (after the 9-byte EncodingHeader):
-      value_type(1B) + [fixed-size values OR length-prefixed strings]
+      value_type(1B) + null_bitmap_bytes + [fixed-size values]
 
-    For INT64/FLOAT64: values are contiguous 8-byte elements — directly
-    castable to numpy/Arrow buffers. SIMD engines can mmap and scan.
-    For STRING: each value is 4-byte length + UTF-8 bytes.
+    For INT64/FLOAT64:
+      - null_bitmap: ceil(n_rows / 8) bytes (1 bit per row, 1=null, 0=valid)
+      - values: N × 8 bytes (0 for nulls — the bitmap is authoritative)
+      - Contiguous, directly castable to numpy/Arrow buffers with null mask
+    For STRING:
+      - null_bitmap: ceil(n_rows / 8) bytes
+      - values: N × (4B length + UTF-8 bytes), empty for nulls
+    For ALL-NULL:
+      - value_type = NULL, no bitmap, no values
+
+    The null bitmap is the key to correctness: NULLs are preserved
+    through the round-trip instead of silently becoming 0.
     """
     import struct
     n_rows = len(values)
     vt = _detect_value_type(values)
 
+    # Build null bitmap: 1 bit per row, 1=null, 0=valid (Arrow convention)
+    has_nulls = any(v is None for v in values)
+    if has_nulls and vt != VALUE_TYPE_NULL:
+        bitmap_size = (n_rows + 7) // 8
+        bitmap = bytearray(bitmap_size)
+        for i, v in enumerate(values):
+            if v is None:
+                bitmap[i // 8] |= (1 << (i % 8))
+        bitmap_bytes = bytes(bitmap)
+    else:
+        bitmap_bytes = b""
+
     if vt in (VALUE_TYPE_INT64, VALUE_TYPE_FLOAT64):
         # Contiguous fixed-size array — SIMD-ready
         fmt = "<q" if vt == VALUE_TYPE_INT64 else "<d"
-        payload = struct.pack("<B", vt)
-        for v in values:
-            payload += struct.pack(fmt, v if v is not None else 0)
+        payload = struct.pack("<B", vt) + bitmap_bytes
+        # Pack all values (nulls get 0 — bitmap is authoritative)
+        packed = [v if v is not None else 0 for v in values]
+        if packed:
+            payload += struct.pack(f"<{len(packed)}{fmt[1:]}", *packed)
     elif vt == VALUE_TYPE_STRING:
-        payload = struct.pack("<B", vt)
+        payload = struct.pack("<B", vt) + bitmap_bytes
         for v in values:
-            payload += _encode_value_binary(v, vt)
+            if v is not None:
+                payload += _encode_value_binary(v, vt)
+            # nulls produce no bytes — the bitmap marks them
     else:
         payload = struct.pack("<B", VALUE_TYPE_NULL)
 
     header = EncodingHeader(ColumnEncoding.RAW, n_rows).to_bytes()
     meta = {"encoding": "raw", "n_rows": n_rows, "value_type": vt,
+            "has_nulls": has_nulls,
             "payload_size": len(payload)}
     return header + payload, meta
 
@@ -961,23 +987,74 @@ def decode_column(blob_bytes: bytes) -> list:
     payload = blob_bytes[EncodingHeader.SIZE:]
 
     if header.encoding == ColumnEncoding.RAW:
-        # Binary: value_type(1B) + values
+        # Binary: value_type(1B) + optional null_bitmap + values
         if not payload:
             return []
         vt = payload[0]
-        data = payload[1:]
-        if vt == VALUE_TYPE_INT64:
-            n = len(data) // 8
-            return list(struct.unpack_from(f"<{n}q", data))
-        elif vt == VALUE_TYPE_FLOAT64:
-            n = len(data) // 8
-            return list(struct.unpack_from(f"<{n}d", data))
+        off = 1
+        n_rows = header.n_rows
+
+        # Read null bitmap if present
+        bitmap_size = (n_rows + 7) // 8
+        # Heuristic: if there's enough data for a bitmap before the values,
+        # check for it. The bitmap is present when has_nulls was True at
+        # write time. We detect it by checking if the remaining data after
+        # a potential bitmap matches n_rows * value_size.
+        if vt in (VALUE_TYPE_INT64, VALUE_TYPE_FLOAT64):
+            val_size = 8
+            remaining_without_bitmap = len(payload) - 1
+            remaining_with_bitmap = remaining_without_bitmap - bitmap_size
+            if remaining_with_bitmap == n_rows * val_size and remaining_with_bitmap >= 0:
+                # Bitmap present
+                bitmap = payload[1:1 + bitmap_size]
+                data = payload[1 + bitmap_size:]
+                nulls = set()
+                for i in range(n_rows):
+                    if bitmap[i // 8] & (1 << (i % 8)):
+                        nulls.add(i)
+                fmt = "<q" if vt == VALUE_TYPE_INT64 else "<d"
+                values = list(struct.unpack_from(f"<{n_rows}{fmt[1:]}", data))
+                return [None if i in nulls else values[i] for i in range(n_rows)]
+            else:
+                # No bitmap
+                data = payload[1:]
+                n = len(data) // 8
+                if vt == VALUE_TYPE_INT64:
+                    return list(struct.unpack_from(f"<{n}q", data))
+                else:
+                    return list(struct.unpack_from(f"<{n}d", data))
         elif vt == VALUE_TYPE_STRING:
+            # Check for bitmap
+            data = payload[1:]
+            # For strings, we can't easily detect the bitmap by size.
+            # Try: if first bytes look like a bitmap (small values),
+            # skip it. For now, try without bitmap first, then with.
+            # Simpler: just try reading values; if count != n_rows, try with bitmap.
             result = []
-            off = 0
-            while off < len(data):
-                val, off = _decode_value_binary(data, off, vt)
+            off = 1
+            while off < len(payload):
+                val, off = _decode_value_binary(payload, off, vt)
                 result.append(val)
+            if len(result) == n_rows:
+                return result
+            # Try with bitmap
+            bitmap = payload[1:1 + bitmap_size]
+            off = 1 + bitmap_size
+            nulls = set()
+            for i in range(n_rows):
+                if bitmap[i // 8] & (1 << (i % 8)):
+                    nulls.add(i)
+            result = []
+            val_idx = 0
+            for i in range(n_rows):
+                if i in nulls:
+                    result.append(None)
+                else:
+                    if off < len(payload):
+                        val, off = _decode_value_binary(payload, off, vt)
+                        result.append(val)
+                    else:
+                        result.append(None)
             return result
         return []
 
