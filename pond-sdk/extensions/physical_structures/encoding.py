@@ -177,53 +177,144 @@ class EncodingHeader:
 
 
 # ---------------------------------------------------------------------------
-# Per-encoding encoders
+# Value type tags (for binary format — SIMD-ready)
+# ---------------------------------------------------------------------------
+# Each value in a chunk blob has a type tag so SIMD engines know how to
+# cast the raw bytes. This is the key to "SIMD-ready storage": the bytes
+# are directly mmappable to numpy/Arrow buffers without JSON parsing.
+VALUE_TYPE_INT64 = 1      # 8-byte signed integer
+VALUE_TYPE_FLOAT64 = 2    # 8-byte double
+VALUE_TYPE_STRING = 3     # 4-byte length + UTF-8 bytes
+VALUE_TYPE_NULL = 4       # no payload (all nulls)
+
+_VT_SIZE = {VALUE_TYPE_INT64: 8, VALUE_TYPE_FLOAT64: 8}
+
+
+def _detect_value_type(values: list) -> int:
+    """Detect the value type from a list of values."""
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            return VALUE_TYPE_INT64
+        if isinstance(v, int):
+            return VALUE_TYPE_INT64
+        if isinstance(v, float):
+            return VALUE_TYPE_FLOAT64
+        return VALUE_TYPE_STRING  # default to string
+    return VALUE_TYPE_NULL
+
+
+def _encode_value_binary(v, vt: int) -> bytes:
+    """Encode a single value as binary bytes (type-tagged)."""
+    import struct
+    if v is None:
+        return b""
+    if vt == VALUE_TYPE_INT64:
+        return struct.pack("<q", int(v))
+    if vt == VALUE_TYPE_FLOAT64:
+        return struct.pack("<d", float(v))
+    # String
+    b = str(v).encode("utf-8")
+    return struct.pack("<I", len(b)) + b
+
+
+def _decode_value_binary(data: bytes, offset: int, vt: int
+                          ) -> tuple[Any, int]:
+    """Decode a single value from binary. Returns (value, new_offset)."""
+    import struct
+    if vt == VALUE_TYPE_INT64:
+        return struct.unpack_from("<q", data, offset)[0], offset + 8
+    if vt == VALUE_TYPE_FLOAT64:
+        return struct.unpack_from("<d", data, offset)[0], offset + 8
+    # String
+    (slen,) = struct.unpack_from("<I", data, offset)
+    offset += 4
+    s = data[offset:offset + slen].decode("utf-8")
+    return s, offset + slen
+
+
+# ---------------------------------------------------------------------------
+# Per-encoding encoders — ALL BINARY (SIMD-ready, no JSON in payload)
 # ---------------------------------------------------------------------------
 
 def encode_raw(values: list) -> tuple[bytes, dict]:
-    """Raw encoding — stores values as a JSON list (no compression).
+    """Raw encoding — contiguous binary array (SIMD-ready).
 
-    This is the fallback when no structural encoding applies. The
-    advantage over Parquet is that we control the format and can
-    short-circuit decode for predicate evaluation.
+    Layout (after the 9-byte EncodingHeader):
+      value_type(1B) + [fixed-size values OR length-prefixed strings]
+
+    For INT64/FLOAT64: values are contiguous 8-byte elements — directly
+    castable to numpy/Arrow buffers. SIMD engines can mmap and scan.
+    For STRING: each value is 4-byte length + UTF-8 bytes.
     """
-    payload = json.dumps(values, default=str).encode()
+    import struct
     n_rows = len(values)
+    vt = _detect_value_type(values)
+
+    if vt in (VALUE_TYPE_INT64, VALUE_TYPE_FLOAT64):
+        # Contiguous fixed-size array — SIMD-ready
+        fmt = "<q" if vt == VALUE_TYPE_INT64 else "<d"
+        payload = struct.pack("<B", vt)
+        for v in values:
+            payload += struct.pack(fmt, v if v is not None else 0)
+    elif vt == VALUE_TYPE_STRING:
+        payload = struct.pack("<B", vt)
+        for v in values:
+            payload += _encode_value_binary(v, vt)
+    else:
+        payload = struct.pack("<B", VALUE_TYPE_NULL)
+
     header = EncodingHeader(ColumnEncoding.RAW, n_rows).to_bytes()
-    meta = {"encoding": "raw", "n_rows": n_rows, "payload_size": len(payload)}
+    meta = {"encoding": "raw", "n_rows": n_rows, "value_type": vt,
+            "payload_size": len(payload)}
     return header + payload, meta
 
 
 def encode_rle(values: list) -> tuple[bytes, dict]:
-    """Run-length encoding — [value, run_length] pairs.
+    """Run-length encoding — binary [value, run_length] pairs (SIMD-ready).
 
-    Great for low-cardinality / sorted columns. For a column with N
-    consecutive identical values, RLE stores 2 numbers instead of N.
+    Layout (after the 9-byte EncodingHeader):
+      n_runs(4B) + value_type(1B) + [value_bytes + run_length(4B)] * n_runs
 
-    Layout: [value, run_length, value, run_length, ...] as JSON list
+    For INT64/FLOAT64: each run is 8B value + 4B length = 12 bytes.
+    SIMD engines can scan the run_length array to find matching ranges
+    without touching the value array.
     """
+    import struct
     if not values:
-        runs = []
-    else:
-        runs = []
-        current = values[0]
-        count = 1
-        for v in values[1:]:
-            if v == current:
-                count += 1
-            else:
-                runs.append([current, count])
-                current = v
-                count = 1
-        runs.append([current, count])
+        payload = struct.pack("<IB", 0, VALUE_TYPE_NULL)
+        header = EncodingHeader(ColumnEncoding.RLE, 0).to_bytes()
+        meta = {"encoding": "rle", "n_rows": 0, "n_runs": 0,
+                "payload_size": len(payload)}
+        return header + payload, meta
 
-    payload = json.dumps(runs, default=str).encode()
+    # Build runs
+    runs = []
+    current = values[0]
+    count = 1
+    for v in values[1:]:
+        if v == current:
+            count += 1
+        else:
+            runs.append((current, count))
+            current = v
+            count = 1
+    runs.append((current, count))
+
+    vt = _detect_value_type(values)
     n_rows = len(values)
+
+    # Binary layout: n_runs(4B) + value_type(1B) + [value + run_length(4B)] * n_runs
+    payload = struct.pack("<IB", len(runs), vt)
+    for val, count in runs:
+        payload += _encode_value_binary(val, vt)
+        payload += struct.pack("<I", count)
+
     header = EncodingHeader(ColumnEncoding.RLE, n_rows).to_bytes()
     meta = {
-        "encoding": "rle",
-        "n_rows": n_rows,
-        "n_runs": len(runs),
+        "encoding": "rle", "n_rows": n_rows, "n_runs": len(runs),
+        "value_type": vt,
         "compression_ratio": n_rows / max(len(runs), 1),
         "payload_size": len(payload),
     }
@@ -231,19 +322,23 @@ def encode_rle(values: list) -> tuple[bytes, dict]:
 
 
 def encode_dict(values: list) -> tuple[bytes, dict]:
-    """Dictionary encoding — dict_values + dict_codes.
+    """Dictionary encoding — binary dict_values + packed codes (SIMD-ready).
 
-    Great for strings / categoricals. Stores unique values in a
-    dictionary and replaces each value with its code (small int).
+    Layout (after the 9-byte EncodingHeader):
+      n_unique(4B) + value_type(1B) + [value_bytes] * n_unique
+      + code_bitwidth(1B) + packed_codes (bitpacked using encode_bitpack logic)
 
-    Layout: JSON dict {"dict": [...], "codes": [...]}
+    The packed_codes use bitpacking — SIMD engines can unpack codes
+    with the same numpy/vectorized path as bitpack. The dictionary
+    values are contiguous for direct scanning.
     """
+    import struct
     if not values:
-        payload = json.dumps({"dict": [], "codes": []}).encode()
-        n_rows = 0
+        payload = struct.pack("<IB", 0, VALUE_TYPE_NULL) + b"\x00"
+        header = EncodingHeader(ColumnEncoding.DICT, 0).to_bytes()
         meta = {"encoding": "dict", "n_rows": 0, "n_unique": 0,
                 "payload_size": len(payload)}
-        return EncodingHeader(ColumnEncoding.DICT, 0).to_bytes() + payload, meta
+        return header + payload, meta
 
     # Build dictionary
     unique: list = []
@@ -253,16 +348,40 @@ def encode_dict(values: list) -> tuple[bytes, dict]:
             code_map[v] = len(unique)
             unique.append(v)
     codes = [code_map[v] for v in values]
-
-    payload = json.dumps({"dict": unique, "codes": codes}, default=str).encode()
     n_rows = len(values)
+    vt = _detect_value_type(values)
+
+    # Binary layout: n_unique(4B) + value_type(1B) + [value_bytes] * n_unique
+    payload = struct.pack("<IB", len(unique), vt)
+    for val in unique:
+        payload += _encode_value_binary(val, vt)
+
+    # Pack codes using bitpacking (codes are non-negative ints starting at 0)
+    # We embed the bitpacked codes directly — no separate header needed
+    # because the code range is always [0, n_unique-1].
+    if codes:
+        code_max = max(codes)
+        code_bitwidth = max(1, (code_max + 1).bit_length()) if code_max > 0 else 1
+        # Pack codes as bitwidth-bit values
+        n_code_bytes = (len(codes) * code_bitwidth + 7) // 8
+        packed_codes = bytearray(n_code_bytes)
+        bit_pos = 0
+        for c in codes:
+            for i in range(code_bitwidth):
+                if c & (1 << i):
+                    byte_idx = (bit_pos + i) >> 3
+                    bit_idx = (bit_pos + i) & 7
+                    if byte_idx < len(packed_codes):
+                        packed_codes[byte_idx] |= (1 << bit_idx)
+            bit_pos += code_bitwidth
+        payload += struct.pack("<B", code_bitwidth) + bytes(packed_codes)
+    else:
+        payload += struct.pack("<B", 0)
+
     header = EncodingHeader(ColumnEncoding.DICT, n_rows).to_bytes()
     meta = {
-        "encoding": "dict",
-        "n_rows": n_rows,
-        "n_unique": len(unique),
-        "cardinality_ratio": len(unique) / n_rows,
-        "payload_size": len(payload),
+        "encoding": "dict", "n_rows": n_rows, "n_unique": len(unique),
+        "value_type": vt, "payload_size": len(payload),
     }
     return header + payload, meta
 
@@ -561,22 +680,29 @@ def eval_predicate_encoded(blob_bytes: bytes, column: str,
 
 def _eval_rle(payload: bytes, op: str, value: Any
               ) -> tuple[list[tuple[int, int]], dict]:
-    """Evaluate predicate on RLE-encoded data.
+    """Evaluate predicate on RLE-encoded data (binary format).
 
     Walks runs; for each run, checks if run_value matches the predicate.
     If yes, yields (run_start, run_start + run_length) as a surviving range.
     """
-    runs = json.loads(payload)
+    import struct
+    if len(payload) < 5:
+        return [], {"encoding": "rle", "n_runs": 0, "n_surviving_rows": 0}
+    n_runs, vt = struct.unpack_from("<IB", payload, 0)
+    off = 5
     surviving = []
     pos = 0
-    for run_value, run_length in runs:
+    for _ in range(n_runs):
+        run_value, off = _decode_value_binary(payload, off, vt)
+        (run_length,) = struct.unpack_from("<I", payload, off)
+        off += 4
         if _value_matches(run_value, op, value):
             surviving.append((pos, pos + run_length))
         pos += run_length
 
     return surviving, {
         "encoding": "rle",
-        "n_runs": len(runs),
+        "n_runs": n_runs,
         "n_surviving_runs": len(surviving),
         "n_surviving_rows": sum(e - s for s, e in surviving),
     }
@@ -584,15 +710,21 @@ def _eval_rle(payload: bytes, op: str, value: Any
 
 def _eval_dict(payload: bytes, op: str, value: Any
                ) -> tuple[list[tuple[int, int]], dict]:
-    """Evaluate predicate on dictionary-encoded data.
+    """Evaluate predicate on dictionary-encoded data (binary format).
 
-    Scans dict_values once to find matching codes, then scans codes
-    array to find row positions where codes[pos] in matching_codes.
-    Returns surviving_ranges as a list of (start, end) tuples.
+    Scans dict_values once to find matching codes, then scans the
+    packed codes array to find row positions where codes[pos] in
+    matching_codes. Returns surviving_ranges.
     """
-    data = json.loads(payload)
-    dict_values = data["dict"]
-    codes = data["codes"]
+    import struct
+    if len(payload) < 5:
+        return [], {"encoding": "dict", "n_unique": 0, "n_surviving_rows": 0}
+    n_unique, vt = struct.unpack_from("<IB", payload, 0)
+    off = 5
+    dict_values = []
+    for _ in range(n_unique):
+        val, off = _decode_value_binary(payload, off, vt)
+        dict_values.append(val)
 
     # Find matching codes
     matching_codes = set()
@@ -604,11 +736,37 @@ def _eval_dict(payload: bytes, op: str, value: Any
         return [], {"encoding": "dict", "n_unique": len(dict_values),
                     "n_surviving_rows": 0}
 
+    # Read packed codes (bitpacked) and unpack
+    if off >= len(payload):
+        return [], {"encoding": "dict", "n_unique": len(dict_values),
+                    "n_surviving_rows": 0}
+    code_bitwidth = payload[off]
+    off += 1
+    packed = payload[off:]
+    n_rows = (len(packed) * 8) // code_bitwidth if code_bitwidth > 0 else 0
+
+    # Unpack codes
+    try:
+        import numpy as np
+        codes = _numpy_unpack_bitpack(packed, code_bitwidth, n_rows, 0)
+        codes_list = codes.tolist()
+    except (ImportError, Exception):
+        codes_list = []
+        bit_pos = 0
+        for _ in range(n_rows):
+            v = 0
+            for i in range(code_bitwidth):
+                byte_idx = (bit_pos + i) >> 3
+                bit_idx = (bit_pos + i) & 7
+                if byte_idx < len(packed) and (packed[byte_idx] >> bit_idx) & 1:
+                    v |= (1 << i)
+            codes_list.append(v)
+            bit_pos += code_bitwidth
+
     # Find row positions where codes[pos] in matching_codes
-    # Coalesce consecutive positions into ranges
     surviving = []
     range_start = None
-    for pos, code in enumerate(codes):
+    for pos, code in enumerate(codes_list):
         if code in matching_codes:
             if range_start is None:
                 range_start = pos
@@ -617,7 +775,7 @@ def _eval_dict(payload: bytes, op: str, value: Any
                 surviving.append((range_start, pos))
                 range_start = None
     if range_start is not None:
-        surviving.append((range_start, len(codes)))
+        surviving.append((range_start, len(codes_list)))
 
     return surviving, {
         "encoding": "dict",
@@ -796,27 +954,84 @@ def _value_matches(val: Any, op: str, value: Any) -> bool:
 def decode_column(blob_bytes: bytes) -> list:
     """Decode an encoded chunk blob back to a list of values.
 
-    Used as a fallback when eval_predicate_encoded returns None or
-    when the caller needs the actual values (e.g., for projection).
+    Handles all four binary encodings (SIMD-ready format, no JSON).
     """
+    import struct
     header = EncodingHeader.from_bytes(blob_bytes[:EncodingHeader.SIZE])
     payload = blob_bytes[EncodingHeader.SIZE:]
 
     if header.encoding == ColumnEncoding.RAW:
-        return json.loads(payload)
+        # Binary: value_type(1B) + values
+        if not payload:
+            return []
+        vt = payload[0]
+        data = payload[1:]
+        if vt == VALUE_TYPE_INT64:
+            n = len(data) // 8
+            return list(struct.unpack_from(f"<{n}q", data))
+        elif vt == VALUE_TYPE_FLOAT64:
+            n = len(data) // 8
+            return list(struct.unpack_from(f"<{n}d", data))
+        elif vt == VALUE_TYPE_STRING:
+            result = []
+            off = 0
+            while off < len(data):
+                val, off = _decode_value_binary(data, off, vt)
+                result.append(val)
+            return result
+        return []
+
     elif header.encoding == ColumnEncoding.RLE:
-        runs = json.loads(payload)
+        # Binary: n_runs(4B) + value_type(1B) + [value + run_length(4B)] * n_runs
+        if len(payload) < 5:
+            return []
+        n_runs, vt = struct.unpack_from("<IB", payload, 0)
+        off = 5
         result = []
-        for value, length in runs:
-            result.extend([value] * length)
+        for _ in range(n_runs):
+            val, off = _decode_value_binary(payload, off, vt)
+            (run_len,) = struct.unpack_from("<I", payload, off)
+            off += 4
+            result.extend([val] * run_len)
         return result
+
     elif header.encoding == ColumnEncoding.DICT:
-        data = json.loads(payload)
-        dict_values = data["dict"]
-        codes = data["codes"]
-        return [dict_values[c] for c in codes]
+        # Binary: n_unique(4B) + value_type(1B) + [value] * n_unique
+        #         + code_bitwidth(1B) + packed_codes
+        if len(payload) < 5:
+            return []
+        n_unique, vt = struct.unpack_from("<IB", payload, 0)
+        off = 5
+        dict_values = []
+        for _ in range(n_unique):
+            val, off = _decode_value_binary(payload, off, vt)
+            dict_values.append(val)
+        # Read code_bitwidth + packed codes
+        if off >= len(payload):
+            return []
+        code_bitwidth = payload[off]
+        off += 1
+        packed = payload[off:]
+        n_rows = header.n_rows
+        # Unpack codes using numpy if available, else Python
+        try:
+            arr = _numpy_unpack_bitpack(packed, code_bitwidth, n_rows, 0)
+            return [dict_values[c] for c in arr.tolist()]
+        except (ImportError, Exception):
+            codes = []
+            bit_pos = 0
+            for _ in range(n_rows):
+                v = 0
+                for i in range(code_bitwidth):
+                    byte_idx = (bit_pos + i) >> 3
+                    bit_idx = (bit_pos + i) & 7
+                    if byte_idx < len(packed) and (packed[byte_idx] >> bit_idx) & 1:
+                        v |= (1 << i)
+                codes.append(v)
+                bit_pos += code_bitwidth
+            return [dict_values[c] for c in codes]
+
     elif header.encoding == ColumnEncoding.BITPACK:
-        # Real bitpack: payload is a binary sub-header + packed body
         return _decode_bitpack_packed(payload)
     else:
         raise ValueError(f"Unknown encoding: {header.encoding}")
@@ -849,9 +1064,12 @@ def decode_surviving_values(blob_bytes: bytes,
     payload = blob_bytes[EncodingHeader.SIZE:]
 
     if header.encoding == ColumnEncoding.RLE:
-        # Walk runs; for each run, check if it overlaps any surviving range.
-        # If yes, materialize only the overlapping rows.
-        runs = json.loads(payload)
+        # Binary: n_runs(4B) + value_type(1B) + [value + run_length(4B)] * n_runs
+        import struct
+        if len(payload) < 5:
+            return []
+        n_runs, vt = struct.unpack_from("<IB", payload, 0)
+        off = 5
         result = []
         pos = 0
         ranges_iter = iter(surviving_ranges)
@@ -860,15 +1078,16 @@ def decode_surviving_values(blob_bytes: bytes,
         except StopIteration:
             return []
 
-        for run_value, run_length in runs:
+        for _ in range(n_runs):
+            run_value, off = _decode_value_binary(payload, off, vt)
+            (run_length,) = struct.unpack_from("<I", payload, off)
+            off += 4
             run_end = pos + run_length
-            # Skip surviving ranges that end before this run starts
             while cur_end <= pos:
                 try:
                     cur_start, cur_end = next(ranges_iter)
                 except StopIteration:
                     return result
-            # Process all surviving ranges that overlap this run
             while cur_start < run_end:
                 if cur_end <= pos:
                     try:
@@ -876,11 +1095,9 @@ def decode_surviving_values(blob_bytes: bytes,
                     except StopIteration:
                         return result
                     continue
-                # Compute overlap
                 overlap_start = max(cur_start, pos)
                 overlap_end = min(cur_end, run_end)
                 if overlap_end > overlap_start:
-                    offset = overlap_start - pos
                     n = overlap_end - overlap_start
                     result.extend([run_value] * n)
                 if cur_end <= run_end:
@@ -889,16 +1106,44 @@ def decode_surviving_values(blob_bytes: bytes,
                     except StopIteration:
                         return result
                 else:
-                    break  # next run will handle the rest
+                    break
             pos = run_end
         return result
 
     elif header.encoding == ColumnEncoding.DICT:
-        # Walk codes; for each code, check if its position is in any
-        # surviving range. If yes, materialize dict_values[code].
-        data = json.loads(payload)
-        dict_values = data["dict"]
-        codes = data["codes"]
+        # Binary: n_unique(4B) + value_type(1B) + [value] * n_unique
+        #         + code_bitwidth(1B) + packed_codes
+        import struct
+        if len(payload) < 5:
+            return []
+        n_unique, vt = struct.unpack_from("<IB", payload, 0)
+        off = 5
+        dict_values = []
+        for _ in range(n_unique):
+            val, off = _decode_value_binary(payload, off, vt)
+            dict_values.append(val)
+        # Unpack codes
+        if off >= len(payload):
+            return []
+        code_bitwidth = payload[off]
+        off += 1
+        packed = payload[off:]
+        n_rows = header.n_rows
+        try:
+            codes = _numpy_unpack_bitpack(packed, code_bitwidth, n_rows, 0).tolist()
+        except (ImportError, Exception):
+            codes = []
+            bit_pos = 0
+            for _ in range(n_rows):
+                v = 0
+                for i in range(code_bitwidth):
+                    byte_idx = (bit_pos + i) >> 3
+                    bit_idx = (bit_pos + i) & 7
+                    if byte_idx < len(packed) and (packed[byte_idx] >> bit_idx) & 1:
+                        v |= (1 << i)
+                codes.append(v)
+                bit_pos += code_bitwidth
+
         result = []
         ranges_iter = iter(surviving_ranges)
         try:
@@ -907,7 +1152,6 @@ def decode_surviving_values(blob_bytes: bytes,
             return []
 
         for pos, code in enumerate(codes):
-            # Advance past ranges that end before this position
             while cur_end <= pos:
                 try:
                     cur_start, cur_end = next(ranges_iter)
