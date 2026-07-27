@@ -80,10 +80,20 @@ class ColumnChunkStorage:
             encode_fn=None) -> tuple[str, ColumnChunkZoneMap]:
         """Split a row group into per-column-chunk blobs and store them.
 
-        Format-agnostic (design review C4 fix): accepts either a PyArrow
-        Table (auto-wrapped) or any ColumnSource. Each chunk is encoded
-        via `encode_fn`, which receives a single-column PyArrow Table
-        (constructed from the source's column_slice) and returns bytes.
+        Fully format-agnostic: accepts any ColumnSource (PyArrow Table,
+        list-of-dicts, or custom adapter). Each chunk is encoded via
+        `encode_fn(col_name, values: list) -> bytes` — the lens provides
+        its own encoder (Parquet, JSON, binary, rich text, diffs, etc.).
+        No PyArrow dependency in the storage contract.
+
+        This enables ANY workload to use column-chunk storage:
+          - LakehouseLens: Parquet encoder
+          - KeyValueLens: JSON encoder
+          - VectorLens: binary encoder
+          - Notebook lens: rich-text encoder
+          - Git lens: diff-based encoder
+        Any app built on Pond gets infinite storage + versioning +
+        branching + pruning + encoding on object stores.
 
         Args:
             table_or_source: PyArrow Table OR ColumnSource (a single row
@@ -91,25 +101,21 @@ class ColumnChunkStorage:
             row_group_key: the ProllyTreeIndex key for this row group
                 (e.g., "rg/999")
             chunk_size: rows per column chunk (default 1000)
-            encode_fn: REQUIRED function(column_table) -> bytes that
-                encodes a single-column PyArrow Table to your preferred
-                format (e.g., Parquet). There is no default — the lens
-                must supply its own encoder.
+            encode_fn: REQUIRED function(col_name: str, values: list) -> bytes
+                that encodes a single column's values to the lens's
+                preferred format. No default — the lens must supply its
+                own encoder.
 
         Returns:
             Tuple of (manifest_blob_hash, ColumnChunkZoneMap).
-            The manifest is a small JSON blob listing all chunk blob
-            hashes (used for full-row-group reads). The ColumnChunkZoneMap
-            has each chunk's blob_hash field populated for pruning.
         """
         if encode_fn is None:
             raise ValueError(
-                "encode_fn is required — pass a function(table) -> bytes "
-                "that encodes a single-column PyArrow Table to your "
-                "preferred format (e.g., Parquet).")
+                "encode_fn is required — pass a function(col_name, values) "
+                "-> bytes that encodes a single column's values to your "
+                "preferred format (e.g., Parquet, JSON, binary).")
 
         from column_source import as_column_source, compute_list_stats
-        import pyarrow as pa
         source = as_column_source(table_or_source)
 
         n_rows = source.num_rows()
@@ -126,14 +132,10 @@ class ColumnChunkStorage:
                 end = min(start + chunk_size, n_rows)
                 values = source.column_slice(col_name, start, end)
 
-                # Wrap the single column as a one-column Table for encoding.
-                # (encode_fn expects a PyArrow Table; this is the encoding
-                # contract, separate from the ColumnSource contract.)
-                chunk_table = pa.Table.from_arrays(
-                    [pa.array(values)], names=[col_name])
-
-                # Encode + write the chunk as its own blob
-                chunk_bytes = encode_fn(chunk_table)
+                # Encode + write the chunk as its own blob.
+                # encode_fn receives (col_name, values: list) — format-agnostic.
+                # The lens decides how to encode (Parquet, JSON, binary, etc.).
+                chunk_bytes = encode_fn(col_name, values)
                 chunk_blob_hash = self.kernel.write(chunk_bytes)
                 chunk_hashes.append(chunk_blob_hash)
 
@@ -167,77 +169,79 @@ class ColumnChunkStorage:
         return manifest_blob_hash, cczm
 
     def read_full_row_group(self, manifest_blob_hash: str,
-                             decode_fn=None) -> Any:
+                             decode_fn=None) -> dict[str, list]:
         """Reconstruct a full row group by reading all chunk blobs.
 
-        Used for backward-compatible full reads (read_table). Reads
-        every chunk blob for every column and reassembles the table.
+        Format-agnostic: decode_fn(bytes) -> list returns a list of
+        values for one column. The caller (lens) is responsible for
+        constructing its native data structure (pa.Table, list[dict],
+        etc.) from the returned dict[str, list].
 
         Args:
             manifest_blob_hash: the manifest blob hash
-            decode_fn: function(bytes) -> PyArrow Table
+            decode_fn: function(bytes) -> list that decodes a chunk blob
+                to a list of values for one column.
 
         Returns:
-            PyArrow Table containing all rows from all chunks.
+            dict[str, list] mapping column_name → list of all values
+            for that column across all chunks.
         """
         if decode_fn is None:
             raise ValueError("decode_fn is required — pass a function(bytes) "
-                             "-> PyArrow Table that decodes your format.")
+                             "-> list that decodes a chunk blob to values.")
 
         manifest_bytes = self.kernel.read_blob(manifest_blob_hash)
         manifest = json.loads(manifest_bytes)
 
-        import pyarrow as pa
-        columns = {}
+        columns: dict[str, list] = {}
         for col_name, chunk_hashes in manifest["column_chunks"].items():
-            arrays = []
+            all_values: list = []
             for chunk_hash in chunk_hashes:
                 chunk_bytes = self.kernel.read_blob(chunk_hash)
-                chunk_table = decode_fn(chunk_bytes)
-                arrays.append(chunk_table.column(col_name))
-            columns[col_name] = pa.concat_arrays(arrays)
+                all_values.extend(decode_fn(chunk_bytes))
+            columns[col_name] = all_values
 
-        return pa.Table.from_arrays(
-            [columns[c] for c in columns],
-            names=list(columns.keys()),
-        )
+        return columns
 
     def read_column_chunks(
             self,
             cczm: ColumnChunkZoneMap,
             columns: list[str],
             surviving_chunk_indices: Optional[set[int]] = None,
-            decode_fn=None) -> dict[str, list[Any]]:
+            decode_fn=None) -> dict[str, list[list]]:
         """Read specific column chunks for surviving chunk indices.
 
-        This is the read path used by PruningReader when column-chunk
-        storage is active. Only fetches the chunk blobs that survived
-        column-chunk pruning — real I/O savings.
+        Format-agnostic: decode_fn(bytes) -> list returns a list of
+        values for one column. Returns dict[str, list[list]] —
+        column_name → list of value-lists (one per surviving chunk).
+
+        The caller (lens) is responsible for concatenating the
+        value-lists and constructing its native data structure.
 
         Args:
             cczm: ColumnChunkZoneMap for the row group (with blob_hashes)
             columns: list of column names to read (predicate + projection)
             surviving_chunk_indices: set of chunk indices to read.
                 If None, read all chunks.
-            decode_fn: function(bytes) -> PyArrow Table
+            decode_fn: function(bytes) -> list that decodes a chunk blob
+                to a list of values for one column.
 
         Returns:
-            Dict of column_name → list of PyArrow Arrays (one per
-            surviving chunk, in chunk_index order). The caller
-            concatenates these and builds the result table.
+            Dict of column_name → list of value-lists (one per
+            surviving chunk, in chunk_index order). Empty dict if
+            any column has no blob_hash (caller should fall back).
         """
         if decode_fn is None:
             raise ValueError("decode_fn is required")
 
-        result: dict[str, list[Any]] = {}
+        result: dict[str, list[list]] = {}
 
         for col_name in columns:
             if col_name not in cczm.column_chunks:
-                # Column has no chunks (not in schema) — skip
                 continue
 
             chunk_stats = cczm.column_chunks[col_name]
-            arrays = []
+            value_lists: list[list] = []
 
             for stats in chunk_stats:
                 if surviving_chunk_indices is not None and \
@@ -245,18 +249,13 @@ class ColumnChunkStorage:
                     continue  # SKIP — chunk pruned, no I/O
 
                 if stats.blob_hash is None:
-                    # No separate chunk blob — caller should fall back
-                    # to full row-group read
-                    return {}
+                    return {}  # fall back to caller
 
                 chunk_bytes = self.kernel.read_blob(stats.blob_hash)
-                chunk_table = decode_fn(chunk_bytes)
-                # chunk_table.column(col_name) returns a ChunkedArray;
-                # combine_chunks() to get a single Array for concatenation.
-                col_array = chunk_table.column(col_name).combine_chunks()
-                arrays.append(col_array)
+                values = decode_fn(chunk_bytes)
+                value_lists.append(values)
 
-            result[col_name] = arrays
+            result[col_name] = value_lists
 
         return result
 

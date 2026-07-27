@@ -608,10 +608,17 @@ class LakehouseLens(PondLens):
 
         storage = ColumnChunkStorage(self.kernel)
 
+        # Format-agnostic encode_fn: (col_name, values: list) -> bytes.
+        # LakehouseLens uses Parquet; other lenses would use their own encoder.
+        def encode_parquet(col_name, values):
+            chunk_table = pa.Table.from_arrays(
+                [pa.array(values)], names=[col_name])
+            return self._encode_table(chunk_table)
+
         def write_per_column_chunks(group_table, rg_key):
             manifest_hash, cczm = storage.write_row_group_column_chunks(
                 group_table, rg_key, chunk_size=chunk_size,
-                encode_fn=self._encode_table,
+                encode_fn=encode_parquet,
             )
             return manifest_hash, cczm
 
@@ -1149,26 +1156,33 @@ class LakehouseLens(PondLens):
                     return None
                 return decoded
 
-            # Column-chunk storage active — read only surviving chunks
+            # Column-chunk storage active — read only surviving chunks.
+            # decode_fn returns list (format-agnostic); we wrap in pa.array.
             cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
             surviving_chunks = self._compute_surviving_chunks(cczm, cc_predicates)
             if surviving_chunks is not None and not surviving_chunks:
                 return None  # all chunks pruned — skip row group
 
-            col_arrays = storage.read_column_chunks(
+            def decode_parquet(chunk_bytes):
+                table = self._decode_table(chunk_bytes)
+                return table.column(0).to_pylist()
+
+            col_data = storage.read_column_chunks(
                 cczm, columns, surviving_chunks,
-                decode_fn=self._decode_table,
+                decode_fn=decode_parquet,
             )
-            if not col_arrays:
+            if not col_data:
                 return None
 
-            # Reassemble rows: concatenate arrays per column, build Table.
-            # Return pa.Table directly (Arrow-native — no list[dict] round-trip).
+            # Reassemble: concatenate value-lists per column, build pa.Table.
             arrays = []
             col_names_out = []
             for col_name in columns:
-                if col_name in col_arrays and col_arrays[col_name]:
-                    arrays.append(pa.concat_arrays(col_arrays[col_name]))
+                if col_name in col_data and col_data[col_name]:
+                    all_vals = []
+                    for vals in col_data[col_name]:
+                        all_vals.extend(vals)
+                    arrays.append(pa.array(all_vals))
                     col_names_out.append(col_name)
             if not arrays:
                 return None
@@ -1229,17 +1243,23 @@ class LakehouseLens(PondLens):
                 if ColumnChunkStorage.has_column_chunk_storage(zm_dict):
                     # Column-chunk storage: read all chunks for this row group
                     cczm = ColumnChunkZoneMap.from_dict(zm_dict["column_chunks"])
-                    col_arrays = plain_storage.read_column_chunks(
+                    def decode_parquet_fallback(chunk_bytes):
+                        table = self._decode_table(chunk_bytes)
+                        return table.column(0).to_pylist()
+                    col_data = plain_storage.read_column_chunks(
                         cczm, columns, None,  # None = read all chunks
-                        decode_fn=self._decode_table,
+                        decode_fn=decode_parquet_fallback,
                     )
-                    if not col_arrays:
+                    if not col_data:
                         return None
                     arrays = []
                     col_names_out = []
                     for col_name in columns:
-                        if col_name in col_arrays and col_arrays[col_name]:
-                            arrays.append(pa.concat_arrays(col_arrays[col_name]))
+                        if col_name in col_data and col_data[col_name]:
+                            all_vals = []
+                            for vals in col_data[col_name]:
+                                all_vals.extend(vals)
+                            arrays.append(pa.array(all_vals))
                             col_names_out.append(col_name)
                     if not arrays:
                         return None
@@ -1669,18 +1689,24 @@ class LakehouseLens(PondLens):
         else:
             # Plain Parquet column-chunk storage
             storage = ColumnChunkStorage(self.kernel)
-            col_arrays = storage.read_column_chunks(
+            def decode_parquet_manifest(chunk_bytes):
+                table = self._decode_table(chunk_bytes)
+                return table.column(0).to_pylist()
+            col_data = storage.read_column_chunks(
                 cczm, col_names, None,
-                decode_fn=self._decode_table,
+                decode_fn=decode_parquet_manifest,
             )
-            if not col_arrays:
+            if not col_data:
                 return None
 
             arrays = []
             col_names_out = []
             for col_name in col_names:
-                if col_name in col_arrays and col_arrays[col_name]:
-                    arrays.append(pa.concat_arrays(col_arrays[col_name]))
+                if col_name in col_data and col_data[col_name]:
+                    all_vals = []
+                    for vals in col_data[col_name]:
+                        all_vals.extend(vals)
+                    arrays.append(pa.array(all_vals))
                     col_names_out.append(col_name)
             if not arrays:
                 return None
