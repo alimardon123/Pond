@@ -134,10 +134,35 @@ class ZoneMapIndex:
     def commit_zone_maps(self, collection: str, message: str = "") -> str:
         """Commit staged zone maps for a collection.
 
+        Also builds a zone-map manifest: a single blob containing ALL
+        zone maps for the collection, serialized as one JSON array.
+        This eliminates the N individual zone-map blob reads that
+        scan_with_pruning would otherwise need — on S3, reading one
+        manifest blob (1 fetch) instead of N zone-map blobs (N fetches)
+        is a massive latency win.
+
         Returns the zone-map tree root hash.
         """
         base = self._get_base(collection)
         commit_hash = base.commit(message or f"zone maps for {collection}")
+
+        # Build a manifest blob: all zone maps in one JSON array.
+        # This is the key optimization for S3: 1 fetch instead of N.
+        state = base.read_all()
+        manifest = []
+        for k in sorted(state.keys()):
+            if k.startswith("_"):
+                continue
+            zm_blob_hash = state[k]
+            zm_dict = json.loads(self.kernel.read_blob(zm_blob_hash))
+            manifest.append({"key": k, "zm": zm_dict})
+
+        manifest_bytes = json.dumps(manifest, sort_keys=True,
+                                     default=str).encode()
+        manifest_hash = self.kernel.write(manifest_bytes)
+        self.kernel.reference(
+            f"collections/{collection}/zone_map_manifest", manifest_hash)
+
         # Also store the tree root as a ref for O(1) lookup
         tree_root = self.kernel.resolve(f"collections/{collection}__zone_maps/HEAD")
         if tree_root:
@@ -253,6 +278,50 @@ class ZoneMapIndex:
         """
         # Use ProllyLensBase to read the current state (handles commit→snapshot)
         base = self._get_base(collection)
+
+        # FAST PATH: Try the zone-map manifest first.
+        # The manifest is a single blob containing ALL zone maps for the
+        # collection. Reading it requires 1 kernel.read_blob call instead
+        # of N (one per zone map entry). On S3, this is the difference
+        # between 1 fetch (50ms) and N fetches (N × 50ms).
+        manifest_ref = f"collections/{collection}/zone_map_manifest"
+        manifest_hash = self.kernel.resolve(manifest_ref)
+
+        if manifest_hash:
+            # Read the manifest (1 blob fetch) and parse all zone maps
+            manifest_bytes = self.kernel.read_blob(manifest_hash)
+            manifest = json.loads(manifest_bytes)
+
+            # Sort by key for deterministic order
+            entries = sorted(manifest, key=lambda e: e["key"])
+
+            # Apply key range filters
+            if start_key is not None:
+                entries = [e for e in entries if e["key"] >= start_key]
+            if end_key is not None:
+                entries = [e for e in entries if e["key"] <= end_key]
+
+            self.last_scan_total = len(entries)
+
+            for entry in entries:
+                zm_key = entry["key"]
+                zm_dict = entry["zm"]
+
+                # Evaluate pruning predicate if provided
+                if predicate is not None:
+                    zm = ZoneMap.from_dict(zm_dict)
+                    if predicate.can_prune(zm):
+                        continue  # SKIP — data blob not read, not decoded
+
+                data_blob_hash = zm_dict.get("blob_hash", "")
+                if verbose:
+                    yield (zm_key, data_blob_hash, zm_dict)
+                else:
+                    yield data_blob_hash
+            return
+
+        # SLOW PATH: Fall back to reading individual zone map blobs.
+        # Used when no manifest exists (legacy data or manifest not built).
         state = base.read_all()
         if not state:
             return  # No zone maps — nothing to scan
@@ -370,15 +439,23 @@ class ZoneMapIndex:
                         ) -> Iterator[tuple[str, dict]]:
         """Iterate over all (row_group_key, zone_map_dict) for a collection.
 
-        PUBLIC accessor for walking the zone-map tree. Used by lenses
-        that need to enumerate zone maps (e.g., to infer a collection's
-        schema) without reaching into _get_base.
+        Uses the manifest blob if available (1 fetch instead of N).
+        Falls back to individual blob reads for legacy data.
 
         Yields:
             Tuples of (row_group_key, zone_map_dict) in sorted key order.
-            zone_map_dict includes 'min', 'max', 'null_count', 'blob_hash',
-            and optionally 'column_chunks'.
         """
+        # FAST PATH: use manifest if available
+        manifest_ref = f"collections/{collection}/zone_map_manifest"
+        manifest_hash = self.kernel.resolve(manifest_ref)
+        if manifest_hash:
+            manifest_bytes = self.kernel.read_blob(manifest_hash)
+            manifest = json.loads(manifest_bytes)
+            for entry in sorted(manifest, key=lambda e: e["key"]):
+                yield (entry["key"], entry["zm"])
+            return
+
+        # SLOW PATH: individual blob reads
         base = self._get_base(collection)
         state = base.read_all()
         for k in sorted(state.keys()):
