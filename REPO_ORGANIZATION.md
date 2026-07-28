@@ -64,6 +64,7 @@ versions of this document incorrectly listed it under pond-sdk.
 **Current:**
 - `lenses/keyvalue/` (`KeyValueLens`, `KeylessLens`, `CrossLens`)
 - `lenses/lakehouse/` (`LakehouseLens`)
+- `lenses/streaming/` (`StreamingLens`)
 - `lenses/vector/` (`VectorLens`)
 
 **Rule:**
