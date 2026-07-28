@@ -1,12 +1,16 @@
 # Pond Binary Encoding Format Specification
 
-> **Version 1.0** — Stable, documented, SIMD-ready.
+> **Version 1.1** — Stable, documented, SIMD-ready.
 >
 > Any execution engine (DuckDB, Polars, DataFusion, Arrow compute) can
 > read Pond's encoded chunk blobs natively. The format is raw binary —
 > no JSON, no Python intermediaries, no pointer chasing. Bytes are
 > directly mmappable to numpy/Arrow buffers for AVX2/AVX-512 vectorized
 > operations.
+>
+> **v1.1 changes**: Added compression prefix (1 byte) and null bitmap
+> for RAW encoding. Backward compatible — v1.0 readers check the
+> compression byte and treat 0x00 as uncompressed v1.0.
 
 ## Overview
 
@@ -14,10 +18,18 @@ Every encoded chunk blob has the same top-level structure:
 
 ```
 +-------------------+-----------------------------------+
+| CompressionTag    | 1 byte (0x00=none, 0x01=LZ4, 0x02=zstd)|
++-------------------+-----------------------------------+
 | EncodingHeader    | 9 bytes (magic + encoding + n_rows)|
 +-------------------+-----------------------------------+
 | Payload           | encoding-specific (see below)      |
 +-------------------+-----------------------------------+
+```
+
+**Note**: The CompressionTag is OUTSIDE the PND1 format. Readers
+decompress first (if needed), then parse the EncodingHeader + Payload
+as v1.0 PND1. This keeps the PND1 format spec stable — compression
+is a transparent wrapper.
 ```
 
 The EncodingHeader is 9 bytes:
@@ -42,21 +54,35 @@ exactly N×8 bytes, directly castable to `numpy.frombuffer` or
 
 ## Encoding 0: RAW
 
-Uncompressed contiguous values. The fallback when no structural encoding applies.
+Uncompressed contiguous values with null bitmap. The fallback when no
+structural encoding applies.
 
 ```
 +------------+-------------------------------------------+
-| value_type | 1 byte (INT64=1, FLOAT64=2, STRING=3)     |
+| value_type | 1 byte (INT64=1, FLOAT64=2, STRING=3, NULL=4)|
 +------------+-------------------------------------------+
-| values     | N × 8 bytes (INT64/FLOAT64)               |
+| null_bitmap| ceil(n_rows / 8) bytes (1=null, 0=valid)  |
+|            | (absent if no nulls — detected by size)   |
++------------+-------------------------------------------+
+| values     | N × 8 bytes (INT64/FLOAT64, 0 for nulls) |
 |            | OR N × (4B length + UTF-8 bytes) (STRING) |
+|            | (nulls produce no bytes for STRING)       |
 +------------+-------------------------------------------+
 ```
+
+The null bitmap uses Arrow convention: bit 1 = null, bit 0 = valid.
+For INT64/FLOAT64, null values are stored as 0 in the values array —
+the bitmap is authoritative. For STRING, nulls produce no bytes —
+the bitmap marks their position.
+
+**Null bitmap detection**: The reader detects whether a bitmap is
+present by checking if `len(payload) - 1 - bitmap_size == n_rows * 8`
+(for INT64/FLOAT64). If the math works out, the bitmap is present.
 
 **SIMD access**: For INT64/FLOAT64, the values region is directly
 castable to a numpy array:
 ```python
-arr = np.frombuffer(payload[1:], dtype=np.int64)  # or np.float64
+arr = np.frombuffer(payload[1 + bitmap_size:], dtype=np.int64)
 ```
 
 ## Encoding 1: RLE (Run-Length Encoding)
