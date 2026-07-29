@@ -176,6 +176,10 @@ def test_pnd1_vs_parquet_benchmark():
     ok, output = _run_script("pond-labs/benchmarks/pnd1_vs_parquet_benchmark.py")
     assert ok, f"PND1 vs Parquet benchmark failed:\n{output[-500:]}"
 
+def test_stats_index():
+    ok, output = _run_script("tests/integration/test_stats_index.py")
+    assert ok, f"Stats index tests failed:\n{output[-500:]}"
+
 def test_kv_pruning_and_projection():
     ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
     assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"
