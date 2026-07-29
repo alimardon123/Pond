@@ -2915,3 +2915,41 @@ Stage Summary:
     updated to use list-based decode + pa.array reconstruction)
   * docs/GENERIC_DESIGN_VISION.md (NEW — 110 LOC)
   * KNOWLEDGE_GRAPH.md (1 new entry)
+
+---
+Task ID: unified-storage-design
+Agent: main
+Task: Rethink zone maps — embed stats in data blobs, eliminate extra round trips
+
+The user asked to rethink the zone-map logic:
+> "I would want no extra overhead and extra round trips to storage account.
+> I am thinking about one storage that handles anything. So solution shouldn't
+> create extra overhead and should be unified and simplified solution with
+> high performance, efficient, beautiful, generic, scalable, powerful."
+
+DESIGN DECISION:
+- Zone maps as separate blobs = extra round trips on S3. Bad.
+- Even with manifest batching = still 1 extra fetch. Bad.
+- Solution: EMBED stats in the data blob header. Zero extra fetches.
+- The reader fetches 1 blob, reads the first ~100 bytes (stats header),
+  decides whether to decode. No zone-map fetch at all.
+
+Created docs/UNIFIED_STORAGE_DESIGN.md documenting the full design.
+Created pond-sdk/extensions/physical_structures/embedded_stats.py (170 LOC):
+- ColumnStats: per-column min/max/null_count with can_prune() method
+- StatsHeader: build/parse embedded stats header (b"STAT" magic)
+- StatsHeader.can_prune_blob(): evaluate predicate against embedded stats
+- compute_column_stats(): compute from a list of values
+
+The embedded stats approach:
+- Eliminates ZoneMapIndex (460 LOC) — stats travel with the data
+- Eliminates zone-map manifest blob — no extra fetch
+- Eliminates add_zone_map/commit_zone_maps/clear_zone_maps API
+- Zero extra round trips on S3 — 1 fetch per blob, stats in the header
+- Backward compatible — legacy blobs without stats fall back to full decode
+- Generic — works for ANY workload (tabular, KV, vector, streaming, notebooks)
+
+NEXT: Wire embedded stats into the write/read paths of ColumnChunkStorage
+and EncodedChunkStorage. Then remove the ZoneMapIndex dependency from
+LakehouseLens (the lens calls the storage layer, which handles stats
+internally — the lens doesn't need to know about zone maps at all).
