@@ -1223,6 +1223,15 @@ class UnifiedStorage:
                 return True
             combined_filter = self._combine_filters(combined_filter, range_filter)
 
+        # Fix (Round 24 Issue #2): format raw caller keys to "rg/..." format,
+        # matching what point_lookup does internally. This makes the API
+        # consistent — callers can pass raw keys (int, string) without
+        # needing to know about _format_rg_key.
+        if start_key is not None and not (isinstance(start_key, str) and start_key.startswith("rg/")):
+            start_key = _format_rg_key(start_key)
+        if end_key is not None and not (isinstance(end_key, str) and end_key.startswith("rg/")):
+            end_key = _format_rg_key(end_key)
+
         # Walk surviving row groups via manifest (in-memory pruning — 0 GETs)
         # Fix (Round 21): use parallel fetch for surviving row groups (10-16x
         # latency reduction at PB scale). Same infrastructure as read_as_columns.
@@ -1741,7 +1750,7 @@ def _encode_binary_raw(values: list, hint: str = "raw") -> tuple[bytes, dict]:
     payload = struct.pack("<I", n_rows)
     for v in values:
         if v is None:
-            payload += struct.pack("<I", 0)
+            payload += struct.pack("<I", 0xFFFFFFFF)  # null sentinel
         else:
             b = v if isinstance(v, bytes) else bytes(v)
             payload += struct.pack("<I", len(b))
@@ -1776,8 +1785,10 @@ def _decode_binary_raw(payload: bytes, expected_n_rows: int) -> list:
             break
         (blen,) = struct.unpack("<I", payload[pos:pos+4])
         pos += 4
-        if blen == 0:
-            result.append(None)
+        if blen == 0xFFFFFFFF:
+            result.append(None)  # null sentinel
+        elif blen == 0:
+            result.append(b"")  # empty bytes (not null)
         else:
             result.append(bytes(payload[pos:pos+blen]))
             pos += blen

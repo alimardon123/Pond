@@ -88,9 +88,25 @@ class StreamingLens(PondLens):
         lens.append_stream("video_1", more_bytes)
     """
 
-    def __init__(self, kernel: PondMinimal):
+    def __init__(self, kernel: PondMinimal, use_unified_storage: bool = False):
+        """Create a StreamingLens.
+
+        Args:
+            kernel: the PondMinimal kernel instance
+            use_unified_storage: if True, use UnifiedStorage (PND2 format)
+                as the storage backend. Segments stored as BINARY column
+                values with offset as INT64 key_col. Enables parallel fetch,
+                predicate pushdown, and delta-manifest appends.
+        """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
+        self._unified_storage = None
+        if use_unified_storage:
+            try:
+                from unified_storage import UnifiedStorage
+                self._unified_storage = UnifiedStorage(kernel)
+            except ImportError:
+                pass
 
     def _get_base(self, collection: str) -> ProllyLensBase:
         if collection not in self._bases:
@@ -101,41 +117,41 @@ class StreamingLens(PondLens):
                      segment_size: int = 1_000_000) -> str:
         """Write a stream as chunked segments.
 
-        Splits `data` into segments of `segment_size` bytes. Each segment
-        is stored as a separate kernel blob. The ProllyTreeIndex maps
-        segment_number → blob_hash.
-
-        REPLACES existing stream (same overwrite semantics as range_write).
-
-        Args:
-            collection: collection name
-            data: the full byte stream to store
-            segment_size: bytes per segment (default 1MB)
-
-        Returns:
-            The new HEAD commit hash.
+        Unified path: stores segments as rows {'offset': int, 'segment': bytes}
+        via PondStorage. PND2 BINARY column for segment data, INT64 for offset.
         """
-        base = self._get_base(collection)
+        # Unified storage path
+        if self._unified_storage is not None:
+            if not data:
+                return self._unified_storage.write(collection, [],
+                    key_col="offset", message="write_stream: empty")
+            rows = []
+            n_segments = (len(data) + segment_size - 1) // segment_size
+            for i in range(n_segments):
+                start = i * segment_size
+                end = min(start + segment_size, len(data))
+                rows.append({"offset": start, "segment": data[start:end]})
+            return self._unified_storage.write(
+                collection, rows, key_col="offset",
+                row_group_size=max(1, 10_000_000 // segment_size),
+                message=f"write_stream: {len(data)} bytes in {n_segments} segments")
 
-        # Clear old segments (overwrite semantics)
+        # Legacy path
+        base = self._get_base(collection)
         existing = base.read_all()
         for k in existing.keys():
             if k.startswith(_SEG_PREFIX):
                 base.stage_delete(k)
-
         if not data:
             return base.commit("write_stream: empty")
-
-        # Stage each segment
         n_segments = (len(data) + segment_size - 1) // segment_size
         for i in range(n_segments):
             start = i * segment_size
             end = min(start + segment_size, len(data))
             segment = data[start:end]
             blob_hash = self.kernel.write(segment)
-            seg_key = f"{_SEG_PREFIX}{i:010d}"  # zero-padded for sort order
+            seg_key = f"{_SEG_PREFIX}{i:010d}"
             base.stage(seg_key, blob_hash)
-
         return base.commit(
             f"write_stream: {len(data)} bytes in {n_segments} segments "
             f"(segment_size={segment_size})")
@@ -146,21 +162,30 @@ class StreamingLens(PondLens):
                     commit_hash: Optional[str] = None) -> bytes:
         """Read a range of bytes from a stream.
 
-        Only reads the segments that overlap [start_byte, end_byte].
-        Segments outside the range are NOT read from the kernel —
-        real I/O savings for large streams on object storage.
-
-        Args:
-            collection: collection name
-            start_byte: inclusive start byte (None = 0)
-            end_byte: exclusive end byte (None = end of stream)
-            commit_hash: read at a specific commit (time-travel)
-
-        Returns:
-            The requested byte range as bytes.
+        Unified path: uses PondStorage.read with start_key/end_key for
+        range scan. Only fetches segments that overlap the byte range.
         """
-        base = self._get_base(collection)
+        # Unified storage path
+        if self._unified_storage is not None:
+            rows = self._unified_storage.read(collection,
+                start_key=start_byte, end_key=end_byte,
+                columns=["offset", "segment"])
+            result = b""
+            for row in rows:
+                seg_offset = row.get("offset", 0)
+                seg_data = row.get("segment", b"")
+                if seg_data is None:
+                    continue
+                # Slice the segment to the requested range
+                seg_start = max(0, (start_byte or 0) - seg_offset)
+                seg_end = min(len(seg_data),
+                              (end_byte or float('inf')) - seg_offset)
+                if seg_end > seg_start:
+                    result += seg_data[seg_start:int(seg_end)]
+            return result
 
+        # Legacy path
+        base = self._get_base(collection)
         if commit_hash:
             state = base.read_state_at_commit(commit_hash)
         else:

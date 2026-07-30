@@ -238,13 +238,25 @@ class VectorLens(PondLens):
 
         rows = []
         for vec_id, vector, metadata in buffer:
-            row = {"id": vec_id}
-            # Store vector as a JSON string (PND2 STRING column) — simpler
-            # than one column per dimension, and still enables point lookup
-            # by id. A future optimization: one FLOAT64 column per dimension
-            # for bbox pruning.
-            row["vector"] = json.dumps(vector)
-            row["metadata"] = json.dumps(metadata)
+            # Fix (Round 24): convert numeric string IDs to int for correct
+            # sorting and stats. _format_rg_key handles int correctly via
+            # bias encoding; string "9" > "49" lexicographically but
+            # int 9 < int 49 numerically.
+            try:
+                row_id = int(vec_id)
+            except (ValueError, TypeError):
+                row_id = vec_id
+            row = {"id": row_id}
+            # Fix (Round 24 Issue #3): store per-dimension FLOAT64 columns
+            # when n_dimensions is set. This enables bbox pruning via
+            # manifest stats (dim_0 min/max per row group).
+            if self._n_dimensions and len(vector) == self._n_dimensions:
+                for d in range(self._n_dimensions):
+                    row[f"dim_{d}"] = float(vector[d])
+            else:
+                # Fallback: store as JSON string (ragged dims or no n_dimensions)
+                row["vector"] = json.dumps(vector)
+            row["metadata"] = json.dumps(metadata) if metadata else "{}"
             rows.append(row)
 
         commit_hash = self._unified_storage.append(
@@ -269,17 +281,32 @@ class VectorLens(PondLens):
         """Retrieve a vector record by ID (returns None if absent).
 
         Unified storage path: 4 GETs cold point lookup.
-        Legacy path: O(log N) via ProllyTreeIndex.
+        Fix (Round 24 Issue #3): reads per-dim FLOAT64 columns when available.
         """
         # Unified storage path
         if self._unified_storage is not None:
+            # Fix (Round 24): convert numeric string ID to int for lookup
+            try:
+                lookup_key = str(int(id))
+            except (ValueError, TypeError):
+                lookup_key = str(id)
+            # Build column list: id + dim_0..dim_N + metadata (or vector + metadata)
+            if self._n_dimensions:
+                cols = ["id"] + [f"dim_{d}" for d in range(self._n_dimensions)] + ["metadata"]
+            else:
+                cols = ["id", "vector", "metadata"]
             row = self._unified_storage.point_lookup(
-                collection, key=str(id), columns=["id", "vector", "metadata"])
+                collection, key=lookup_key, columns=cols)
             if row is None or row.get("id") is None:
                 return None
+            # Reassemble vector from per-dim columns or JSON
+            if self._n_dimensions and f"dim_0" in row:
+                vector = [row.get(f"dim_{d}") for d in range(self._n_dimensions)]
+            else:
+                vector = json.loads(row["vector"]) if row.get("vector") else []
             return {
                 "id": row["id"],
-                "vector": json.loads(row["vector"]),
+                "vector": vector,
                 "metadata": json.loads(row["metadata"]) if row.get("metadata") else {},
             }
 
@@ -317,14 +344,23 @@ class VectorLens(PondLens):
         """Read all vectors from the collection."""
         # Unified storage path
         if self._unified_storage is not None:
-            rows = self._unified_storage.read(
-                collection, columns=["id", "vector", "metadata"])
+            # Fix (Round 24): handle both per-dim and JSON-string vector formats
+            if self._n_dimensions:
+                cols = ["id"] + [f"dim_{d}" for d in range(self._n_dimensions)] + ["metadata"]
+            else:
+                cols = ["id", "vector", "metadata"]
+            rows = self._unified_storage.read(collection, columns=cols)
             result = {}
             for r in rows:
-                if r.get("id"):
-                    result[r["id"]] = {
+                if r.get("id") is not None:
+                    # Reassemble vector from per-dim columns or JSON
+                    if self._n_dimensions and f"dim_0" in r:
+                        vector = [r.get(f"dim_{d}") for d in range(self._n_dimensions)]
+                    else:
+                        vector = json.loads(r["vector"]) if r.get("vector") else []
+                    result[str(r["id"])] = {
                         "id": r["id"],
-                        "vector": json.loads(r["vector"]),
+                        "vector": vector,
                         "metadata": json.loads(r["metadata"]) if r.get("metadata") else {},
                     }
             return result

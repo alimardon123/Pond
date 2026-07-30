@@ -712,3 +712,4 @@ All active files in the repository (excluding archive/, __pycache__, .git):
 - `scripts/test_stats_tree_smoke.py`
 - `scripts/test_unified_storage_smoke.py`
 - `scripts/test_vector_unified.py`
+- scripts/test_multi_workload.py

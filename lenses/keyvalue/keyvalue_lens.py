@@ -670,10 +670,18 @@ class KeyValueLens(PondLens):
     # --- Serialization (override in subclass) ---
 
     def encode(self, data: Any) -> bytes:
+        # Fix (Round 24 Issue #4): handle raw bytes natively for git blobs,
+        # notebook attachments, video segments, etc.
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
         return json.dumps(data, sort_keys=True).encode()
 
     def decode(self, data: bytes) -> Any:
-        return json.loads(data)
+        # Fix (Round 24 Issue #4): return raw bytes if not JSON
+        try:
+            return json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return bytes(data)
 
 
 # ---------------------------------------------------------------------------
