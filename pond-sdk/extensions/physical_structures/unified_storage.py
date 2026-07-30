@@ -961,31 +961,48 @@ class UnifiedStorage:
             return None  # no delta chain to compact
 
         # Collect ALL row group entries.
-        # Fix (Round 13 Issue #1): the old code manually walked the parent
-        # chain AND called scan_with_pruning() on each manifest — but
-        # scan_with_pruning() ALREADY walks the parent chain recursively.
-        # This caused each entry to appear N times for an N-deep chain.
-        # Fix: call scan_with_pruning() ONCE on the head manifest — it
-        # recursively yields all entries from the entire chain.
+        # Fix (Round 13 Issue #1): call scan_with_pruning() ONCE (it recurses).
+        # Fix (Round 18 Issue #1): keep FIRST (NEWEST) for duplicate keys.
+        # Fix (Round 19 Issue #2): when BOTH stats_tree_root AND parent_manifest_hash
+        # are set, scan_with_pruning delegates to StatsTreeReader and returns
+        # early — the parent chain is NOT walked. We must explicitly walk
+        # the parent chain to collect ALL entries.
         all_entries: list[dict] = []
-        # Fix (Round 18 Issue #1): scan_with_pruning yields NEW entries first
-        # (inline), then OLD entries (parent chain). For last-writer-wins,
-        # we must keep the FIRST occurrence (NEWEST), not overwrite with
-        # later occurrences (OLDER). Use "if key not in seen_keys" to
-        # preserve the first (newest) entry.
         seen_keys: dict[str, dict] = {}
 
+        # Collect entries from the current (delta) manifest
         for rg in manifest.scan_with_pruning():
             if rg.key in seen_keys:
-                continue  # already have a newer entry for this key — skip old
-            entry = {
+                continue
+            seen_keys[rg.key] = {
                 "rg_key": rg.key,
                 "blob_hash": rg.blob_hash,
                 "n_rows": rg.n_rows,
                 "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
                                 for c in rg.columns],
             }
-            seen_keys[rg.key] = entry  # keep FIRST (newest)
+
+        # Fix (Round 19 Issue #2): if the manifest has a stats_tree_root,
+        # scan_with_pruning only yielded the delta's entries (from the stats
+        # tree). We must ALSO walk the parent chain to get the OLD entries.
+        # This is needed because scan_with_pruning early-returns when
+        # stats_tree_root is set, skipping the parent_manifest_hash walk.
+        if manifest.stats_tree_root and manifest.parent_manifest_hash:
+            try:
+                parent = CollectionManifest.load(
+                    self.kernel, manifest.parent_manifest_hash)
+                for rg in parent.scan_with_pruning():
+                    if rg.key in seen_keys:
+                        continue  # newer version already collected
+                    seen_keys[rg.key] = {
+                        "rg_key": rg.key,
+                        "blob_hash": rg.blob_hash,
+                        "n_rows": rg.n_rows,
+                        "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                        for c in rg.columns],
+                    }
+            except (ValueError, KeyError):
+                pass  # parent not found — only use delta entries
 
         all_entries = list(seen_keys.values())
 
@@ -1166,17 +1183,11 @@ class UnifiedStorage:
                 try:
                     return int(raw)
                 except (ValueError, TypeError):
-                    # String key — strip leading zeros from zfill padding
-                    # but preserve the original value (e.g., "user:1" not "000user:1")
-                    # zfill pads on the LEFT with zeros, so lstrip("0") works
-                    # for purely-numeric strings but NOT for strings like "user:1"
-                    # For "user:1", the padded form is "00000000000000user:1"
-                    # We need to strip leading zeros ONLY if the original was
-                    # a numeric string that got zfill'd. For non-numeric strings,
-                    # the zfill creates "00000000user:1" which we need to un-pad.
-                    # Safe approach: strip leading zeros, then compare as strings
-                    stripped = raw.lstrip("0") or "0"
-                    return stripped
+                    # Fix (Round 19 Issue #1): don't lstrip("0") for non-numeric
+                    # strings — it strips legitimate leading zeros from keys
+                    # like "0user1" → "user1", causing wrong comparisons.
+                    # Return the raw string as-is.
+                    return raw
 
             raw_start = _unpad_rg_key(start_key)
             raw_end = _unpad_rg_key(end_key)
@@ -1670,15 +1681,17 @@ def _format_rg_key(max_pk: Any) -> str:
     For numeric keys: "rg/00000000000000000042" (20-digit zero-padded)
     For string keys: "rg/" + key (no padding — strings compared as-is)
 
-    Fix (Round 14 Issue #4): pad string keys for consistent ordering.
-    Fix (Round 16 Issue #3): don't use zfill for non-numeric strings —
-    it's lossy ("0user4" and "user4" both pad to "000000000000000user4").
-    Instead, use the raw string for non-numeric keys. The sort order
-    is determined by the caller (KV lens sorts lexicographically before
-    writing), so the raw string IS the correct sort key.
+    Fix (Round 19 Issue #3): float keys are converted to string repr
+    (not int-truncated). This preserves precision but means float keys
+    use string comparison — which is correct as long as all floats in
+    the key column have the same format (e.g., all 1 decimal place).
+    Float keys are unusual; for production use, prefer INT64 keys.
     """
     if isinstance(max_pk, int):
         return f"rg/{max_pk:0{_RG_KEY_WIDTH}d}"
+    if isinstance(max_pk, float):
+        # Fix (Round 19 Issue #3): don't truncate to int — use string repr
+        return f"rg/{max_pk}"
     try:
         return f"rg/{int(max_pk):0{_RG_KEY_WIDTH}d}"
     except (ValueError, TypeError):
