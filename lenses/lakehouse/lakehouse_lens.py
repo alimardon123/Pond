@@ -294,13 +294,19 @@ class LakehouseLens:
                    end_key: Optional[str] = None) -> pa.Table:
         """Range scan — read row groups in a key range.
 
-        The start_key and end_key are the raw key values (e.g., "e0050"),
-        NOT the internal row-group key format (e.g., "rg/e0050"). The lens
-        adds the "rg/" prefix automatically.
+        The start_key and end_key are the raw key values (e.g., "5" or "50").
+        The lens formats them as zero-padded row group keys for correct
+        lexicographic comparison.
         """
-        # Prefix with "rg/" for internal row-group key comparison
-        sk = f"rg/{start_key}" if start_key is not None else None
-        ek = f"rg/{end_key}" if end_key is not None else None
+        # Fix (Round 11 Issue #3): use _format_rg_key for zero-padded keys
+        # instead of raw "rg/{key}" which breaks for numeric keys > 9.
+        try:
+            from unified_storage import _format_rg_key
+            sk = _format_rg_key(start_key) if start_key is not None else None
+            ek = _format_rg_key(end_key) if end_key is not None else None
+        except ImportError:
+            sk = f"rg/{start_key}" if start_key is not None else None
+            ek = f"rg/{end_key}" if end_key is not None else None
         rows = self._storage.read(name, start_key=sk, end_key=ek)
         if not rows:
             return pa.table({})
@@ -408,6 +414,9 @@ class LakehouseLens:
             )
             merge_hash = self.kernel.write(merge_commit_data)
             self.kernel.reference(head_ref, merge_hash)
+            # Fix (Round 11 Issue #5): save the manifest mapping for the
+            # merge commit so time-travel reads work after merge.
+            self._save_commit_manifest(name, merge_hash)
             return merge_hash
         except Exception:
             # If we can't create a merge commit, return the regular commit

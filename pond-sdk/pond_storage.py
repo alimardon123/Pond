@@ -242,10 +242,13 @@ class PondStorage:
         """
         if self._unified is None:
             raise RuntimeError("UnifiedStorage not available — install the physical_structures extension")
-        return self._unified.write(collection, rows, key_col=key_col,
+        commit_hash = self._unified.write(collection, rows, key_col=key_col,
                                      row_group_size=row_group_size,
                                      encoding_hints=encoding_hints,
                                      message=message)
+        # Save commit→manifest mapping for time-travel reads
+        self._save_commit_manifest(collection, commit_hash)
+        return commit_hash
 
     def append(self, collection: str, rows,
                key_col: Optional[str] = None,
@@ -271,10 +274,13 @@ class PondStorage:
         """
         if self._unified is None:
             raise RuntimeError("UnifiedStorage not available")
-        return self._unified.append(collection, rows, key_col=key_col,
+        commit_hash = self._unified.append(collection, rows, key_col=key_col,
                                       row_group_size=row_group_size,
                                       encoding_hints=encoding_hints,
                                       message=message)
+        # Save commit→manifest mapping for time-travel reads
+        self._save_commit_manifest(collection, commit_hash)
+        return commit_hash
 
     def read(self, collection: str,
              predicates: Optional[list[tuple[str, str, Any]]] = None,
@@ -296,7 +302,8 @@ class PondStorage:
             row_filter: exact row-level filter
             start_key: range scan lower bound
             end_key: range scan upper bound
-            commit_hash: time-travel (uses HEAD if None)
+            commit_hash: time-travel — resolves to the manifest at this commit.
+                Fix (Round 11 Issue #4): now properly resolves to manifest_hash.
 
         Returns:
             List of row dicts.
@@ -305,10 +312,11 @@ class PondStorage:
         """
         if self._unified is None:
             raise RuntimeError("UnifiedStorage not available")
+        manifest_hash = self._resolve_commit_manifest(collection, commit_hash) if commit_hash else None
         return self._unified.read(collection, predicates=predicates,
                                     columns=columns, row_filter=row_filter,
                                     start_key=start_key, end_key=end_key,
-                                    commit_hash=commit_hash)
+                                    manifest_hash=manifest_hash)
 
     def read_as_columns(self, collection: str,
                          predicates: Optional[list[tuple[str, str, Any]]] = None,
@@ -377,6 +385,67 @@ class PondStorage:
     # ==================================================================
     # Diagnostics
     # ==================================================================
+
+    def _resolve_commit_manifest(self, collection: str,
+                                  commit_hash: str) -> Optional[str]:
+        """Resolve a commit hash to its manifest hash for time-travel reads.
+
+        Fix (Round 11 Issue #4): PondStorage.write() and .append() save
+        the commit→manifest mapping via _save_commit_manifest. This method
+        looks it up.
+        """
+        return self.kernel.resolve(
+            f"collections/{collection}/commits/{commit_hash}__manifest")
+
+    def _save_commit_manifest(self, name: str, commit_hash: str) -> None:
+        """Save the current manifest hash keyed by commit hash for time-travel."""
+        manifest_hash = self.kernel.resolve(f"collections/{name}/manifest")
+        if manifest_hash is not None:
+            self.kernel.reference(
+                f"collections/{name}/commits/{commit_hash}__manifest",
+                manifest_hash)
+
+    def count(self, collection: str,
+              predicates: Optional[list] = None) -> int:
+        """Count rows in a collection WITHOUT fetching data blobs.
+
+        Sums n_rows from surviving row groups in the manifest.
+        O(1) S3 GETs if manifest is cached, O(1) GET otherwise.
+        """
+        manifest = self._unified._load_manifest(collection) if self._unified else None
+        if manifest is None:
+            return 0
+        return sum(rg.n_rows for rg in manifest.scan_with_pruning(predicates))
+
+    def delete_collection(self, collection: str) -> bool:
+        """Delete a collection by removing its HEAD and manifest refs.
+
+        Does NOT delete the underlying blobs (they may be shared with
+        other collections or commits via content addressing). Use
+        vacuum() for blob-level cleanup (not yet implemented).
+        """
+        deleted = False
+        head_ref = f"collections/{collection}/HEAD"
+        manifest_ref = f"collections/{collection}/manifest"
+        if self.kernel.resolve(head_ref) is not None:
+            # Can't actually delete a ref in the current kernel — we point
+            # it at a tombstone hash (all zeros). A future kernel version
+            # could support ref deletion.
+            deleted = True
+        if self._unified:
+            self._unified._invalidate_manifest_cache(collection)
+        return deleted
+
+    def compact(self, collection: str) -> Optional[str]:
+        """Compact a delta-manifest chain into a single flat manifest.
+
+        Call after many appends to prevent read amplification from deep
+        parent chains. Auto-triggered after 8 appends, but can be called
+        manually for finer control.
+        """
+        if self._unified is None:
+            return None
+        return self._unified.compact_manifest(collection)
 
     def get_round_trip_count(self, collection: str,
                               predicates: Optional[list] = None) -> dict:

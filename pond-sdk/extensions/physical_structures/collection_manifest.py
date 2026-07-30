@@ -776,10 +776,27 @@ class CollectionManifest:
                 continue
             yield rg
 
-        # Walk parent chain for delta-manifests
+        # Walk parent chain for delta-manifests.
+        # Fix (Round 11 Issue #2): the parent may use a stats tree, in which
+        # case parent.scan_with_pruning() delegates to StatsTreeReader and
+        # yields ALL parent entries. But the parent's stats tree contains
+        # the BASE entries — the inline entries above are the DELTA.
+        # So we must NOT re-yield entries that are already in the parent.
+        # The parent chain walk handles this correctly: inline entries are
+        # new (appended), parent entries are old (existing). They have
+        # different rg_keys so no duplicates.
+        #
+        # HOWEVER: when the parent itself has a parent (delta chain depth > 1),
+        # the parent's scan_with_pruning yields BOTH its inline entries AND
+        # its parent's entries. If we then also load the grandparent, we get
+        # duplicates. Fix: only walk ONE level — the immediate parent — and
+        # let the parent's own scan_with_pruning handle its parent chain.
         if self._parent_manifest_hash:
             try:
                 parent = CollectionManifest.load(self.kernel, self._parent_manifest_hash)
+                # Delegate to parent.scan_with_pruning which handles its own
+                # parent chain (or stats tree) recursively. This avoids
+                # duplicate yields from multi-level delta chains.
                 yield from parent.scan_with_pruning(predicates, start_key, end_key)
             except (ValueError, KeyError):
                 pass  # parent manifest not found — return only inline entries

@@ -706,7 +706,12 @@ class UnifiedStorage:
                     base.stage_delete(rg.key)
 
         if n_rows == 0:
+            # Fix (Round 11 Issue #1): empty write must still update the
+            # manifest so the collection shows as empty (not stale data).
+            # Build an empty manifest and commit it.
             commit_hash = base.commit(message or f"write: empty table")
+            self._build_manifest(collection, [], schema_columns,
+                                  key_col or "", row_group_size)
             self._invalidate_manifest_cache(collection)
             return commit_hash
 
@@ -897,7 +902,122 @@ class UnifiedStorage:
                               key_col or "", row_group_size,
                               parent_manifest_hash=parent_hash)
         self._invalidate_manifest_cache(collection)
+
+        # Fix (Round 11 Issue #2): auto-compact if the delta chain is too deep.
+        # After DELTA_CHAIN_THRESHOLD appends, flatten the chain to avoid
+        # O(chain_depth) read amplification.
+        DELTA_CHAIN_THRESHOLD = 8
+        new_manifest = self._load_manifest(collection)
+        if new_manifest and new_manifest.parent_manifest_hash:
+            chain_depth = 0
+            check = new_manifest
+            while check and check.parent_manifest_hash:
+                chain_depth += 1
+                try:
+                    check = CollectionManifest.load(
+                        self.kernel, check.parent_manifest_hash)
+                except (ValueError, KeyError):
+                    break
+            if chain_depth >= DELTA_CHAIN_THRESHOLD:
+                self.compact_manifest(collection)
+
         return commit_hash
+
+    def compact_manifest(self, collection: str) -> Optional[str]:
+        """Compact a delta-manifest chain into a single flat manifest.
+
+        Fix (Round 11 Issue #2): delta-manifests grow unbounded without
+        compaction. After K appends, reads require K extra GETs to walk
+        the parent chain. This method walks the chain, collects ALL row
+        group entries, and writes a single flat manifest with no parent.
+
+        Should be called periodically (e.g., after every 8 appends, or
+        when the chain depth exceeds a threshold).
+
+        Returns:
+            The new (compacted) manifest hash, or None if no compaction
+            was needed.
+        """
+        manifest = self._load_manifest(collection)
+        if manifest is None or manifest.parent_manifest_hash is None:
+            return None  # no delta chain to compact
+
+        # Walk the parent chain and collect ALL row group entries
+        # Use scan_with_pruning() (not .row_groups) because parents may
+        # use a stats tree (which stores entries externally, not inline).
+        all_entries: list[dict] = []
+        visited: set[str] = set()
+        current: Optional[CollectionManifest] = manifest
+
+        while current is not None:
+            current_hash = current.parent_manifest_hash or "root"
+            if current_hash in visited:
+                break  # cycle detection
+            visited.add(current_hash)
+
+            # Use scan_with_pruning() to get ALL entries — works for both
+            # flat manifests (inline row_groups) AND stats-tree manifests
+            for rg in current.scan_with_pruning():
+                all_entries.append({
+                    "rg_key": rg.key,
+                    "blob_hash": rg.blob_hash,
+                    "n_rows": rg.n_rows,
+                    "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                    for c in rg.columns],
+                })
+
+            if current.parent_manifest_hash:
+                try:
+                    current = CollectionManifest.load(
+                        self.kernel, current.parent_manifest_hash)
+                except (ValueError, KeyError):
+                    break
+            else:
+                break
+
+        # Sort by rg_key (fix from Round 9)
+        all_entries.sort(key=lambda e: e["rg_key"])
+
+        # Write a flat manifest (no parent, no stats tree)
+        schema_columns = manifest.columns
+        key_col = manifest.key_col
+        row_group_size = manifest.row_group_size
+
+        new_manifest = CollectionManifest(self.kernel)
+        new_manifest.set_schema(
+            columns=schema_columns,
+            key_col=key_col,
+            row_group_size=row_group_size,
+            chunk_size=0,
+        )
+        for entry in all_entries:
+            rg = RowGroupEntry(
+                key=entry["rg_key"],
+                blob_hash=entry["blob_hash"],
+                n_rows=entry["n_rows"],
+                storage_mode=STORAGE_WHOLE_BLOB,
+            )
+            for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
+                rg.columns.append(ColumnStatsEntry(
+                    name=col_name, value_type=vtype,
+                    min=mn, max=mx, null_count=null_count, chunks=[],
+                ))
+            new_manifest.add_row_group(rg)
+
+        # Check if we need a stats tree
+        try:
+            from stats_tree import should_use_stats_tree, build_stats_tree
+            if should_use_stats_tree(len(all_entries)):
+                stats_tree_root = build_stats_tree(
+                    self.kernel, new_manifest.row_groups)
+                new_manifest.set_stats_tree_root(stats_tree_root)
+        except ImportError:
+            pass
+
+        new_hash = new_manifest.commit()
+        self.kernel.reference(self._manifest_ref(collection), new_hash)
+        self._invalidate_manifest_cache(collection)
+        return new_hash
 
     def _build_manifest(self, collection: str,
                          entries: list[dict],
