@@ -946,38 +946,27 @@ class UnifiedStorage:
         if manifest is None or manifest.parent_manifest_hash is None:
             return None  # no delta chain to compact
 
-        # Walk the parent chain and collect ALL row group entries
-        # Use scan_with_pruning() (not .row_groups) because parents may
-        # use a stats tree (which stores entries externally, not inline).
+        # Collect ALL row group entries.
+        # Fix (Round 13 Issue #1): the old code manually walked the parent
+        # chain AND called scan_with_pruning() on each manifest — but
+        # scan_with_pruning() ALREADY walks the parent chain recursively.
+        # This caused each entry to appear N times for an N-deep chain.
+        # Fix: call scan_with_pruning() ONCE on the head manifest — it
+        # recursively yields all entries from the entire chain.
         all_entries: list[dict] = []
-        visited: set[str] = set()
-        current: Optional[CollectionManifest] = manifest
+        seen_keys: set[str] = set()  # deduplicate by rg_key (defensive)
 
-        while current is not None:
-            current_hash = current.parent_manifest_hash or "root"
-            if current_hash in visited:
-                break  # cycle detection
-            visited.add(current_hash)
-
-            # Use scan_with_pruning() to get ALL entries — works for both
-            # flat manifests (inline row_groups) AND stats-tree manifests
-            for rg in current.scan_with_pruning():
-                all_entries.append({
-                    "rg_key": rg.key,
-                    "blob_hash": rg.blob_hash,
-                    "n_rows": rg.n_rows,
-                    "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
-                                    for c in rg.columns],
-                })
-
-            if current.parent_manifest_hash:
-                try:
-                    current = CollectionManifest.load(
-                        self.kernel, current.parent_manifest_hash)
-                except (ValueError, KeyError):
-                    break
-            else:
-                break
+        for rg in manifest.scan_with_pruning():
+            if rg.key in seen_keys:
+                continue  # skip duplicates (shouldn't happen after fix, but defensive)
+            seen_keys.add(rg.key)
+            all_entries.append({
+                "rg_key": rg.key,
+                "blob_hash": rg.blob_hash,
+                "n_rows": rg.n_rows,
+                "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                for c in rg.columns],
+            })
 
         # Sort by rg_key (fix from Round 9)
         all_entries.sort(key=lambda e: e["rg_key"])
@@ -1127,27 +1116,27 @@ class UnifiedStorage:
 
         # Build a combined row filter: caller's row_filter AND automatic
         # filters for predicates not handled at the encoded-eval level.
-        #
-        # PND2.decode() only evaluates the FIRST predicate that exists in
-        # the blob's columns (Vortex-style encoded eval). The remaining
-        # predicates must be applied as a post-decode row filter, otherwise
-        # multi-predicate queries return WRONG RESULTS (silently include
-        # rows that violate predicates[1:]).
-        #
-        # Fix (Round 2 Issue #1): derive an automatic row_filter from
-        # predicates[1:] (or all predicates if none were eval'd) and AND
-        # it with the caller's row_filter.
         auto_filter = self._build_predicate_filter(predicates)
         combined_filter = self._combine_filters(row_filter, auto_filter)
+
+        # Fix (Round 13 Issue #2): ensure predicate columns are always decoded
+        # even if the caller's projection doesn't include them. Without this,
+        # the auto_filter sees None for predicate columns not in the projection
+        # and silently filters out ALL rows.
+        eff_columns = list(columns) if columns is not None else None
+        if predicates and eff_columns is not None:
+            pred_cols = {p[0] for p in predicates}
+            missing = pred_cols - set(eff_columns)
+            if missing:
+                eff_columns = list(dict.fromkeys(eff_columns + list(missing)))
 
         # Walk surviving row groups via manifest (in-memory pruning — 0 GETs)
         all_rows: list[dict] = []
         for rg in manifest.scan_with_pruning(predicates, start_key, end_key):
             blob_bytes = self.kernel.read_blob(rg.blob_hash)
 
-            # Decode the blob (with projection + predicate pushdown for
-            # the FIRST predicate only — see PND2.decode docstring)
-            col_data = PND2.decode(blob_bytes, columns=columns,
+            # Decode the blob with effective columns (includes predicate cols)
+            col_data = PND2.decode(blob_bytes, columns=eff_columns,
                                      predicates=predicates)
 
             # Convert column-oriented data to row-oriented dicts
@@ -1157,6 +1146,10 @@ class UnifiedStorage:
                 row = {c: col_data[c][i] if i < len(col_data[c]) else None
                         for c in col_names}
                 if combined_filter is None or combined_filter(row):
+                    # Strip predicate-only columns from the result if the
+                    # caller didn't request them
+                    if columns is not None and eff_columns != columns:
+                        row = {c: row[c] for c in columns if c in row}
                     all_rows.append(row)
 
         return all_rows
@@ -1241,21 +1234,29 @@ class UnifiedStorage:
         if not surviving:
             return {}
 
+        # Fix (Round 13 Issue #2): ensure predicate columns are always decoded
+        eff_columns = list(columns) if columns is not None else None
+        if predicates and eff_columns is not None:
+            pred_cols = {p[0] for p in predicates}
+            missing = pred_cols - set(eff_columns)
+            if missing:
+                eff_columns = list(dict.fromkeys(eff_columns + list(missing)))
+
         # PARALLEL fetch: fetch all surviving blobs concurrently.
         col_results = self._parallel_fetch_and_decode(
-            surviving, columns, predicates)
+            surviving, eff_columns, predicates)
 
         # Fix (Round 12 Issue #1): apply multi-predicate filter.
-        # PND2.decode only evaluates the FIRST predicate at the encoded level.
-        # We must re-apply ALL predicates as a post-decode row filter.
         auto_filter = self._build_predicate_filter(predicates)
 
         # Merge column results across row groups, applying the filter
         result: dict[str, list] = {}
         for col_data in col_results:
             if auto_filter is None:
-                # No filter needed — merge directly
+                # No filter needed — merge directly (but strip predicate-only cols)
                 for col_name, values in col_data.items():
+                    if columns is not None and col_name not in columns:
+                        continue  # skip predicate-only columns
                     if col_name not in result:
                         result[col_name] = []
                     result[col_name].extend(values)
@@ -1267,10 +1268,12 @@ class UnifiedStorage:
                     row = {c: col_data[c][i] if i < len(col_data[c]) else None
                             for c in col_names}
                     if auto_filter(row):
-                        for c in col_names:
+                        # Only include requested columns (strip predicate-only cols)
+                        out_cols = columns if columns is not None else col_names
+                        for c in out_cols:
                             if c not in result:
                                 result[c] = []
-                            result[c].append(row[c])
+                            result[c].append(row.get(c))
 
         return result
 

@@ -446,12 +446,20 @@ class LakehouseLens:
 
         Uses the branch's manifest hash directly — NO ref mutation.
         Fix (Round 9 Issue #2): no more swap-then-restore race condition.
+        Fix (Round 13 Issue #4): falls back to HEAD manifest if branch
+        was created via branch() (not commit_to_branch()). A fresh branch
+        points at HEAD, so HEAD's manifest IS the correct manifest.
         """
         branch_manifest_ref = f"collections/{name}/branches/{branch_name}__manifest"
         branch_manifest = self.kernel.resolve(branch_manifest_ref)
+
+        # Fix (Round 13 Issue #4): if no branch-specific manifest exists
+        # (branch was created via branch(), not commit_to_branch()),
+        # fall back to the HEAD manifest — a fresh branch shares HEAD's data.
         if branch_manifest is None:
-            # Fall back to HEAD manifest if no branch-specific manifest
-            raise KeyError(f"Branch '{branch_name}' has no manifest (was it created via commit_to_branch?)")
+            branch_manifest = self.kernel.resolve(f"collections/{name}/manifest")
+        if branch_manifest is None:
+            raise KeyError(f"Branch '{branch_name}' not found and no HEAD manifest exists")
 
         # Read using the branch's manifest — no ref mutation, no race condition
         return self._read_as_arrow_with_manifest(name, branch_manifest)
