@@ -514,8 +514,11 @@ class StatsTreeReader:
                 # Key range filter
                 if start_key is not None and rg.key < start_key:
                     continue
-                if end_key is not None and rg.key > end_key:
-                    continue
+                # Fix (Round 21 Issue #1): DON'T prune on end_key using rg.key
+                # (max_pk). The group may contain rows <= end_key even when
+                # max_pk > end_key. The row-level range_filter in UnifiedStorage
+                # handles the exact boundary. Just don't skip here.
+                # (Same fix as Round 16 Issue #1 in collection_manifest.py)
                 # Predicate pruning
                 if predicates and rg.can_prune(predicates):
                     continue
