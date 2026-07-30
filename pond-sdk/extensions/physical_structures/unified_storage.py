@@ -805,6 +805,9 @@ class UnifiedStorage:
         # Sort by key_col if specified (empty string = no key col)
         if key_col == "":
             key_col = None
+        # Fix (Round 14 Issue #5): inherit existing manifest key_col
+        if key_col is None and existing_manifest.key_col:
+            key_col = existing_manifest.key_col
         if key_col is not None and key_col in source.column_names():
             source = _sort_source_by(source, key_col)
             key_array = source.column_slice(key_col, 0, n_rows)
@@ -1130,6 +1133,45 @@ class UnifiedStorage:
             if missing:
                 eff_columns = list(dict.fromkeys(eff_columns + list(missing)))
 
+        # Fix (Round 14 Issue #2): apply row-level key range filter.
+        # scan_with_pruning filters at row-group granularity (by max_pk),
+        # but individual rows within a surviving row group may be outside
+        # the requested range. We need a row-level filter on the key column.
+        key_col_name = manifest.key_col
+        if (start_key is not None or end_key is not None) and key_col_name:
+            # Parse raw key values from the formatted "rg/..." strings
+            raw_start = None
+            raw_end = None
+            if start_key is not None:
+                try:
+                    raw_start = int(start_key.replace("rg/", "").lstrip("0") or "0")
+                except (ValueError, AttributeError):
+                    raw_start = start_key.replace("rg/", "") if start_key else None
+            if end_key is not None:
+                try:
+                    raw_end = int(end_key.replace("rg/", "").lstrip("0") or "0")
+                except (ValueError, AttributeError):
+                    raw_end = end_key.replace("rg/", "") if end_key else None
+
+            def range_filter(row):
+                v = row.get(key_col_name)
+                if v is None:
+                    return False
+                try:
+                    if raw_start is not None and v < raw_start:
+                        return False
+                    if raw_end is not None and v > raw_end:
+                        return False
+                except TypeError:
+                    # Type mismatch — compare as strings
+                    sv = str(v)
+                    if raw_start is not None and sv < str(raw_start):
+                        return False
+                    if raw_end is not None and sv > str(raw_end):
+                        return False
+                return True
+            combined_filter = self._combine_filters(combined_filter, range_filter)
+
         # Walk surviving row groups via manifest (in-memory pruning — 0 GETs)
         all_rows: list[dict] = []
         for rg in manifest.scan_with_pruning(predicates, start_key, end_key):
@@ -1409,17 +1451,20 @@ class UnifiedStorage:
         # Fix (Round 2 Issue #4): the old code returned the FIRST row of
         # the row group, not the matching row. Now we decode with a
         # predicate on the key column and return the (single) match.
+        # Fix (Round 14 Issue #3): always include key_col in decoded columns
+        # so the predicate eval and verification work even with RAW encoding.
         key_col = manifest.key_col
         if key_col:
             # Try to coerce the key to the right type for comparison
-            # (manifest keys are strings like "rg/9", but the key column
-            # may be INT64)
             try:
-                # If the key is all digits, try int comparison
                 key_val = int(key) if key.lstrip("-").isdigit() else key
             except (ValueError, AttributeError):
                 key_val = key
-            col_data = PND2.decode(blob_bytes, columns=columns,
+            # Fix (Round 14 Issue #3): ensure key_col is always decoded
+            eff_columns = list(columns) if columns is not None else None
+            if eff_columns is not None and key_col not in eff_columns:
+                eff_columns = eff_columns + [key_col]
+            col_data = PND2.decode(blob_bytes, columns=eff_columns,
                                      predicates=[(key_col, "=", key_val)])
         else:
             col_data = PND2.decode(blob_bytes, columns=columns)
@@ -1436,11 +1481,13 @@ class UnifiedStorage:
                 row_key = row[key_col]
                 try:
                     if str(row_key) == str(key) or row_key == int(key):
+                        # Fix (Round 14 Issue #3): strip key_col if not in caller's projection
+                        if columns is not None and key_col not in columns:
+                            row = {c: row[c] for c in columns if c in row}
                         return row
                 except (ValueError, TypeError):
                     pass
-            else:
-                return row  # no key column — return first row
+            # Don't return first row as fallback — that's a bug (R2 fix)
         return None
 
     def scan_with_pruning(self, collection: str,
@@ -1498,9 +1545,18 @@ class UnifiedStorage:
 
         auto_filter = self._build_predicate_filter(predicates)
 
+        # Fix (Round 14 Issue #1): ensure predicate columns are always decoded
+        # even if not in the caller's projection (same fix as read()/read_as_columns())
+        eff_columns = list(columns) if columns is not None else None
+        if predicates and eff_columns is not None:
+            pred_cols = {p[0] for p in predicates}
+            missing = pred_cols - set(eff_columns)
+            if missing:
+                eff_columns = list(dict.fromkeys(eff_columns + list(missing)))
+
         for rg in manifest.scan_with_pruning(predicates):
             blob_bytes = self.kernel.read_blob(rg.blob_hash)
-            col_data = PND2.decode(blob_bytes, columns=columns,
+            col_data = PND2.decode(blob_bytes, columns=eff_columns,
                                      predicates=predicates)
 
             row_count = max((len(v) for v in col_data.values()), default=0)
@@ -1514,6 +1570,9 @@ class UnifiedStorage:
                     row = {c: col_data[c][i] if i < len(col_data[c]) else None
                             for c in col_names}
                     if auto_filter is None or auto_filter(row):
+                        # Strip predicate-only columns from the result
+                        if columns is not None and eff_columns != columns:
+                            row = {c: row[c] for c in columns if c in row}
                         batch.append(row)
                 if batch:
                     yield batch
@@ -1575,7 +1634,11 @@ def _format_rg_key(max_pk: Any) -> str:
     """Format a row group key with zero-padding for correct lexicographic ordering.
 
     For numeric keys: "rg/00000000000000000042" (20-digit zero-padded)
-    For string keys: "rg/" + key (no padding — caller must pad if needed)
+    For string keys: "rg/" + key.zfill(20) (left-padded for consistent ordering)
+
+    Fix (Round 14 Issue #4): previously, non-numeric string keys were used
+    as-is without padding, causing sort/pad mismatch. Now ALL keys are
+    padded to _RG_KEY_WIDTH for consistent lexicographic ordering.
 
     This ensures "rg/9" < "rg/42" (because "000...9" < "000...42" lexically).
     """
@@ -1586,8 +1649,10 @@ def _format_rg_key(max_pk: Any) -> str:
     try:
         return f"rg/{int(max_pk):0{_RG_KEY_WIDTH}d}"
     except (ValueError, TypeError):
-        # Non-numeric key — use as-is (caller's responsibility to pad)
-        return f"rg/{max_pk}"
+        # Non-numeric string key — pad to fixed width for consistent
+        # lexicographic ordering (matches the sort order the caller used)
+        s = str(max_pk)
+        return f"rg/{s.zfill(_RG_KEY_WIDTH)}"
 
 
 def _detect_value_type_with_binary(values: list) -> int:
