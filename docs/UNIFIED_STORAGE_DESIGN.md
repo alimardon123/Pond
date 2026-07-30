@@ -1,157 +1,255 @@
-# Unified Stats Index — One Blob, Two Round Trips, Any Workload
+# Unified Storage — ONE format, ONE write path, ONE read path
 
-## The insight
+**Date:** 2026-07-30
+**Status:** Design + implementation
+**Mandate:** "Simpler storage solution that unifies all workloads in same storage format regardless of use with no overhead for writes and reads."
 
-The user's concern: "reading many blobs to check stats = same as raw Parquet."
+## The problem we're solving
 
-The solution is NOT to embed stats in every data blob (that still requires
-N fetches to check N blobs). The solution is a **single stats index blob**
-that aggregates min/max/null_count across ALL row groups in the collection.
+After the manifest work, Pond has:
+- **3 write modes**: `range_write` (whole-blob Parquet), `range_write_column_chunks` (per-column Parquet blobs), `range_write_encoded` (per-column encoded blobs)
+- **4+ read modes**: `read_table`, `read_with_pruning`, `read_with_column_chunk_pruning`, `read_with_encoded_pruning`, `read_table_via_manifest`, `read_with_pruning_via_manifest`, `range_point_lookup_via_manifest`
+- **2 index types**: `ZoneMapIndex` (legacy), `CollectionManifest` (new)
+- **Multiple "storage modes"**: `STORAGE_WHOLE_BLOB`, `STORAGE_COLUMN_CHUNKS`, `STORAGE_ENCODED`
 
-## How other systems solve this
+This is too many choices. The user wants ONE format, ONE write, ONE read — with zero overhead.
 
-| System | Index structure | Round trips to find 1 matching row |
-|--------|----------------|-----------------------------------|
-| Iceberg | Manifest file (lists data files + stats) | 2 (manifest + 1 data file) |
-| Delta Lake | Transaction log (_delta_log/) | 2 (log + 1 data file) |
-| Parquet | Row-group footer (embedded) | N (must read each file's footer) |
-| Database B-tree | Index pages (separate, cached) | O(log N) page reads + 1 data page |
-| **Pond (this design)** | **Stats index blob (1 blob, content-addressed)** | **2 (stats blob + 1 data blob)** |
+## The unified design
 
-Pond's advantage over Iceberg/Delta: the stats index is content-addressed
-and versioned. Time-travel to commit X reads the stats index at commit X.
-Branching creates a new stats index for the branch. No transaction log
-to replay — just ref resolution.
+### ONE format: PND2 (Pond Blob v2)
 
-## Design
-
-### Stats Index Blob
-
-A single JSON blob stored at ref `collections/{name}/stats`. Contains
-an entry for every row group in the collection:
-
-```json
-[
-  {
-    "key": "rg/9999",
-    "blob_hash": "abc123...",
-    "n_rows": 10000,
-    "columns": {
-      "age": {"min": 0, "max": 99, "null_count": 0},
-      "region": {"min": "ASIA", "max": "US", "null_count": 0}
-    }
-  },
-  {
-    "key": "rg/19999",
-    "blob_hash": "def456...",
-    "n_rows": 10000,
-    "columns": {
-      "age": {"min": 0, "max": 99, "null_count": 0},
-      "region": {"min": "ASIA", "max": "US", "null_count": 0}
-    }
-  }
-]
-```
-
-Size: ~200 bytes per row group. For 100 row groups: ~20KB — ONE fetch.
-
-### Write Path
-
-When the lens commits a write (via ProllyLensBase.commit), it also
-updates the stats index:
-
-1. Encode data chunks (existing path)
-2. Compute per-row-group stats (min/max/null_count per column)
-3. Build the stats index blob (JSON array of all row groups)
-4. Write it to the kernel: `kernel.write(stats_bytes)`
-5. Point the ref: `kernel.reference("collections/{name}/stats", stats_hash)`
-6. Commit (the stats ref is part of the commit's namespace)
-
-The stats index is **always in sync** with the data — it's updated in
-the same commit. No separate `commit_zone_maps` call.
-
-### Read Path (2 round trips total)
+A single binary blob format for **every** workload:
 
 ```
-1. Fetch stats index blob (1 fetch — ~20KB for 100 row groups)
-   → Evaluate predicate against ALL row groups' stats
-   → Identify the 1-2 surviving row groups
-
-2. Fetch surviving data blobs (1-2 fetches)
-   → Decode and return rows
-
-Total: 2-3 round trips, regardless of collection size.
++--------------------------------+
+| Magic (4B): b"PND2"            |
+| Version (1B): 2                |
+| Flags (1B):                    |
+|   bit 0: has_stats             |
+|   bit 1: compressed            |
+|   bit 2-7: reserved            |
+| n_rows (4B uint32)             |
+| n_columns (2B uint16)          |
++--------------------------------+
+| Schema section:                |
+|   For each column:             |
+|     name_len (1B)              |
+|     name (UTF-8)               |
+|     value_type (1B)            |  1=INT64, 2=FLOAT64, 3=STRING, 4=NULL, 5=BINARY
+|     encoding (1B)              |  0=raw, 1=rle, 2=dict, 3=bitpack
++--------------------------------+
+| Stats section (if has_stats):  |
+|   For each column:             |
+|     has_min (1B)               |
+|     min (8B or var-len)        |
+|     max (8B or var-len)        |
+|     null_count (4B)            |
++--------------------------------+
+| Compression tag (1B)           |  0=none, 1=lz4, 2=zstd (if compressed flag)
++--------------------------------+
+| Payload:                       |
+|   For each column:             |
+|     payload_len (4B)           |
+|     encoded bytes (variable)   |
++--------------------------------+
 ```
 
-For a point lookup (1 row group): **2 round trips** (stats + 1 data blob).
-For a 1% selectivity query (1 of 100 row groups): **2 round trips**.
-For a full scan (no predicate): **1 round trip** (skip stats, fetch all).
+**ONE blob per row group.** All columns in one blob. Stats in the header. Compression transparent. Encoding auto-selected per column.
 
-### What about per-column-chunk pruning?
+### ONE write path
 
-Per-column-chunk stats (finer than row-group) can be embedded in the
-data blob header (the `embedded_stats.py` module we already built).
-This gives a THIRD level of pruning:
+```python
+def write(collection, rows, key_col=None, row_group_size=10_000):
+    """
+    rows: a ColumnSource (any lens can produce one — pa.Table, list[dict], etc.)
+    """
+    # 1. Split rows into row groups of `row_group_size` rows each
+    # 2. For each row group:
+    #    a. For each column:
+    #       - Auto-select encoding (RLE/DICT/BITPACK/RAW)
+    #       - Encode values → encoded_bytes + enc_meta
+    #       - Compute stats (min/max/null_count) DURING encode (free, one pass)
+    #    b. Build PND2 blob: header + schema + stats + compressed payload
+    #    c. Write blob to kernel → blob_hash
+    # 3. Build manifest with all row-group blob hashes + inline stats
+    # 4. Commit (HEAD → commit → manifest → blobs)
+```
 
-1. Stats index blob → skip non-matching row groups (2 round trips)
-2. Data blob header → skip non-matching column chunks (0 extra fetch)
-3. Encoded predicate eval → skip non-matching rows (0 extra fetch)
+No choices. No modes. No separate index updates. Stats are computed during encode (zero overhead — same loop that encodes also tracks min/max/null_count).
 
-But the stats index blob is the KEY innovation — it's the single fetch
-that eliminates 99% of data blob fetches.
+### ONE read path
 
-### S3 performance
+```python
+def read(collection, predicates=None, columns=None, commit_hash=None):
+    """
+    Returns rows (as a ColumnSource-compatible structure).
+    """
+    # 1. Resolve HEAD → commit_hash (SQLite, free)
+    # 2. Fetch commit blob (S3 GET #1)
+    # 3. Resolve manifest ref (SQLite, free)
+    # 4. Fetch manifest blob (S3 GET #2 — has ALL stats + blob hashes)
+    # 5. Evaluate predicates IN MEMORY against manifest stats
+    #    → K surviving row groups (0 S3 GETs)
+    # 6. For each surviving row group (parallel):
+    #    a. Fetch blob (S3 GET)
+    #    b. Read stats from header (free — already in the blob)
+    #    c. Optional: third-level pruning via embedded stats
+    #    d. Decompress payload (transparent)
+    #    e. For each requested column (projection pushdown):
+    #       - Decode the column's encoded bytes
+    #       - Optional: Vortex-style predicate eval on encoded form
+    # 7. Concatenate row groups → return rows
+```
 
-| Query type | Without stats index | With stats index |
-|-----------|--------------------|-----------------|
-| Point lookup | 100 fetches (scan all) | 2 fetches (stats + 1 blob) |
-| 1% selectivity | 100 fetches | 3 fetches (stats + 1 blob) |
-| 10% selectivity | 100 fetches | 12 fetches (stats + 11 blobs) |
-| Full scan | 100 fetches | 100 fetches (skip stats) |
+No choices. No modes. Just: manifest → prune → fetch → decode.
 
-### What gets removed
+### Round trips: 2 + K (the irreducible minimum)
 
-- `ZoneMapIndex` class (460 LOC) — replaced by a single stats blob
-- Zone-map ProllyTreeIndex (separate tree per collection)
-- `add_zone_map`, `commit_zone_maps`, `clear_zone_maps`, `iter_zone_maps`
-- Zone-map manifest blob (the previous optimization — superseded)
-- Per-row-group zone-map blobs (N small blobs → 1 stats blob)
+For a content-addressed store:
+1. Commit blob (immutable, gives manifest_hash)
+2. Manifest blob (immutable, gives blob hashes + stats)
+3. K data blobs (parallel, the actual data)
 
-### What stays
+That's the minimum. The unified storage achieves it.
 
-- `PruningPredicate` / `ColumnPredicate` — evaluate against stats
-- `ColumnSource` — format-agnostic data access
-- `encode_fn` / `decode_fn` — lens's format contract
-- All 4 encodings + compression — unchanged
-- `embedded_stats.py` — optional third-level pruning in blob headers
+## What gets removed
 
-### Generic
+| Component | Status |
+| --- | --- |
+| `range_write` (whole-blob Parquet) | Replaced by `write_unified` |
+| `range_write_column_chunks` | Replaced by `write_unified` |
+| `range_write_encoded` | Replaced by `write_unified` |
+| `read_with_pruning` | Replaced by `read_unified` |
+| `read_with_column_chunk_pruning` | Replaced by `read_unified` |
+| `read_with_encoded_pruning` | Replaced by `read_unified` |
+| `STORAGE_WHOLE_BLOB` / `STORAGE_COLUMN_CHUNKS` / `STORAGE_ENCODED` | Single mode now |
+| `ColumnChunkStorage` class | One blob per row group, no per-chunk blobs |
+| `EncodedChunkStorage` class | Encoding is automatic, no separate class |
+| `ColumnChunkZoneMap` class | Stats are inline in the PND2 blob |
+| `ZoneMapIndex` class | Manifest replaces it |
+| `StatsIndex` class | Manifest replaces it |
+| `PruningReader` class | `read_unified` does pruning inline |
+| `encode_fn` / `decode_fn` (lens-owned) | PND2 owns the format; lens provides a `ColumnSource` |
 
-The stats index works for ANY workload:
-- **Tabular**: columns are table columns (age, region, etc.)
-- **KV**: columns are JSON fields (id, name, timestamp)
-- **Vector**: columns are dimensions (dim_0, dim_1, ...)
-- **Streaming**: columns are segment metadata (start_byte, end_byte)
-- **Notebooks**: columns are metadata (author, created_at, tags)
+## What stays
 
-Any lens that can compute min/max per column can use the stats index.
-The stats index doesn't know or care what format the data is in.
+- **Kernel** (FROZEN — 3 primitives)
+- **CollectionManifest** (the index — one blob per commit)
+- **stats_tree.py** (PB-scale hierarchical index)
+- **encoding.py** (4 encodings — used internally by PND2)
+- **compression.py** (zstd/LZ4 — transparent layer)
+- **column_source.py** (format-agnostic data access — any lens produces one)
+- **embedded_stats.py** (the format spec — now inside every PND2 blob)
+- **PruningPredicate / ColumnPredicate** (predicate evaluation)
+- **PondLens base class** (shared namespace ops)
+- **All 5 lenses** (Lakehouse, KV, Vector, Streaming, FeatureStore) — they all just provide a ColumnSource
 
-### Versioning
+## Genericity — works for ANY workload
 
-The stats index is stored at `collections/{name}/stats` — a kernel ref.
-Each commit updates this ref. Time-travel to commit X:
-`kernel.resolve("collections/{name}/stats")` at commit X returns the
-stats index as of that commit. Branching creates a new stats ref for
-the branch. No replay, no transaction log.
+The PND2 format is columnar. ANY workload that can be expressed as columns works:
 
-### Simplicity
+| Workload | Columns | Why it works |
+| --- | --- | --- |
+| **Tabular** (Lakehouse) | Table columns (age, region, ...) | Native columnar |
+| **KV** (KeyValue) | JSON fields (id, name, timestamp) | Each field is a column |
+| **Vector** (Vector) | Dimensions (dim_0, dim_1, ...) + vector_id | Each dimension is a column |
+| **Streaming** (video/music/logs) | One BINARY column "data" + metadata columns (start_byte, end_byte) | BINARY value type = raw bytes |
+| **Notebooks** | Cell metadata (author, created_at, tags) + cell content (BINARY) | Cell content as BINARY column |
+| **Feature Store** | Feature columns + entity_id + timestamp | Native columnar |
+| **Git** | File path, blob content (BINARY), commit metadata | File content as BINARY column |
 
-The entire stats index is:
-- ONE blob (JSON array)
-- ONE ref (`collections/{name}/stats`)
-- Updated in ONE write per commit
-- Fetched in ONE read per query
+The `BINARY` value type (new in PND2) stores raw bytes for non-columnar data (video, music, file content). It uses RAW encoding with no compression at the column level (the blob-level zstd still applies).
 
-No ZoneMapIndex class. No ProllyTreeIndex for zone maps. No manifest.
-No `add_zone_map` API. Just one blob.
+## SIMD-ready
+
+PND2 is designed for SIMD execution engines:
+- INT64/FLOAT64 columns are contiguous 8-byte arrays (directly castable to numpy/Arrow)
+- Null bitmap uses Arrow convention (1=null, 0=valid)
+- Encoded forms (RLE/DICT/BITPACK) are also binary, not JSON
+- No PyArrow conversion needed — readers can `np.frombuffer` directly
+
+## Zero overhead proof
+
+### Write overhead
+
+Old path (range_write_encoded):
+1. Encode each column → N_chunks encoded blobs (N writes)
+2. Write JSON manifest blob (1 write)
+3. Compute ZoneMap (separate pass)
+4. Write zone map blob (1 write)
+5. Commit zone maps (1 write)
+6. Build collection manifest (separate pass)
+7. Write manifest blob (1 write)
+8. Commit (1 write)
+
+**Total: N + 5 writes**
+
+Unified path:
+1. For each row group: encode columns + compute stats (one pass) → 1 PND2 blob (1 write)
+2. Build manifest (one pass over the just-written row groups) → 1 manifest blob (1 write)
+3. Commit (1 write)
+
+**Total: N_row_groups + 2 writes**
+
+For a 100-row-group table with 5 columns × 10 chunks each:
+- Old: 5000 chunk writes + 5 index writes = **5005 writes**
+- Unified: 100 row-group writes + 2 index writes = **102 writes**
+
+**~50x fewer writes.**
+
+### Read overhead
+
+Old path (read_with_encoded_pruning):
+1. Resolve HEAD (free)
+2. Fetch commit (1 GET)
+3. Fetch snapshot tree root (1 GET)
+4. Walk Prolly tree to find row group keys (log N GETs)
+5. Fetch zone map manifest (1 GET)
+6. Evaluate predicates against zone maps (in memory)
+7. For each surviving row group:
+   - Fetch zone map blob (1 GET) — wait, already in manifest?
+   - Fetch column-chunk manifest blob (1 GET)
+   - For each surviving chunk:
+     - Fetch chunk blob (1 GET)
+     - Decompress, decode
+
+**Total: 3 + log N + K_row_groups + K_row_groups + K_chunks GETs**
+
+Unified path:
+1. Resolve HEAD (free)
+2. Fetch commit (1 GET)
+3. Fetch manifest (1 GET)
+4. Evaluate predicates IN MEMORY against manifest stats
+5. For each surviving row group:
+   - Fetch PND2 blob (1 GET)
+   - Decompress, decode requested columns
+
+**Total: 2 + K_row_groups GETs**
+
+For a 1% selectivity query on 100 row groups (K=1):
+- Old: 3 + 7 + 1 + 1 + 10 = **22 GETs** (assuming 10 chunks per column for the predicate column)
+- Unified: 2 + 1 = **3 GETs**
+
+**~7x fewer reads.**
+
+## Implementation
+
+`pond-sdk/extensions/physical_structures/unified_storage.py`:
+- `PND2` class — encode/decode the PND2 format
+- `UnifiedStorage` class — `write()`, `read()`, `point_lookup()`
+
+`lenses/lakehouse/lakehouse_lens.py`:
+- New methods: `write_unified()`, `read_unified()`, `point_lookup_unified()`
+- These are the new DEFAULT path
+- Old methods (`range_write*`, `read_with_*_pruning`) remain as legacy
+
+## Why this is the right design
+
+- **Simple**: ONE format, ONE write, ONE read. No choices.
+- **Powerful**: Same pruning, encoding, compression as before — just unified.
+- **Performant**: SIMD-ready binary, auto-encoding, transparent compression.
+- **Scalable**: Manifest + lazy stats tree handle PB scale.
+- **Efficient**: Stats computed during encode (zero overhead). Reads are 2 + K.
+- **Beautiful**: One responsibility per layer. Kernel frozen, storage unified, lenses provide ColumnSource.
+- **Functional**: Covers ALL workloads (tabular, KV, vector, streaming, notebooks, git, feature store).
+- **Storage-Independent**: PND2 is binary; never depends on execution engine.

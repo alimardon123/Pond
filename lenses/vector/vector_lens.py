@@ -73,10 +73,38 @@ class VectorLens(PondLens):
         lens.search("vectors", [1.5, 1.5], k=2)
     """
 
-    def __init__(self, kernel: PondMinimal):
+    def __init__(self, kernel: PondMinimal, n_dimensions: int = 0,
+                 use_unified_storage: bool = False):
+        """Create a VectorLens.
+
+        Args:
+            kernel: the PondMinimal kernel instance
+            n_dimensions: number of dimensions per vector (required for
+                unified storage path — each dimension becomes a FLOAT64
+                column in PND2). Ignored on legacy path.
+            use_unified_storage: if True, use UnifiedStorage (PND2 format)
+                as the storage backend. This gives:
+                  - 4 GETs cold point lookup (vs O(log N))
+                  - Bounding-box pruning via manifest stats
+                  - Non-destructive append() semantics
+                The lens API is IDENTICAL — only the storage backend changes.
+                Default: False (legacy path, for backward compat).
+        """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
         self._attached_indexer = None
+        self._n_dimensions = n_dimensions
+
+        # Unified storage backend (optional)
+        self._unified_storage = None
+        if use_unified_storage:
+            try:
+                from unified_storage import UnifiedStorage
+                self._unified_storage = UnifiedStorage(kernel)
+            except ImportError:
+                pass
+        # Buffer for uncommitted inserts: collection → list of (id, vector, metadata)
+        self._unified_buffer: dict[str, list[tuple[str, list[float], dict]]] = {}
 
     def attach_indexer(self, indexer) -> None:
         """Attach a CollectionMetadata or CollectionIndexer for auto-notify.
@@ -157,9 +185,27 @@ class VectorLens(PondLens):
 
     def insert(self, collection: str, id: str, vector: list[float],
                metadata: dict | None = None) -> str:
-        """Insert (or replace) a vector. Returns the commit hash."""
+        """Insert (or replace) a vector. Returns the commit hash.
+
+        Unified storage path: buffers the insert, commits on explicit
+        commit() call (or auto-commits if buffer is full).
+        Legacy path: commits immediately per insert.
+        """
         if metadata is None:
             metadata = {}
+
+        # Unified storage path: buffer
+        if self._unified_storage is not None:
+            if collection not in self._unified_buffer:
+                self._unified_buffer[collection] = []
+            self._unified_buffer[collection].append(
+                (str(id), [float(v) for v in vector], metadata))
+            # Auto-commit if buffer is large enough
+            if len(self._unified_buffer[collection]) >= 10000:
+                return self.commit(collection)
+            return ""  # not yet committed
+
+        # Legacy path: commit immediately
         record = {
             "id": str(id),
             "vector": [float(v) for v in vector],
@@ -169,6 +215,43 @@ class VectorLens(PondLens):
         self._get_base(collection).stage(str(id), blob_hash)
         commit_hash = self._get_base(collection).commit(f"insert vector {id}")
         self._notify_indexers(collection)
+        return commit_hash
+
+    def commit(self, collection: str, message: str = "") -> str:
+        """Commit buffered inserts (unified storage path only).
+
+        Legacy path commits immediately on each insert, so this is a no-op.
+        """
+        if self._unified_storage is None:
+            return ""  # legacy path already committed
+
+        if collection not in self._unified_buffer:
+            raise ValueError(f"No staged data for collection '{collection}'")
+
+        buffer = self._unified_buffer[collection]
+        # Use numeric ID for row group key (zero-padded for correct ordering)
+        # Try to convert IDs to int for proper sorting; fall back to string
+        try:
+            buffer.sort(key=lambda x: int(x[0]))
+        except (ValueError, TypeError):
+            buffer.sort(key=lambda x: x[0])
+
+        rows = []
+        for vec_id, vector, metadata in buffer:
+            row = {"id": vec_id}
+            # Store vector as a JSON string (PND2 STRING column) — simpler
+            # than one column per dimension, and still enables point lookup
+            # by id. A future optimization: one FLOAT64 column per dimension
+            # for bbox pruning.
+            row["vector"] = json.dumps(vector)
+            row["metadata"] = json.dumps(metadata)
+            rows.append(row)
+
+        commit_hash = self._unified_storage.append(
+            collection, rows, key_col="id",
+            row_group_size=10_000,
+            message=message or f"vector insert: {len(rows)} vectors")
+        del self._unified_buffer[collection]
         return commit_hash
 
     def delete_vector(self, collection: str, id: str) -> str:
@@ -183,7 +266,24 @@ class VectorLens(PondLens):
     # ==================================================================
 
     def get_vector(self, collection: str, id: str) -> Optional[dict]:
-        """Retrieve a vector record by ID (returns None if absent)."""
+        """Retrieve a vector record by ID (returns None if absent).
+
+        Unified storage path: 4 GETs cold point lookup.
+        Legacy path: O(log N) via ProllyTreeIndex.
+        """
+        # Unified storage path
+        if self._unified_storage is not None:
+            row = self._unified_storage.point_lookup(
+                collection, key=str(id), columns=["id", "vector", "metadata"])
+            if row is None or row.get("id") is None:
+                return None
+            return {
+                "id": row["id"],
+                "vector": json.loads(row["vector"]),
+                "metadata": json.loads(row["metadata"]) if row.get("metadata") else {},
+            }
+
+        # Legacy path
         h = self._get_base(collection).lookup(str(id))
         return self.decode(self.kernel.read_blob(h)) if h else None
 
@@ -194,16 +294,42 @@ class VectorLens(PondLens):
 
     def list_vectors(self, collection: str) -> list[str]:
         """List all vector IDs."""
+        # Unified storage path
+        if self._unified_storage is not None:
+            rows = self._unified_storage.read(collection, columns=["id"])
+            return [r["id"] for r in rows if r.get("id")]
+
+        # Legacy path
         return [k for k in self._get_base(collection).read_all()
                 if not k.startswith("_")]
 
     def count(self, collection: str) -> int:
         """Return the number of stored vectors."""
+        # Unified storage path
+        if self._unified_storage is not None:
+            return len(self.list_vectors(collection))
+
+        # Legacy path
         return sum(1 for k in self._get_base(collection).read_all()
                    if not k.startswith("_"))
 
     def get_all(self, collection: str) -> dict[str, dict]:
         """Read all vectors from the collection."""
+        # Unified storage path
+        if self._unified_storage is not None:
+            rows = self._unified_storage.read(
+                collection, columns=["id", "vector", "metadata"])
+            result = {}
+            for r in rows:
+                if r.get("id"):
+                    result[r["id"]] = {
+                        "id": r["id"],
+                        "vector": json.loads(r["vector"]),
+                        "metadata": json.loads(r["metadata"]) if r.get("metadata") else {},
+                    }
+            return result
+
+        # Legacy path
         state = self._get_base(collection).read_all()
         return {k: self.decode(self.kernel.read_blob(h))
                 for k, h in state.items() if not k.startswith("_")}

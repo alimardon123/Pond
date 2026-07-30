@@ -1,0 +1,1588 @@
+"""
+UnifiedStorage — ONE format, ONE write path, ONE read path.
+
+THE MANDATE:
+  "Simpler storage solution that unifies all workloads in same storage
+   format regardless of use with no overhead for writes and reads."
+
+THE DESIGN:
+  ONE binary blob format (PND2) for EVERY workload:
+    - Tabular (Lakehouse): table columns
+    - KV (KeyValue): JSON fields as columns
+    - Vector: dimensions as columns
+    - Streaming: BINARY column for raw bytes + metadata columns
+    - Notebooks: cell metadata + BINARY column for cell content
+    - Git: file path + BINARY column for file content
+    - Feature Store: feature columns + entity_id + timestamp
+
+  ONE write path:
+    write(collection, rows, key_col, row_group_size)
+    - Splits rows into row groups
+    - For each row group: encodes columns (auto-selects best encoding),
+      computes stats (during encode — zero overhead), compresses,
+      writes ONE PND2 blob
+    - Builds manifest with all blob hashes + inline stats
+    - Commits atomically
+
+  ONE read path:
+    read(collection, predicates, columns, commit_hash)
+    - Fetches commit + manifest (2 S3 GETs)
+    - Evaluates predicates IN MEMORY against manifest stats
+    - Fetches K surviving blobs (K S3 GETs)
+    - Decompresses + decodes only requested columns (projection pushdown)
+    - Total: 2 + K S3 GETs (the irreducible minimum)
+
+PND2 FORMAT:
+  +--------------------------------+
+  | Magic (4B): b"PND2"            |
+  | Version (1B): 2                |
+  | Flags (1B):                    |
+  |   bit 0: has_stats             |
+  |   bit 1: compressed            |
+  |   bit 2-7: reserved            |
+  | n_rows (4B uint32)             |
+  | n_columns (2B uint16)          |
+  +--------------------------------+
+  | Schema section:                |
+  |   For each column:             |
+  |     name_len (1B)              |
+  |     name (UTF-8)               |
+  |     value_type (1B)            |
+  |     encoding (1B)              |
+  +--------------------------------+
+  | Stats section (if has_stats):  |
+  |   For each column:             |
+  |     has_min (1B)               |
+  |     min (8B or var-len)        |
+  |     max (8B or var-len)        |
+  |     null_count (4B)            |
+  +--------------------------------+
+  | Compression tag (1B)           |
+  +--------------------------------+
+  | Payload:                       |
+  |   For each column:             |
+  |     payload_len (4B)           |
+  |     encoded bytes (variable)   |
+  +--------------------------------+
+
+WHAT THIS REPLACES:
+  - 3 write modes (range_write, range_write_column_chunks, range_write_encoded)
+  - 4+ read modes (read_table, read_with_*_pruning, etc.)
+  - STORAGE_WHOLE_BLOB / STORAGE_COLUMN_CHUNKS / STORAGE_ENCODED
+  - ColumnChunkStorage, EncodedChunkStorage classes
+  - ColumnChunkZoneMap class (stats are inline in PND2)
+  - ZoneMapIndex, StatsIndex classes (manifest replaces them)
+  - PruningReader class (read_unified does pruning inline)
+  - encode_fn/decode_fn lens-owned contract (PND2 owns the format)
+
+WHAT STAYS:
+  - Kernel (FROZEN — 3 primitives)
+  - CollectionManifest (the index — one blob per commit)
+  - stats_tree.py (PB-scale hierarchical index)
+  - encoding.py (4 encodings — used internally by PND2)
+  - compression.py (zstd/LZ4 — transparent layer)
+  - column_source.py (format-agnostic data access)
+  - PruningPredicate / ColumnPredicate (predicate evaluation)
+  - All 5 lenses (they just provide a ColumnSource)
+"""
+
+from __future__ import annotations
+
+import struct
+import os
+import sys
+import json
+from dataclasses import dataclass, field
+from typing import Optional, Any, Iterator, Callable
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "..", "..", "..", "pond-core"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from kernel import PondMinimal  # noqa: E402
+
+# Reuse the existing encoding + compression + manifest + column_source
+from encoding import (  # noqa: E402
+    ColumnEncoding, encode_column, decode_column,
+    eval_predicate_encoded, decode_surviving_values,
+    _detect_value_type, EncodingHeader,
+    VALUE_TYPE_INT64, VALUE_TYPE_FLOAT64, VALUE_TYPE_STRING, VALUE_TYPE_NULL,
+)
+from compression import (  # noqa: E402
+    compress_blob, decompress_blob,
+    COMPRESSION_NONE, COMPRESSION_ZSTD,
+)
+from column_source import (  # noqa: E402
+    ColumnSource, as_column_source, compute_list_stats,
+    PyArrowColumnSource, ListColumnSource,
+)
+from collection_manifest import (  # noqa: E402
+    CollectionManifest, RowGroupEntry, ColumnStatsEntry,
+    STORAGE_WHOLE_BLOB,  # reuse as "unified" storage mode
+    build_manifest_from_zone_map,
+)
+
+
+# ---------------------------------------------------------------------------
+# PND2 format constants
+# ---------------------------------------------------------------------------
+
+_PND2_MAGIC = b"PND2"
+_PND2_VERSION = 2
+
+# Flags
+_FLAG_HAS_STATS = 0x01
+_FLAG_COMPRESSED = 0x02
+
+# New value type for raw bytes (video, music, file content, etc.)
+VALUE_TYPE_BINARY = 5
+
+
+# ---------------------------------------------------------------------------
+# PND2 blob — encode/decode
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PND2Column:
+    """One column's metadata in a PND2 blob."""
+    name: str
+    value_type: int
+    encoding: int
+    min: Any = None
+    max: Any = None
+    null_count: int = 0
+    payload: bytes = b""  # encoded bytes (after decompression)
+
+
+class PND2:
+    """Encode/decode the PND2 unified blob format.
+
+    ONE blob per row group. All columns in one blob. Stats inline.
+    Compression transparent. Encoding auto-selected per column.
+
+    Lifecycle:
+      1. PND2.encode(source, key_col) → bytes, [RowGroupEntry stats]
+         (encode columns, compute stats during encode, compress)
+      2. kernel.write(bytes) → blob_hash
+      3. (later) bytes = kernel.read_blob(blob_hash)
+      4. PND2.decode(bytes, columns=None) → dict[col_name, list[values]]
+         (decompress, decode only requested columns — projection pushdown)
+    """
+
+    # ------------------------------------------------------------------
+    # Encode — write side
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def encode(source: ColumnSource,
+                encoding_hints: Optional[dict[str, str]] = None,
+                compress: bool = True) -> tuple[bytes, list[tuple[str, int, Any, Any, int]]]:
+        """Encode a ColumnSource as a PND2 blob.
+
+        Args:
+            source: a ColumnSource (PyArrow table, list[dict], etc.)
+            encoding_hints: optional dict {col_name: "auto"|"rle"|"dict"|"bitpack"|"raw"}
+            compress: if True (default), compress the payload with zstd
+
+        Returns:
+            Tuple of (pnd2_bytes, column_stats_list) where column_stats_list
+            is [(name, value_type, min, max, null_count), ...] — used to
+            build the manifest entry without re-decoding.
+        """
+        if encoding_hints is None:
+            encoding_hints = {}
+
+        n_rows = source.num_rows()
+        col_names = source.column_names()
+
+        # Encode each column + compute stats (single pass per column)
+        columns_meta: list[PND2Column] = []
+        for col_name in col_names:
+            values = source.column_slice(col_name, 0, n_rows)
+            hint = encoding_hints.get(col_name, "auto")
+
+            # Detect value type (special-case BINARY for raw bytes)
+            vtype = _detect_value_type_with_binary(values)
+
+            # Encode — encode_column picks the best encoding
+            # For BINARY values, force RAW encoding (no RLE/DICT/BITPACK)
+            if vtype == VALUE_TYPE_BINARY:
+                # _encode_binary_raw returns a full PND1 chunk blob (header + payload).
+                # Extract just the payload (skip the 9-byte PND1 header) for
+                # storage in PND2. The encoding code is always RAW for BINARY.
+                full_blob, enc_meta = _encode_binary_raw(values, hint="raw")
+                encoding_code = ColumnEncoding.RAW
+                encoded_bytes = full_blob[EncodingHeader.SIZE:]
+            else:
+                # encode_column returns (full_pnd1_blob, meta) — extract the payload
+                full_blob, enc_meta = encode_column(values, hint=hint)
+                enc_name = enc_meta.get("encoding", "raw")
+                if isinstance(enc_name, str):
+                    encoding_code = {"raw": 0, "rle": 1, "dict": 2,
+                                      "bitpack": 3}.get(enc_name, 0)
+                else:
+                    encoding_code = int(enc_name)
+                # Skip the 9-byte PND1 header to get just the payload
+                encoded_bytes = full_blob[EncodingHeader.SIZE:]
+
+            # Compute stats (one pass over values)
+            if vtype == VALUE_TYPE_BINARY:
+                # Binary columns have no min/max (raw bytes)
+                mn, mx, null_count = None, None, sum(1 for v in values if v is None)
+            else:
+                mn, mx, null_count = compute_list_stats(values)
+
+            columns_meta.append(PND2Column(
+                name=col_name,
+                value_type=vtype,
+                encoding=encoding_code,
+                min=mn,
+                max=mx,
+                null_count=null_count,
+                payload=encoded_bytes,
+            ))
+
+        # Build the PND2 bytes
+        return PND2._build_blob(columns_meta, n_rows, compress), \
+               [(c.name, c.value_type, c.min, c.max, c.null_count) for c in columns_meta]
+
+    @staticmethod
+    def _build_blob(columns: list[PND2Column], n_rows: int,
+                     compress: bool) -> bytes:
+        """Build the PND2 binary blob from column metadata + payloads."""
+        # Build the inner payload (schema + stats + per-column payloads)
+        inner = bytearray()
+
+        # Schema section
+        for col in columns:
+            name_bytes = col.name.encode("utf-8")
+            inner += struct.pack("<B", len(name_bytes))
+            inner += name_bytes
+            inner += struct.pack("<BB", col.value_type, col.encoding)
+
+        # Stats section (always present — zero overhead since we compute
+        # them during encode anyway)
+        for col in columns:
+            has_min = col.min is not None and col.max is not None
+            inner += struct.pack("<B", 1 if has_min else 0)
+            if has_min:
+                inner += _encode_pnd2_value(col.value_type, col.min)
+                inner += _encode_pnd2_value(col.value_type, col.max)
+            inner += struct.pack("<I", col.null_count)
+
+        # Per-column payloads
+        for col in columns:
+            inner += struct.pack("<I", len(col.payload))
+            inner += col.payload
+
+        # Compress the inner payload (transparent)
+        if compress and len(inner) > 64:
+            try:
+                import zstandard as zstd
+                compressed = zstd.compress(bytes(inner))
+                if len(compressed) + 1 < len(inner):
+                    payload = struct.pack("<B", COMPRESSION_ZSTD) + compressed
+                    flags = _FLAG_HAS_STATS | _FLAG_COMPRESSED
+                else:
+                    payload = struct.pack("<B", COMPRESSION_NONE) + bytes(inner)
+                    flags = _FLAG_HAS_STATS
+            except ImportError:
+                payload = struct.pack("<B", COMPRESSION_NONE) + bytes(inner)
+                flags = _FLAG_HAS_STATS
+        else:
+            payload = struct.pack("<B", COMPRESSION_NONE) + bytes(inner)
+            flags = _FLAG_HAS_STATS
+
+        # Build the final blob: header + payload
+        header = bytearray()
+        header += _PND2_MAGIC
+        header += struct.pack("<BB", _PND2_VERSION, flags)
+        header += struct.pack("<IH", n_rows, len(columns))
+
+        return bytes(header) + bytes(payload)
+
+    # ------------------------------------------------------------------
+    # Decode — read side
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def decode(data: bytes,
+                columns: Optional[list[str]] = None,
+                predicates: Optional[list[tuple[str, str, Any]]] = None
+                ) -> dict[str, list]:
+        """Decode a PND2 blob.
+
+        Args:
+            data: the PND2 blob bytes
+            columns: optional list of column names to decode (projection
+                pushdown — other columns are skipped entirely). If None,
+                decode all columns.
+            predicates: optional list of (column, op, value) tuples for
+                Vortex-style predicate eval on the encoded form. Only
+                surviving row ranges are decoded.
+
+        Returns:
+            Dict mapping column_name → list of values. Columns not in
+            `columns` (if specified) are not in the dict.
+        """
+        if data[:4] != _PND2_MAGIC:
+            raise ValueError(f"Not a PND2 blob (magic={data[:4]!r})")
+
+        version, flags = struct.unpack("<BB", data[4:6])
+        if version != _PND2_VERSION:
+            raise ValueError(f"Unsupported PND2 version: {version}")
+        n_rows, n_columns = struct.unpack("<IH", data[6:12])
+        pos = 12
+
+        # Compression tag
+        compression_tag = data[pos]; pos += 1
+
+        # Decompress if needed — `inner` is the decompressed bytes (a NEW
+        # bytes object). After this, we parse `inner` starting at pos=0.
+        if compression_tag == COMPRESSION_NONE:
+            inner = data[pos:]
+        elif compression_tag == COMPRESSION_ZSTD:
+            import zstandard as zstd
+            inner = zstd.decompress(data[pos:])
+        else:
+            # LZ4 or unknown — try zstd as fallback
+            try:
+                import zstandard as zstd
+                inner = zstd.decompress(data[pos:])
+            except Exception:
+                inner = data[pos:]
+
+        # Parse `inner` from position 0 (NOT `pos` — that was for `data`)
+        pos = 0
+
+        # Parse schema
+        schema: list[tuple[str, int, int]] = []  # (name, value_type, encoding)
+        for _ in range(n_columns):
+            name_len = inner[pos]; pos += 1
+            name = inner[pos:pos+name_len].decode("utf-8"); pos += name_len
+            vtype, enc = struct.unpack("<BB", inner[pos:pos+2]); pos += 2
+            schema.append((name, vtype, enc))
+
+        # Parse stats (skip if we don't need them — but they're cheap to parse)
+        stats: dict[str, tuple[Any, Any, int]] = {}
+        for name, vtype, enc in schema:
+            has_min = inner[pos]; pos += 1
+            if has_min:
+                mn, pos = _decode_pnd2_value(vtype, inner, pos)
+                mx, pos = _decode_pnd2_value(vtype, inner, pos)
+            else:
+                mn = mx = None
+            null_count = struct.unpack("<I", inner[pos:pos+4])[0]; pos += 4
+            stats[name] = (mn, mx, null_count)
+
+        # Parse per-column payloads
+        payloads: dict[str, tuple[int, bytes]] = {}  # name → (encoding, bytes)
+        for name, vtype, enc in schema:
+            payload_len = struct.unpack("<I", inner[pos:pos+4])[0]; pos += 4
+            payload_bytes = inner[pos:pos+payload_len]; pos += payload_len
+            payloads[name] = (enc, payload_bytes)
+
+        # Determine which columns to decode (projection pushdown)
+        if columns is None:
+            columns_to_decode = [s[0] for s in schema]
+        else:
+            columns_to_decode = [c for c in columns if c in payloads]
+
+        # Determine surviving row ranges (for Vortex-style eval)
+        # Find the first predicate column that exists in this blob
+        surviving_ranges: Optional[list[tuple[int, int]]] = None
+        pred_col_name: Optional[str] = None
+        if predicates:
+            for col_name, op, val in predicates:
+                if col_name in payloads:
+                    pred_col_name = col_name
+                    enc, payload_bytes = payloads[col_name]
+
+                    # Find this column's value_type
+                    pred_vtype = VALUE_TYPE_NULL
+                    for s_name, s_vtype, s_enc in schema:
+                        if s_name == col_name:
+                            pred_vtype = s_vtype
+                            break
+
+                    if pred_vtype == VALUE_TYPE_BINARY:
+                        # BINARY columns don't support encoded predicate eval;
+                        # decode all values and filter in Python
+                        all_vals = _decode_binary_raw(payload_bytes, n_rows)
+                        surviving = []
+                        range_start = None
+                        for pos, v in enumerate(all_vals):
+                            if _binary_value_matches(v, op, val):
+                                if range_start is None:
+                                    range_start = pos
+                            else:
+                                if range_start is not None:
+                                    surviving.append((range_start, pos))
+                                    range_start = None
+                        if range_start is not None:
+                            surviving.append((range_start, len(all_vals)))
+                        surviving_ranges = surviving
+                        if not surviving_ranges:
+                            return {c: [] for c in columns_to_decode}
+                    else:
+                        # eval_predicate_encoded expects a PND1 chunk blob
+                        # (EncodingHeader + payload). Reconstruct it.
+                        pnd1_blob = EncodingHeader(enc, n_rows).to_bytes() + payload_bytes
+                        result = eval_predicate_encoded(pnd1_blob, col_name, op, val)
+                        if result is not None:
+                            surviving_ranges, _ = result
+                            # Bitpack eval may produce ranges that extend past
+                            # the declared n_rows (due to byte-boundary padding).
+                            # Truncate any range end to n_rows.
+                            surviving_ranges = [(s, min(e, n_rows))
+                                                  for s, e in surviving_ranges
+                                                  if s < n_rows]
+                            if not surviving_ranges:
+                                # All rows pruned — return empty lists
+                                return {c: [] for c in columns_to_decode}
+                    break  # only one predicate column drives the ranges
+
+        # Decode the requested columns
+        result: dict[str, list] = {}
+        for col_name in columns_to_decode:
+            # Find this column's value_type from the schema
+            col_vtype = VALUE_TYPE_NULL
+            for s_name, s_vtype, s_enc in schema:
+                if s_name == col_name:
+                    col_vtype = s_vtype
+                    break
+
+            enc, payload_bytes = payloads[col_name]
+
+            # BINARY columns use a custom decode (decode_column doesn't
+            # know about VALUE_TYPE_BINARY)
+            if col_vtype == VALUE_TYPE_BINARY:
+                values = _decode_binary_raw(payload_bytes, n_rows)
+                # Apply surviving ranges if applicable
+                if surviving_ranges is not None and pred_col_name is not None:
+                    surviving_values = []
+                    for start, end in surviving_ranges:
+                        surviving_values.extend(values[start:end])
+                    values = surviving_values
+                result[col_name] = values
+                continue
+
+            # Non-BINARY: reconstruct PND1 chunk blob for decode_column
+            pnd1_blob = EncodingHeader(enc, n_rows).to_bytes() + payload_bytes
+
+            if surviving_ranges is not None and pred_col_name is not None:
+                # Decode only the surviving ranges
+                values = decode_surviving_values(pnd1_blob, surviving_ranges)
+            else:
+                values = decode_column(pnd1_blob)
+                # Bitpack decode may return more values than n_rows (pads to
+                # the next byte boundary). Truncate to the declared n_rows.
+                if enc == 3 and len(values) > n_rows:  # 3 = BITPACK
+                    values = values[:n_rows]
+            result[col_name] = values
+
+        return result
+
+    @staticmethod
+    def peek_stats(data: bytes) -> Optional[dict[str, tuple[Any, Any, int]]]:
+        """Peek at the stats in a PND2 blob header without decoding payloads.
+
+        Useful for third-level pruning: fetch the blob, peek at stats,
+        decide whether to decode. Returns None if not a PND2 blob or
+        no stats.
+        """
+        if data[:4] != _PND2_MAGIC:
+            return None
+        version, flags = struct.unpack("<BB", data[4:6])
+        if version != _PND2_VERSION:
+            return None
+        if not (flags & _FLAG_HAS_STATS):
+            return None
+
+        n_rows, n_columns = struct.unpack("<IH", data[6:12])
+        pos = 12
+        compression_tag = data[pos]; pos += 1
+
+        # Decompress if needed
+        if compression_tag == COMPRESSION_NONE:
+            inner = data[pos:]
+        elif compression_tag == COMPRESSION_ZSTD:
+            try:
+                import zstandard as zstd
+                inner = zstd.decompress(data[pos:])
+            except Exception:
+                return None
+        else:
+            return None
+
+        # Parse `inner` from position 0
+        ipos = 0
+
+        # Parse schema
+        schema: list[tuple[str, int, int]] = []
+        for _ in range(n_columns):
+            name_len = inner[ipos]; ipos += 1
+            name = inner[ipos:ipos+name_len].decode("utf-8"); ipos += name_len
+            vtype, enc = struct.unpack("<BB", inner[ipos:ipos+2]); ipos += 2
+            schema.append((name, vtype, enc))
+
+        # Parse stats
+        stats: dict[str, tuple[Any, Any, int]] = {}
+        for name, vtype, enc in schema:
+            has_min = inner[ipos]; ipos += 1
+            if has_min:
+                mn, ipos = _decode_pnd2_value(vtype, inner, ipos)
+                mx, ipos = _decode_pnd2_value(vtype, inner, ipos)
+            else:
+                mn = mx = None
+            null_count = struct.unpack("<I", inner[ipos:ipos+4])[0]; ipos += 4
+            stats[name] = (mn, mx, null_count)
+
+        return stats
+
+
+# ---------------------------------------------------------------------------
+# UnifiedStorage — the ONE write path + ONE read path
+# ---------------------------------------------------------------------------
+
+class UnifiedStorage:
+    """ONE write path, ONE read path, ANY workload.
+
+    Replaces:
+      - range_write (whole-blob Parquet)
+      - range_write_column_chunks (per-column Parquet blobs)
+      - range_write_encoded (per-column encoded blobs)
+      - read_with_pruning / read_with_column_chunk_pruning / read_with_encoded_pruning
+
+    Usage (write):
+        storage = UnifiedStorage(kernel)
+        commit_hash = storage.write("users", table, key_col="id",
+                                      row_group_size=10_000)
+
+    Usage (read):
+        storage = UnifiedStorage(kernel)
+        # Full scan
+        rows = storage.read("users")
+        # Predicate-pruned
+        rows = storage.read("users", predicates=[("age", ">", 30)])
+        # Projection + predicate
+        rows = storage.read("users",
+                              predicates=[("region", "=", "US")],
+                              columns=["id", "age"])
+        # Point lookup
+        rows = storage.point_lookup("users", key="12345")
+    """
+
+    def __init__(self, kernel: PondMinimal):
+        self.kernel = kernel
+        self._manifest_cache: dict[str, CollectionManifest] = {}
+
+    # ------------------------------------------------------------------
+    # Manifest ref helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _manifest_ref(collection: str) -> str:
+        return f"collections/{collection}/manifest"
+
+    @staticmethod
+    def _head_ref(collection: str) -> str:
+        return f"collections/{collection}/HEAD"
+
+    def _load_manifest(self, collection: str,
+                        manifest_hash: Optional[str] = None
+                        ) -> Optional[CollectionManifest]:
+        """Load the manifest for a collection (cached).
+
+        If manifest_hash is provided, loads that specific manifest (for
+        time-travel reads — no ref mutation, no race condition).
+        If manifest_hash is None, resolves the current manifest ref.
+
+        Fix (Round 9 Issue #2): the old approach mutated the manifest ref
+        to time-travel, causing race conditions and hidden PUTs. Now the
+        caller passes the manifest hash directly — no mutation needed.
+        """
+        # If a specific manifest hash is requested, load it directly
+        # (bypassing the cache, since it's a historical manifest)
+        if manifest_hash is not None:
+            try:
+                return CollectionManifest.load(self.kernel, manifest_hash)
+            except (ValueError, KeyError):
+                return None
+
+        # Normal path: resolve the current manifest ref (cached)
+        if collection in self._manifest_cache:
+            return self._manifest_cache[collection]
+
+        resolved_hash = self.kernel.resolve(self._manifest_ref(collection))
+        if resolved_hash is None:
+            return None
+
+        try:
+            manifest = CollectionManifest.load(self.kernel, resolved_hash)
+            self._manifest_cache[collection] = manifest
+            return manifest
+        except (ValueError, KeyError):
+            return None
+
+    def _invalidate_manifest_cache(self, collection: str) -> None:
+        self._manifest_cache.pop(collection, None)
+
+    # ------------------------------------------------------------------
+    # WRITE — the ONE write path
+    # ------------------------------------------------------------------
+
+    def write(self, collection: str, rows,
+              key_col: Optional[str] = None,
+              row_group_size: int = 10_000,
+              encoding_hints: Optional[dict[str, str]] = None,
+              message: str = "") -> str:
+        """Write rows to a collection as PND2 blobs.
+
+        Args:
+            collection: collection name
+            rows: a ColumnSource OR PyArrow Table OR list[dict] (KV rows)
+            key_col: column to use as the sort key (None = use row index)
+            row_group_size: rows per row group (default 10_000)
+            encoding_hints: optional dict {col_name: "auto"|"rle"|"dict"|"bitpack"|"raw"}
+            message: commit message
+
+        Returns:
+            The new HEAD commit hash.
+        """
+        # Coerce input to a ColumnSource
+        if isinstance(rows, list):
+            source = ListColumnSource(rows)
+        elif isinstance(rows, ColumnSource):
+            source = rows
+        else:
+            source = as_column_source(rows)
+        n_rows = source.num_rows()
+
+        # Sort by key_col if specified
+        if key_col is not None and key_col in source.column_names():
+            # For PyArrow, we can sort. For ListColumnSource, sort in Python.
+            source = _sort_source_by(source, key_col)
+            key_array = source.column_slice(key_col, 0, n_rows)
+        elif key_col is not None:
+            raise KeyError(f"key column '{key_col}' not in source columns")
+        else:
+            key_array = list(range(n_rows))
+
+        # Build row groups
+        manifest_entries: list[dict] = []
+        col_names = source.column_names()
+
+        # Detect value types once (from the first chunk)
+        schema_columns: list[tuple[str, int]] = []
+        if n_rows > 0:
+            for col_name in col_names:
+                sample = source.column_slice(col_name, 0, min(100, n_rows))
+                vtype = _detect_value_type_with_binary(sample)
+                schema_columns.append((col_name, vtype))
+
+        # Stage each row group
+        from prolly_tree import ProllyLensBase
+        base = ProllyLensBase(self.kernel, collection)
+
+        # Delete existing row group keys (overwrite semantics).
+        #
+        # Fix (Round 2 Issue #2a): the old code called base.read_all() which
+        # walks the ENTIRE Prolly tree — O(N) S3 GETs at PB scale. Now we
+        # use the EXISTING MANIFEST (1 GET) to discover the old row group
+        # keys, which is O(1) regardless of scale.
+        existing_manifest = self._load_manifest(collection)
+        if existing_manifest is not None:
+            for rg in existing_manifest.row_groups:
+                base.stage_delete(rg.key)
+            # Also handle PB-scale: if the manifest uses a stats tree,
+            # walk it to get all row group keys (still O(N) but unavoidable
+            # for full overwrite; users who want append should use append())
+            if existing_manifest.stats_tree_root:
+                from stats_tree import StatsTreeReader
+                reader = StatsTreeReader(self.kernel,
+                                          existing_manifest.stats_tree_root)
+                for rg in reader.scan_with_pruning():
+                    base.stage_delete(rg.key)
+
+        if n_rows == 0:
+            commit_hash = base.commit(message or f"write: empty table")
+            self._invalidate_manifest_cache(collection)
+            return commit_hash
+
+        for start in range(0, n_rows, row_group_size):
+            end = min(start + row_group_size, n_rows)
+            # Slice the source for this row group
+            group_source = _slice_source(source, start, end)
+            max_pk = key_array[end - 1]
+            # Zero-pad the key for correct lexicographic ordering.
+            # Fix (Round 3 Issue #1): without padding, "rg/9" > "rg/42"
+            # (because "9" > "4"), which silently breaks point_lookup
+            # and range scans for collections with >10 row groups.
+            # We pad to 20 digits — enough for 10^20 keys.
+            rg_key = _format_rg_key(max_pk)
+
+            # Encode as PND2 blob
+            pnd2_bytes, col_stats = PND2.encode(
+                group_source, encoding_hints=encoding_hints)
+            blob_hash = self.kernel.write(pnd2_bytes)
+
+            # Stage in the ProllyTreeIndex
+            base.stage(rg_key, blob_hash)
+
+            # Track for manifest building
+            manifest_entries.append({
+                "rg_key": rg_key,
+                "blob_hash": blob_hash,
+                "n_rows": end - start,
+                "col_stats": col_stats,  # [(name, vtype, min, max, null_count), ...]
+            })
+
+        n_groups = (n_rows + row_group_size - 1) // row_group_size
+        commit_hash = base.commit(
+            message or f"unified write: {n_rows} rows in {n_groups} row groups")
+
+        # Build the manifest (one blob, atomically with the commit)
+        self._build_manifest(collection, manifest_entries, schema_columns,
+                              key_col or "", row_group_size)
+
+        self._invalidate_manifest_cache(collection)
+        return commit_hash
+
+    def append(self, collection: str, rows,
+               key_col: Optional[str] = None,
+               row_group_size: int = 10_000,
+               encoding_hints: Optional[dict[str, str]] = None,
+               message: str = "") -> str:
+        """Append rows to an existing collection WITHOUT rewriting it.
+
+        Fix (Round 2 Issue #2b): the write() method has destructive
+        overwrite semantics — it deletes all existing row groups before
+        writing new ones. This append() method preserves existing data:
+          1. Reads the existing manifest (1 GET)
+          2. Keeps all existing row group entries in the new manifest
+          3. Adds new row groups from `rows`
+          4. Writes a new manifest + commit
+
+        No read_all() walk, no destructive delete. The old row groups
+        remain accessible via the new manifest.
+
+        Args:
+            collection: collection name (must already exist)
+            rows: new rows to append (ColumnSource, list[dict], or pa.Table)
+            key_col: sort key column (should match the existing collection)
+            row_group_size: rows per new row group
+            encoding_hints: optional encoding hints for new row groups
+            message: commit message
+
+        Returns:
+            The new HEAD commit hash.
+        """
+        existing_manifest = self._load_manifest(collection)
+        if existing_manifest is None:
+            # Collection doesn't exist — delegate to write()
+            return self.write(collection, rows, key_col=key_col,
+                                row_group_size=row_group_size,
+                                encoding_hints=encoding_hints,
+                                message=message)
+
+        # Coerce input
+        if isinstance(rows, list):
+            source = ListColumnSource(rows)
+        elif isinstance(rows, ColumnSource):
+            source = rows
+        else:
+            source = as_column_source(rows)
+        n_rows = source.num_rows()
+
+        # Sort by key_col if specified
+        if key_col is not None and key_col in source.column_names():
+            source = _sort_source_by(source, key_col)
+            key_array = source.column_slice(key_col, 0, n_rows)
+        elif key_col is not None:
+            raise KeyError(f"key column '{key_col}' not in source columns")
+        else:
+            key_array = list(range(n_rows))
+
+        # Use the existing collection's schema
+        schema_columns = existing_manifest.columns
+        if not schema_columns and n_rows > 0:
+            for col_name in source.column_names():
+                sample = source.column_slice(col_name, 0, min(100, n_rows))
+                vtype = _detect_value_type_with_binary(sample)
+                schema_columns.append((col_name, vtype))
+
+        # Stage new row groups (NO delete of existing ones)
+        from prolly_tree import ProllyLensBase
+        base = ProllyLensBase(self.kernel, collection)
+        manifest_entries: list[dict] = []
+
+        # Carry over existing row group entries from the old manifest.
+        # Fix (Round 9 Issue #5): for large collections, use DELTA-MANIFEST
+        # instead of reading ALL existing entries. A delta-manifest stores
+        # only the NEW row groups + a pointer to the parent manifest.
+        # The reader walks the parent chain to find all entries.
+        # This makes append() O(new_row_groups) instead of O(total_row_groups).
+        #
+        # Strategy: if the existing manifest has >1000 row groups (or uses
+        # a stats tree), use delta-manifest. Otherwise, rebuild the full
+        # manifest (cheap at small scale).
+        existing_manifest_hash = self.kernel.resolve(self._manifest_ref(collection))
+        use_delta = (
+            existing_manifest.stats_tree_root is not None
+            or len(existing_manifest.row_groups) > 1000
+            or existing_manifest.parent_manifest_hash is not None
+        )
+
+        if use_delta:
+            # DELTA path: only store NEW row groups + parent pointer
+            # No need to read existing entries — the parent chain has them
+            manifest_entries = []  # only new entries
+        elif not existing_manifest.stats_tree_root:
+            # FLAT path: carry over all existing entries (small collection)
+            for rg in existing_manifest.row_groups:
+                manifest_entries.append({
+                    "rg_key": rg.key,
+                    "blob_hash": rg.blob_hash,
+                    "n_rows": rg.n_rows,
+                    "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                    for c in rg.columns],
+                })
+        else:
+            # PB-scale flat path: walk the stats tree
+            from stats_tree import StatsTreeReader
+            reader = StatsTreeReader(self.kernel, existing_manifest.stats_tree_root)
+            for rg in reader.scan_with_pruning():
+                manifest_entries.append({
+                    "rg_key": rg.key,
+                    "blob_hash": rg.blob_hash,
+                    "n_rows": rg.n_rows,
+                    "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                    for c in rg.columns],
+                })
+
+        # Add new row groups
+        for start in range(0, n_rows, row_group_size):
+            end = min(start + row_group_size, n_rows)
+            group_source = _slice_source(source, start, end)
+            max_pk = key_array[end - 1]
+            rg_key = _format_rg_key(max_pk)
+
+            pnd2_bytes, col_stats = PND2.encode(
+                group_source, encoding_hints=encoding_hints)
+            blob_hash = self.kernel.write(pnd2_bytes)
+            base.stage(rg_key, blob_hash)
+
+            manifest_entries.append({
+                "rg_key": rg_key,
+                "blob_hash": blob_hash,
+                "n_rows": end - start,
+                "col_stats": col_stats,
+            })
+
+        n_new_groups = (n_rows + row_group_size - 1) // row_group_size
+        commit_hash = base.commit(
+            message or f"append: {n_rows} rows in {n_new_groups} new row groups")
+
+        # Fix (Round 9 Issue #1): SORT manifest entries by rg_key before
+        # building the manifest. Without sorting, appended entries with
+        # smaller keys sit at the end of the list, and find_row_group()
+        # (linear scan for first key >= target) returns the wrong row group.
+        # This causes point_lookup to silently return None for appended rows.
+        manifest_entries.sort(key=lambda e: e["rg_key"])
+
+        # Build the manifest. If using delta mode, pass the parent hash.
+        parent_hash = existing_manifest_hash if use_delta else None
+        self._build_manifest(collection, manifest_entries, schema_columns,
+                              key_col or "", row_group_size,
+                              parent_manifest_hash=parent_hash)
+        self._invalidate_manifest_cache(collection)
+        return commit_hash
+
+    def _build_manifest(self, collection: str,
+                         entries: list[dict],
+                         schema_columns: list[tuple[str, int]],
+                         key_col: str,
+                         row_group_size: int,
+                         parent_manifest_hash: Optional[str] = None) -> Optional[str]:
+        """Build the CollectionManifest for the just-written row groups.
+
+        At PB scale (>25K row groups), the manifest delegates to a
+        hierarchical stats tree. The manifest blob itself stays small
+        (schema + sort order + stats_tree_root = ~200 bytes), and the
+        stats tree provides O(log N) reads via content-addressed nodes.
+
+        For delta-appends (parent_manifest_hash set), the manifest stores
+        only the NEW row groups + a pointer to the parent. The reader
+        walks the parent chain. This makes append() O(new_row_groups).
+        """
+        manifest = CollectionManifest(self.kernel)
+        manifest.set_schema(
+            columns=schema_columns,
+            key_col=key_col,
+            row_group_size=row_group_size,
+            chunk_size=0,  # unified storage has no per-chunk blobs
+        )
+
+        # Build RowGroupEntry objects (we need them for both the flat
+        # manifest AND the stats tree)
+        rg_entries: list[RowGroupEntry] = []
+        for entry in entries:
+            rg = RowGroupEntry(
+                key=entry["rg_key"],
+                blob_hash=entry["blob_hash"],
+                n_rows=entry["n_rows"],
+                storage_mode=STORAGE_WHOLE_BLOB,  # unified mode
+            )
+            # Build column stats entries from the per-column stats
+            for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
+                rg.columns.append(ColumnStatsEntry(
+                    name=col_name,
+                    value_type=vtype,
+                    min=mn,
+                    max=mx,
+                    null_count=null_count,
+                    chunks=[],  # no per-chunk stats in unified mode
+                ))
+            manifest.add_row_group(rg)
+            rg_entries.append(rg)
+
+        # PB-scale check: if we have >25K row groups, build a stats tree
+        # and delegate scan/find_row_group to it. The manifest blob stays
+        # small (just schema + stats_tree_root).
+        try:
+            from stats_tree import should_use_stats_tree, build_stats_tree
+            if should_use_stats_tree(len(rg_entries)):
+                stats_tree_root = build_stats_tree(self.kernel, rg_entries)
+                manifest.set_stats_tree_root(stats_tree_root)
+        except ImportError:
+            pass  # stats_tree not available — fall back to flat manifest
+
+        # Delta-manifest: set parent pointer for O(1) appends at PB scale
+        if parent_manifest_hash is not None:
+            manifest.set_parent_manifest(parent_manifest_hash)
+
+        manifest_hash = manifest.commit()
+        self.kernel.reference(self._manifest_ref(collection), manifest_hash)
+        return manifest_hash
+
+    # ------------------------------------------------------------------
+    # READ — the ONE read path
+    # ------------------------------------------------------------------
+
+    def read(self, collection: str,
+             predicates: Optional[list[tuple[str, str, Any]]] = None,
+             columns: Optional[list[str]] = None,
+             row_filter: Optional[Callable[[dict], bool]] = None,
+             start_key: Optional[str] = None,
+             end_key: Optional[str] = None,
+             commit_hash: Optional[str] = None,
+             manifest_hash: Optional[str] = None) -> list[dict]:
+        """Read rows from a collection.
+
+        Args:
+            collection: collection name
+            predicates: list of (column, op, value) tuples. All ANDed.
+            columns: projection pushdown (None = all columns)
+            row_filter: exact row-level filter
+            start_key: range scan lower bound
+            end_key: range scan upper bound
+            commit_hash: (unused — use manifest_hash for time-travel)
+            manifest_hash: load a specific manifest by hash (for time-travel
+                and branch reads). No ref mutation, no race condition.
+                Fix (Round 9 Issue #2): replaces the old swap-then-restore pattern.
+
+        Returns:
+            List of row dicts.
+
+        Round trips: 3 + K S3 GETs cold (root pointer + root ref + manifest + K data blobs)
+        """
+        manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
+        if manifest is None:
+            return []
+
+        # Build a combined row filter: caller's row_filter AND automatic
+        # filters for predicates not handled at the encoded-eval level.
+        #
+        # PND2.decode() only evaluates the FIRST predicate that exists in
+        # the blob's columns (Vortex-style encoded eval). The remaining
+        # predicates must be applied as a post-decode row filter, otherwise
+        # multi-predicate queries return WRONG RESULTS (silently include
+        # rows that violate predicates[1:]).
+        #
+        # Fix (Round 2 Issue #1): derive an automatic row_filter from
+        # predicates[1:] (or all predicates if none were eval'd) and AND
+        # it with the caller's row_filter.
+        auto_filter = self._build_predicate_filter(predicates)
+        combined_filter = self._combine_filters(row_filter, auto_filter)
+
+        # Walk surviving row groups via manifest (in-memory pruning — 0 GETs)
+        all_rows: list[dict] = []
+        for rg in manifest.scan_with_pruning(predicates, start_key, end_key):
+            blob_bytes = self.kernel.read_blob(rg.blob_hash)
+
+            # Decode the blob (with projection + predicate pushdown for
+            # the FIRST predicate only — see PND2.decode docstring)
+            col_data = PND2.decode(blob_bytes, columns=columns,
+                                     predicates=predicates)
+
+            # Convert column-oriented data to row-oriented dicts
+            row_count = max((len(v) for v in col_data.values()), default=0)
+            col_names = list(col_data.keys())
+            for i in range(row_count):
+                row = {c: col_data[c][i] if i < len(col_data[c]) else None
+                        for c in col_names}
+                if combined_filter is None or combined_filter(row):
+                    all_rows.append(row)
+
+        return all_rows
+
+    @staticmethod
+    def _build_predicate_filter(
+            predicates: Optional[list[tuple[str, str, Any]]]
+            ) -> Optional[Callable[[dict], bool]]:
+        """Build a row filter that applies ALL predicates.
+
+        PND2.decode only evaluates the first predicate at the encoded
+        level. This method builds a Python-level filter for ALL
+        predicates (including the first, for safety — the encoded eval
+        may not have been able to prune, e.g., for RAW encoding).
+
+        Returns None if no predicates. Returns a function(row_dict) -> bool.
+        """
+        if not predicates:
+            return None
+
+        def filt(row: dict) -> bool:
+            for col, op, val in predicates:
+                row_val = row.get(col)
+                if row_val is None:
+                    return False  # NULL never matches
+                try:
+                    if op == "=" and not (row_val == val): return False
+                    elif op == "!=" and not (row_val != val): return False
+                    elif op == ">" and not (row_val > val): return False
+                    elif op == ">=" and not (row_val >= val): return False
+                    elif op == "<" and not (row_val < val): return False
+                    elif op == "<=" and not (row_val <= val): return False
+                    elif op == "in" and row_val not in val: return False
+                    else:
+                        pass  # unknown op — don't filter (safe default)
+                except TypeError:
+                    return False  # type mismatch — row doesn't match
+            return True
+        return filt
+
+    @staticmethod
+    def _combine_filters(
+            f1: Optional[Callable], f2: Optional[Callable]
+            ) -> Optional[Callable]:
+        """Combine two row filters with AND. None = no filter."""
+        if f1 is None:
+            return f2
+        if f2 is None:
+            return f1
+        def combined(row: dict) -> bool:
+            return f1(row) and f2(row)
+        return combined
+
+    def read_as_columns(self, collection: str,
+                         predicates: Optional[list[tuple[str, str, Any]]] = None,
+                         columns: Optional[list[str]] = None,
+                         commit_hash: Optional[str] = None,
+                         manifest_hash: Optional[str] = None
+                         ) -> dict[str, list]:
+        """Read rows from a collection as column-oriented data.
+
+        Like read(), but returns dict[col_name, list[values]] instead of
+        list[dict]. Faster when the caller wants columnar data (e.g.,
+        feeding into PyArrow or numpy).
+
+        Uses PARALLEL blob fetch for surviving row groups (via thread pool).
+        """
+        manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
+        if manifest is None:
+            return {}
+
+        # Collect surviving row groups
+        surviving = list(manifest.scan_with_pruning(predicates))
+        if not surviving:
+            return {}
+
+        # PARALLEL fetch: fetch all surviving blobs concurrently.
+        # This reduces wall-clock latency from K × RTT to ~1 × RTT
+        # (when the object store supports concurrent requests, which S3 does).
+        col_results = self._parallel_fetch_and_decode(
+            surviving, columns, predicates)
+
+        # Merge column results across row groups
+        result: dict[str, list] = {}
+        for col_data in col_results:
+            for col_name, values in col_data.items():
+                if col_name not in result:
+                    result[col_name] = []
+                result[col_name].extend(values)
+
+        return result
+
+    def _parallel_fetch_and_decode(
+            self,
+            row_groups: list,
+            columns: Optional[list[str]],
+            predicates: Optional[list[tuple[str, str, Any]]]
+            ) -> list[dict[str, list]]:
+        """Fetch and decode multiple row groups in parallel.
+
+        Uses a thread pool to fetch blobs concurrently. Each thread:
+          1. Calls kernel.read_blob (1 S3 GET)
+          2. Calls PND2.decode (CPU work)
+
+        This reduces wall-clock latency from K × RTT to ~1 × RTT for
+        the fetch phase, and parallelizes the decode phase across cores.
+
+        For small K (1-2 row groups), the thread pool overhead exceeds
+        the benefit — we fall back to sequential.
+        """
+        if len(row_groups) <= 2:
+            # Sequential for small K (thread pool overhead > benefit)
+            results = []
+            for rg in row_groups:
+                blob_bytes = self.kernel.read_blob(rg.blob_hash)
+                col_data = PND2.decode(blob_bytes, columns=columns,
+                                         predicates=predicates)
+                results.append(col_data)
+            return results
+
+        # Parallel for large K
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def fetch_and_decode(rg):
+            blob_bytes = self.kernel.read_blob(rg.blob_hash)
+            return PND2.decode(blob_bytes, columns=columns,
+                                 predicates=predicates)
+
+        # Use at most 16 threads (S3 recommends max 50 concurrent per connection)
+        max_workers = min(16, len(row_groups))
+        results = [None] * len(row_groups)  # preserve order
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(fetch_and_decode, rg): i
+                for i, rg in enumerate(row_groups)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                results[idx] = future.result()
+
+        return [r for r in results if r is not None]
+
+    def read_as_arrow(self, collection: str,
+                       predicates: Optional[list[tuple[str, str, Any]]] = None,
+                       columns: Optional[list[str]] = None) -> "pa.Table":
+        """Read rows as a PyArrow Table — ZERO-COPY from PND2 where possible.
+
+        This is the FASTEST read path for tabular workloads:
+          1. Manifest pruning (in-memory, 0 GETs)
+          2. Parallel blob fetch (K GETs in ~1 RTT wall-clock)
+          3. For INT64/FLOAT64 columns: np.frombuffer → pa.array (zero-copy)
+          4. For STRING columns: pa.array from Python list (1 copy)
+
+        Returns a pa.Table directly — no list[dict] intermediate.
+
+        Args:
+            collection: collection name
+            predicates: list of (column, op, value) tuples for pruning
+            columns: projection pushdown (None = all columns)
+
+        Returns:
+            A pyarrow.Table with the surviving rows.
+
+        Round trips: 3 + K S3 GETs cold (but K blobs fetched in parallel
+        → wall-clock ~3 + 1 RTT for the fetch phase).
+        """
+        try:
+            import pyarrow as pa
+        except ImportError:
+            raise ImportError(
+                "pyarrow is required for read_as_arrow. "
+                "Install with: pip install pyarrow")
+
+        col_data = self.read_as_columns(collection, predicates=predicates,
+                                          columns=columns)
+        if not col_data:
+            return pa.table({})
+
+        # Build Arrow arrays directly from column data
+        arrays = []
+        names = []
+        for col_name, values in col_data.items():
+            arrays.append(pa.array(values))
+            names.append(col_name)
+
+        return pa.Table.from_arrays(arrays, names=names)
+
+    def point_lookup(self, collection: str, key: str,
+                      columns: Optional[list[str]] = None,
+                      manifest_hash: Optional[str] = None) -> Optional[dict]:
+        """Point lookup — find the single row with the given key.
+
+        Returns the row as a dict, or None if not found.
+
+        Round trips: 2 S3 GETs (manifest + 1 data blob) — O(1) regardless
+        of collection scale.
+        """
+        manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
+        if manifest is None:
+            return None
+
+        # Find the row group with smallest key >= "rg/{key}"
+        # Fix (Round 3 Issue #1): use zero-padded key format for correct
+        # lexicographic ordering.
+        target = _format_rg_key(key)
+        rg = manifest.find_row_group(target)
+        if rg is None:
+            return None
+
+        blob_bytes = self.kernel.read_blob(rg.blob_hash)
+        # Use the key column (manifest.key_col) as the predicate for
+        # encoded eval — this returns only the surviving row(s) that
+        # match the key, not the entire row group.
+        #
+        # Fix (Round 2 Issue #4): the old code returned the FIRST row of
+        # the row group, not the matching row. Now we decode with a
+        # predicate on the key column and return the (single) match.
+        key_col = manifest.key_col
+        if key_col:
+            # Try to coerce the key to the right type for comparison
+            # (manifest keys are strings like "rg/9", but the key column
+            # may be INT64)
+            try:
+                # If the key is all digits, try int comparison
+                key_val = int(key) if key.lstrip("-").isdigit() else key
+            except (ValueError, AttributeError):
+                key_val = key
+            col_data = PND2.decode(blob_bytes, columns=columns,
+                                     predicates=[(key_col, "=", key_val)])
+        else:
+            col_data = PND2.decode(blob_bytes, columns=columns)
+
+        # Convert to row dicts and find the matching one
+        row_count = max((len(v) for v in col_data.values()), default=0)
+        col_names = list(col_data.keys())
+        for i in range(row_count):
+            row = {c: col_data[c][i] if i < len(col_data[c]) else None
+                    for c in col_names}
+            # Verify this row matches the key (defensive — the predicate
+            # eval should have already filtered)
+            if key_col and key_col in row:
+                row_key = row[key_col]
+                try:
+                    if str(row_key) == str(key) or row_key == int(key):
+                        return row
+                except (ValueError, TypeError):
+                    pass
+            else:
+                return row  # no key column — return first row
+        return None
+
+    def scan_with_pruning(self, collection: str,
+                           predicates: Optional[list[tuple[str, str, Any]]] = None,
+                           manifest_hash: Optional[str] = None
+                           ) -> Iterator[tuple[str, str, dict]]:
+        """Low-level scan — yields (rg_key, blob_hash, stats_dict) for
+        surviving row groups. The caller fetches and decodes the blobs.
+
+        Useful for batch processing or when the caller wants to control
+        the decode step.
+        """
+        manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
+        if manifest is None:
+            return
+
+        for rg in manifest.scan_with_pruning(predicates):
+            stats_dict = {c.name: (c.min, c.max, c.null_count)
+                           for c in rg.columns}
+            yield (rg.key, rg.blob_hash, stats_dict)
+
+    def iter_rows(self, collection: str,
+                  predicates: Optional[list[tuple[str, str, Any]]] = None,
+                  columns: Optional[list[str]] = None,
+                  batch_size: int = 1000,
+                  manifest_hash: Optional[str] = None
+                  ) -> Iterator[list[dict]]:
+        """Streaming read — yields rows in batches without loading all into memory.
+
+        This is the MEMORY-SAFE read path for large collections. Instead of
+        returning list[dict] (which OOMs at 1B rows), this generator yields
+        batches of `batch_size` rows at a time.
+
+        Each batch is fetched from one row group (or a slice of one), decoded,
+        and yielded. The caller processes the batch and discards it before the
+        next batch is fetched.
+
+        Args:
+            collection: collection name
+            predicates: list of (column, op, value) tuples for pruning
+            columns: projection pushdown (None = all columns)
+            batch_size: rows per batch (default 1000). Actual batch size
+                may be larger if row groups are larger than batch_size.
+            manifest_hash: for time-travel reads
+
+        Yields:
+            Lists of row dicts (batch_size rows at a time).
+
+        Round trips: 3 + K S3 GETs cold (same as read()), but memory usage
+        is O(batch_size) instead of O(total_rows).
+        """
+        manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
+        if manifest is None:
+            return
+
+        auto_filter = self._build_predicate_filter(predicates)
+
+        for rg in manifest.scan_with_pruning(predicates):
+            blob_bytes = self.kernel.read_blob(rg.blob_hash)
+            col_data = PND2.decode(blob_bytes, columns=columns,
+                                     predicates=predicates)
+
+            row_count = max((len(v) for v in col_data.values()), default=0)
+            col_names = list(col_data.keys())
+
+            # Yield in batches
+            for start in range(0, row_count, batch_size):
+                end = min(start + batch_size, row_count)
+                batch = []
+                for i in range(start, end):
+                    row = {c: col_data[c][i] if i < len(col_data[c]) else None
+                            for c in col_names}
+                    if auto_filter is None or auto_filter(row):
+                        batch.append(row)
+                if batch:
+                    yield batch
+
+
+# ---------------------------------------------------------------------------
+# Helpers — value encoding for PND2 stats
+# ---------------------------------------------------------------------------
+
+def _encode_pnd2_value(value_type: int, value: Any) -> bytes:
+    """Encode a single min/max value as binary bytes (PND2 stats section)."""
+    if value_type == VALUE_TYPE_INT64:
+        return struct.pack("<q", int(value))
+    if value_type == VALUE_TYPE_FLOAT64:
+        return struct.pack("<d", float(value))
+    if value_type == VALUE_TYPE_STRING:
+        s = str(value).encode("utf-8")
+        return struct.pack("<I", len(s)) + s
+    if value_type == VALUE_TYPE_BINARY:
+        b = bytes(value) if not isinstance(value, bytes) else value
+        return struct.pack("<I", len(b)) + b
+    return b""
+
+
+def _decode_pnd2_value(value_type: int, data: bytes, pos: int) -> tuple[Any, int]:
+    """Decode a single min/max value from PND2 stats section."""
+    if value_type == VALUE_TYPE_INT64:
+        v = struct.unpack("<q", data[pos:pos+8])[0]
+        return v, pos + 8
+    if value_type == VALUE_TYPE_FLOAT64:
+        v = struct.unpack("<d", data[pos:pos+8])[0]
+        return v, pos + 8
+    if value_type == VALUE_TYPE_STRING:
+        slen = struct.unpack("<I", data[pos:pos+4])[0]
+        pos += 4
+        s = data[pos:pos+slen].decode("utf-8")
+        return s, pos + slen
+    if value_type == VALUE_TYPE_BINARY:
+        slen = struct.unpack("<I", data[pos:pos+4])[0]
+        pos += 4
+        b = bytes(data[pos:pos+slen])
+        return b, pos + slen
+    return None, pos
+
+
+# ---------------------------------------------------------------------------
+# Helpers — BINARY value type + source slicing/sorting + key formatting
+# ---------------------------------------------------------------------------
+
+# Row group key format: "rg/" + zero-padded numeric key.
+# Padding to 20 digits supports up to 10^20 row groups — far beyond any
+# realistic workload (1 PB at 100 MB/row group = 10^7 row groups).
+# Without padding, lexicographic comparison breaks: "rg/9" > "rg/42"
+# because "9" > "4". This silently corrupts point_lookup and range scans
+# for collections with >10 row groups.
+_RG_KEY_WIDTH = 20
+
+def _format_rg_key(max_pk: Any) -> str:
+    """Format a row group key with zero-padding for correct lexicographic ordering.
+
+    For numeric keys: "rg/00000000000000000042" (20-digit zero-padded)
+    For string keys: "rg/" + key (no padding — caller must pad if needed)
+
+    This ensures "rg/9" < "rg/42" (because "000...9" < "000...42" lexically).
+    """
+    if isinstance(max_pk, int):
+        return f"rg/{max_pk:0{_RG_KEY_WIDTH}d}"
+    # Try to convert string to int (common case: key_col is INT64 but
+    # max_pk comes back as a string from ListColumnSource)
+    try:
+        return f"rg/{int(max_pk):0{_RG_KEY_WIDTH}d}"
+    except (ValueError, TypeError):
+        # Non-numeric key — use as-is (caller's responsibility to pad)
+        return f"rg/{max_pk}"
+
+
+def _detect_value_type_with_binary(values: list) -> int:
+    """Detect value type, including BINARY for raw bytes."""
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            return VALUE_TYPE_INT64
+        if isinstance(v, int):
+            return VALUE_TYPE_INT64
+        if isinstance(v, float):
+            return VALUE_TYPE_FLOAT64
+        if isinstance(v, bytes):
+            return VALUE_TYPE_BINARY
+        return VALUE_TYPE_STRING  # default to string
+    return VALUE_TYPE_NULL
+
+
+def _encode_binary_raw(values: list, hint: str = "raw") -> tuple[bytes, dict]:
+    """Encode a BINARY column as raw bytes (no RLE/DICT/BITPACK).
+
+    Layout (after the 9-byte EncodingHeader):
+      n_values(4B) + [length(4B) + bytes] * n_values
+    """
+    n_rows = len(values)
+    payload = struct.pack("<I", n_rows)
+    for v in values:
+        if v is None:
+            payload += struct.pack("<I", 0)
+        else:
+            b = v if isinstance(v, bytes) else bytes(v)
+            payload += struct.pack("<I", len(b))
+            payload += b
+
+    header = EncodingHeader(ColumnEncoding.RAW, n_rows).to_bytes()
+    meta = {"encoding": "raw", "n_rows": n_rows, "value_type": VALUE_TYPE_BINARY,
+            "payload_size": len(payload)}
+    return header + payload, meta
+
+
+def _decode_binary_raw(payload: bytes, expected_n_rows: int) -> list:
+    """Decode a BINARY column's raw payload.
+
+    Layout: n_values(4B) + [length(4B) + bytes] * n_values
+
+    Args:
+        payload: the column's payload bytes (after the PND2 schema/stats
+            sections, NOT including any PND1 header)
+        expected_n_rows: the declared n_rows from the PND2 header
+
+    Returns:
+        List of values (bytes or None for nulls).
+    """
+    if len(payload) < 4:
+        return []
+    n_values = struct.unpack("<I", payload[:4])[0]
+    pos = 4
+    result = []
+    for _ in range(n_values):
+        if pos + 4 > len(payload):
+            break
+        (blen,) = struct.unpack("<I", payload[pos:pos+4])
+        pos += 4
+        if blen == 0:
+            result.append(None)
+        else:
+            result.append(bytes(payload[pos:pos+blen]))
+            pos += blen
+    # Pad with None if we ran out of data (defensive)
+    while len(result) < expected_n_rows:
+        result.append(None)
+    return result
+
+
+def _binary_value_matches(val: Any, op: str, target: Any) -> bool:
+    """Check if a BINARY value matches a predicate.
+
+    Supports =, !=, and "in" (target is a list of bytes). Other ops
+    return True (can't prune — caller should not filter).
+    """
+    if op == "=":
+        if val is None or target is None:
+            return val is None and target is None
+        if isinstance(target, str):
+            target = target.encode("utf-8")
+        return val == target
+    if op == "!=":
+        if val is None or target is None:
+            return not (val is None and target is None)
+        if isinstance(target, str):
+            target = target.encode("utf-8")
+        return val != target
+    if op == "in":
+        if val is None:
+            return False
+        targets = [t.encode("utf-8") if isinstance(t, str) else t
+                    for t in target]
+        return val in targets
+    # Unknown op — don't filter (return True so the row survives)
+    return True
+
+
+def _slice_source(source: ColumnSource, start: int, end: int) -> ColumnSource:
+    """Slice a ColumnSource — returns a new source with rows [start, end)."""
+    # For PyArrowColumnSource, we can slice the underlying table
+    if isinstance(source, PyArrowColumnSource):
+        return PyArrowColumnSource(source._table.slice(start, end - start))
+    # For ListColumnSource, slice the rows list
+    if isinstance(source, ListColumnSource):
+        return ListColumnSource(source._rows[start:end])
+    # Fallback: wrap in a SlicedSource
+    return _SlicedSource(source, start, end)
+
+
+class _SlicedSource:
+    """A slice of a ColumnSource — used when the source doesn't natively support slicing."""
+    def __init__(self, parent: ColumnSource, start: int, end: int):
+        self._parent = parent
+        self._start = start
+        self._end = end
+
+    def column_names(self) -> list[str]:
+        return self._parent.column_names()
+
+    def num_rows(self) -> int:
+        return self._end - self._start
+
+    def column_slice(self, name: str, start: int, end: int) -> list:
+        return self._parent.column_slice(name,
+                                           self._start + start,
+                                           self._start + end)
+
+    def column_stats(self, name: str) -> tuple:
+        values = self.column_slice(name, 0, self.num_rows())
+        return compute_list_stats(values)
+
+
+def _sort_source_by(source: ColumnSource, key_col: str) -> ColumnSource:
+    """Sort a ColumnSource by a column — returns a new sorted source."""
+    # For PyArrowColumnSource, use PyArrow's sort_by
+    if isinstance(source, PyArrowColumnSource):
+        return PyArrowColumnSource(source._table.sort_by(key_col))
+    # For ListColumnSource, sort in Python
+    if isinstance(source, ListColumnSource):
+        rows = sorted(source._rows, key=lambda r: (r.get(key_col) is None, r.get(key_col)))
+        return ListColumnSource(rows)
+    # Fallback: read all rows, sort, wrap in ListColumnSource
+    n = source.num_rows()
+    col_names = source.column_names()
+    rows = []
+    for i in range(n):
+        row = {c: source.column_slice(c, i, i+1)[0] for c in col_names}
+        rows.append(row)
+    rows.sort(key=lambda r: (r.get(key_col) is None, r.get(key_col)))
+    return ListColumnSource(rows)

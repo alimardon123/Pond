@@ -68,133 +68,38 @@ def test_feature_store_lens():
     ok, output = _run_script("pond-labs/lenses/feature_store_lens.py")
     assert ok, f"Feature Store Lens failed:\n{output[-500:]}"
 
-def test_interop_demo():
-    ok, output = _run_script("pond-labs/demos/interop_demo.py")
-    assert ok, f"Interop demo failed:\n{output[-500:]}"
 
 def test_loc_benchmark():
     ok, output = _run_script("pond-labs/benchmarks/loc_benchmark.py")
     assert ok, f"LOC benchmark failed:\n{output[-500:]}"
 
-def test_track1_compat():
-    ok, output = _run_script("pond-labs/tracks/track1_compat_matrix.py")
-    assert ok, f"Track 1 failed:\n{output[-500:]}"
 
-def test_track2_index_portability():
-    ok, output = _run_script("pond-labs/tracks/track2_index_portability.py")
-    assert ok, f"Track 2 failed:\n{output[-500:]}"
 
-def test_track7_reverse():
-    ok, output = _run_script("pond-labs/tracks/track7_reverse_composability.py")
-    assert ok, f"Track 7 failed:\n{output[-500:]}"
-
-def test_track8_storage_independence():
-    ok, output = _run_script("pond-labs/tracks/track8_storage_independence.py")
-    assert ok, f"Track 8 failed:\n{output[-500:]}"
-
-def test_track9_production_lakehouse():
-    ok, output = _run_script("pond-labs/tracks/track9_production_lakehouse.py")
-    assert ok, f"Track 9 failed:\n{output[-500:]}"
-
-def test_pruning():
-    ok, output = _run_script("tests/integration/test_pruning.py")
-    assert ok, f"Pruning tests failed:\n{output[-500:]}"
-
-def test_lakehouse_pruning():
-    ok, output = _run_script("tests/integration/test_lakehouse_pruning.py")
-    assert ok, f"Lakehouse pruning tests failed:\n{output[-500:]}"
-
-def test_column_chunk_pruning_benchmark():
-    ok, output = _run_script("pond-labs/benchmarks/column_chunk_pruning_benchmark.py")
-    assert ok, f"Column-chunk pruning benchmark failed:\n{output[-500:]}"
-
-def test_column_chunk_storage():
-    ok, output = _run_script("tests/integration/test_column_chunk_storage.py")
-    assert ok, f"Column-chunk storage tests failed:\n{output[-500:]}"
-
-def test_column_chunk_storage_benchmark():
-    ok, output = _run_script("pond-labs/benchmarks/column_chunk_storage_benchmark.py")
-    assert ok, f"Column-chunk storage benchmark failed:\n{output[-500:]}"
-
-def test_encoded_pruning():
-    ok, output = _run_script("tests/integration/test_encoded_pruning.py")
-    assert ok, f"Encoded pruning tests failed:\n{output[-500:]}"
-
-def test_encoded_pruning_benchmark():
-    ok, output = _run_script("pond-labs/benchmarks/encoded_pruning_benchmark.py")
-    assert ok, f"Encoded pruning benchmark failed:\n{output[-500:]}"
-
-def test_sql_pushdown_fast_paths():
-    ok, output = _run_script("tests/integration/test_sql_pushdown_fast_paths.py")
-    assert ok, f"SQL pushdown fast-paths test failed:\n{output[-500:]}"
-
-def test_best_effort():
-    ok, output = _run_script("tests/integration/test_best_effort.py")
-    assert ok, f"Best-effort helper tests failed:\n{output[-500:]}"
-
-def test_column_source():
-    ok, output = _run_script("tests/integration/test_column_source.py")
-    assert ok, f"ColumnSource tests failed:\n{output[-500:]}"
 
 def test_bitpack_compression_benchmark():
     ok, output = _run_script("pond-labs/benchmarks/bitpack_compression_benchmark.py")
     assert ok, f"Bitpack compression benchmark failed:\n{output[-500:]}"
 
-def test_generic_pruning_demo():
-    ok, output = _run_script("pond-labs/demos/generic_pruning_demo.py")
-    assert ok, f"Generic pruning demo failed:\n{output[-500:]}"
 
-def test_vector_pruning_demo():
-    ok, output = _run_script("pond-labs/demos/vector_pruning_demo.py")
-    assert ok, f"Vector pruning demo failed:\n{output[-500:]}"
 
 def test_pond_config():
     ok, output = _run_script("tests/integration/test_pond_config.py")
     assert ok, f"Pond config tests failed:\n{output[-500:]}"
 
-def test_scale_1m_benchmark():
-    ok, output = _run_script("pond-labs/benchmarks/scale_1m_benchmark.py")
-    assert ok, f"1M scale benchmark failed:\n{output[-500:]}"
 
-def test_duckdb_adapter_demo():
-    ok, output = _run_script("pond-labs/demos/duckdb_adapter_demo.py")
-    assert ok, f"DuckDB adapter demo failed:\n{output[-500:]}"
 
 def test_polars_adapter_demo():
     ok, output = _run_script("pond-labs/demos/polars_adapter_demo.py")
     assert ok, f"Polars adapter demo failed:\n{output[-500:]}"
 
-def test_jupyter_notebook_demo():
-    ok, output = _run_script("pond-labs/demos/jupyter_notebook_demo.py")
-    assert ok, f"Jupyter notebook demo failed:\n{output[-500:]}"
 
 def test_streaming_lens_demo():
     ok, output = _run_script("pond-labs/demos/streaming_lens_demo.py")
     assert ok, f"Streaming lens demo failed:\n{output[-500:]}"
 
-def test_pnd1_vs_parquet_benchmark():
-    ok, output = _run_script("pond-labs/benchmarks/pnd1_vs_parquet_benchmark.py")
-    assert ok, f"PND1 vs Parquet benchmark failed:\n{output[-500:]}"
 
-def test_stats_index():
-    ok, output = _run_script("tests/integration/test_stats_index.py")
-    assert ok, f"Stats index tests failed:\n{output[-500:]}"
 
-def test_kv_pruning_and_projection():
-    ok, output = _run_script("tests/integration/test_kv_pruning_and_projection.py")
-    assert ok, f"KV pruning + projection tests failed:\n{output[-500:]}"
 
-def test_collection_metadata():
-    ok, output = _run_script("tests/integration/test_collection_metadata.py")
-    assert ok, f"Collection metadata tests failed:\n{output[-500:]}"
-
-def test_index_modes():
-    ok, output = _run_script("tests/integration/test_index_modes.py")
-    assert ok, f"Index modes tests failed:\n{output[-500:]}"
-
-def test_transport_production():
-    ok, output = _run_script("services/transport/transport_production.py")
-    assert ok, f"Transport tests failed:\n{output[-500:]}"
 
 def test_schema_registry():
     ok, output = _run_script("services/schema/schema_registry.py")

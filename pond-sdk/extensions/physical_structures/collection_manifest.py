@@ -1,0 +1,950 @@
+"""
+CollectionManifest — ONE blob per commit, ALL pruning, ANY workload.
+
+THE MANDATE (per architecture review #2):
+  "Make sure we will have less round trips possible with object storage
+   for all interactions/access with our storage."
+
+THE DESIGN:
+  ONE blob per commit that contains EVERYTHING a reader needs:
+    - Schema (column names + types)
+    - Sort order (key column, row_group_size, chunk_size)
+    - Per-row-group entries with INLINE stats + blob hashes
+    - Optional hierarchical stats tree root (for PB scale)
+
+READ PATH (3 + K round trips, irreducible on content-addressed stores):
+    1. HEAD ref          (cheap, SDK-cached)
+    2. commit blob       (~200 bytes — gives us manifest_hash)
+    3. manifest blob     (~200 bytes/row group — gives us all blob hashes + stats)
+    4. K data blobs      (parallelizable — the only "real" I/O)
+
+WRITE PATH (N + 2 writes):
+    1. N data blob writes (parallelizable)
+    2. 1 manifest blob write
+    3. 1 commit blob write  (contains manifest_hash)
+    4. 1 HEAD ref update
+
+This replaces:
+  - ZoneMapIndex (460 LOC) — manifest has inline stats, no separate tree
+  - StatsIndex (177 LOC)   — manifest is the stats index, in binary not JSON
+  - zone_map_manifest blob — manifest IS the manifest, lives in commit
+  - Per-row-group zone-map blobs — stats are INLINE in the manifest
+  - column_chunk manifest JSON blobs — chunk hashes are INLINE in the manifest
+
+WHAT STAYS:
+  - PruningPredicate / ColumnPredicate — evaluate against manifest entries
+  - ColumnSource — format-agnostic data access
+  - encode_fn / decode_fn — lens's format contract
+  - All 4 encodings + compression — unchanged
+  - embedded_stats.py — third-level pruning in chunk blob headers
+  - ColumnChunkZoneMap / ColumnChunkStats — used by manifest entries
+
+GENERIC:
+  Works for ANY workload:
+    - Tabular: columns are table columns; row groups are PK ranges
+    - KV:      columns are JSON fields; row groups are key ranges
+    - Vector:  columns are dimensions + vector_id; stats are bounding boxes
+    - Streaming: columns are segment metadata; row groups are byte ranges
+    - Notebooks: columns are cell metadata; row groups are cell ranges
+
+BINARY FORMAT (PND1-manifest v1):
+    +-----------------------------+
+    | Magic (4B): b"PMAN"         |
+    | Version (1B): 1             |
+    | Flags (1B):                 |
+    |   bit 0: has_stats_tree     |
+    |   bit 1: has_bloom          |
+    |   bit 2-7: reserved         |
+    | n_row_groups (4B uint32)    |
+    | n_columns (2B uint16)       |
+    +-----------------------------+
+    | Schema section:             |
+    |   For each column:          |
+    |     name_len (1B)           |
+    |     name (UTF-8)            |
+    |     value_type (1B)         |
+    +-----------------------------+
+    | Sort order section:         |
+    |   key_col_len (1B)          |
+    |   key_col (UTF-8)           |
+    |   row_group_size (4B)       |
+    |   chunk_size (4B)           |
+    +-----------------------------+
+    | Optional sections:          |
+    |   stats_tree_root (32B)     |  if flags bit 0
+    |   bloom_filter_ref (32B)    |  if flags bit 1
+    +-----------------------------+
+    | Row group entries:          |
+    |   For each row group:       |
+    |     key_len (2B)            |
+    |     key (UTF-8)             |
+    |     blob_hash (32B binary)  |
+    |     n_rows (4B)             |
+    |     storage_mode (1B):      |
+    |       0=whole_blob          |
+    |       1=column_chunks       |
+    |       2=encoded             |
+    |     For each column (n_columns entries):  |
+    |       value_type (1B)       |
+    |       has_min (1B)          |
+    |       min (8B or var-len)   |
+    |       max (8B or var-len)   |
+    |       null_count (4B)       |
+    |       n_chunks (2B)         |
+    |       For each chunk:       |
+    |         chunk_blob_hash (32B)|
+    |         chunk_min (8B or var)|
+    |         chunk_max (8B or var)|
+    |         chunk_null_count (4B)|
+    |         encoding (1B)       |
+    |         encoding_meta_len (2B)|
+    |         encoding_meta (var) |
+
+SIZE ESTIMATE:
+    - ~50 bytes per row group (whole-blob mode, no chunks)
+    - ~80 bytes per column chunk (with hash + stats)
+    - 100 row groups × 5 columns × 10 chunks = 100 × (50 + 5×80) = 45 KB
+    - ONE fetch on S3.
+
+LAZY HIERARCHICAL STATS TREE (PB scale):
+    For >10K row groups (manifest >5MB), the manifest delegates to a
+    stats tree: a Prolly tree with aggregated stats in internal nodes.
+    Built lazily on first OLAP read; cached via content addressing.
+    See `stats_tree.py`.
+"""
+
+from __future__ import annotations
+
+import struct
+import os
+import sys
+from dataclasses import dataclass, field
+from typing import Optional, Any, Iterator
+
+# Make pond-core importable
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "..", "..", "..", "pond-core"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from kernel import PondMinimal  # noqa: E402
+
+# Reuse value-type constants from embedded_stats for consistency
+from embedded_stats import (  # noqa: E402
+    VALUE_TYPE_INT64, VALUE_TYPE_FLOAT64, VALUE_TYPE_STRING, VALUE_TYPE_NULL,
+)
+
+# Reuse ColumnChunkStats / ColumnChunkZoneMap for chunk-level stats
+try:
+    from column_chunk_zone_map import ColumnChunkStats, ColumnChunkZoneMap  # noqa: E402
+    _HAVE_CCZM = True
+except ImportError:
+    _HAVE_CCZM = False
+    # Define stubs so the code below doesn't break at import time
+    class ColumnChunkStats:  # type: ignore
+        pass
+    class ColumnChunkZoneMap:  # type: ignore
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Manifest constants
+# ---------------------------------------------------------------------------
+
+_MANIFEST_MAGIC = b"PMAN"
+_MANIFEST_VERSION = 1
+
+# Storage modes
+STORAGE_WHOLE_BLOB = 0      # one Parquet blob per row group
+STORAGE_COLUMN_CHUNKS = 1   # per-column-chunk Parquet blobs (manifest blob has hashes)
+STORAGE_ENCODED = 2         # per-column-chunk encoded blobs (PND1 + compression)
+
+# Flags
+FLAG_HAS_STATS_TREE = 0x01
+FLAG_HAS_BLOOM = 0x02
+FLAG_HAS_PARENT_MANIFEST = 0x04  # delta-manifest for O(1) appends
+
+
+# ---------------------------------------------------------------------------
+# Data classes for manifest entries
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ColumnChunkEntry:
+    """Per-chunk entry in a manifest — chunk-level stats + blob hash."""
+    blob_hash: str             # 32-byte hex hash of the chunk blob
+    min: Any = None
+    max: Any = None
+    null_count: int = 0
+    encoding: int = 0          # 0=raw, 1=rle, 2=dict, 3=bitpack
+    encoding_meta: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "blob_hash": self.blob_hash,
+            "min": self.min,
+            "max": self.max,
+            "null_count": self.null_count,
+            "encoding": self.encoding,
+            "encoding_meta": self.encoding_meta,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ColumnChunkEntry":
+        return cls(
+            blob_hash=d["blob_hash"],
+            min=d.get("min"),
+            max=d.get("max"),
+            null_count=d.get("null_count", 0),
+            encoding=d.get("encoding", 0),
+            encoding_meta=d.get("encoding_meta", {}),
+        )
+
+    @classmethod
+    def from_cczm_stats(cls, stats: "ColumnChunkStats",
+                         encoding: int = 0,
+                         encoding_meta: Optional[dict] = None) -> "ColumnChunkEntry":
+        """Build from a ColumnChunkStats object (from column_chunk_zone_map)."""
+        return cls(
+            blob_hash=stats.blob_hash or "",
+            min=stats.min,
+            max=stats.max,
+            null_count=stats.null_count,
+            encoding=encoding,
+            encoding_meta=encoding_meta or {},
+        )
+
+
+@dataclass
+class ColumnStatsEntry:
+    """Per-column stats for one row group — min/max/null_count + optional chunks."""
+    name: str
+    value_type: int = VALUE_TYPE_NULL
+    min: Any = None
+    max: Any = None
+    null_count: int = 0
+    chunks: list[ColumnChunkEntry] = field(default_factory=list)
+
+    def can_prune(self, op: str, value: Any) -> bool:
+        """Return True if this column's stats prove NO rows can match.
+
+        Used at row-group level (skip the entire row group).
+        """
+        if self.min is None or self.max is None:
+            return False  # no stats — can't prune
+        try:
+            if op == ">" and self.max <= value:
+                return True
+            if op == ">=" and self.max < value:
+                return True
+            if op == "<" and self.min >= value:
+                return True
+            if op == "<=" and self.min > value:
+                return True
+            if op == "=" and (value < self.min or value > self.max):
+                return True
+            if op == "in":
+                if not value:
+                    return True
+                v_min, v_max = min(value), max(value)
+                if self.max < v_min or self.min > v_max:
+                    return True
+        except TypeError:
+            return False  # type mismatch — can't prune
+        return False
+
+    def prune_chunks(self, op: str, value: Any) -> Optional[list[int]]:
+        """Find which chunk indices MIGHT match a predicate.
+
+        Returns the indices of chunks that cannot be pruned (might match).
+        Returns None if no chunk-level pruning is possible (no chunks, or
+        chunk stats missing).
+        Returns [] if all chunks pruned (caller should skip the row group
+        for this column — but be careful: an empty intersection across
+        columns means the whole row group is pruned, which is correct).
+        """
+        if not self.chunks:
+            return None
+        surviving = []
+        for i, chunk in enumerate(self.chunks):
+            if chunk.min is None or chunk.max is None:
+                surviving.append(i)  # no stats — can't prune
+                continue
+            try:
+                if op == ">" and chunk.max <= value: continue
+                if op == ">=" and chunk.max < value: continue
+                if op == "<" and chunk.min >= value: continue
+                if op == "<=" and chunk.min > value: continue
+                if op == "=" and (value < chunk.min or value > chunk.max): continue
+                if op == "in":
+                    if not value: continue
+                    v_min, v_max = min(value), max(value)
+                    if chunk.max < v_min or chunk.min > v_max: continue
+            except TypeError:
+                pass  # type mismatch — can't prune, keep chunk
+            surviving.append(i)
+        return surviving
+
+
+@dataclass
+class RowGroupEntry:
+    """Per-row-group entry in a manifest — key, blob hash, and per-column stats."""
+    key: str                        # e.g., "rg/9999"
+    blob_hash: str                  # data blob hash (whole-blob mode) or chunk-manifest hash
+    n_rows: int = 0
+    storage_mode: int = STORAGE_WHOLE_BLOB
+    columns: list[ColumnStatsEntry] = field(default_factory=list)
+
+    def can_prune(self, predicates: list[tuple[str, str, Any]]) -> bool:
+        """Return True if this row group CANNOT match any predicate (skip it)."""
+        if not predicates:
+            return False  # no predicates — never prune
+        col_lookup = {c.name: c for c in self.columns}
+        for col_name, op, val in predicates:
+            col = col_lookup.get(col_name)
+            if col is None:
+                continue  # no stats — can't prune on this column
+            if col.can_prune(op, val):
+                return True  # this column proves the row group can't match
+        return False
+
+    def get_column(self, name: str) -> Optional[ColumnStatsEntry]:
+        for c in self.columns:
+            if c.name == name:
+                return c
+        return None
+
+    def to_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "blob_hash": self.blob_hash,
+            "n_rows": self.n_rows,
+            "storage_mode": self.storage_mode,
+            "columns": [c.__dict__ for c in self.columns],
+        }
+
+
+# ---------------------------------------------------------------------------
+# CollectionManifest — the main class
+# ---------------------------------------------------------------------------
+
+class CollectionManifest:
+    """ONE blob per commit with ALL pruning info for a collection.
+
+    Built atomically with each commit. Read in ONE fetch on S3.
+
+    Lifecycle:
+      1. writer = CollectionManifest(kernel)
+      2. writer.set_schema(columns, key_col, row_group_size, chunk_size)
+      3. For each row group: writer.add_row_group(entry)
+      4. manifest_hash = writer.commit(collection_name)  # writes ONE blob
+      5. Reader: manifest = CollectionManifest.load(kernel, manifest_hash)
+
+    The manifest is content-addressed — the same row groups always produce
+    the same manifest bytes (deduplication for free).
+    """
+
+    def __init__(self, kernel: PondMinimal):
+        self.kernel = kernel
+        self._columns: list[tuple[str, int]] = []  # (name, value_type)
+        self._key_col: str = ""
+        self._row_group_size: int = 0
+        self._chunk_size: int = 0
+        self._row_groups: list[RowGroupEntry] = []
+        self._stats_tree_root: Optional[str] = None
+        self._bloom_filter_ref: Optional[str] = None
+        # Delta-manifest support (Round 9 Issue #5): for O(1) appends at PB scale,
+        # a manifest can reference a PARENT manifest instead of duplicating all
+        # row groups. The reader walks the parent chain to find all entries.
+        self._parent_manifest_hash: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Builder API — write side
+    # ------------------------------------------------------------------
+
+    def set_schema(self, columns: list[tuple[str, int]],
+                   key_col: str = "",
+                   row_group_size: int = 0,
+                   chunk_size: int = 0) -> None:
+        """Set the schema and sort-order info.
+
+        Args:
+            columns: list of (column_name, value_type) tuples
+                value_type: 1=INT64, 2=FLOAT64, 3=STRING, 4=NULL
+            key_col: name of the sort key column ("" if none)
+            row_group_size: rows per row group
+            chunk_size: rows per column chunk
+        """
+        self._columns = list(columns)
+        self._key_col = key_col
+        self._row_group_size = row_group_size
+        self._chunk_size = chunk_size
+
+    def add_row_group(self, entry: RowGroupEntry) -> None:
+        """Add a row group entry to the manifest."""
+        self._row_groups.append(entry)
+
+    def set_stats_tree_root(self, root_hash: str) -> None:
+        """Attach a hierarchical stats tree root (for PB scale)."""
+        self._stats_tree_root = root_hash
+
+    def set_bloom_filter_ref(self, ref: str) -> None:
+        """Attach a bloom filter ref (for membership queries)."""
+        self._bloom_filter_ref = ref
+
+    def set_parent_manifest(self, parent_hash: str) -> None:
+        """Set the parent manifest hash for delta-appends (O(1) at PB scale).
+
+        Fix (Round 9 Issue #5): instead of reading ALL existing row groups
+        to rebuild the manifest on every append, a delta-manifest only stores
+        the NEW row groups + a pointer to the parent manifest. The reader
+        walks the parent chain to find all entries.
+
+        This makes append() O(new_row_groups) instead of O(total_row_groups).
+        """
+        self._parent_manifest_hash = parent_hash
+
+    def commit(self) -> str:
+        """Serialize the manifest and write it as ONE kernel blob.
+
+        Returns:
+            The manifest blob hash. The lens writes this hash into the
+            commit blob's manifest_hash field.
+        """
+        data = self.encode()
+        return self.kernel.write(data)
+
+    # ------------------------------------------------------------------
+    # Encoding — binary PND1-manifest v1
+    # ------------------------------------------------------------------
+
+    def encode(self) -> bytes:
+        """Encode the manifest as binary bytes.
+
+        Format: see module docstring.
+        """
+        flags = 0
+        if self._stats_tree_root:
+            flags |= FLAG_HAS_STATS_TREE
+        if self._bloom_filter_ref:
+            flags |= FLAG_HAS_BLOOM
+        if self._parent_manifest_hash:
+            flags |= FLAG_HAS_PARENT_MANIFEST
+
+        buf = bytearray()
+        buf += _MANIFEST_MAGIC
+        buf += struct.pack("<BB", _MANIFEST_VERSION, flags)
+        # When stats_tree_root is set (PB scale), we DON'T encode the row
+        # groups inline — they live in the stats tree. The manifest blob
+        # stays small (just schema + sort_order + stats_tree_root).
+        # When parent_manifest_hash is set (delta-append), we only encode
+        # the NEW row groups (not the parent's). The reader walks the chain.
+        n_inline_row_groups = 0 if self._stats_tree_root else len(self._row_groups)
+        buf += struct.pack("<IH", n_inline_row_groups, len(self._columns))
+
+        # Schema section
+        for name, vtype in self._columns:
+            name_bytes = name.encode("utf-8")
+            buf += struct.pack("<B", len(name_bytes))
+            buf += name_bytes
+            buf += struct.pack("<B", vtype)
+
+        # Sort order section
+        key_col_bytes = self._key_col.encode("utf-8")
+        buf += struct.pack("<B", len(key_col_bytes))
+        buf += key_col_bytes
+        buf += struct.pack("<II", self._row_group_size, self._chunk_size)
+
+        # Optional sections
+        if self._stats_tree_root:
+            buf += bytes.fromhex(self._stats_tree_root)
+        if self._bloom_filter_ref:
+            buf += bytes.fromhex(self._bloom_filter_ref)
+        if self._parent_manifest_hash:
+            buf += bytes.fromhex(self._parent_manifest_hash)
+
+        # Row group entries — ONLY when no stats tree (small-manifest path)
+        if not self._stats_tree_root:
+            for rg in self._row_groups:
+                buf += self._encode_row_group(rg)
+
+        return bytes(buf)
+
+    def _encode_row_group(self, rg: RowGroupEntry) -> bytes:
+        buf = bytearray()
+        key_bytes = rg.key.encode("utf-8")
+        buf += struct.pack("<H", len(key_bytes))
+        buf += key_bytes
+        buf += bytes.fromhex(rg.blob_hash)
+        buf += struct.pack("<IB", rg.n_rows, rg.storage_mode)
+
+        # Per-column entries (n_columns total, in schema order)
+        col_lookup = {c.name: c for c in rg.columns}
+        for col_name, expected_vtype in self._columns:
+            col = col_lookup.get(col_name)
+            if col is None:
+                # Missing column — write empty entry
+                buf += struct.pack("<BB", expected_vtype, 0)
+                buf += struct.pack("<I", 0)  # null_count
+                buf += struct.pack("<H", 0)  # n_chunks
+                continue
+
+            buf += struct.pack("<B", col.value_type)
+            has_min = col.min is not None and col.max is not None
+            buf += struct.pack("<B", 1 if has_min else 0)
+            if has_min:
+                buf += _encode_value(col.value_type, col.min)
+                buf += _encode_value(col.value_type, col.max)
+            buf += struct.pack("<I", col.null_count)
+            buf += struct.pack("<H", len(col.chunks))
+
+            for chunk in col.chunks:
+                buf += bytes.fromhex(chunk.blob_hash)
+                # Chunk min/max (same encoding as column min/max)
+                chunk_has_min = chunk.min is not None and chunk.max is not None
+                # Encode has_min flag (1 byte) + min/max (if present)
+                # To keep the format compact, we use the SAME has_min byte
+                # convention as column-level stats.
+                buf += struct.pack("<B", 1 if chunk_has_min else 0)
+                if chunk_has_min:
+                    buf += _encode_value(col.value_type, chunk.min)
+                    buf += _encode_value(col.value_type, chunk.max)
+                buf += struct.pack("<I", chunk.null_count)
+                buf += struct.pack("<B", chunk.encoding)
+                # encoding_meta as a small JSON blob (length-prefixed)
+                import json
+                meta_bytes = json.dumps(chunk.encoding_meta,
+                                         sort_keys=True,
+                                         default=str).encode("utf-8")
+                buf += struct.pack("<H", len(meta_bytes))
+                buf += meta_bytes
+
+        return bytes(buf)
+
+    # ------------------------------------------------------------------
+    # Decoding — read side
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def load(cls, kernel: PondMinimal, manifest_hash: str) -> "CollectionManifest":
+        """Load a manifest from a kernel blob.
+
+        Args:
+            kernel: the PondMinimal kernel
+            manifest_hash: the manifest blob hash
+
+        Returns:
+            A populated CollectionManifest instance.
+        """
+        data = kernel.read_blob(manifest_hash)
+        return cls.decode(kernel, data)
+
+    @classmethod
+    def decode(cls, kernel: PondMinimal, data: bytes) -> "CollectionManifest":
+        """Decode manifest bytes into a CollectionManifest instance."""
+        if data[:4] != _MANIFEST_MAGIC:
+            raise ValueError(f"Not a manifest blob (magic={data[:4]!r})")
+        version, flags = struct.unpack("<BB", data[4:6])
+        if version != _MANIFEST_VERSION:
+            raise ValueError(f"Unsupported manifest version: {version}")
+        n_row_groups, n_columns = struct.unpack("<IH", data[6:12])
+        pos = 12
+
+        manifest = cls(kernel)
+
+        # Schema section
+        columns: list[tuple[str, int]] = []
+        for _ in range(n_columns):
+            name_len = data[pos]; pos += 1
+            name = data[pos:pos+name_len].decode("utf-8"); pos += name_len
+            vtype = data[pos]; pos += 1
+            columns.append((name, vtype))
+        manifest._columns = columns
+
+        # Sort order section
+        key_col_len = data[pos]; pos += 1
+        key_col = data[pos:pos+key_col_len].decode("utf-8"); pos += key_col_len
+        row_group_size, chunk_size = struct.unpack("<II", data[pos:pos+8])
+        pos += 8
+        manifest._key_col = key_col
+        manifest._row_group_size = row_group_size
+        manifest._chunk_size = chunk_size
+
+        # Optional sections
+        if flags & FLAG_HAS_STATS_TREE:
+            manifest._stats_tree_root = data[pos:pos+32].hex(); pos += 32
+        if flags & FLAG_HAS_BLOOM:
+            manifest._bloom_filter_ref = data[pos:pos+32].hex(); pos += 32
+        if flags & FLAG_HAS_PARENT_MANIFEST:
+            manifest._parent_manifest_hash = data[pos:pos+32].hex(); pos += 32
+
+        # Row group entries
+        for _ in range(n_row_groups):
+            rg, pos = cls._decode_row_group(data, pos, columns)
+            manifest._row_groups.append(rg)
+
+        return manifest
+
+    @classmethod
+    def _decode_row_group(cls, data: bytes, pos: int,
+                          columns: list[tuple[str, int]]) -> tuple[RowGroupEntry, int]:
+        key_len = struct.unpack("<H", data[pos:pos+2])[0]; pos += 2
+        key = data[pos:pos+key_len].decode("utf-8"); pos += key_len
+        blob_hash = data[pos:pos+32].hex(); pos += 32
+        n_rows, storage_mode = struct.unpack("<IB", data[pos:pos+5]); pos += 5
+
+        rg = RowGroupEntry(
+            key=key, blob_hash=blob_hash,
+            n_rows=n_rows, storage_mode=storage_mode,
+        )
+
+        for col_name, expected_vtype in columns:
+            vtype = data[pos]; pos += 1
+            has_min = data[pos]; pos += 1
+            mn = mx = None
+            if has_min:
+                mn, pos = _decode_value(vtype, data, pos)
+                mx, pos = _decode_value(vtype, data, pos)
+            null_count = struct.unpack("<I", data[pos:pos+4])[0]; pos += 4
+            n_chunks = struct.unpack("<H", data[pos:pos+2])[0]; pos += 2
+
+            chunks: list[ColumnChunkEntry] = []
+            for _ in range(n_chunks):
+                chunk_blob = data[pos:pos+32].hex(); pos += 32
+                chunk_has_min = data[pos]; pos += 1
+                c_mn = c_mx = None
+                if chunk_has_min:
+                    c_mn, pos = _decode_value(vtype, data, pos)
+                    c_mx, pos = _decode_value(vtype, data, pos)
+                c_null = struct.unpack("<I", data[pos:pos+4])[0]; pos += 4
+                c_encoding = data[pos]; pos += 1
+                meta_len = struct.unpack("<H", data[pos:pos+2])[0]; pos += 2
+                if meta_len:
+                    import json
+                    c_meta = json.loads(data[pos:pos+meta_len].decode("utf-8"))
+                else:
+                    c_meta = {}
+                pos += meta_len
+                chunks.append(ColumnChunkEntry(
+                    blob_hash=chunk_blob, min=c_mn, max=c_mx,
+                    null_count=c_null, encoding=c_encoding,
+                    encoding_meta=c_meta,
+                ))
+
+            rg.columns.append(ColumnStatsEntry(
+                name=col_name, value_type=vtype,
+                min=mn, max=mx, null_count=null_count,
+                chunks=chunks,
+            ))
+
+        return rg, pos
+
+    # ------------------------------------------------------------------
+    # Reader API — read side
+    # ------------------------------------------------------------------
+
+    @property
+    def columns(self) -> list[tuple[str, int]]:
+        return list(self._columns)
+
+    @property
+    def column_names(self) -> list[str]:
+        return [c[0] for c in self._columns]
+
+    @property
+    def key_col(self) -> str:
+        return self._key_col
+
+    @property
+    def row_group_size(self) -> int:
+        return self._row_group_size
+
+    @property
+    def chunk_size(self) -> int:
+        return self._chunk_size
+
+    @property
+    def row_groups(self) -> list[RowGroupEntry]:
+        return list(self._row_groups)
+
+    @property
+    def stats_tree_root(self) -> Optional[str]:
+        return self._stats_tree_root
+
+    @property
+    def parent_manifest_hash(self) -> Optional[str]:
+        """The parent manifest hash (for delta-appends). None if this is a base manifest."""
+        return self._parent_manifest_hash
+
+    def find_row_group(self, key: str) -> Optional[RowGroupEntry]:
+        """Find the row group whose key matches `key` (smallest key >= target).
+
+        Used for point lookups — the row group with max_pk >= key contains
+        the row.
+
+        At PB scale (stats_tree_root set), this is O(log N) via the
+        hierarchical stats tree. At small scale, it's an O(N) linear scan
+        (fine for N < 25K — the manifest fits in one blob).
+        """
+        # PB-scale path: walk the stats tree top-down
+        if self._stats_tree_root:
+            return self._find_row_group_via_stats_tree(key)
+        # Small-scale path: linear scan
+        target = key
+        for rg in self._row_groups:
+            if rg.key >= target:
+                return rg
+        return None
+
+    def _find_row_group_via_stats_tree(self, key: str) -> Optional[RowGroupEntry]:
+        """O(log N) point lookup via the hierarchical stats tree.
+
+        Walks the tree top-down, descending into the child whose
+        [min_key, max_key] range contains `key`. At the leaf, returns
+        the matching RowGroupEntry.
+
+        Each tree level is 1 S3 GET (cached by content addressing).
+        Total: O(log N) GETs for cold lookup.
+        """
+        try:
+            from stats_tree import StatsTreeReader, InternalChild
+        except ImportError:
+            # Stats tree not available — fall back to linear scan
+            target = key
+            for rg in self._row_groups:
+                if rg.key >= target:
+                    return rg
+            return None
+
+        reader = StatsTreeReader(self.kernel, self._stats_tree_root)
+        # Walk the tree to find the smallest leaf entry with key >= target
+        # The stats tree's leaves contain RowGroupEntry objects sorted by key.
+        # We do a top-down descent: at each internal node, find the first
+        # child whose max_key >= target, then descend.
+        return reader.find_row_group(key)
+
+    def scan_with_pruning(
+            self,
+            predicates: Optional[list[tuple[str, str, Any]]] = None,
+            start_key: Optional[str] = None,
+            end_key: Optional[str] = None,
+    ) -> Iterator[RowGroupEntry]:
+        """Yield row groups that MIGHT match the predicates.
+
+        Evaluates predicates IN MEMORY against the manifest's inline stats.
+        No S3 fetches — just memory work.
+
+        At PB scale (stats_tree_root set), this delegates to the
+        StatsTreeReader which walks the tree top-down, pruning subtrees
+        whose aggregated stats prove they can't match. O(log N + K) reads.
+
+        For delta-manifests (parent_manifest_hash set), this yields the
+        inline row groups AND walks the parent chain to find all entries.
+        The parent walk is O(chain_length) GETs — typically 1-3 appends
+        before a compaction rebuilds the full manifest.
+
+        Args:
+            predicates: list of (column, op, value) tuples. None = no pruning.
+            start_key: inclusive lower bound on row group keys (None = no lower)
+            end_key: inclusive upper bound on row group keys (None = no upper)
+
+        Yields:
+            RowGroupEntry objects for row groups that might match.
+            The caller fetches only these data blobs.
+        """
+        # PB-scale path: delegate to the stats tree reader
+        if self._stats_tree_root:
+            try:
+                from stats_tree import StatsTreeReader
+                reader = StatsTreeReader(self.kernel, self._stats_tree_root)
+                yield from reader.scan_with_pruning(
+                    predicates, start_key, end_key)
+                return
+            except ImportError:
+                pass  # fall through to linear scan
+
+        # Delta-manifest path: yield inline row groups, then walk parent chain
+        # The inline row groups are the NEW ones from this append.
+        # The parent chain has the PREVIOUS row groups.
+        for rg in self._row_groups:
+            # Key range filter
+            if start_key is not None and rg.key < start_key:
+                continue
+            if end_key is not None and rg.key > end_key:
+                continue
+            # Predicate pruning
+            if predicates and rg.can_prune(predicates):
+                continue
+            yield rg
+
+        # Walk parent chain for delta-manifests
+        if self._parent_manifest_hash:
+            try:
+                parent = CollectionManifest.load(self.kernel, self._parent_manifest_hash)
+                yield from parent.scan_with_pruning(predicates, start_key, end_key)
+            except (ValueError, KeyError):
+                pass  # parent manifest not found — return only inline entries
+
+    def scan_column_chunks(
+            self,
+            column: str,
+            op: str,
+            value: Any,
+    ) -> dict[str, list[int]]:
+        """For each row group, compute surviving chunk indices for a column.
+
+        Returns:
+            Dict mapping row_group_key → list of surviving chunk indices.
+            Row groups not in the dict are pruned entirely.
+        """
+        result: dict[str, list[int]] = {}
+        for rg in self._row_groups:
+            col = rg.get_column(column)
+            if col is None:
+                continue
+            if col.can_prune(op, value):
+                continue  # row group pruned
+            surviving = col.prune_chunks(op, value)
+            if surviving is None:
+                # No chunk-level stats — must read all chunks for this row group
+                surviving = list(range(len(col.chunks)))
+            if surviving:
+                result[rg.key] = surviving
+        return result
+
+    def total_rows(self) -> int:
+        """Total rows across all row groups."""
+        return sum(rg.n_rows for rg in self._row_groups)
+
+
+# ---------------------------------------------------------------------------
+# Helpers — value encoding (shared with embedded_stats)
+# ---------------------------------------------------------------------------
+
+def _encode_value(value_type: int, value: Any) -> bytes:
+    """Encode a single min/max value as binary bytes."""
+    if value_type == VALUE_TYPE_INT64:
+        return struct.pack("<q", int(value))
+    if value_type == VALUE_TYPE_FLOAT64:
+        return struct.pack("<d", float(value))
+    if value_type == VALUE_TYPE_STRING:
+        s = str(value).encode("utf-8")
+        return struct.pack("<I", len(s)) + s
+    # NULL or unknown — 0 bytes
+    return b""
+
+
+def _decode_value(value_type: int, data: bytes, pos: int) -> tuple[Any, int]:
+    """Decode a single min/max value from binary bytes."""
+    if value_type == VALUE_TYPE_INT64:
+        v = struct.unpack("<q", data[pos:pos+8])[0]
+        return v, pos + 8
+    if value_type == VALUE_TYPE_FLOAT64:
+        v = struct.unpack("<d", data[pos:pos+8])[0]
+        return v, pos + 8
+    if value_type == VALUE_TYPE_STRING:
+        slen = struct.unpack("<I", data[pos:pos+4])[0]
+        pos += 4
+        s = data[pos:pos+slen].decode("utf-8")
+        return s, pos + slen
+    return None, pos
+
+
+# ---------------------------------------------------------------------------
+# Convenience: build a manifest from a ColumnChunkZoneMap
+# ---------------------------------------------------------------------------
+
+def build_manifest_from_zone_map(
+        kernel: PondMinimal,
+        row_group_key: str,
+        data_blob_hash: str,
+        n_rows: int,
+        zone_map,  # ZoneMap from pruning.py
+        cczm: Optional["ColumnChunkZoneMap"] = None,
+        encoding_meta_per_col: Optional[dict[str, list[dict]]] = None,
+        storage_mode: int = STORAGE_WHOLE_BLOB,
+) -> RowGroupEntry:
+    """Build a RowGroupEntry from a ZoneMap + optional ColumnChunkZoneMap.
+
+    This is the bridge between the existing zone-map-based code and the
+    new manifest-based code. Lenses can call this to convert their
+    existing zone-map data into manifest entries.
+
+    Args:
+        kernel: the PondMinimal kernel (unused, kept for API symmetry)
+        row_group_key: e.g., "rg/9999"
+        data_blob_hash: hash of the data blob (whole-blob mode) or chunk
+            manifest hash (column-chunk / encoded mode)
+        n_rows: number of rows in this row group
+        zone_map: ZoneMap from pruning.py — has min/max/null_count dicts
+        cczm: optional ColumnChunkZoneMap — if provided, chunk-level stats
+            are added to each column entry
+        encoding_meta_per_col: optional dict {col_name: [enc_meta per chunk]}
+            from EncodedChunkStorage — if provided, encoding metadata is
+            attached to each chunk entry. enc_meta is the dict returned
+            by encoding.encode_column, e.g.
+            {"encoding": "rle", "n_rows": 1000, "n_runs": 5}
+        storage_mode: STORAGE_WHOLE_BLOB / STORAGE_COLUMN_CHUNKS / STORAGE_ENCODED
+
+    Returns:
+        A RowGroupEntry ready to be added to a CollectionManifest.
+    """
+    # _detect_value_type lives in encoding.py (not column_source.py).
+    # Lazy import to avoid a circular dep at module load time.
+    from encoding import _detect_value_type, ColumnEncoding
+
+    rg = RowGroupEntry(
+        key=row_group_key,
+        blob_hash=data_blob_hash,
+        n_rows=n_rows,
+        storage_mode=storage_mode,
+    )
+
+    # Get column names from zone_map.min (or .max if min is empty)
+    all_cols = set(zone_map.min.keys()) | set(zone_map.max.keys()) | set(zone_map.null_count.keys())
+
+    for col_name in sorted(all_cols):
+        # Determine value type from the actual value
+        sample = zone_map.min.get(col_name)
+        if sample is None:
+            sample = zone_map.max.get(col_name)
+        vtype = _detect_value_type([sample]) if sample is not None else VALUE_TYPE_NULL
+
+        col_entry = ColumnStatsEntry(
+            name=col_name,
+            value_type=vtype,
+            min=zone_map.min.get(col_name),
+            max=zone_map.max.get(col_name),
+            null_count=zone_map.null_count.get(col_name, 0),
+        )
+
+        # Attach chunk-level stats if cczm is provided.
+        # ONLY include chunks that have a real blob_hash — phantom chunks
+        # (blob_hash=None) are stats-only and don't correspond to actual
+        # chunk blobs. They appear when storage_mode=STORAGE_WHOLE_BLOB
+        # (whole-blob mode) where the row group is ONE blob, not per-column
+        # chunks. In that mode, the manifest entry has the row-group blob
+        # hash but no per-chunk entries.
+        if cczm is not None and _HAVE_CCZM:
+            cczm_chunks = cczm.column_chunks.get(col_name, [])
+            enc_metas = (encoding_meta_per_col or {}).get(col_name, [])
+            for i, chunk_stats in enumerate(cczm_chunks):
+                # Skip phantom chunks (no blob_hash) — they're stats only
+                if not chunk_stats.blob_hash:
+                    continue
+                enc_meta = enc_metas[i] if i < len(enc_metas) else {}
+                # Convert string encoding name ("rle", "dict", etc.) to int
+                # code (0=raw, 1=rle, 2=dict, 3=bitpack). The encoding meta
+                # dict from encoding.py uses string names.
+                enc_name = enc_meta.get("encoding", "raw")
+                if isinstance(enc_name, str):
+                    encoding_code = {"raw": 0, "rle": 1, "dict": 2,
+                                       "bitpack": 3}.get(enc_name, 0)
+                else:
+                    encoding_code = int(enc_name)
+                col_entry.chunks.append(ColumnChunkEntry.from_cczm_stats(
+                    chunk_stats, encoding=encoding_code, encoding_meta=enc_meta,
+                ))
+
+        rg.columns.append(col_entry)
+
+    return rg

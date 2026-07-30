@@ -11,6 +11,13 @@
 > **v1.1 changes**: Added compression prefix (1 byte) and null bitmap
 > for RAW encoding. Backward compatible — v1.0 readers check the
 > compression byte and treat 0x00 as uncompressed v1.0.
+>
+> **IMPORTANT — PND2 is now the unified blob format**: PND1 (this spec)
+> is the INNER column encoding used INSIDE PND2 blobs. PND2 wraps PND1
+> columns with schema + inline stats + compression into a single blob
+> per row group. See [`UNIFIED_STORAGE_DESIGN.md`](UNIFIED_STORAGE_DESIGN.md)
+> for the PND2 format. This document specifies the PND1 column encoding
+> that PND2 uses internally.
 
 ## Overview
 

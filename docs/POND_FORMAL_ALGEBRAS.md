@@ -458,12 +458,15 @@ nodes).
 | OSN4 (Bounded RTT) | Partial | Lookup=3, Scan=4, Branch=2. Merge=unbounded (needs diff-based). |
 | OSN5 (Eventual consistency) | ✓ | Content-addressed blobs are never overwritten |
 | OSN6 (Resumable) | Partial | Commits are atomic. Scans could be resumed (future work). |
-| OSN7 (No local metadata) | ✗ | Current kernel uses SQLite for root namespace. Needs object-store backend. |
+| OSN7 (No local metadata) | ✓ (ObjectStoreNativeKernel) / ✗ (PondMinimal) | `ObjectStoreNativeKernel` stores refs as content-addressed blobs — no SQLite. `PondMinimal` (legacy) still uses SQLite. New code should use `ObjectStoreNativeKernel`. |
 | OSN8 (Range reads) | Partial | Pack files support range reads. Tree nodes don't yet. |
 
-**Gap:** OSN7 is the biggest gap. The current SQLite root namespace
-is a local metadata dependency. An object-store-native root namespace
-(each reference is a separate object) would close this gap.
+**Gap (closed):** OSN7 was the biggest gap. The legacy `PondMinimal` kernel
+uses SQLite for the root namespace. The new `ObjectStoreNativeKernel`
+(`pond-core/object_store_native_kernel.py`) closes this gap — refs are
+stored as content-addressed blobs in the object store (root pointer →
+root ref blob → name→hash dict). New code should use `ObjectStoreNativeKernel`;
+`PondMinimal` remains for backward compatibility and local-disk testing.
 
 ---
 
@@ -717,9 +720,9 @@ commits. The graph is derived.
 
 ### 9.1. The correction
 
-The kernel is **not** three primitives. It is **five substrates**,
+The kernel is **not** three primitives. It is **six substrates**,
 each with its own axioms and operations. The "three operations"
-story is the user-facing API; the "five substrates" story is the
+story is the user-facing API; the "six substrates" story is the
 model.
 
 ```
@@ -1090,7 +1093,7 @@ two layers do not communicate about state.
 ### 12.6. Closing A1
 
 The substrate is bytes, not state. The "three primitives" claim
-is rhetorical; the honest count is "five substrates, three
+is rhetorical; the honest count is "six substrates, three
 operations on the bytes substrate, two operations on the names
 substrate, etc." State is a Layer-2 (Lens) concept.
 
@@ -1344,7 +1347,7 @@ Cache (off-graph; depends on access patterns, not on sources)
 
 ### 15.1. What the model guarantees
 
-Given the five substrates (§9), and given that no coordinator
+Given the six substrates (§9), and given that no coordinator
 substrate is in-model (A7), the model guarantees the following
 *and nothing more*:
 
@@ -2343,9 +2346,10 @@ R3 is rewritten to make the conditional explicit:
 
 > **R3' (CAS is backend-conditional).** Some backends provide
 > `compare_and_swap(name, expected, new) → bool` as an atomic
-> primitive. The kernel's default backend (SQLite) does not
+> primitive. The legacy `PondMinimal` kernel (SQLite) does not
 > expose this via the kernel API; it exposes only `Ref(name, h)`
-> (unconditional LWW). Applications requiring CAS implement the
+> (unconditional LWW). The `ObjectStoreNativeKernel` also uses LWW
+> for ref updates (no CAS). Applications requiring CAS implement the
 > optimistic-loop pattern: read expected, compute new, write new,
 > detect conflict by re-reading. This pattern is correct under
 > single-writer-per-Ref (A9); under multi-writer, it requires

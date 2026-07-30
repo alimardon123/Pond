@@ -119,10 +119,17 @@ The seven principles, in priority order:
 
 ### 3.1 Simple — the kernel remains intellectually small
 
-The kernel is 3 primitives, ~140 LOC, stdlib only. It must stay
-small enough that a single engineer can hold the entire kernel in
-their head. If a proposed change makes the kernel too large to hold
-in one's head, it is rejected — even if it adds useful capability.
+The kernel is 6 substrates + 3 operations (~140 LOC in `pond-core/kernel.py`,
+plus ~280 LOC in `pond-core/object_store_native_kernel.py` for the
+object-store-native variant). It must stay intellectually small. Rich
+behavior must *emerge* from composition, not from kernel features. The
+honest substrate count is 6 (Bytes, Names, Time, Coordination, Range-Read,
+Key) — see the honesty note in §1.
+
+The kernel must stay small enough that a single engineer can hold the
+entire kernel in their head. If a proposed change makes the kernel too
+large to hold in one's head, it is rejected — even if it adds useful
+capability.
 
 **Test:** Can you describe the kernel in one sentence? ("Three
 primitives: write bytes, read bytes, mutate a name→hash mapping.")
@@ -315,28 +322,34 @@ frozen.
 
 | Document | Purpose |
 |---|---|
-| `FORMAL_SPEC.md` | 5 storage laws + 7 composition laws + preconditions/postconditions |
-| `FORMAL_ALGEBRA.md` | Mathematical definition + 8 theorems + lower-bound proof |
-| `LENS_AUTHORS_GUIDE.md` | 6 guarantees + 7 conventions + 12 unspecified (the Lens boundary) |
-| `LENS_INTEROP_SPEC.md` | 10 ambiguities from independent implementation, classified |
-| `REJECTED_DESIGNS.md` | 15+ rejected architectural decisions with reasons |
-| `NON_GOALS.md` | 15 things Pond deliberately does NOT solve |
-| `PEER_COMPARISON.md` | vs Git, Irmin, IPFS, LakeFS, FDB, Dolt |
-| `PROBLEM_TAXONOMY.md` | 7 categories for classifying all issues |
+| `docs/UNIFIED_STORAGE_DESIGN.md` | ONE format (PND2), ONE write/read path — current architecture |
+| `docs/COLLECTION_MANIFEST_DESIGN.md` | ONE index blob per commit with inline stats |
+| `docs/ROUND_TRIP_AUDIT.md` | Honest cold-read round-trip accounting |
+| `docs/BINARY_ENCODING_FORMAT.md` | PND1 column encoding spec (used inside PND2) |
+| `docs/LENS_GUIDE.md` | How to write a Lens |
+| `docs/NON_GOALS.md` | What Pond doesn't do |
+| `docs/POND_WHITEPAPER.md` | The 20-page contribution |
+| `docs/WHERE_POND_FAILS.md` | Honest scope + Lens roadmap |
+| `docs/POND_FORMAL_ALGEBRAS.md` | 17 algebras, 10 axioms |
+| `docs/archive/` | Historical docs (Phase L-Q reports, Red Team reviews, RFCs) |
 
-### 5.4 Code (`pond-core/`, `pond-sdk/`, `pond-*`)
+### 5.4 Code (`pond-core/`, `pond-sdk/`, `lenses/`)
 
 | Package | Layer | LOC | Responsibility |
 |---|---|---|---|
-| `pond-core` | 0 | ~140 | The 3 primitives. FROZEN. Do not modify without an Accepted RFC. |
-| `pond-sdk` | 1–2 | (see repo) | `View` base class, `IndexedView`, common View patterns, `maintenance.py` (tombstones per RFC-0008), `lens_laws.py` (algebra property tests per RFC-0007) |
-| `pond-sql` | 3 | (see repo) | SQL View (CREATE/INSERT/SELECT/UPDATE/DELETE/ALTER + indexes + time travel) |
-| `pond-streaming` | 3 | (see repo) | Streaming View (topics, consumer groups, offsets) |
-| `pond-git` | 3 | (see repo) | Git View (init/add/commit/branch/checkout/merge/diff) |
-| `pond-notebook` | 3 | (see repo) | Notebook View (pages, search, attachments, history) |
-| `pond-feature-store` | 3 | (see repo) | Feature Store View (the current flagship) |
-| `pond-semantic` | 3 | (see repo) | Semantic View (OssieAdapter; future CubeAdapter, DbtAdapter) |
-| `pond-vector` | 3 | (see repo) | Vector View (k-NN search) — built by external validation |
+| `pond-core` | 0 | ~420 | The kernel: `kernel.py` (PondMinimal, SQLite-backed, ~140 LOC) + `object_store_native_kernel.py` (ObjectStoreNativeKernel, no SQLite, ~280 LOC) + `s3_mock_backend.py` (S3 mock with latency). FROZEN. |
+| `pond-sdk` | 1–2 | ~3000 | `base_lens.py` (PondLens shared namespace), `prolly_tree.py` (ProllyLensBase), `binary_encoding.py`, `collection_metadata.py`, `best_effort.py`, `maintenance.py`, `uuid7.py`, extensions (`physical_structures/`: `unified_storage.py`, `collection_manifest.py`, `stats_tree.py`, `encoding.py`, `compression.py`, `column_source.py`, `embedded_stats.py`, etc.) |
+| `lenses/lakehouse` | 3 | ~2200 | LakehouseLens (Parquet + DuckDB + SQL pushdown). Flagship tabular lens. |
+| `lenses/keyvalue` | 3 | ~760 | KeyValueLens (ProllyTreeIndex + optional UnifiedStorage via `use_unified_storage=True`) |
+| `lenses/vector` | 3 | ~530 | VectorLens (k-NN search + optional UnifiedStorage). Linear scan; no HNSW/IVF. |
+| `lenses/streaming` | 3 | ~400 | StreamingLens (chunked segments + range reads). No consumer groups. |
+| `services/` | 3 | ~500 | Schema registry, replication coordinator, transport (production) |
+| `pond-labs/` | 3 | ~3000 | Demos, benchmarks, tracks (validation suite) |
+
+**Note:** Old packages `pond-sql`, `pond-git`, `pond-notebook`, `pond-feature-store`,
+`pond-semantic`, `pond-arrow` are in `archive/`. The old `pond-vector` is now
+`lenses/vector/`. File names changed: `lakehouse.py` → `lakehouse_lens.py`,
+`vector_view.py` → `vector_lens.py`, `keyvalue_lens.py` moved to `lenses/keyvalue/`.
 
 **Removability rule:** Every package above must be removable without
 changing any lower layer. If removing `pond-feature-store` requires
@@ -905,7 +918,7 @@ Pond is the right abstraction is not yet decided.**
 > Status: IN PROGRESS. See `POND_PHASE_Q_REPORT.md`,
 > `POND_WHITEPAPER.md`, `POND_PHASE_Q_BENCHMARKS.md`,
 > `POND_PHASE_Q_REVIEW_PACKET.md`,
-> `scripts/phase_q_benchmarks.py`, `lenses/lakehouse/lakehouse.py`.
+> `scripts/phase_q_benchmarks.py`, `lenses/lakehouse/lakehouse_lens.py`.
 
 Phase Q is validation, not invention. No new algebras. No new
 substrates. No new axioms. The architecture is frozen; the
@@ -916,7 +929,7 @@ question is whether it survives contact with reality.
 | Q.1 Overclaim correction | Are the docs honest? | DESIGN_GOALS.md §1-§2 revised | DONE |
 | Q.2 Whitepaper | Can Pond be explained rigorously? | `POND_WHITEPAPER.md` (20 pages) | DONE (draft) |
 | Q.3 Benchmarks | Is Pond competitive? | `scripts/phase_q_benchmarks.py` + report | DONE (directional) |
-| Q.4 Flagship | Does Lens cover real workloads? | `lenses/lakehouse/lakehouse.py` (10 tests) | DONE (works, 15-357% overhead) |
+| Q.4 Flagship | Does Lens cover real workloads? | `lenses/lakehouse/lakehouse_lens.py` (10 tests) | DONE (works, 15-357% overhead) |
 | Q.5 External review | Do experts find it sound? | `POND_PHASE_Q_REVIEW_PACKET.md` | PREPARED, no reviews yet |
 
 **Phase Q.1 (overclaim retraction):** earlier docs said "Pond is
@@ -1024,7 +1037,7 @@ If you are an agent picking up Pond work, do this in order:
 
 ### If you are an AI agent specifically
 
-- The kernel is FROZEN. Do not modify `pond-core/pond_minimal.py`
+- The kernel is FROZEN. Do not modify `pond-core/kernel.py`
   without an Accepted RFC that passes the Admission Rule
   (`rfcs/README.md`).
 - Do not add features to the kernel to solve Lens-level problems.
@@ -1041,10 +1054,81 @@ If you are an agent picking up Pond work, do this in order:
 
 ---
 
-## 10. The one-sentence summary
+## 10. Current architecture (post-Round-1-through-4, 2026-07-30)
 
-> **Pond is a research project asking whether three storage
-> primitives are sufficient to compose all workload semantics; the
-> answer so far is supported, not proven, and the path from here
-> is to formalize, polish, and prove compatibility — not to add
-> more features.**
+> **Honest status update.** The architecture has evolved significantly
+> since the Phase K-Q docs were written. This section is the CURRENT
+> truth; anything above that contradicts this is historical.
+
+### What's been built (unified storage layer)
+
+1. **`ObjectStoreNativeKernel`** (`pond-core/object_store_native_kernel.py`) —
+   a kernel with NO SQLite. Refs are stored as content-addressed blobs in
+   the object store (the Git HEAD→commit→tree pattern). Every ref
+   resolution is 2 S3 GETs cold (root pointer + root ref blob), 0 warm
+   (SDK-cached). This is the object-store-native kernel the whitepaper
+   always described but didn't have.
+
+2. **`UnifiedStorage`** (`pond-sdk/extensions/physical_structures/unified_storage.py`) —
+   ONE binary format (PND2), ONE write path (`write`/`append`), ONE read
+   path (`read`/`point_lookup`). Replaces the 3 write modes + 7+ read
+   methods of the old LakehouseLens. Stats computed during encode (zero
+   overhead). Non-destructive `append()`. Range scans via `start_key`/`end_key`.
+
+3. **`CollectionManifest`** (`pond-sdk/extensions/physical_structures/collection_manifest.py`) —
+   ONE index blob per commit with ALL row-group stats + blob hashes inline.
+   At PB scale (>25K row groups), delegates to a hierarchical `StatsTree`
+   for O(log N) reads. Manifest blob stays at ~64 bytes regardless of scale.
+
+4. **`StatsTreeReader`** (`pond-sdk/extensions/physical_structures/stats_tree.py`) —
+   lazy hierarchical stats tree with aggregated min/max at internal nodes.
+   Content-addressed nodes (cached by SDK). O(log N) point lookups and
+   pruned scans at PB scale.
+
+5. **Lens unified storage integration** — `KeyValueLens` and `VectorLens`
+   now accept `use_unified_storage=True` to use PND2/UnifiedStorage as
+   their backend. Same lens API, just a storage backend swap. No adapter
+   layers. (LakehouseLens and StreamingLens still use the legacy path —
+   migration is in progress.)
+
+### Honest competitive assessment
+
+See [`docs/HONEST_COMPETITOR_COMPARISON.md`](docs/HONEST_COMPETITOR_COMPARISON.md)
+for the full analysis. Summary:
+
+| Workload | Pond cold RTT | Competitor RTT | Verdict |
+|---|---|---|---|
+| Lakehouse point lookup | 4 GETs (UnifiedStorage) | 3 GETs (Iceberg) | Close, slightly worse |
+| Vector k-NN @ 10M | **10M GETs** (linear scan) | 5-100 GETs (HNSW/IVF) | **100,000x worse — not competitive** |
+| KV point lookup | 4 GETs (UnifiedStorage) | <1ms (Redis) | 200x worse latency |
+| Streaming append | N+3 PUTs ≈ 200ms | <5ms (Kafka) | 40x worse, no consumer groups |
+
+**Pond is NOT yet competitive with production systems** in vector, KV, or
+streaming workloads. The lakehouse path is directionally close to Iceberg
+on RTTs but lacks production deployment, catalog, and partitioning. The
+unified storage layer (PND2 + CollectionManifest + StatsTree) is a solid
+foundation, but the lenses need workload-specific acceleration structures
+(HNSW for vectors, memtable+SST for KV, partitions+consumer groups for
+streaming) to be competitive.
+
+### What's NOT built (honest gaps)
+
+- **No HNSW/IVF for vector search** — linear scan only. Not usable at >100K vectors.
+- **No transactions** — single-writer per Ref. No cross-collection atomicity.
+- **No consumer groups / partitioning** in StreamingLens.
+- **LakehouseLens still defaults to PondMinimal (SQLite)** — not yet migrated to ObjectStoreNativeKernel.
+- **No production S3 backend** — only InMemoryObjectStore with simulated latency.
+- **No PB-scale benchmark** — max tested is 30K row groups (smoke test, not perf).
+- **Git lens is archived** — 63-line prototype, not shipped.
+
+---
+
+## 11. The one-sentence summary
+
+> **Pond is a research project asking whether a small storage kernel is
+> sufficient to compose all workload semantics; the unified storage layer
+> (PND2 + CollectionManifest + StatsTree) is a solid foundation, but the
+> lenses are not yet competitive with production systems in vector, KV,
+> or streaming workloads. The path forward is workload-specific
+> acceleration structures (HNSW, memtable+SST, consumer groups), not
+> more kernel features.**

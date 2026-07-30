@@ -328,9 +328,14 @@ class ProllyLensBase:
         parent_hash = self.kernel.resolve(f"collections/{self.name}/HEAD")
         index = self._commit_index
 
+        # BUG FIX (Architecture Review #2): use the COMPACTION_THRESHOLD
+        # constant (defined at module top) instead of the literal `16`.
+        # The previous code's `16` matched the constant by coincidence,
+        # but future tuning (e.g., COMPACTION_THRESHOLD=8 for faster
+        # compaction) would silently diverge.
         write_snapshot = (
             parent_hash is None  # first commit
-            or self._delta_count_since_snapshot >= 16  # compaction threshold
+            or self._delta_count_since_snapshot >= COMPACTION_THRESHOLD  # compaction
         )
 
         if write_snapshot:

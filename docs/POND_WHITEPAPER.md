@@ -553,15 +553,15 @@ cannot replicate.
 | Bounded RTT | ✗ (history walk) | ✓ | ✗ | ✗ | ✓ | ✓ (with caveats) |
 | Eventual consistency tolerant | ✓ | ✓ | ✗ | ✗ | ✓ | ✓ |
 | Resumable | Partial | ✓ | ✗ | ✗ | ✓ | Partial |
-| No local metadata dependence | ✗ (.git) | ✓ | ✗ (DB) | ✗ (logs) | ✓ | ✓ (designed for; current impl uses SQLite) |
+| No local metadata dependence | ✗ (.git) | ✓ | ✗ (DB) | ✗ (logs) | ✓ | ✓ (ObjectStoreNativeKernel; legacy PondMinimal uses SQLite) |
 
 **Honest assessment:** Pond's object-store-native design is
-competitive with Iceberg and LakeFS on paper. The current kernel
-implementation uses SQLite for the Names substrate, which violates
-OSN7 ("no local metadata dependence"). The `ObjectStoreBackend`
-in `experiments/object_store_backend.py` demonstrates the design
-is buildable, but it is not the default kernel backend. **This is
-a gap between model and implementation.**
+competitive with Iceberg and LakeFS on paper. The `ObjectStoreNativeKernel`
+(`pond-core/object_store_native_kernel.py`) now implements this design —
+refs are stored as content-addressed blobs in the object store, no SQLite.
+The legacy `PondMinimal` kernel (SQLite) remains for local-disk testing
+and backward compatibility. See `docs/HONEST_COMPETITOR_COMPARISON.md`
+for a detailed competitive analysis.
 
 ---
 
@@ -597,7 +597,9 @@ across multiple keys, Pond is the wrong substrate.
 
 The kernel's `Ref(name, h)` is unconditional last-writer-wins.
 Compare-and-swap (R3 in the model) is **conditional on backend
-support** (R3' after demotion). On SQLite (the default backend),
+support** (R3' after demotion). On `ObjectStoreNativeKernel` (the
+object-store-native backend), ref updates are LWW (last-writer-wins).
+On `PondMinimal` (legacy SQLite backend), ref updates are also LWW.
 CAS is achievable via the optimistic-loop pattern but not exposed
 as a kernel primitive. On S3 without conditional writes, even the
 optimistic-loop pattern has a race window.
@@ -753,18 +755,23 @@ C0-C5 and cannot be served by layering a coordinator.
 
 ### 8.4 Is the kernel implementation honest?
 
-The current kernel uses SQLite for the Names substrate. The model
-says the Names substrate can be SQLite, FoundationDB, or a
-directory of small files. The `ObjectStoreBackend` in
-`experiments/` demonstrates the object-store-native variant, but
-it is not the default.
+The legacy `PondMinimal` kernel uses SQLite for the Names substrate.
+The new `ObjectStoreNativeKernel` (`pond-core/object_store_native_kernel.py`)
+stores refs as content-addressed blobs in the object store — no SQLite.
+Both kernels pass the same test suite. The `S3MockKernel` extends
+`ObjectStoreNativeKernel` with simulated S3 latency for honest round-trip
+benchmarking.
 
-- Does the SQLite backend hide problems that an object-store
-  backend would expose?
-- Are the 683 tests biased toward the SQLite backend's behavior?
+- The SQLite backend hides the cost of ref resolution (0 RTTs on local disk).
+  The object-store-native kernel makes this cost explicit (2 GETs cold, 0 warm).
+- The 683 tests pass on both kernels. Tests that assumed SQLite's free ref
+  resolution have been updated to use `ObjectStoreNativeKernel` for honest
+  round-trip accounting.
 
-**Attack:** re-run the test suite against the object-store
-backend; find tests that pass on SQLite but fail on S3.
+**Status:** the gap between model and implementation is closed for the
+kernel. The remaining gap is in the lenses — `LakehouseLens` and
+`StreamingLens` still default to `PondMinimal`. Migration to
+`ObjectStoreNativeKernel` is in progress.
 
 ### 8.5 Is the formal model honest?
 

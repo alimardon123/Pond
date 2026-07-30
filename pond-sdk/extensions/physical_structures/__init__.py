@@ -1,75 +1,20 @@
 """
-Physical Structure extensions — pluggable acceleration structures.
+Storage engine extensions — the PND2 format, CollectionManifest, and encodings.
 
-Physical Structures are `f(snapshot) → artifact` (deterministic,
-rebuildable, per the Physical Structure algebra §14). Each type
-accelerates a specific access pattern:
+This package contains the physical storage layer for Pond:
+  - UnifiedStorage: ONE write/read path (PND2 format)
+  - CollectionManifest: ONE index blob per commit
+  - StatsTree: PB-scale hierarchical index
+  - encoding: 4 binary encodings (RAW/RLE/DICT/BITPACK)
+  - compression: transparent zstd/LZ4
+  - column_source: format-agnostic data access
+  - embedded_stats: value-type constants + ColumnStats
 
-  - IndexStructure: O(log N) point lookup by non-primary key
-  - BloomFilter: O(1) membership test (may have false positives)
-  - Statistics: column min/max/null_count for pruning
-
-All Physical Structures:
-  1. Are stored as kernel blobs (content-addressed, immutable)
-  2. Are referenced by naming convention (__{type}/{collection})
-  3. Can be shared across Lenses (Track 2 proved this)
-  4. Can be lost and rebuilt from the snapshot (P1 rebuildability)
-  5. Are OPTIONAL — the base Lens works without them
-
-Usage:
-    from extensions.physical_structures import BloomFilter, Statistics
-
-    # Build a bloom filter from a Lens's data
-    bf_hash = BloomFilter.build(kernel, "users", user_ids)
-
-    # Query it (any Lens can query, not just the one that built it)
-    exists = BloomFilter.query(kernel, "users", "user_42")
-
-    # Build statistics
-    stats_hash = Statistics.build(kernel, "users", table_data)
-
-    # Use statistics for pruning
-    stats = Statistics.load(kernel, "users")
-    can_skip = Statistics.can_prune(stats, "age", 999)
-
-Available types:
-  - BloomFilter: probabilistic membership test
-  - Statistics: column-level min/max/null_count
-  - PruningPredicate / ColumnPredicate / ZoneMap (in pruning.py):
-    Vortex-style row-group zone maps + predicate evaluation.
-    NOTE: pruning.ZoneMap is a @dataclass with min/max/null_count/
-    row_count/column_chunks fields — it is NOT the same as the legacy
-    zone_map.py:ZoneMap PhysicalStructure (which was deleted as dead
-    code; see the design review C3).
-  - ZoneMapIndex: ProllyTreeIndex of zone maps
-  - PruningReader: generic reader with three-level pruning
-  - ColumnChunkZoneMap / ColumnChunkStorage: per-column-chunk blobs
-  - ColumnEncoding / EncodingHeader / EncodedChunkStorage:
-    FastLanes-style structural encodings
-
-Future types (implement PhysicalStructure):
-  - HNSW: vector ANN index
-  - Trie: prefix search index
-  - Histogram: value distribution
-  - Sketch: HLL, count-min
+Legacy files (zone_map_index, pruning, pruning_reader, column_chunk_storage,
+encoded_chunk_storage, stats_index, base, bloom_filter, statistics) have
+been DELETED as superseded by UnifiedStorage + CollectionManifest.
 """
 
-# Module-level constants shared across the pruning infrastructure.
-# Importing code should use these instead of magic numbers.
 DEFAULT_CHUNK_SIZE = 1000
-"""Default rows per column chunk. Used by ColumnChunkZoneMap.build,
-ColumnChunkStorage, EncodedChunkStorage, PruningReader.scan, and
-LakehouseLens.range_write_*. Mismatched chunk_size between write and
-read silently corrupts column-chunk pruning."""
-
-from extensions.physical_structures.base import PhysicalStructure
-from extensions.physical_structures.bloom_filter import BloomFilter
-from extensions.physical_structures.statistics import Statistics
-
-__all__ = [
-    "PhysicalStructure",
-    "BloomFilter",
-    "Statistics",
-    "DEFAULT_CHUNK_SIZE",
-]
-
+"""Default rows per column chunk. Kept for backward compat with code
+that references this constant."""

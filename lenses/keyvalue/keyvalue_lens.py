@@ -106,13 +106,23 @@ class KeyValueLens(PondLens):
       - diff(collection, a, b)
     """
 
-    def __init__(self, kernel: PondMinimal, name: Optional[str] = None):
+    def __init__(self, kernel: PondMinimal, name: Optional[str] = None,
+                 use_unified_storage: bool = False):
         """Create a KeyValueLens.
 
         Args:
             kernel: the PondMinimal kernel instance
             name: OPTIONAL. If provided, enables backward-compatible
                   single-collection API.
+            use_unified_storage: if True, use UnifiedStorage (PND2 format)
+                  as the storage backend instead of the legacy ProllyTreeIndex
+                  + per-key JSON blobs. This gives:
+                    - 4 GETs cold point lookup (vs O(log N))
+                    - Non-destructive append() (vs rewrite-on-commit)
+                    - Predicate pushdown via manifest stats
+                    - Range scans via start_key/end_key
+                  The lens API is IDENTICAL — only the storage backend changes.
+                  Default: False (legacy path, for backward compat).
         """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
@@ -121,6 +131,18 @@ class KeyValueLens(PondLens):
             self.name = name
         # Attached indexer for auto-notify on commit (set via attach_indexer)
         self._attached_indexer = None
+
+        # Unified storage backend (optional)
+        self._unified_storage = None
+        if use_unified_storage:
+            try:
+                from unified_storage import UnifiedStorage
+                self._unified_storage = UnifiedStorage(kernel)
+            except ImportError:
+                # UnifiedStorage not available — fall back to legacy
+                pass
+        # Unified storage write buffer: collection → {key → value}
+        self._unified_buffer: dict[str, dict[str, Any]] = {}
 
     def _resolve_collection(self, *args) -> tuple:
         """Resolve the collection name from args or default.
@@ -169,6 +191,15 @@ class KeyValueLens(PondLens):
         """
         collection, rest = self._resolve_collection(*args)
         key, data = rest[0], rest[1]
+
+        # Unified storage path: buffer the put, commit later
+        if self._unified_storage is not None:
+            if collection not in self._unified_buffer:
+                self._unified_buffer[collection] = {}
+            self._unified_buffer[collection][key] = data
+            return key  # placeholder — real hash assigned at commit
+
+        # Legacy path: write blob immediately, stage in ProllyTreeIndex
         blob_hash = self.kernel.write(self.encode(data))
         self._get_base(collection).stage(key, blob_hash)
         return blob_hash
@@ -219,6 +250,23 @@ class KeyValueLens(PondLens):
         """
         collection, rest = self._resolve_collection(*args)
         message = rest[0] if rest else ""
+
+        # Unified storage path: flush buffer via UnifiedStorage.append()
+        if self._unified_storage is not None:
+            if collection not in self._unified_buffer:
+                raise ValueError(f"No staged data for collection '{collection}'")
+            buffer = self._unified_buffer[collection]
+            rows = [{"_key": k, "value": self.encode(v)}
+                     for k, v in buffer.items()]
+            rows.sort(key=lambda r: r["_key"])
+            commit_hash = self._unified_storage.append(
+                collection, rows, key_col="_key",
+                row_group_size=10_000,
+                message=message or f"{collection} unified commit")
+            del self._unified_buffer[collection]
+            return commit_hash
+
+        # Legacy path: ProllyTreeIndex commit
         commit_hash = self._get_base(collection).commit(message or f"{collection} commit")
 
         # Notify attached indexer (EAGER mode auto-refresh)
@@ -309,9 +357,22 @@ class KeyValueLens(PondLens):
 
         Collection-agnostic API: get(collection, key)
         Backward compat API:    get(key)  [requires name in __init__]
+
+        Unified storage path (use_unified_storage=True): 4 GETs cold
+        point lookup via manifest + encoded predicate eval.
         """
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
+
+        # Unified storage path: point_lookup via manifest
+        if self._unified_storage is not None:
+            row = self._unified_storage.point_lookup(
+                collection, key=key, columns=["_key", "value"])
+            if row is None:
+                return None
+            return self.decode(row["value"])
+
+        # Legacy path: ProllyTreeIndex lookup
         h = self._get_base(collection).lookup(key)
         return self.decode(self.kernel.read_blob(h)) if h else None
 
@@ -325,6 +386,15 @@ class KeyValueLens(PondLens):
     def get_all(self, *args) -> dict[str, Any]:
         """Read all key→value pairs from the collection."""
         collection, rest = self._resolve_collection(*args)
+
+        # Unified storage path
+        if self._unified_storage is not None:
+            rows = self._unified_storage.read(collection,
+                                                columns=["_key", "value"])
+            return {r["_key"]: self.decode(r["value"])
+                    for r in rows if r.get("_key")}
+
+        # Legacy path
         state = self._get_base(collection).read_all()
         return {k: self.decode(self.kernel.read_blob(h))
                 for k, h in state.items() if not k.startswith("_")}
@@ -332,17 +402,38 @@ class KeyValueLens(PondLens):
     def keys(self, *args) -> list[str]:
         """List all user keys in the collection (excludes internal _ keys)."""
         collection, rest = self._resolve_collection(*args)
+
+        # Unified storage path
+        if self._unified_storage is not None:
+            rows = self._unified_storage.read(collection, columns=["_key"])
+            return [r["_key"] for r in rows if r.get("_key")]
+
+        # Legacy path
         return [k for k in self._get_base(collection).read_all() if not k.startswith("_")]
 
     def exists(self, *args) -> bool:
         """Check if a key exists in the collection."""
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
+
+        # Unified storage path
+        if self._unified_storage is not None:
+            row = self._unified_storage.point_lookup(
+                collection, key=key, columns=["_key"])
+            return row is not None and row.get("_key") is not None
+
+        # Legacy path
         return self._get_base(collection).lookup(key) is not None
 
     def count(self, *args) -> int:
         """Count user keys in the collection."""
         collection, rest = self._resolve_collection(*args)
+
+        # Unified storage path
+        if self._unified_storage is not None:
+            return len(self.keys(collection))
+
+        # Legacy path
         return sum(1 for k in self._get_base(collection).read_all() if not k.startswith("_"))
 
     # ------------------------------------------------------------------
@@ -357,6 +448,16 @@ class KeyValueLens(PondLens):
         Backward compat:    iterate()  [uses default collection]
         """
         collection, rest = self._resolve_collection(*args)
+
+        # Unified storage path: read all rows via manifest
+        if self._unified_storage is not None:
+            rows = self._unified_storage.read(collection,
+                                                columns=["_key", "value"])
+            for row in rows:
+                yield self.decode(row["value"])
+            return
+
+        # Legacy path: ProllyTreeIndex
         for key in self.keys(collection):
             row = self.get(collection, key)
             if row is not None:

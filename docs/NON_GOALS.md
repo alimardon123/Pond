@@ -71,7 +71,7 @@ StreamView provides append-only log semantics; full streaming
 
 ### Garbage collector
 Pond's kernel has no GC. Orphaned objects accumulate.
-GC is a Lens-level utility (PondGC in engineering/02_gc.py).
+GC is a Lens-level utility (PondGC in archive/engineering/02_gc.py).
 
 ### Time-travel accelerator
 Pond's kernel has no skip pointers, no history index.
@@ -111,7 +111,7 @@ Each of the above is either:
 ## The boundary
 
 ```
-What Pond IS:     a minimal immutable object runtime (3 primitives)
+What Pond IS:     a minimal immutable object runtime (6 substrates, 3 operations)
 What Pond is NOT: everything else (see above)
 ```
 
