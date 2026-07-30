@@ -446,17 +446,27 @@ class LakehouseLens:
 
         Uses the branch's manifest hash directly — NO ref mutation.
         Fix (Round 9 Issue #2): no more swap-then-restore race condition.
-        Fix (Round 13 Issue #4): falls back to HEAD manifest if branch
-        was created via branch() (not commit_to_branch()). A fresh branch
-        points at HEAD, so HEAD's manifest IS the correct manifest.
+        Fix (Round 13 Issue #4): falls back to HEAD manifest if no __manifest ref.
+        Fix (Round 15 Issue #1): resolve branch commit → commits/{hash}__manifest
+        instead of falling back to the LIVE HEAD manifest (which may have
+        advanced past the branch point).
         """
+        # Try branch-specific manifest ref first (set by commit_to_branch)
         branch_manifest_ref = f"collections/{name}/branches/{branch_name}__manifest"
         branch_manifest = self.kernel.resolve(branch_manifest_ref)
 
-        # Fix (Round 13 Issue #4): if no branch-specific manifest exists
-        # (branch was created via branch(), not commit_to_branch()),
-        # fall back to the HEAD manifest — a fresh branch shares HEAD's data.
         if branch_manifest is None:
+            # Fix (Round 15 Issue #1): resolve the branch's commit hash,
+            # then look up its manifest via the commit→manifest mapping.
+            # This correctly returns the branch's SNAPSHOT, not the live HEAD.
+            branch_commit_ref = f"collections/{name}/branches/{branch_name}"
+            branch_commit = self.kernel.resolve(branch_commit_ref)
+            if branch_commit is not None:
+                branch_manifest = self.kernel.resolve(
+                    f"collections/{name}/commits/{branch_commit}__manifest")
+
+        if branch_manifest is None:
+            # Last resort: fall back to HEAD manifest (branch == HEAD snapshot)
             branch_manifest = self.kernel.resolve(f"collections/{name}/manifest")
         if branch_manifest is None:
             raise KeyError(f"Branch '{branch_name}' not found and no HEAD manifest exists")

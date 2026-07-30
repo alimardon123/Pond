@@ -903,6 +903,18 @@ class UnifiedStorage:
         # This causes point_lookup to silently return None for appended rows.
         manifest_entries.sort(key=lambda e: e["rg_key"])
 
+        # Fix (Round 15 Issue #3): deduplicate by rg_key (last-writer-wins).
+        # When append() carries over existing entries AND adds new entries
+        # with the same rg_key (e.g., KV overwrite), the manifest would
+        # contain duplicates. find_row_group returns the FIRST match (old),
+        # causing point_lookup to return stale data. Fix: keep only the
+        # LAST entry for each rg_key (new data wins).
+        seen: dict[str, dict] = {}
+        for entry in manifest_entries:
+            seen[entry["rg_key"]] = entry  # last wins
+        manifest_entries = list(seen.values())
+        manifest_entries.sort(key=lambda e: e["rg_key"])
+
         # Build the manifest. If using delta mode, pass the parent hash.
         parent_hash = existing_manifest_hash if use_delta else None
         self._build_manifest(collection, manifest_entries, schema_columns,
@@ -957,19 +969,20 @@ class UnifiedStorage:
         # Fix: call scan_with_pruning() ONCE on the head manifest — it
         # recursively yields all entries from the entire chain.
         all_entries: list[dict] = []
-        seen_keys: set[str] = set()  # deduplicate by rg_key (defensive)
+        seen_keys: dict[str, dict] = {}  # deduplicate by rg_key (last-wins, fix R15)
 
         for rg in manifest.scan_with_pruning():
-            if rg.key in seen_keys:
-                continue  # skip duplicates (shouldn't happen after fix, but defensive)
-            seen_keys.add(rg.key)
-            all_entries.append({
+            entry = {
                 "rg_key": rg.key,
                 "blob_hash": rg.blob_hash,
                 "n_rows": rg.n_rows,
                 "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
                                 for c in rg.columns],
-            })
+            }
+            # Fix (Round 15 Issue #3): last-writer-wins for duplicate rg_keys
+            seen_keys[rg.key] = entry
+
+        all_entries = list(seen_keys.values())
 
         # Sort by rg_key (fix from Round 9)
         all_entries.sort(key=lambda e: e["rg_key"])
@@ -1134,41 +1147,57 @@ class UnifiedStorage:
                 eff_columns = list(dict.fromkeys(eff_columns + list(missing)))
 
         # Fix (Round 14 Issue #2): apply row-level key range filter.
-        # scan_with_pruning filters at row-group granularity (by max_pk),
-        # but individual rows within a surviving row group may be outside
-        # the requested range. We need a row-level filter on the key column.
+        # Fix (Round 15 Issue #2): properly unpad zfill-padded string keys
+        # so the comparison works against actual row values.
         key_col_name = manifest.key_col
         if (start_key is not None or end_key is not None) and key_col_name:
             # Parse raw key values from the formatted "rg/..." strings
-            raw_start = None
-            raw_end = None
-            if start_key is not None:
+            # Strip "rg/" prefix and any zfill padding
+            def _unpad_rg_key(formatted_key):
+                if formatted_key is None:
+                    return None
+                raw = formatted_key.replace("rg/", "", 1) if formatted_key.startswith("rg/") else formatted_key
+                # Try numeric first
                 try:
-                    raw_start = int(start_key.replace("rg/", "").lstrip("0") or "0")
-                except (ValueError, AttributeError):
-                    raw_start = start_key.replace("rg/", "") if start_key else None
-            if end_key is not None:
-                try:
-                    raw_end = int(end_key.replace("rg/", "").lstrip("0") or "0")
-                except (ValueError, AttributeError):
-                    raw_end = end_key.replace("rg/", "") if end_key else None
+                    return int(raw)
+                except (ValueError, TypeError):
+                    # String key — strip leading zeros from zfill padding
+                    # but preserve the original value (e.g., "user:1" not "000user:1")
+                    # zfill pads on the LEFT with zeros, so lstrip("0") works
+                    # for purely-numeric strings but NOT for strings like "user:1"
+                    # For "user:1", the padded form is "00000000000000user:1"
+                    # We need to strip leading zeros ONLY if the original was
+                    # a numeric string that got zfill'd. For non-numeric strings,
+                    # the zfill creates "00000000user:1" which we need to un-pad.
+                    # Safe approach: strip leading zeros, then compare as strings
+                    stripped = raw.lstrip("0") or "0"
+                    return stripped
+
+            raw_start = _unpad_rg_key(start_key)
+            raw_end = _unpad_rg_key(end_key)
 
             def range_filter(row):
                 v = row.get(key_col_name)
                 if v is None:
                     return False
                 try:
-                    if raw_start is not None and v < raw_start:
+                    # Try numeric comparison first
+                    v_num = v if isinstance(v, (int, float)) else int(v)
+                    if raw_start is not None and isinstance(raw_start, int) and v_num < raw_start:
                         return False
-                    if raw_end is not None and v > raw_end:
+                    if raw_end is not None and isinstance(raw_end, int) and v_num > raw_end:
                         return False
-                except TypeError:
-                    # Type mismatch — compare as strings
+                except (ValueError, TypeError):
+                    # Fall back to string comparison
                     sv = str(v)
-                    if raw_start is not None and sv < str(raw_start):
-                        return False
-                    if raw_end is not None and sv > str(raw_end):
-                        return False
+                    if raw_start is not None:
+                        ss = str(raw_start)
+                        if sv < ss:
+                            return False
+                    if raw_end is not None:
+                        se = str(raw_end)
+                        if sv > se:
+                            return False
                 return True
             combined_filter = self._combine_filters(combined_filter, range_filter)
 
