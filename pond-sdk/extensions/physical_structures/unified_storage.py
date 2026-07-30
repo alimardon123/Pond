@@ -1179,14 +1179,12 @@ class UnifiedStorage:
                 if formatted_key is None:
                     return None
                 raw = formatted_key.replace("rg/", "", 1) if formatted_key.startswith("rg/") else formatted_key
-                # Try numeric first
+                # Try numeric first (reverse bias encoding for INT64 keys)
                 try:
-                    return int(raw)
+                    # Fix (Round 20 Issue #1): reverse the bias encoding
+                    return int(raw) - _INT64_BIAS
                 except (ValueError, TypeError):
-                    # Fix (Round 19 Issue #1): don't lstrip("0") for non-numeric
-                    # strings — it strips legitimate leading zeros from keys
-                    # like "0user1" → "user1", causing wrong comparisons.
-                    # Return the raw string as-is.
+                    # Non-numeric string — return as-is
                     return raw
 
             raw_start = _unpad_rg_key(start_key)
@@ -1675,25 +1673,31 @@ def _decode_pnd2_value(value_type: int, data: bytes, pos: int) -> tuple[Any, int
 # for collections with >10 row groups.
 _RG_KEY_WIDTH = 20
 
+# Fix (Round 20 Issue #1): bias for negative INT64 keys.
+# f"{-3:020d}" = "-0000000000000000003" which sorts REVERSE lexicographically
+# vs positive numbers. Fix: add INT64_MAX bias so all keys are non-negative.
+# -3 → (2^63 - 1) + (-3) = 9223372036854775804 → "rg/09223372036854775804"
+# This preserves numeric order in lexicographic comparison.
+_INT64_BIAS = 2**63 - 1
+
 def _format_rg_key(max_pk: Any) -> str:
     """Format a row group key with zero-padding for correct lexicographic ordering.
 
-    For numeric keys: "rg/00000000000000000042" (20-digit zero-padded)
+    For numeric keys: bias-encode (add INT64_MAX) then zero-pad to 20 digits.
+    This ensures negative numbers sort correctly: -3 < -1 < 0 < 5 < 42.
     For string keys: "rg/" + key (no padding — strings compared as-is)
+    For float keys: "rg/" + str(float) (string comparison, prefer INT64)
 
-    Fix (Round 19 Issue #3): float keys are converted to string repr
-    (not int-truncated). This preserves precision but means float keys
-    use string comparison — which is correct as long as all floats in
-    the key column have the same format (e.g., all 1 decimal place).
-    Float keys are unusual; for production use, prefer INT64 keys.
+    Fix (Round 20 Issue #1): negative INT64 keys now sort correctly via
+    bias encoding. Previously f"{-3:020d}" = "-000...3" sorted AFTER
+    positive numbers lexicographically (because "-" > "0" in ASCII).
     """
     if isinstance(max_pk, int):
-        return f"rg/{max_pk:0{_RG_KEY_WIDTH}d}"
+        return f"rg/{(max_pk + _INT64_BIAS):0{_RG_KEY_WIDTH}d}"
     if isinstance(max_pk, float):
-        # Fix (Round 19 Issue #3): don't truncate to int — use string repr
         return f"rg/{max_pk}"
     try:
-        return f"rg/{int(max_pk):0{_RG_KEY_WIDTH}d}"
+        return f"rg/{(int(max_pk) + _INT64_BIAS):0{_RG_KEY_WIDTH}d}"
     except (ValueError, TypeError):
         # Non-numeric string key — use as-is (caller sorted lexicographically)
         return f"rg/{max_pk}"

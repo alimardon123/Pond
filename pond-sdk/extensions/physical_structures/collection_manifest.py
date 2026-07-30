@@ -758,13 +758,17 @@ class CollectionManifest:
                 reader = StatsTreeReader(self.kernel, self._stats_tree_root)
                 yield from reader.scan_with_pruning(
                     predicates, start_key, end_key)
-                return
+                # Fix (Round 20 Issue #2): DON'T early-return if we also
+                # have a parent_manifest_hash. The stats tree only contains
+                # the DELTA's new entries. We must also walk the parent
+                # chain to get OLD entries.
+                if not self._parent_manifest_hash:
+                    return  # no parent — stats tree has everything
+                # Fall through to parent chain walk below
             except ImportError:
                 pass  # fall through to linear scan
 
-        # Delta-manifest path: yield inline row groups, then walk parent chain
-        # The inline row groups are the NEW ones from this append.
-        # The parent chain has the PREVIOUS row groups.
+        # Inline row groups (or delta entries when stats tree is set)
         for rg in self._row_groups:
             # Key range filter
             # rg.key is the MAX pk in the group. For start_key, we can
