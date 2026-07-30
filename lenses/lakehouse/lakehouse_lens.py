@@ -392,17 +392,20 @@ class LakehouseLens:
         key_col = manifest.key_col if manifest else None
 
         # Deduplicate by key_col (last-writer-wins: branch data overrides HEAD)
+        # Fix (Round 18 Issue #3): don't drop rows with None key — they have
+        # no dedup key but should still be included in the merge result.
         if key_col and key_col in merged.column_names:
             merged = merged.sort_by(key_col)
-            # Use PyArrow's group_by to deduplicate (keep last occurrence)
-            # Simpler: convert to pylist, deduplicate by key, convert back
             rows = merged.to_pylist()
             seen = {}
+            none_key_rows = []
             for row in rows:
                 k = row.get(key_col)
-                if k is not None:
+                if k is None:
+                    none_key_rows.append(row)
+                else:
                     seen[k] = row
-            deduped = list(seen.values())
+            deduped = list(seen.values()) + none_key_rows
             if deduped:
                 merged = pa.Table.from_pylist(deduped)
 
@@ -509,27 +512,34 @@ class LakehouseLens:
 
         # RESTORE the original HEAD and manifest (so main is unchanged)
         # Fix (Round 17 Issue #3): for new collections (original_head is None),
-        # we must point HEAD at a tombstone so the collection doesn't appear
-        # to exist on main. Using an empty blob as tombstone.
+        # tombstone HEAD so the collection doesn't appear to exist on main.
+        # Fix (Round 18 Issue #2): use actual TOMBSTONE_HASH from maintenance,
+        # not just an empty blob. Also fix collection_exists to check for it.
         if original_head is not None:
             self.kernel.reference(head_ref, original_head)
         else:
-            # New collection — tombstone HEAD so collection_exists returns False
+            # New collection — tombstone HEAD
             try:
-                from maintenance import TOMBSTONE_HASH
-                tombstone_blob = self.kernel.write(b"")
-                self.kernel.reference(head_ref, tombstone_blob)
+                from maintenance import TOMBSTONE_HASH, is_dropped
+                # Write the tombstone blob if it doesn't exist
+                if not self.kernel.resolve(head_ref):
+                    self.kernel.reference(head_ref, TOMBSTONE_HASH)
+                else:
+                    self.kernel.reference(head_ref, TOMBSTONE_HASH)
             except ImportError:
-                # Fallback: point at an empty blob
-                empty = self.kernel.write(b"")
+                # Fallback: use a known empty-marker
+                empty = self.kernel.write(b"__TOMBSTONE__")
                 self.kernel.reference(head_ref, empty)
 
         if original_manifest is not None:
             self.kernel.reference(manifest_ref, original_manifest)
         else:
-            # New collection — tombstone manifest too
-            empty = self.kernel.write(b"")
-            self.kernel.reference(manifest_ref, empty)
+            try:
+                from maintenance import TOMBSTONE_HASH
+                self.kernel.reference(manifest_ref, TOMBSTONE_HASH)
+            except ImportError:
+                empty = self.kernel.write(b"__TOMBSTONE__")
+                self.kernel.reference(manifest_ref, empty)
 
         # Invalidate the storage's manifest cache
         if self._storage and self._storage._unified:

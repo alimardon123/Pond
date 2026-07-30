@@ -904,14 +904,13 @@ class UnifiedStorage:
         manifest_entries.sort(key=lambda e: e["rg_key"])
 
         # Fix (Round 15 Issue #3): deduplicate by rg_key (last-writer-wins).
-        # When append() carries over existing entries AND adds new entries
-        # with the same rg_key (e.g., KV overwrite), the manifest would
-        # contain duplicates. find_row_group returns the FIRST match (old),
-        # causing point_lookup to return stale data. Fix: keep only the
-        # LAST entry for each rg_key (new data wins).
+        # Fix (Round 18 Issue #1): manifest_entries is [existing(OLD)..., new(NEW)...]
+        # after sort. For last-writer-wins we must keep the LAST entry (NEW)
+        # for each rg_key. Dict overwrite naturally keeps the last — which is
+        # the NEW entry since new entries are appended after old ones.
         seen: dict[str, dict] = {}
         for entry in manifest_entries:
-            seen[entry["rg_key"]] = entry  # last wins
+            seen[entry["rg_key"]] = entry  # last wins = NEW (correct for append)
         manifest_entries = list(seen.values())
         manifest_entries.sort(key=lambda e: e["rg_key"])
 
@@ -969,9 +968,16 @@ class UnifiedStorage:
         # Fix: call scan_with_pruning() ONCE on the head manifest — it
         # recursively yields all entries from the entire chain.
         all_entries: list[dict] = []
-        seen_keys: dict[str, dict] = {}  # deduplicate by rg_key (last-wins, fix R15)
+        # Fix (Round 18 Issue #1): scan_with_pruning yields NEW entries first
+        # (inline), then OLD entries (parent chain). For last-writer-wins,
+        # we must keep the FIRST occurrence (NEWEST), not overwrite with
+        # later occurrences (OLDER). Use "if key not in seen_keys" to
+        # preserve the first (newest) entry.
+        seen_keys: dict[str, dict] = {}
 
         for rg in manifest.scan_with_pruning():
+            if rg.key in seen_keys:
+                continue  # already have a newer entry for this key — skip old
             entry = {
                 "rg_key": rg.key,
                 "blob_hash": rg.blob_hash,
@@ -979,8 +985,7 @@ class UnifiedStorage:
                 "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
                                 for c in rg.columns],
             }
-            # Fix (Round 15 Issue #3): last-writer-wins for duplicate rg_keys
-            seen_keys[rg.key] = entry
+            seen_keys[rg.key] = entry  # keep FIRST (newest)
 
         all_entries = list(seen_keys.values())
 
