@@ -483,6 +483,11 @@ class LakehouseLens:
         Strategy: write via storage.append (which creates a new manifest + commit),
         then save BOTH the commit hash AND the manifest hash as branch refs.
         Restore the original HEAD + manifest so main is unchanged.
+
+        Fix (Round 17 Issue #3): if the collection is NEW (no prior HEAD),
+        we must still restore HEAD to its original state (None). A new
+        collection's HEAD should remain unset after commit_to_branch —
+        the data lives only in the branch ref.
         """
         head_ref = f"collections/{name}/HEAD"
         manifest_ref = f"collections/{name}/manifest"
@@ -503,10 +508,28 @@ class LakehouseLens:
         self.kernel.reference(f"collections/{name}/branches/{branch_name}__manifest", branch_manifest)
 
         # RESTORE the original HEAD and manifest (so main is unchanged)
+        # Fix (Round 17 Issue #3): for new collections (original_head is None),
+        # we must point HEAD at a tombstone so the collection doesn't appear
+        # to exist on main. Using an empty blob as tombstone.
         if original_head is not None:
             self.kernel.reference(head_ref, original_head)
+        else:
+            # New collection — tombstone HEAD so collection_exists returns False
+            try:
+                from maintenance import TOMBSTONE_HASH
+                tombstone_blob = self.kernel.write(b"")
+                self.kernel.reference(head_ref, tombstone_blob)
+            except ImportError:
+                # Fallback: point at an empty blob
+                empty = self.kernel.write(b"")
+                self.kernel.reference(head_ref, empty)
+
         if original_manifest is not None:
             self.kernel.reference(manifest_ref, original_manifest)
+        else:
+            # New collection — tombstone manifest too
+            empty = self.kernel.write(b"")
+            self.kernel.reference(manifest_ref, empty)
 
         # Invalidate the storage's manifest cache
         if self._storage and self._storage._unified:

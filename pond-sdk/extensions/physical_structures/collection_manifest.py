@@ -785,13 +785,27 @@ class CollectionManifest:
                             key_col_min = col.min
                             break
                 if key_col_min is not None:
-                    # We have min stats — use them for a safe exclusion
+                    # Fix (Round 17 Issue #2): compare UNFORMATTED values.
+                    # end_key is formatted as "rg/..." (e.g., "rg/000...099").
+                    # key_col_min is the raw value (e.g., 50 as int).
+                    # Fix (Round 17 Issue #2b): str(50) > "000...099" is True
+                    # lexicographically ("5" > "0"). Must try numeric first.
+                    end_raw = end_key
+                    if isinstance(end_key, str) and end_key.startswith("rg/"):
+                        end_raw = end_key[3:]
                     try:
-                        # Compare as strings (both are formatted/padded)
-                        if str(key_col_min) > end_key:
+                        # Try numeric comparison first
+                        end_num = int(end_raw)
+                        key_num = int(key_col_min)
+                        if key_num > end_num:
                             continue
-                    except TypeError:
-                        pass  # can't compare — don't skip (safe)
+                    except (ValueError, TypeError):
+                        # Fall back to string comparison
+                        try:
+                            if str(key_col_min) > str(end_raw):
+                                continue
+                        except TypeError:
+                            pass  # can't compare — don't skip (safe)
                 # No min stats — don't skip (the row-level filter will handle it)
             # Predicate pruning
             if predicates and rg.can_prune(predicates):

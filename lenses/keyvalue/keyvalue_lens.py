@@ -265,22 +265,48 @@ class KeyValueLens(PondLens):
         collection, rest = self._resolve_collection(*args)
         message = rest[0] if rest else ""
 
-        # Unified storage path: flush buffer via UnifiedStorage.append()
+        # Unified storage path: flush buffer via UnifiedStorage
         if self._unified_storage is not None:
             if collection not in self._unified_buffer:
                 raise ValueError(f"No staged data for collection '{collection}'")
             buffer = self._unified_buffer[collection]
-            # Fix (Round 16 Issue #2): skip tombstoned keys (value is None)
-            rows = [{"_key": k, "value": self.encode(v)}
-                     for k, v in buffer.items() if v is not None]
-            if rows:
+
+            # Fix (Round 17 Issue #1): deletes must actually remove data.
+            # UnifiedStorage.append() only adds — it can't delete old keys.
+            # If there are tombstones (value=None), we must do a full rewrite:
+            # read all existing data, remove deleted keys, add new puts,
+            # write the result via write() (overwrite).
+            has_deletes = any(v is None for v in buffer.values())
+            puts_only = {k: v for k, v in buffer.items() if v is not None}
+
+            if has_deletes:
+                # Full rewrite: read existing data, apply deletes + puts
+                existing_rows = self._unified_storage.read(collection,
+                                                             columns=["_key", "value"])
+                deleted_keys = {k for k, v in buffer.items() if v is None}
+                # Keep existing rows that aren't deleted and aren't being overwritten
+                result_rows = []
+                for row in existing_rows:
+                    if row["_key"] not in deleted_keys and row["_key"] not in puts_only:
+                        result_rows.append(row)
+                # Add new puts
+                for k, v in puts_only.items():
+                    result_rows.append({"_key": k, "value": self.encode(v)})
+                result_rows.sort(key=lambda r: r["_key"])
+                commit_hash = self._unified_storage.write(
+                    collection, result_rows, key_col="_key",
+                    row_group_size=10_000,
+                    message=message or f"{collection} unified commit (with deletes)")
+            elif puts_only:
+                # No deletes — just append new puts
+                rows = [{"_key": k, "value": self.encode(v)}
+                         for k, v in puts_only.items()]
                 rows.sort(key=lambda r: r["_key"])
                 commit_hash = self._unified_storage.append(
                     collection, rows, key_col="_key",
                     row_group_size=10_000,
                     message=message or f"{collection} unified commit")
             else:
-                # Only deletes, no puts — just commit empty
                 commit_hash = ""
             del self._unified_buffer[collection]
             return commit_hash
