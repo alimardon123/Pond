@@ -367,9 +367,10 @@ class LakehouseLens:
     def merge_branch(self, name: str, branch_name: str) -> str:
         """Merge a branch into HEAD.
 
-        Reads the branch data + the HEAD data, concatenates, and writes
-        the merged result via storage.write(). Creates a proper 2-parent
-        merge commit via ProllyLensBase.create_merge_commit.
+        Fix (Round 12 Issue #5):
+        - Deduplicates by key_col (last-writer-wins from branch)
+        - Preserves key_col from the existing collection's manifest
+        - Logs merge-commit rewrite errors instead of silently swallowing
         """
         # Read both branch and HEAD data
         head_table = self.read_table(name)
@@ -380,26 +381,43 @@ class LakehouseLens:
         except TypeError:
             merged = pa.concat_tables([head_table, branch_table])
 
-        # Get the current HEAD and branch commit hashes (for 2-parent merge)
+        # Get the branch commit hash for the merge commit's second_parent
         head_ref = f"collections/{name}/HEAD"
         first_parent = self.kernel.resolve(head_ref)
         branch_ref = f"collections/{name}/branches/{branch_name}"
         second_parent = self.kernel.resolve(branch_ref)
 
+        # Get key_col from the existing manifest
+        manifest = self._storage._unified._load_manifest(name) if self._storage and self._storage._unified else None
+        key_col = manifest.key_col if manifest else None
+
+        # Deduplicate by key_col (last-writer-wins: branch data overrides HEAD)
+        if key_col and key_col in merged.column_names:
+            merged = merged.sort_by(key_col)
+            # Use PyArrow's group_by to deduplicate (keep last occurrence)
+            # Simpler: convert to pylist, deduplicate by key, convert back
+            rows = merged.to_pylist()
+            seen = {}
+            for row in rows:
+                k = row.get(key_col)
+                if k is not None:
+                    seen[k] = row
+            deduped = list(seen.values())
+            if deduped:
+                merged = pa.Table.from_pylist(deduped)
+
         # Write the merged data as PND2 blobs + manifest
         rows = merged.to_pylist()
         commit_hash = self._storage.write(name, rows,
-                                            key_col=None,
+                                            key_col=key_col,
                                             row_group_size=DEFAULT_ROW_GROUP_SIZE,
                                             message=f"merge branch '{branch_name}'")
 
-        # The storage.write() created a regular commit (1 parent).
-        # We need to rewrite it as a merge commit (2 parents).
+        # Rewrite as a 2-parent merge commit
         try:
             from binary_encoding import BinaryProllyTree
             commit_data = self.kernel.read_blob(commit_hash)
             commit = BinaryProllyTree.decode_commit(commit_data)
-            # Re-encode with second_parent
             delta = commit.get("delta") or {}
             merge_commit_data = BinaryProllyTree.encode_commit(
                 parent_hash=commit.get("parent"),
@@ -414,12 +432,13 @@ class LakehouseLens:
             )
             merge_hash = self.kernel.write(merge_commit_data)
             self.kernel.reference(head_ref, merge_hash)
-            # Fix (Round 11 Issue #5): save the manifest mapping for the
-            # merge commit so time-travel reads work after merge.
             self._save_commit_manifest(name, merge_hash)
             return merge_hash
-        except Exception:
-            # If we can't create a merge commit, return the regular commit
+        except Exception as e:
+            # Log the error but don't silently swallow it
+            import sys
+            print(f"WARNING: merge commit rewrite failed ({e}), "
+                  f"returning regular commit {commit_hash[:12]}", file=sys.stderr)
             return commit_hash
 
     def read_branch(self, name: str, branch_name: str) -> pa.Table:
@@ -533,12 +552,19 @@ class LakehouseLens:
 
         Returns the ENTIRE row group containing the key (not just the
         matching row), matching the old API's behavior.
+
+        Fix (Round 12 Issue #7): use _format_rg_key for zero-padded keys.
         """
         # Find the row group containing this key via the manifest
         manifest = self._storage._unified._load_manifest(name) if self._storage and self._storage._unified else None
         if manifest is None:
             return None
-        target = f"rg/{key}"
+        # Fix (Round 12 Issue #7): use _format_rg_key for zero-padded keys
+        try:
+            from unified_storage import _format_rg_key
+            target = _format_rg_key(key)
+        except ImportError:
+            target = f"rg/{key}"
         rg = manifest.find_row_group(target)
         if rg is None:
             return None

@@ -327,29 +327,47 @@ class PondStorage:
 
         Uses PARALLEL blob fetch for surviving row groups — K blobs fetched
         in ~1 RTT wall-clock instead of K × RTT.
+
+        Fix (Round 12 Issue #2): resolves commit_hash to manifest_hash.
+        Fix (Round 12 Issue #1): applies multi-predicate filter.
         """
         if self._unified is None:
             raise RuntimeError("UnifiedStorage not available")
+        manifest_hash = self._resolve_commit_manifest(collection, commit_hash) if commit_hash else None
         return self._unified.read_as_columns(collection, predicates=predicates,
                                                columns=columns,
-                                               commit_hash=commit_hash)
+                                               manifest_hash=manifest_hash)
 
     def read_as_arrow(self, collection: str,
                        predicates: Optional[list[tuple[str, str, Any]]] = None,
-                       columns: Optional[list[str]] = None) -> "pa.Table":
+                       columns: Optional[list[str]] = None,
+                       commit_hash: Optional[str] = None) -> "pa.Table":
         """Read rows as a PyArrow Table — FASTEST read path for tabular.
 
         1. Manifest pruning (in-memory, 0 GETs)
         2. Parallel blob fetch (K GETs in ~1 RTT wall-clock)
         3. Zero-copy Arrow construction from column data
 
-        Round trips: 3 + K cold, but K blobs fetched in parallel
-        → wall-clock ~3 + 1 RTT for the fetch phase.
+        Fix (Round 12 Issue #2): resolves commit_hash to manifest_hash.
+        Fix (Round 12 Issue #1): applies multi-predicate filter.
         """
         if self._unified is None:
             raise RuntimeError("UnifiedStorage not available")
-        return self._unified.read_as_arrow(collection, predicates=predicates,
-                                             columns=columns)
+        manifest_hash = self._resolve_commit_manifest(collection, commit_hash) if commit_hash else None
+        # read_as_arrow delegates to read_as_columns, so pass manifest_hash
+        col_data = self._unified.read_as_columns(collection, predicates=predicates,
+                                                   columns=columns,
+                                                   manifest_hash=manifest_hash)
+        if not col_data:
+            import pyarrow as pa
+            return pa.table({})
+        import pyarrow as pa
+        arrays = []
+        names = []
+        for col_name, values in col_data.items():
+            arrays.append(pa.array(values))
+            names.append(col_name)
+        return pa.Table.from_arrays(arrays, names=names)
 
     def point_lookup(self, collection: str, key: str,
                       columns: Optional[list[str]] = None) -> Optional[dict]:
@@ -418,20 +436,40 @@ class PondStorage:
         return sum(rg.n_rows for rg in manifest.scan_with_pruning(predicates))
 
     def delete_collection(self, collection: str) -> bool:
-        """Delete a collection by removing its HEAD and manifest refs.
+        """Delete a collection by tombstoning its HEAD and manifest refs.
 
-        Does NOT delete the underlying blobs (they may be shared with
-        other collections or commits via content addressing). Use
-        vacuum() for blob-level cleanup (not yet implemented).
+        Fix (Round 12 Issue #3): previously a no-op that returned True.
+        Now uses the RFC-0008 tombstone pattern from maintenance.py to
+        actually rebind HEAD to TOMBSTONE_HASH, making the collection
+        unreadable. Underlying blobs are NOT deleted (content-addressed,
+        may be shared). Use vacuum() for blob cleanup (not yet implemented).
         """
         deleted = False
         head_ref = f"collections/{collection}/HEAD"
         manifest_ref = f"collections/{collection}/manifest"
-        if self.kernel.resolve(head_ref) is not None:
-            # Can't actually delete a ref in the current kernel — we point
-            # it at a tombstone hash (all zeros). A future kernel version
-            # could support ref deletion.
-            deleted = True
+
+        try:
+            from maintenance import drop_name, TOMBSTONE_HASH
+            # Tombstone HEAD (makes collection_exists return False)
+            if self.kernel.resolve(head_ref) is not None:
+                drop_name(self.kernel, head_ref)
+                deleted = True
+            # Tombstone manifest (makes _load_manifest return None)
+            if self.kernel.resolve(manifest_ref) is not None:
+                drop_name(self.kernel, manifest_ref)
+                deleted = True
+        except ImportError:
+            # maintenance.py not available — manual tombstone
+            # Write a zero-length blob and point HEAD at it
+            if self.kernel.resolve(head_ref) is not None:
+                empty_blob = self.kernel.write(b"")
+                self.kernel.reference(head_ref, empty_blob)
+                deleted = True
+            if self.kernel.resolve(manifest_ref) is not None:
+                empty_blob = self.kernel.write(b"")
+                self.kernel.reference(manifest_ref, empty_blob)
+                deleted = True
+
         if self._unified:
             self._unified._invalidate_manifest_cache(collection)
         return deleted

@@ -659,7 +659,9 @@ class UnifiedStorage:
             source = as_column_source(rows)
         n_rows = source.num_rows()
 
-        # Sort by key_col if specified
+        # Sort by key_col if specified (empty string = no key col)
+        if key_col == "":
+            key_col = None
         if key_col is not None and key_col in source.column_names():
             # For PyArrow, we can sort. For ListColumnSource, sort in Python.
             source = _sort_source_by(source, key_col)
@@ -800,7 +802,9 @@ class UnifiedStorage:
             source = as_column_source(rows)
         n_rows = source.num_rows()
 
-        # Sort by key_col if specified
+        # Sort by key_col if specified (empty string = no key col)
+        if key_col == "":
+            key_col = None
         if key_col is not None and key_col in source.column_names():
             source = _sort_source_by(source, key_col)
             key_array = source.column_slice(key_col, 0, n_rows)
@@ -1219,7 +1223,15 @@ class UnifiedStorage:
         feeding into PyArrow or numpy).
 
         Uses PARALLEL blob fetch for surviving row groups (via thread pool).
+
+        Fix (Round 12 Issue #1): applies _build_predicate_filter to ALL
+        predicates (not just the first one that PND2.decode evaluates).
+        Fix (Round 12 Issue #2): resolves commit_hash to manifest_hash.
         """
+        # Fix (Round 12 Issue #2): resolve commit_hash if manifest_hash not provided
+        if manifest_hash is None and commit_hash is not None:
+            manifest_hash = self._resolve_commit_manifest(collection, commit_hash)
+
         manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
         if manifest is None:
             return {}
@@ -1230,20 +1242,43 @@ class UnifiedStorage:
             return {}
 
         # PARALLEL fetch: fetch all surviving blobs concurrently.
-        # This reduces wall-clock latency from K × RTT to ~1 × RTT
-        # (when the object store supports concurrent requests, which S3 does).
         col_results = self._parallel_fetch_and_decode(
             surviving, columns, predicates)
 
-        # Merge column results across row groups
+        # Fix (Round 12 Issue #1): apply multi-predicate filter.
+        # PND2.decode only evaluates the FIRST predicate at the encoded level.
+        # We must re-apply ALL predicates as a post-decode row filter.
+        auto_filter = self._build_predicate_filter(predicates)
+
+        # Merge column results across row groups, applying the filter
         result: dict[str, list] = {}
         for col_data in col_results:
-            for col_name, values in col_data.items():
-                if col_name not in result:
-                    result[col_name] = []
-                result[col_name].extend(values)
+            if auto_filter is None:
+                # No filter needed — merge directly
+                for col_name, values in col_data.items():
+                    if col_name not in result:
+                        result[col_name] = []
+                    result[col_name].extend(values)
+            else:
+                # Apply filter row-by-row
+                row_count = max((len(v) for v in col_data.values()), default=0)
+                col_names = list(col_data.keys())
+                for i in range(row_count):
+                    row = {c: col_data[c][i] if i < len(col_data[c]) else None
+                            for c in col_names}
+                    if auto_filter(row):
+                        for c in col_names:
+                            if c not in result:
+                                result[c] = []
+                            result[c].append(row[c])
 
         return result
+
+    def _resolve_commit_manifest(self, collection: str,
+                                  commit_hash: str) -> Optional[str]:
+        """Resolve a commit hash to its manifest hash for time-travel reads."""
+        return self.kernel.resolve(
+            f"collections/{collection}/commits/{commit_hash}__manifest")
 
     def _parallel_fetch_and_decode(
             self,
