@@ -767,10 +767,32 @@ class CollectionManifest:
         # The parent chain has the PREVIOUS row groups.
         for rg in self._row_groups:
             # Key range filter
+            # rg.key is the MAX pk in the group. For start_key, we can
+            # safely skip groups whose max < start_key (all rows too small).
             if start_key is not None and rg.key < start_key:
                 continue
-            if end_key is not None and rg.key > end_key:
-                continue
+            # For end_key, we CANNOT skip groups whose max > end_key,
+            # because the group may still contain rows <= end_key.
+            # Fix (Round 16 Issue #1): use the key column's MIN stat
+            # to decide if the group can be excluded. If min > end_key,
+            # ALL rows in the group are > end_key → safe to skip.
+            if end_key is not None:
+                # Find the key column's min stat
+                key_col_min = None
+                if self._key_col:
+                    for col in rg.columns:
+                        if col.name == self._key_col:
+                            key_col_min = col.min
+                            break
+                if key_col_min is not None:
+                    # We have min stats — use them for a safe exclusion
+                    try:
+                        # Compare as strings (both are formatted/padded)
+                        if str(key_col_min) > end_key:
+                            continue
+                    except TypeError:
+                        pass  # can't compare — don't skip (safe)
+                # No min stats — don't skip (the row-level filter will handle it)
             # Predicate pruning
             if predicates and rg.can_prune(predicates):
                 continue

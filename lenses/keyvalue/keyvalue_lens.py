@@ -232,9 +232,23 @@ class KeyValueLens(PondLens):
 
         Collection-agnostic API: delete(collection, key)
         Backward compat API:    delete(key)  [requires name in __init__]
+
+        Fix (Round 16 Issue #2): in unified mode, stage the delete by
+        marking the key in the buffer with a tombstone sentinel.
+        commit() then skips tombstoned keys when writing.
         """
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
+
+        # Unified storage path: mark key for deletion in the buffer
+        if self._unified_storage is not None:
+            if collection not in self._unified_buffer:
+                self._unified_buffer[collection] = {}
+            # Tombstone: set value to None (commit skips None values)
+            self._unified_buffer[collection][key] = None
+            return
+
+        # Legacy path: stage delete on ProllyLensBase
         self._get_base(collection).stage_delete(key)
 
     def commit(self, *args) -> str:
@@ -256,13 +270,18 @@ class KeyValueLens(PondLens):
             if collection not in self._unified_buffer:
                 raise ValueError(f"No staged data for collection '{collection}'")
             buffer = self._unified_buffer[collection]
+            # Fix (Round 16 Issue #2): skip tombstoned keys (value is None)
             rows = [{"_key": k, "value": self.encode(v)}
-                     for k, v in buffer.items()]
-            rows.sort(key=lambda r: r["_key"])
-            commit_hash = self._unified_storage.append(
-                collection, rows, key_col="_key",
-                row_group_size=10_000,
-                message=message or f"{collection} unified commit")
+                     for k, v in buffer.items() if v is not None]
+            if rows:
+                rows.sort(key=lambda r: r["_key"])
+                commit_hash = self._unified_storage.append(
+                    collection, rows, key_col="_key",
+                    row_group_size=10_000,
+                    message=message or f"{collection} unified commit")
+            else:
+                # Only deletes, no puts — just commit empty
+                commit_hash = ""
             del self._unified_buffer[collection]
             return commit_hash
 

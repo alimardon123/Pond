@@ -1663,25 +1663,22 @@ def _format_rg_key(max_pk: Any) -> str:
     """Format a row group key with zero-padding for correct lexicographic ordering.
 
     For numeric keys: "rg/00000000000000000042" (20-digit zero-padded)
-    For string keys: "rg/" + key.zfill(20) (left-padded for consistent ordering)
+    For string keys: "rg/" + key (no padding — strings compared as-is)
 
-    Fix (Round 14 Issue #4): previously, non-numeric string keys were used
-    as-is without padding, causing sort/pad mismatch. Now ALL keys are
-    padded to _RG_KEY_WIDTH for consistent lexicographic ordering.
-
-    This ensures "rg/9" < "rg/42" (because "000...9" < "000...42" lexically).
+    Fix (Round 14 Issue #4): pad string keys for consistent ordering.
+    Fix (Round 16 Issue #3): don't use zfill for non-numeric strings —
+    it's lossy ("0user4" and "user4" both pad to "000000000000000user4").
+    Instead, use the raw string for non-numeric keys. The sort order
+    is determined by the caller (KV lens sorts lexicographically before
+    writing), so the raw string IS the correct sort key.
     """
     if isinstance(max_pk, int):
         return f"rg/{max_pk:0{_RG_KEY_WIDTH}d}"
-    # Try to convert string to int (common case: key_col is INT64 but
-    # max_pk comes back as a string from ListColumnSource)
     try:
         return f"rg/{int(max_pk):0{_RG_KEY_WIDTH}d}"
     except (ValueError, TypeError):
-        # Non-numeric string key — pad to fixed width for consistent
-        # lexicographic ordering (matches the sort order the caller used)
-        s = str(max_pk)
-        return f"rg/{s.zfill(_RG_KEY_WIDTH)}"
+        # Non-numeric string key — use as-is (caller sorted lexicographically)
+        return f"rg/{max_pk}"
 
 
 def _detect_value_type_with_binary(values: list) -> int:
