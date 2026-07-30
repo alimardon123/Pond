@@ -503,28 +503,38 @@ class KeyValueLens(PondLens):
             return
 
         # Legacy path: ProllyTreeIndex
+        # Fix (Round 22): call _get_base directly to avoid _resolve_collection
+        # misinterpreting the key as the collection in bound mode.
+        base = self._get_base(collection)
         for key in self.keys(collection):
-            row = self.get(collection, key)
-            if row is not None:
-                yield row
+            h = base.lookup(key)
+            if h:
+                row = self.decode(self.kernel.read_blob(h))
+                if row is not None:
+                    yield row
 
     def __iter__(self):
         """Backward compat: iterate over default collection."""
         if self._default_collection is None:
             raise TypeError("lens is not bound to a default collection; use iterate(collection)")
-        return self.iterate(self._default_collection)
+        # Fix (Round 22): pass NO args — _resolve_collection will use
+        # _default_collection automatically. Passing it explicitly causes
+        # it to be treated as a key by _resolve_collection.
+        return self.iterate()
 
     def __len__(self):
         """Backward compat: len(lens) == lens.count()."""
         if self._default_collection is None:
             raise TypeError("lens is not bound to a default collection; use count(collection)")
-        return self.count(self._default_collection)
+        return self.count()
 
     def __contains__(self, key: str):
         """Backward compat: key in lens == lens.exists(key)."""
         if self._default_collection is None:
             raise TypeError("lens is not bound to a default collection; use exists(collection, key)")
-        return self.exists(self._default_collection, key)
+        # Fix (Round 22): pass only the key — _resolve_collection will
+        # use _default_collection automatically.
+        return self.exists(key)
 
     def where(self, *args, **kwargs) -> LensQuery:
         """Start a lazy query that filters rows.
