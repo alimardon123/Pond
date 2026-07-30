@@ -3816,3 +3816,65 @@ Not yet fixed (documented for future rounds):
   #5: append() O(N) at PB scale — needs delta-manifest format (parent_manifest_hash).
       Effort: ~200-300 LOC, 3-5 days. This is the biggest remaining architectural
       gap vs Iceberg/Delta.
+
+---
+Task ID: round-10-delta-manifests-streaming-read-github-push
+Agent: main
+Task: Fix #5 (delta-manifests for O(1) appends at PB scale), add streaming read API, push to GitHub.
+
+Work Log:
+- Implemented DELTA-MANIFESTS for O(1) appends at PB scale (Round 9 Issue #5):
+  * Added FLAG_HAS_PARENT_MANIFEST (0x04) to collection_manifest.py
+  * Added _parent_manifest_hash field + set_parent_manifest() setter
+  * Updated encode()/decode() to include parent_manifest_hash (32 bytes)
+  * Updated scan_with_pruning() to walk the parent chain: yields inline
+    row groups, then recursively loads the parent manifest and yields
+    its row groups too
+  * Updated append() in unified_storage.py to use delta-manifests when
+    the collection has >1000 row groups OR uses a stats tree OR already
+    has a parent_manifest_hash
+  * The delta path stores ONLY new row groups + parent pointer → O(new) not O(total)
+  * Reader walks the chain: O(chain_length) GETs, typically 1-3 before compaction
+
+- Added STREAMING READ API (iter_rows):
+  * UnifiedStorage.iter_rows() — generator that yields batches of rows
+  * Memory-safe for 1B+ row collections (O(batch_size) memory per yield)
+  * Supports predicates, projection pushdown, manifest_hash (time-travel)
+  * Added to PondStorage as well
+  * Usage: for batch in storage.iter_rows("big_table", batch_size=1000): process(batch)
+
+- Pushed everything to GitHub:
+  * Repo: https://github.com/alimardon123/Pond.git
+  * Commit: 17d65f6 (main branch)
+  * 59 files changed (additions + modifications + deletions + moves)
+
+Test results:
+  - 17/18 test_all.py pass (1 failure is doc coverage check)
+  - All 18 architecture laws pass
+  - All 7 smoke test suites pass (PondStorage, UnifiedStorage, KeyValue,
+    Vector, ObjectStoreNativeKernel, PB-scale, Round 9 fixes)
+  - All 3 Round 9 fix tests pass (append-sort, time-travel-no-mutation,
+    branch-read-no-mutation)
+
+Final architecture summary:
+  Lenses (2078 LOC)
+    LakehouseLens   603 LOC (was 2227 — 73% reduction)
+    KeyValueLens    836 LOC (use_unified_storage option)
+    VectorLens      639 LOC (use_unified_storage option)
+       ↓ compose
+  PondStorage (400 LOC — ONE class)
+    Namespace | Commit/Branch | Data I/O + read_as_arrow + iter_rows
+       ↓ delegates to
+  UnifiedStorage (1550+ LOC)
+    PND2 format + CollectionManifest + StatsTree
+    Parallel blob fetch + zero-copy Arrow export + streaming reads
+    Delta-manifests for O(1) appends at PB scale
+       ↓ built on
+  Kernel (668 LOC — FROZEN, 3 primitives, no SQLite)
+
+  Cold point lookup: 4 GETs (O(1) at any scale)
+  PB-scale point lookup: 7 GETs (O(log N) via stats tree)
+  PB-scale append: O(new_row_groups) via delta-manifests (was O(total))
+  Full scan: 3 + K GETs, parallel fetch → ~1 RTT wall-clock
+  Streaming read: O(batch_size) memory, suitable for 1B+ rows
+  Time-travel: via manifest_hash (no ref mutation, no race condition)
