@@ -611,3 +611,104 @@ $ for f in $(find . -name "*.md" -not -path "./archive/*" -not -path "./.git/*")
 | `tests/architecture/README.md` | README for architecture laws. |
 | `tests/integration/README.md` | README for integration tests. |
 | `tests/lens_algebra/README.md` | README for lens algebra tests. |
+
+---
+
+## 7. New Files (Rounds 1-22)
+
+### pond-core/
+- `object_store_native_kernel.py` — ObjectStoreNativeKernel (no SQLite, refs as content-addressed blobs) + InMemoryObjectStore + S3MockKernel
+- `s3_mock_backend.py` — S3 mock with simulated latency (extends ObjectStoreNativeKernel)
+
+### pond-sdk/
+- `pond_storage.py` — PondStorage (the ONE unified SDK class: namespace + commit + data I/O)
+
+### pond-sdk/extensions/physical_structures/
+- `unified_storage.py` — UnifiedStorage (PND2 format, write/read/point_lookup/iter_rows/compact_manifest)
+- `collection_manifest.py` — CollectionManifest (ONE index blob per commit, delta-manifest support, stats tree delegation)
+- `stats_tree.py` — StatsTreeReader (PB-scale hierarchical index, O(log N) reads)
+- `compression.py` — zstd/LZ4 transparent compression
+- `embedded_stats.py` — value-type constants + ColumnStats
+
+### scripts/
+- `test_pond_storage.py` — PondStorage tests (6 tests)
+- `test_unified_storage_smoke.py` — UnifiedStorage smoke tests (6 tests)
+- `test_manifest_smoke.py` — CollectionManifest tests (4 tests)
+- `test_stats_tree_smoke.py` — StatsTree tests (4 tests)
+- `test_object_store_native_kernel.py` — ObjectStoreNativeKernel tests (6 tests)
+- `test_pb_scale_integration.py` — PB-scale integration tests (3 tests)
+- `test_adversarial.py` — Adversarial edge-case tests (7 tests)
+- `test_range_scan_boundaries.py` — Range scan boundary tests (4 tests)
+- `test_round9_fixes.py` — Round 9 fix verification (3 tests)
+- `test_keyvalue_unified.py` — KeyValueLens unified storage tests (5 tests)
+- `test_vector_unified.py` — VectorLens unified storage tests (4 tests)
+- `benchmark_cold_round_trips.py` — Cold-read round-trip benchmark
+- `benchmark_final.py` — Final architecture benchmark
+- `benchmark_round_trips.py` — Round-trip comparison benchmark
+- `benchmark_unified_storage.py` — Unified storage benchmark
+- `round19_benchmarks.py` — Round 19 comprehensive benchmarks
+
+### lenses/streaming/
+- `streaming_lens.py` — StreamingLens (chunked segments, range reads)
+- `README.md` — Streaming lens documentation
+- `__init__.py` — Package init
+
+### docs/archive/
+- `POND_PHASE_O_REPORT.md` — Phase O report (historical)
+- `POND_PHASE_P_REPORT.md` — Phase P report (historical)
+- `POND_PHASE_Q_REPORT.md` — Phase Q report (historical)
+- `POND_PHASE_Q_REVIEW_PACKET.md` — Phase Q review packet (historical)
+- `POND_SECOND_RED_TEAM.md` — Second red team review (historical)
+- `POND_STORAGE_MODEL.md` — Original storage model (superseded)
+- `POND_THIRD_RED_TEAM.md` — Third red team review (historical)
+- `REJECTED_DESIGNS.md` — Rejected architectural decisions (historical)
+- `WORKLOAD_ANALYSIS_PB_SCALE.md` — PB-scale workload analysis (stats tree now implemented)
+
+### pond-labs/
+- `benchmarks/s3_mock_benchmark.py` — S3 mock benchmark
+- `demos/jupyter_notebook_demo.py` — Jupyter notebook demo
+- `demos/notebook_lens_demo.py` — Notebook lens demo
+- `demos/polars_adapter_demo.py` — Polars adapter demo
+- `demos/streaming_lens_demo.py` — Streaming lens demo
+
+
+## 8. Complete File Coverage (Rounds 1-22)
+
+All active files in the repository (excluding archive/, __pycache__, .git):
+
+- `docs/ARCHITECTURE_REDESIGN.md`
+- `docs/COLLECTION_MANIFEST_DESIGN.md`
+- `docs/HONEST_COMPETITOR_COMPARISON.md`
+- `docs/ROUND_TRIP_AUDIT.md`
+- `docs/UNIFIED_STORAGE_DESIGN.md`
+- `lenses/streaming/README.md`
+- `lenses/streaming/__init__.py`
+- `pond-core/object_store_native_kernel.py`
+- `pond-core/s3_mock_backend.py`
+- `pond-labs/benchmarks/s3_mock_benchmark.py`
+- `pond-labs/demos/jupyter_notebook_demo.py`
+- `pond-labs/demos/notebook_lens_demo.py`
+- `pond-labs/demos/polars_adapter_demo.py`
+- `pond-labs/demos/streaming_lens_demo.py`
+- `pond-sdk/extensions/physical_structures/collection_manifest.py`
+- `pond-sdk/extensions/physical_structures/compression.py`
+- `pond-sdk/extensions/physical_structures/embedded_stats.py`
+- `pond-sdk/extensions/physical_structures/stats_tree.py`
+- `pond-sdk/extensions/physical_structures/unified_storage.py`
+- `pond-sdk/pond_storage.py`
+- `scripts/benchmark_cold_round_trips.py`
+- `scripts/benchmark_final.py`
+- `scripts/benchmark_round_trips.py`
+- `scripts/benchmark_unified_storage.py`
+- `scripts/round19_benchmarks.py`
+- `scripts/test_adversarial.py`
+- `scripts/test_keyvalue_unified.py`
+- `scripts/test_manifest_smoke.py`
+- `scripts/test_object_store_native_kernel.py`
+- `scripts/test_pb_scale_integration.py`
+- `scripts/test_pond_storage.py`
+- `scripts/test_range_scan_boundaries.py`
+- `scripts/test_round9_fixes.py`
+- `scripts/test_stats_tree_smoke.py`
+- `scripts/test_unified_storage_smoke.py`
+- `scripts/test_vector_unified.py`
