@@ -579,6 +579,15 @@ class UnifiedStorage:
         # Cache the manifest HASH alongside the manifest object so we
         # don't need a separate resolve() call to get the hash.
         self._manifest_hash_cache: dict[str, str] = {}
+        # Cache the HEAD commit hash per collection so append doesn't
+        # need to resolve(HEAD) on every write.
+        self._head_cache: dict[str, str] = {}
+        # Cache the next commit index per collection so append doesn't
+        # need to read the parent commit blob just for the index number.
+        self._commit_index_cache: dict[str, int] = {}
+        # Cache the delta chain depth per collection so the compaction
+        # check doesn't need to walk the parent chain on every append.
+        self._delta_chain_depth_cache: dict[str, int] = {}
         # Active branch per collection (set by checkout, cleared by undo/merge)
         self._active_branches: dict[str, str] = {}
 
@@ -595,7 +604,8 @@ class UnifiedStorage:
         return f"collections/{collection}/HEAD"
 
     def _load_manifest(self, collection: str,
-                        manifest_hash: Optional[str] = None
+                        manifest_hash: Optional[str] = None,
+                        skip_cache: bool = False
                         ) -> Optional[CollectionManifest]:
         """Load the manifest for a collection (cached).
 
@@ -603,21 +613,31 @@ class UnifiedStorage:
         time-travel reads — no ref mutation, no race condition).
         If manifest_hash is None, resolves the current manifest ref.
 
-        Fix (Round 9 Issue #2): the old approach mutated the manifest ref
-        to time-travel, causing race conditions and hidden PUTs. Now the
-        caller passes the manifest hash directly — no mutation needed.
+        Round 26 caching strategy:
+        - skip_cache=False (READS): verify cached hash matches current ref
+          (1 GET). Handles multi-writer scenarios correctly.
+        - skip_cache=True (WRITES): trust the cache blindly (0 GETs).
+          The write path is single-writer — the cache is authoritative.
         """
         # If a specific manifest hash is requested, load it directly
-        # (bypassing the cache, since it's a historical manifest)
         if manifest_hash is not None:
             try:
                 return CollectionManifest.load(self.kernel, manifest_hash)
             except (ValueError, KeyError):
                 return None
 
-        # Normal path: resolve the current manifest ref (cached)
-        if collection in self._manifest_cache:
+        # skip_cache=True (WRITE path): trust the cache blindly — 0 GETs
+        if skip_cache and collection in self._manifest_cache:
             return self._manifest_cache[collection]
+
+        # skip_cache=False (READ path): verify freshness — 1 GET
+        if not skip_cache and collection in self._manifest_cache:
+            current_hash = self.kernel.resolve(self._manifest_ref(collection))
+            cached_hash = self._manifest_hash_cache.get(collection)
+            if current_hash == cached_hash:
+                return self._manifest_cache[collection]
+            # Stale cache — fall through to re-read
+            self._invalidate_manifest_cache(collection)
 
         resolved_hash = self.kernel.resolve(self._manifest_ref(collection))
         if resolved_hash is None:
@@ -640,8 +660,37 @@ class UnifiedStorage:
         return self._manifest_hash_cache.get(collection)
 
     def _invalidate_manifest_cache(self, collection: str) -> None:
+        """Invalidate ALL caches for a collection (used by undo/checkout/merge
+        where the HEAD changed externally and we must re-read)."""
         self._manifest_cache.pop(collection, None)
         self._manifest_hash_cache.pop(collection, None)
+        self._head_cache.pop(collection, None)
+        self._commit_index_cache.pop(collection, None)
+        self._delta_chain_depth_cache.pop(collection, None)
+
+    def _update_caches_after_write(self, collection: str,
+                                     manifest: CollectionManifest,
+                                     manifest_hash: str,
+                                     commit_hash: str,
+                                     commit_index: int,
+                                     is_delta: bool = False) -> None:
+        """Update ALL caches after a write/append — enables O(1) warm writes.
+
+        Instead of invalidating the cache (which forces the next write to
+        re-read from storage), we UPDATE the cache with the new values.
+        The next write to the same collection uses 0 GETs.
+        """
+        self._manifest_cache[collection] = manifest
+        self._manifest_hash_cache[collection] = manifest_hash
+        self._head_cache[collection] = commit_hash
+        self._commit_index_cache[collection] = commit_index + 1
+        # Track delta chain depth for compaction check (0 GETs vs walking chain)
+        if is_delta:
+            self._delta_chain_depth_cache[collection] = \
+                self._delta_chain_depth_cache.get(collection, 0) + 1
+        else:
+            # Flat manifest — reset chain depth to 0
+            self._delta_chain_depth_cache[collection] = 0
 
     # ------------------------------------------------------------------
     # VERSION CONTROL — manifest-based commit/branch/merge/history
@@ -988,21 +1037,26 @@ class UnifiedStorage:
         # ProllyTree (we no longer use one). The old blobs remain
         # content-addressed (deduped); the old manifest is simply not
         # referenced by the new commit.
-        existing_manifest = self._load_manifest(collection)
+        # skip_cache=True: for writes, the cache is authoritative (single-writer)
+        existing_manifest = self._load_manifest(collection, skip_cache=True)
         # (existing_manifest is read for schema inheritance if needed;
         #  no deletion of old row group keys is required.)
 
         if n_rows == 0:
             # Fix (Round 11 Issue #1): empty write must still update the
             # manifest so the collection shows as empty (not stale data).
-            # Build an empty manifest and commit it.
+            manifest = CollectionManifest(self.kernel)
+            manifest.set_schema(columns=schema_columns, key_col=key_col or "",
+                                 row_group_size=row_group_size, chunk_size=0)
             manifest_hash = self._build_manifest(
                 collection, [], schema_columns,
                 key_col or "", row_group_size)
-            # Round 26 optimization: resolve HEAD once, read commit once
-            parent = self.kernel.resolve(self._head_ref(collection))
-            commit_index = 0
-            if parent:
+            # O(1) warm write: use cached HEAD + commit_index if available
+            parent = self._head_cache.get(collection)
+            if parent is None:
+                parent = self.kernel.resolve(self._head_ref(collection))
+            commit_index = self._commit_index_cache.get(collection, 0)
+            if commit_index == 0 and parent:
                 pc = self._read_commit_blob(parent)
                 if pc:
                     commit_index = pc.get("index", 0) + 1
@@ -1010,43 +1064,41 @@ class UnifiedStorage:
                 collection, manifest_hash, parent=parent,
                 message=message or "write: empty table",
                 index=commit_index)
-            self._invalidate_manifest_cache(collection)
+            self._update_caches_after_write(
+                collection, manifest, manifest_hash, commit_hash, commit_index,
+                is_delta=False)
             return commit_hash
 
         for start in range(0, n_rows, row_group_size):
             end = min(start + row_group_size, n_rows)
-            # Slice the source for this row group
             group_source = _slice_source(source, start, end)
             max_pk = key_array[end - 1]
             rg_key = _format_rg_key(max_pk)
 
-            # Encode as PND2 blob
             pnd2_bytes, col_stats = PND2.encode(
                 group_source, encoding_hints=encoding_hints)
             blob_hash = self.kernel.write(pnd2_bytes)
 
-            # Track for manifest building (no ProllyTree staging —
-            # the manifest IS the index now)
             manifest_entries.append({
                 "rg_key": rg_key,
                 "blob_hash": blob_hash,
                 "n_rows": end - start,
-                "col_stats": col_stats,  # [(name, vtype, min, max, null_count), ...]
+                "col_stats": col_stats,
             })
 
         n_groups = (n_rows + row_group_size - 1) // row_group_size
 
         # Build the manifest (one blob, atomically with the commit)
-        manifest_hash = self._build_manifest(collection, manifest_entries,
-                                              schema_columns,
-                                              key_col or "", row_group_size)
+        manifest_hash, new_manifest = self._build_manifest_with_return(
+            collection, manifest_entries, schema_columns,
+            key_col or "", row_group_size)
 
-        # Round 26 optimization: resolve HEAD ONCE and read the parent
-        # commit blob ONCE to get the index. Saves 2 GETs vs the old
-        # approach of calling _commit_index() separately.
-        parent = self.kernel.resolve(self._head_ref(collection))
-        commit_index = 0
-        if parent:
+        # O(1) warm write: use cached HEAD + commit_index if available
+        parent = self._head_cache.get(collection)
+        if parent is None:
+            parent = self.kernel.resolve(self._head_ref(collection))
+        commit_index = self._commit_index_cache.get(collection, 0)
+        if commit_index == 0 and parent:
             pc = self._read_commit_blob(parent)
             if pc:
                 commit_index = pc.get("index", 0) + 1
@@ -1057,7 +1109,10 @@ class UnifiedStorage:
             message=message or f"unified write: {n_rows} rows in {n_groups} row groups",
             index=commit_index)
 
-        self._invalidate_manifest_cache(collection)
+        # Update caches (don't invalidate) → next write is O(1)
+        self._update_caches_after_write(
+            collection, new_manifest, manifest_hash, commit_hash, commit_index,
+            is_delta=False)
         return commit_hash
 
     def append(self, collection: str, rows,
@@ -1089,7 +1144,8 @@ class UnifiedStorage:
         Returns:
             The new HEAD commit hash.
         """
-        existing_manifest = self._load_manifest(collection)
+        # skip_cache=True: for writes, the cache is authoritative (single-writer)
+        existing_manifest = self._load_manifest(collection, skip_cache=True)
         if existing_manifest is None:
             # Collection doesn't exist — delegate to write()
             return self.write(collection, rows, key_col=key_col,
@@ -1219,24 +1275,29 @@ class UnifiedStorage:
 
         # Build the manifest. If using delta mode, pass the parent hash.
         parent_hash = existing_manifest_hash if use_delta else None
-        manifest_hash = self._build_manifest(
+        manifest_hash, new_manifest = self._build_manifest_with_return(
             collection, manifest_entries, schema_columns,
             key_col or "", row_group_size,
             parent_manifest_hash=parent_hash)
 
-        # Round 26 optimization: resolve HEAD ONCE and reuse for both
-        # the commit index and the parent pointer. This saves 1 GET.
-        parent_commit = self.kernel.resolve(self._head_ref(collection))
+        # O(1) warm write: use cached HEAD + commit_index if available.
+        # The manifest cache was populated by _load_manifest above (or
+        # by the previous write). HEAD and commit_index are cached by
+        # _update_caches_after_write.
+        parent_commit = self._head_cache.get(collection)
+        if parent_commit is None:
+            parent_commit = self.kernel.resolve(self._head_ref(collection))
 
-        # Round 26 optimization: get the commit index from the parent
-        # commit blob WITHOUT a separate _commit_index() call. We already
-        # have parent_commit — read it once, extract the index, reuse.
-        # This saves 2 GETs (resolve HEAD + read_blob commit).
-        commit_index = 0
-        if parent_commit:
+        commit_index = self._commit_index_cache.get(collection, -1)
+        if commit_index < 0 and parent_commit:
+            # Cold path: read parent commit blob to get the index
             parent_commit_data = self._read_commit_blob(parent_commit)
             if parent_commit_data:
                 commit_index = parent_commit_data.get("index", 0) + 1
+            else:
+                commit_index = 0
+        elif commit_index < 0:
+            commit_index = 0
 
         commit_hash = self._write_commit_blob(
             collection, manifest_hash,
@@ -1244,38 +1305,20 @@ class UnifiedStorage:
             message=message or f"append: {n_rows} rows in {n_new_groups} new row groups",
             index=commit_index)
 
-        self._invalidate_manifest_cache(collection)
+        # Update caches (don't invalidate) → next append is O(1)
+        self._update_caches_after_write(
+            collection, new_manifest, manifest_hash, commit_hash, commit_index,
+            is_delta=use_delta)
 
         # Fix (Round 11 Issue #2): auto-compact if the delta chain is too deep.
         # After DELTA_CHAIN_THRESHOLD appends, flatten the chain to avoid
         # O(chain_depth) read amplification.
         #
-        # Round 26 optimization: we already have existing_manifest in
-        # memory. We can check the chain depth from it WITHOUT reading
-        # any additional manifests. The chain depth is:
-        #   0 if existing_manifest has no parent_manifest_hash (first delta)
-        #   1 + (depth of existing_manifest's parent) otherwise
-        # But we can't know the parent's depth without reading it.
-        # However, we stored the chain depth in the manifest's metadata
-        # when we built it (via the delta chain). For now, use the
-        # existing_manifest's parent_manifest_hash to decide:
-        #   - If None: this is the first delta, chain_depth = 0, skip
-        #   - If not None: walk the chain (unavoidable, but rare)
-        if use_delta and parent_hash and existing_manifest.parent_manifest_hash:
+        # Round 26 optimization: use the cached delta chain depth instead
+        # of walking the parent chain. This is 0 GETs for the common case.
+        if use_delta:
+            chain_depth = self._delta_chain_depth_cache.get(collection, 0)
             DELTA_CHAIN_THRESHOLD = 8
-            chain_depth = 1  # existing_manifest has a parent
-            check_hash = existing_manifest.parent_manifest_hash
-            while check_hash and chain_depth < DELTA_CHAIN_THRESHOLD:
-                try:
-                    check_manifest = CollectionManifest.load(
-                        self.kernel, check_hash)
-                    if check_manifest.parent_manifest_hash:
-                        chain_depth += 1
-                        check_hash = check_manifest.parent_manifest_hash
-                    else:
-                        break
-                except (ValueError, KeyError):
-                    break
             if chain_depth >= DELTA_CHAIN_THRESHOLD:
                 self.compact_manifest(collection)
 
@@ -1389,6 +1432,57 @@ class UnifiedStorage:
         self.kernel.reference(self._manifest_ref(collection), new_hash)
         self._invalidate_manifest_cache(collection)
         return new_hash
+
+    def _build_manifest_with_return(self, collection: str,
+                         entries: list[dict],
+                         schema_columns: list[tuple[str, int]],
+                         key_col: str,
+                         row_group_size: int,
+                         parent_manifest_hash: Optional[str] = None
+                         ) -> tuple[str, CollectionManifest]:
+        """Build the manifest and return (hash, manifest_object).
+
+        The manifest object is returned so callers can cache it for
+        O(1) warm writes (avoids re-reading from storage on next write).
+        """
+        manifest = CollectionManifest(self.kernel)
+        manifest.set_schema(
+            columns=schema_columns,
+            key_col=key_col,
+            row_group_size=row_group_size,
+            chunk_size=0,
+        )
+
+        rg_entries: list[RowGroupEntry] = []
+        for entry in entries:
+            rg = RowGroupEntry(
+                key=entry["rg_key"],
+                blob_hash=entry["blob_hash"],
+                n_rows=entry["n_rows"],
+                storage_mode=STORAGE_WHOLE_BLOB,
+            )
+            for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
+                rg.columns.append(ColumnStatsEntry(
+                    name=col_name, value_type=vtype, min=mn, max=mx,
+                    null_count=null_count, chunks=[],
+                ))
+            manifest.add_row_group(rg)
+            rg_entries.append(rg)
+
+        try:
+            from stats_tree import should_use_stats_tree, build_stats_tree
+            if should_use_stats_tree(len(rg_entries)):
+                stats_tree_root = build_stats_tree(self.kernel, rg_entries)
+                manifest.set_stats_tree_root(stats_tree_root)
+        except ImportError:
+            pass
+
+        if parent_manifest_hash is not None:
+            manifest.set_parent_manifest(parent_manifest_hash)
+
+        manifest_hash = manifest.commit()
+        self.kernel.reference(self._manifest_ref(collection), manifest_hash)
+        return manifest_hash, manifest
 
     def _build_manifest(self, collection: str,
                          entries: list[dict],
