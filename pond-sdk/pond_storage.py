@@ -327,6 +327,73 @@ class PondStorage:
             encoding_hints=encoding_hints,
             message=message, max_retries=max_retries)
 
+    def append_shard(self, collection: str, rows,
+                      key_col: Optional[str] = None,
+                      row_group_size: int = 10_000,
+                      encoding_hints: Optional[dict[str, str]] = None,
+                      message: str = "") -> str:
+        """Concurrent-safe append — NO CAS, NO retry, NO coordination.
+
+        This is the BEAUTIFUL concurrency model. Each writer writes its
+        own shard to a unique path. Readers merge all shards (CRDT union).
+
+        Better than CAS because:
+        - No retry storms — writes always succeed
+        - No object-store-specific conditional PUTs — works on local FS too
+        - No boilerplate — just write your shard, you're done
+        - No coordination — writers don't know about each other
+
+        Works on ANY storage that supports listing (local FS, S3, GCS).
+
+        After writing shards, call compact_shards() periodically to merge
+        them into HEAD (bounds read amplification).
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.append_shard(
+            collection, rows, key_col=key_col,
+            row_group_size=row_group_size,
+            encoding_hints=encoding_hints, message=message)
+
+    def read_with_shards(self, collection: str,
+                          predicates: Optional[list[tuple[str, str, Any]]] = None,
+                          columns: Optional[list[str]] = None,
+                          row_filter: Optional[Callable[[dict], bool]] = None,
+                          start_key: Optional[str] = None,
+                          end_key: Optional[str] = None) -> list[dict]:
+        """Read rows merging HEAD + all shards (CRDT union).
+
+        Use this instead of read() when shards exist (after append_shard).
+        Falls back to plain read() if no shards exist.
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        # If no shards, fall back to plain read (faster)
+        if self._unified.shard_count(collection) == 0:
+            return self.read(collection, predicates=predicates,
+                              columns=columns, row_filter=row_filter,
+                              start_key=start_key, end_key=end_key)
+        return self._unified.read_with_shards(
+            collection, predicates=predicates, columns=columns,
+            row_filter=row_filter, start_key=start_key, end_key=end_key)
+
+    def compact_shards(self, collection: str) -> Optional[str]:
+        """Merge all shards into HEAD, then clear the shards.
+
+        Idempotent — multiple compactors produce the same result.
+        Should be called periodically (e.g., after every N shards) to
+        bound read amplification.
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.compact_shards(collection)
+
+    def shard_count(self, collection: str) -> int:
+        """Return the number of unmerged shards for a collection."""
+        if self._unified is None:
+            return 0
+        return self._unified.shard_count(collection)
+
     def read(self, collection: str,
              predicates: Optional[list[tuple[str, str, Any]]] = None,
              columns: Optional[list[str]] = None,

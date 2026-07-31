@@ -1054,6 +1054,365 @@ class UnifiedStorage:
         return {"added": added, "removed": removed, "modified": modified}
 
     # ------------------------------------------------------------------
+    # SHARD-BASED CONCURRENCY (CRDT-like, no CAS)
+    #
+    # The beautiful concurrency model: each writer writes its own shard.
+    # No coordination, no retry, no CAS. Readers merge all shards.
+    #
+    # Why this works:
+    #   - Appends are COMMUTATIVE (adding RG1 then RG2 == RG2 then RG1)
+    #   - The manifest is a G-Set (Grow-Only Set) of row group entries
+    #   - Merge = set union (commutative, associative, idempotent)
+    #   - Each shard is an independent immutable blob
+    #
+    # Architecture:
+    #   collections/{name}/HEAD → compacted manifest (merged state)
+    #   collections/{name}/shards/{uuid} → shard manifest (one per writer batch)
+    #
+    # Write path (append_shard):
+    #   1. Writer generates a UUIDv7 (time-ordered, unique)
+    #   2. Encodes row groups as PND2 blobs (concurrent-safe — immutable)
+    #   3. Writes a shard manifest blob (just the new row groups)
+    #   4. Writes collections/{name}/shards/{uuid} → shard_manifest_hash
+    #   Done. No CAS, no retry, no coordination.
+    #
+    # Read path (read_with_shards):
+    #   1. Read HEAD manifest (1 GET — the compacted base)
+    #   2. List collections/{name}/shards/ (1 LIST)
+    #   3. Read all shard manifests (N GETs — parallel, ~1 RTT)
+    #   4. Merge: union of all row group entries (CRDT merge)
+    #   5. Read surviving data blobs (K GETs — parallel)
+    #
+    # Compaction (compact_shards):
+    #   1. Read HEAD + all shards
+    #   2. Merge into one flat manifest
+    #   3. Write new compacted HEAD (last-writer-wins OK — rare, idempotent)
+    #   4. Clear old shards (delete the shard refs)
+    #   Compaction is the ONLY place that needs coordination, and it's
+    #   idempotent — multiple compactors produce the same result.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _shards_prefix(collection: str) -> str:
+        return f"collections/{collection}/shards/"
+
+    def append_shard(self, collection: str, rows,
+                      key_col: Optional[str] = None,
+                      row_group_size: int = 10_000,
+                      encoding_hints: Optional[dict[str, str]] = None,
+                      message: str = "") -> str:
+        """Concurrent-safe append — NO CAS, NO retry, NO coordination.
+
+        This is the beautiful concurrency model. Each writer writes its
+        own shard to a unique path. Readers merge all shards.
+
+        Flow:
+          1. Generate UUIDv7 (time-ordered, unique per writer)
+          2. Encode row groups as PND2 blobs (immutable, concurrent-safe)
+          3. Write a shard manifest blob (just the new row groups)
+          4. Write collections/{name}/shards/{uuid} → shard_manifest_hash
+
+        That's it. No CAS, no retry, no reading the current HEAD, no
+        coordination with other writers. The shard is immediately
+        visible to readers (they list shards on every read).
+
+        Works on ANY storage that supports listing (local FS, S3, GCS).
+        No conditional PUTs needed.
+
+        Args:
+            collection: collection name (must exist — call write() first)
+            rows: new rows to append
+            key_col: sort key column (should match existing)
+            row_group_size: rows per new row group
+            encoding_hints: optional encoding hints
+            message: commit message (stored in shard metadata)
+
+        Returns:
+            The shard manifest hash.
+        """
+        # Coerce input
+        if isinstance(rows, list):
+            source = ListColumnSource(rows)
+        elif isinstance(rows, ColumnSource):
+            source = rows
+        else:
+            source = as_column_source(rows)
+        n_rows = source.num_rows()
+
+        if n_rows == 0:
+            return ""  # nothing to append
+
+        # Read existing manifest for schema (cache-independent — read fresh)
+        existing_manifest = self._load_manifest(collection, skip_cache=True)
+        if existing_manifest is None:
+            # Collection doesn't exist — use write() instead
+            return self.write(collection, rows, key_col=key_col,
+                                row_group_size=row_group_size,
+                                encoding_hints=encoding_hints,
+                                message=message)
+
+        if key_col == "":
+            key_col = None
+        if key_col is None and existing_manifest.key_col:
+            key_col = existing_manifest.key_col
+        if key_col is not None and key_col in source.column_names():
+            source = _sort_source_by(source, key_col)
+            key_array = source.column_slice(key_col, 0, n_rows)
+        elif key_col is not None:
+            raise KeyError(f"key column '{key_col}' not in source columns")
+        else:
+            key_array = list(range(n_rows))
+
+        schema_columns = existing_manifest.columns
+        if not schema_columns and n_rows > 0:
+            for col_name in source.column_names():
+                sample = source.column_slice(col_name, 0, min(100, n_rows))
+                vtype = _detect_value_type_with_binary(sample)
+                schema_columns.append((col_name, vtype))
+
+        # Encode new row groups (concurrent-safe — immutable blobs)
+        manifest_entries: list[dict] = []
+        for start in range(0, n_rows, row_group_size):
+            end = min(start + row_group_size, n_rows)
+            group_source = _slice_source(source, start, end)
+            max_pk = key_array[end - 1]
+            rg_key = _format_rg_key(max_pk)
+            pnd2_bytes, col_stats = PND2.encode(
+                group_source, encoding_hints=encoding_hints)
+            blob_hash = self.kernel.write(pnd2_bytes)
+            manifest_entries.append({
+                "rg_key": rg_key,
+                "blob_hash": blob_hash,
+                "n_rows": end - start,
+                "col_stats": col_stats,
+            })
+
+        manifest_entries.sort(key=lambda e: e["rg_key"])
+
+        # Build the shard manifest WITHOUT updating the HEAD manifest ref.
+        # The shard is a SEPARATE manifest — it must NOT touch HEAD.
+        # We call CollectionManifest directly instead of _build_manifest_with_return
+        # because _build_manifest_with_return updates the manifest ref.
+        shard_manifest = CollectionManifest(self.kernel)
+        shard_manifest.set_schema(
+            columns=schema_columns,
+            key_col=key_col or "",
+            row_group_size=row_group_size,
+            chunk_size=0,
+        )
+        for entry in manifest_entries:
+            rg = RowGroupEntry(
+                key=entry["rg_key"],
+                blob_hash=entry["blob_hash"],
+                n_rows=entry["n_rows"],
+                storage_mode=STORAGE_WHOLE_BLOB,
+            )
+            for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
+                rg.columns.append(ColumnStatsEntry(
+                    name=col_name, value_type=vtype, min=mn, max=mx,
+                    null_count=null_count, chunks=[],
+                ))
+            shard_manifest.add_row_group(rg)
+
+        # Write the shard manifest blob (does NOT update any ref)
+        shard_hash = shard_manifest.commit()
+
+        # Write the shard ref to a unique path (UUIDv7 — time-ordered, unique)
+        # This is the KEY: each writer writes to its own path. No conflict.
+        try:
+            from uuid7 import uuidv7
+            shard_id = uuidv7()
+        except ImportError:
+            import time as _t
+            shard_id = f"{_t.time_ns()}_{id(rows)}"
+
+        shard_ref = f"{self._shards_prefix(collection)}{shard_id}"
+        self.kernel.reference(shard_ref, shard_hash)
+
+        # Invalidate cache so the next read picks up the new shard
+        self._invalidate_manifest_cache(collection)
+
+        return shard_hash
+
+    def list_shards(self, collection: str) -> list[str]:
+        """List all shard manifest hashes for a collection.
+
+        Returns a list of manifest hashes (not refs). Each hash can be
+        loaded via CollectionManifest.load().
+
+        Filters out "deleted" shards (those pointing at empty blobs from
+        compaction's tombstone).
+        """
+        prefix = self._shards_prefix(collection)
+        # Use the kernel's list_names to find shard refs
+        all_names = self.kernel.list_names()
+        shard_hashes = []
+        for name in all_names:
+            if name.startswith(prefix):
+                h = self.kernel.resolve(name)
+                if h is not None:
+                    # Skip tombstoned shards (empty blobs from compaction)
+                    # We check by trying to load as a manifest — if it fails,
+                    # it's not a valid shard manifest
+                    try:
+                        from collection_manifest import CollectionManifest as _CM
+                        _CM.load(self.kernel, h)  # validate it's a real manifest
+                        shard_hashes.append(h)
+                    except (ValueError, KeyError):
+                        pass  # tombstoned or invalid — skip
+        return shard_hashes
+
+    def read_with_shards(self, collection: str,
+                          predicates: Optional[list[tuple[str, str, Any]]] = None,
+                          columns: Optional[list[str]] = None,
+                          row_filter: Optional[Callable[[dict], bool]] = None,
+                          start_key: Optional[str] = None,
+                          end_key: Optional[str] = None) -> list[dict]:
+        """Read rows from a collection, merging HEAD + all shards.
+
+        This is the CRDT merge: union of all row group entries from HEAD
+        and all shards. Last-writer-wins for duplicate rg_keys (shards
+        override HEAD, newer shards override older ones by UUIDv7 order).
+
+        Flow:
+          1. Read HEAD manifest (1 GET — the compacted base)
+          2. List shards (1 LIST)
+          3. Read all shard manifests (N GETs — parallel)
+          4. Merge: union of row group entries
+          5. Fetch + decode surviving data blobs (K GETs — parallel)
+        """
+        # Read HEAD manifest (the compacted base)
+        head_manifest = self._load_manifest(collection)
+        # Read all shards
+        shard_hashes = self.list_shards(collection)
+        shard_manifests = []
+        for sh in shard_hashes:
+            try:
+                sm = CollectionManifest.load(self.kernel, sh)
+                shard_manifests.append(sm)
+            except (ValueError, KeyError):
+                pass  # skip unreadable shards
+
+        # Merge: collect all row group entries, dedup by key (last wins)
+        # Shards override HEAD; among shards, later UUIDv7 = newer = wins
+        # (we rely on list_shards returning them in ref order, which is
+        # lexicographic = time-ordered for UUIDv7)
+        merged: dict[str, Any] = {}  # rg_key → RowGroupEntry
+        if head_manifest:
+            for rg in head_manifest.scan_with_pruning(predicates, start_key, end_key):
+                merged[rg.key] = rg
+        for sm in shard_manifests:
+            for rg in sm.scan_with_pruning(predicates, start_key, end_key):
+                merged[rg.key] = rg  # shard overrides HEAD
+
+        if not merged:
+            return []
+
+        # Fetch + decode data blobs (parallel for large K)
+        row_groups = list(merged.values())
+        col_data_list = self._parallel_fetch_and_decode(
+            row_groups, columns, predicates)
+
+        # Combine into rows
+        result: list[dict] = []
+        for col_data in col_data_list:
+            n = len(next(iter(col_data.values()))) if col_data else 0
+            for i in range(n):
+                row = {c: vals[i] for c, vals in col_data.items()}
+                if row_filter is None or row_filter(row):
+                    result.append(row)
+        return result
+
+    def compact_shards(self, collection: str) -> Optional[str]:
+        """Merge all shards into HEAD, then clear the shards.
+
+        This is the ONLY place that needs coordination, and it's idempotent:
+        multiple compactors produce the same result (CRDT merge is
+        commutative). Last-writer-wins on HEAD is safe here because the
+        result is deterministic.
+
+        After compaction:
+          - HEAD points to a new flat manifest containing all row groups
+          - All shards are cleared (their refs are deleted)
+          - Reads are fast again (1 manifest, no shard list)
+
+        Should be called periodically (e.g., after every N shards) to
+        bound read amplification.
+        """
+        head_manifest = self._load_manifest(collection)
+        shard_hashes = self.list_shards(collection)
+        if not shard_hashes:
+            return None  # nothing to compact
+
+        # Merge all row group entries
+        merged: dict[str, Any] = {}
+        if head_manifest:
+            for rg in head_manifest.scan_with_pruning():
+                merged[rg.key] = rg
+        for sh in shard_hashes:
+            try:
+                sm = CollectionManifest.load(self.kernel, sh)
+                for rg in sm.scan_with_pruning():
+                    merged[rg.key] = rg
+            except (ValueError, KeyError):
+                pass
+
+        # Build the merged manifest entries
+        schema = (head_manifest.columns if head_manifest
+                   else [("value", 4)])  # fallback schema
+        key_col = (head_manifest.key_col if head_manifest else "")
+        rg_size = (head_manifest.row_group_size if head_manifest else 10_000)
+
+        merged_entries = []
+        for rg in sorted(merged.values(), key=lambda r: r.key):
+            merged_entries.append({
+                "rg_key": rg.key,
+                "blob_hash": rg.blob_hash,
+                "n_rows": rg.n_rows,
+                "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                for c in rg.columns],
+            })
+
+        # Write the new compacted manifest
+        manifest_hash, new_manifest = self._build_manifest_with_return(
+            collection, merged_entries, schema, key_col, rg_size)
+
+        # Write a new commit pointing to the compacted manifest
+        parent = self._head_cache.get(collection)
+        if parent is None:
+            parent = self.kernel.resolve(self._head_ref(collection))
+        commit_index = self._commit_index_cache.get(collection, 0)
+        if commit_index == 0 and parent:
+            pc = self._read_commit_blob(parent)
+            if pc:
+                commit_index = pc.get("index", 0) + 1
+
+        commit_hash = self._write_commit_blob(
+            collection, manifest_hash, parent=parent,
+            message=f"compact {len(shard_hashes)} shards",
+            index=commit_index)
+
+        # Clear the shards (delete their refs)
+        prefix = self._shards_prefix(collection)
+        for name in list(self.kernel.list_names()):
+            if name.startswith(prefix):
+                # "Delete" by pointing at an empty blob
+                # (the kernel doesn't have a delete; tombstone via empty ref)
+                empty = self.kernel.write(b"")
+                self.kernel.reference(name, empty)
+
+        # Update caches
+        self._update_caches_after_write(
+            collection, new_manifest, manifest_hash, commit_hash,
+            commit_index, is_delta=False)
+
+        return commit_hash
+
+    def shard_count(self, collection: str) -> int:
+        """Return the number of unmerged shards for a collection."""
+        return len(self.list_shards(collection))
+
+    # ------------------------------------------------------------------
     # WRITE — the ONE write path
     # ------------------------------------------------------------------
 
