@@ -79,42 +79,27 @@ class VectorLens(PondLens):
 
         Args:
             kernel: the PondMinimal kernel instance
-            n_dimensions: number of dimensions per vector (required for
-                unified storage path — each dimension becomes a FLOAT64
-                column in PND2). Ignored on legacy path.
-            use_unified_storage: if True (DEFAULT), use UnifiedStorage
-                (PND2 format) as the storage backend. This is the
-                cross-lens default — any lens can read/write any
-                collection through the same PND2 format. Setting
-                this to False selects the legacy ProllyTreeIndex +
-                per-vector binary blob path (kept for backward compat,
-                but produces collections that other lenses cannot
-                read through PND2).
-
-                Unified storage gives:
-                  - 4 GETs cold point lookup (vs O(log N))
-                  - Bounding-box pruning via manifest stats
-                  - Non-destructive append() semantics
-                  - CROSS-LENS: any lens can read this collection.
-                The lens API is IDENTICAL — only the storage backend changes.
+            n_dimensions: number of dimensions per vector (each dimension
+                becomes a FLOAT64 column in PND2 for bbox pruning).
+            use_unified_storage: IGNORED (kept for backward compat).
+                There is now only ONE storage path — the unified
+                manifest-based architecture.
         """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
         self._attached_indexer = None
         self._n_dimensions = n_dimensions
 
-        # Unified storage backend (default ON for cross-lens compatibility)
+        # Unified storage backend (the ONLY storage path now)
         self._unified_storage = None
-        if use_unified_storage:
-            try:
-                from unified_storage import UnifiedStorage
-                self._unified_storage = UnifiedStorage(kernel)
-            except ImportError:
-                pass
+        try:
+            from unified_storage import UnifiedStorage
+            self._unified_storage = UnifiedStorage(kernel)
+        except ImportError:
+            pass
         # Buffer for uncommitted inserts: collection → list of (id, vector, metadata)
         self._unified_buffer: dict[str, list[tuple[str, list[float], dict]]] = {}
-        # Cross-lens metadata cache: collection → key_col (so cold lookup
-        # costs 1 GET, subsequent lookups are free).
+        # Cross-lens metadata cache: collection → key_col
         self._key_col_cache: dict[str, str] = {}
 
     def _resolve_key_col(self, collection: str) -> str:

@@ -106,20 +106,24 @@ def test_unified_vector_multi_commit():
 
 
 def test_legacy_vector_still_works():
-    """Legacy path (use_unified_storage=False) still works."""
+    """Legacy path is no longer supported — use_unified_storage flag is
+    ignored. This test now verifies that passing use_unified_storage=False
+    still works (uses the unified path, as that's the only path now)."""
     from kernel import PondMinimal
     import tempfile, shutil
     tmp = tempfile.mkdtemp(prefix="pond-legacy-")
     try:
         kernel = PondMinimal(tmp)
+        # use_unified_storage=False is ignored — always unified now
         vl = VectorLens(kernel, use_unified_storage=False)
 
         vl.insert("vecs", "1", [1.0, 2.0], {"label": "a"})
+        vl.commit("vecs")
         vec = vl.get_vector("vecs", "1")
         assert vec is not None
         assert vec["vector"] == [1.0, 2.0]
 
-        print("PASS: test_legacy_vector_still_works")
+        print("PASS: test_legacy_vector_still_works (unified path, flag ignored)")
         return True
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

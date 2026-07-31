@@ -576,6 +576,8 @@ class UnifiedStorage:
     def __init__(self, kernel: PondMinimal):
         self.kernel = kernel
         self._manifest_cache: dict[str, CollectionManifest] = {}
+        # Active branch per collection (set by checkout, cleared by undo/merge)
+        self._active_branches: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Manifest ref helper
@@ -627,6 +629,291 @@ class UnifiedStorage:
 
     def _invalidate_manifest_cache(self, collection: str) -> None:
         self._manifest_cache.pop(collection, None)
+
+    # ------------------------------------------------------------------
+    # VERSION CONTROL — manifest-based commit/branch/merge/history
+    #
+    # This replaces ProllyLensBase. The commit blob is a simple JSON
+    # dict stored as a kernel blob:
+    #
+    #   {
+    #     "parent": "<parent_commit_hash or null>",
+    #     "second_parent": "<merge_parent or null>",
+    #     "manifest": "<manifest_hash>",
+    #     "message": "...",
+    #     "timestamp": 1234.5,
+    #     "index": 42
+    #   }
+    #
+    # The commit chain is: HEAD ref → commit blob → manifest blob → data blobs
+    # Branches are just ref copies. Merges create a commit with two parents.
+    # History walks parent pointers. No ProllyTree needed.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _branch_ref(collection: str, branch: str) -> str:
+        return f"collections/{collection}/branches/{branch}"
+
+    def _write_commit_blob(self, collection: str,
+                            manifest_hash: str,
+                            parent: Optional[str] = None,
+                            second_parent: Optional[str] = None,
+                            message: str = "",
+                            index: int = 0) -> str:
+        """Write a commit blob and update HEAD.
+
+        The commit blob is a JSON dict linking to the manifest hash.
+        This is the ONE commit format for ALL workloads — no more
+        BinaryProllyTree encoding.
+
+        If the collection has an active branch (set by checkout), the
+        branch ref is also updated to point to the new commit.
+        """
+        import json as _json
+        import time as _time
+
+        commit = {
+            "parent": parent,
+            "second_parent": second_parent,
+            "manifest": manifest_hash,
+            "message": message or f"commit #{index}",
+            "timestamp": _time.time(),
+            "index": index,
+        }
+        commit_bytes = _json.dumps(commit, sort_keys=True).encode()
+        commit_hash = self.kernel.write(commit_bytes)
+        self.kernel.reference(self._head_ref(collection), commit_hash)
+        # Update active branch ref if set (so commits on a branch move the branch)
+        active = self._active_branches.get(collection)
+        if active:
+            self.kernel.reference(active, commit_hash)
+        return commit_hash
+
+    def _read_commit_blob(self, commit_hash: str) -> Optional[dict]:
+        """Read and decode a commit blob."""
+        import json as _json
+        try:
+            raw = self.kernel.read_blob(commit_hash)
+            return _json.loads(raw)
+        except (ValueError, KeyError, Exception):
+            return None
+
+    def _commit_index(self, collection: str) -> int:
+        """Get the next commit index for a collection."""
+        head = self.kernel.resolve(self._head_ref(collection))
+        if head is None:
+            return 0
+        commit = self._read_commit_blob(head)
+        if commit is None:
+            return 0
+        return commit.get("index", 0) + 1
+
+    def branch(self, collection: str, branch_name: str) -> str:
+        """Create a branch — O(1) ref copy."""
+        head = self.kernel.resolve(self._head_ref(collection))
+        if head is None:
+            raise KeyError(f"Collection '{collection}' not found")
+        self.kernel.reference(self._branch_ref(collection, branch_name), head)
+        return head
+
+    def _sync_manifest_ref_to_head(self, collection: str) -> None:
+        """After undo/checkout/merge, sync the manifest ref to match HEAD's commit.
+
+        The manifest ref (collections/{name}/manifest) must point to the
+        manifest blob of the current HEAD commit. Otherwise reads would
+        see stale data from the old manifest.
+        """
+        head = self.kernel.resolve(self._head_ref(collection))
+        if head is None:
+            return
+        commit = self._read_commit_blob(head)
+        if commit and commit.get("manifest"):
+            self.kernel.reference(self._manifest_ref(collection),
+                                   commit["manifest"])
+        self._invalidate_manifest_cache(collection)
+
+    def checkout(self, collection: str, branch_name: str) -> None:
+        """Checkout a branch — point HEAD at the branch's commit.
+
+        Sets the active branch so subsequent commits/append update the
+        branch ref too (git-like behavior).
+        """
+        h = self.kernel.resolve(self._branch_ref(collection, branch_name))
+        if h is None:
+            raise ValueError(f"Branch '{branch_name}' does not exist")
+        self.kernel.reference(self._head_ref(collection), h)
+        self._active_branches[collection] = self._branch_ref(collection, branch_name)
+        self._sync_manifest_ref_to_head(collection)
+
+    def list_branches(self, collection: str) -> list[str]:
+        """List all branches for a collection."""
+        prefix = f"collections/{collection}/branches/"
+        return [n[len(prefix):] for n in self.kernel.list_names()
+                if n.startswith(prefix)]
+
+    def merge(self, collection: str, branch_name: str,
+              message: str = "") -> str:
+        """Merge a branch into HEAD.
+
+        Reads both manifests, unions row group entries (last-writer-wins
+        for duplicate keys), writes a new manifest + merge commit with
+        two parents.
+        """
+        branch_head = self.kernel.resolve(
+            self._branch_ref(collection, branch_name))
+        if branch_head is None:
+            raise ValueError(f"Branch '{branch_name}' does not exist")
+
+        # Read both manifests
+        head = self.kernel.resolve(self._head_ref(collection))
+        head_commit = self._read_commit_blob(head) if head else None
+        branch_commit = self._read_commit_blob(branch_head)
+
+        head_manifest = None
+        if head_commit and head_commit.get("manifest"):
+            head_manifest = CollectionManifest.load(
+                self.kernel, head_commit["manifest"])
+        branch_manifest = None
+        if branch_commit and branch_commit.get("manifest"):
+            branch_manifest = CollectionManifest.load(
+                self.kernel, branch_commit["manifest"])
+
+        # Union row group entries (branch wins on conflict)
+        seen: dict[str, RowGroupEntry] = {}
+        if head_manifest:
+            for rg in head_manifest.scan_with_pruning():
+                seen[rg.key] = rg
+        if branch_manifest:
+            for rg in branch_manifest.scan_with_pruning():
+                seen[rg.key] = rg  # branch wins
+
+        # Build merged manifest
+        merged_entries = []
+        for rg in sorted(seen.values(), key=lambda r: r.key):
+            merged_entries.append({
+                "rg_key": rg.key,
+                "blob_hash": rg.blob_hash,
+                "n_rows": rg.n_rows,
+                "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                for c in rg.columns],
+            })
+
+        schema = (head_manifest or branch_manifest).columns if \
+            (head_manifest or branch_manifest) else []
+        key_col = (head_manifest or branch_manifest).key_col if \
+            (head_manifest or branch_manifest) else ""
+
+        manifest_hash = self._build_manifest(
+            collection, merged_entries, schema, key_col,
+            row_group_size=10_000)
+
+        # Write merge commit with TWO parents
+        commit_hash = self._write_commit_blob(
+            collection, manifest_hash,
+            parent=head,
+            second_parent=branch_head,
+            message=message or f"merge '{branch_name}'",
+            index=self._commit_index(collection))
+
+        self._active_branches.pop(collection, None)  # merge detaches from branch
+        self._invalidate_manifest_cache(collection)
+        return commit_hash
+
+    def undo(self, collection: str, steps: int = 1) -> str:
+        """Undo the last N commits — walk parent pointers.
+
+        Clears the active branch (undo is a detached-HEAD operation).
+        """
+        head = self.kernel.resolve(self._head_ref(collection))
+        if head is None:
+            raise ValueError("No commits to undo")
+        for _ in range(steps):
+            commit = self._read_commit_blob(head)
+            if commit is None or not commit.get("parent"):
+                break
+            head = commit["parent"]
+        self.kernel.reference(self._head_ref(collection), head)
+        self._active_branches.pop(collection, None)  # detach from branch
+        self._sync_manifest_ref_to_head(collection)
+        return head[:12] if head else ""
+
+    def history(self, collection: str, limit: int = 100) -> list[dict]:
+        """Walk the commit chain from HEAD backwards."""
+        head = self.kernel.resolve(self._head_ref(collection))
+        if head is None:
+            return []
+
+        history: list[dict] = []
+        current: Optional[str] = head
+        seen: set[str] = set()
+
+        while current and current not in seen and len(history) < limit:
+            seen.add(current)
+            commit = self._read_commit_blob(current)
+            if commit is None:
+                # Could be a legacy BinaryProllyTree commit — try decoding
+                try:
+                    from binary_encoding import BinaryProllyTree
+                    raw = self.kernel.read_blob(current)
+                    if raw and raw[0] == 3:
+                        bc = BinaryProllyTree.decode_commit(raw)
+                        history.append({
+                            "hash": current,
+                            "message": bc.get("message", ""),
+                            "parent": bc.get("parent"),
+                            "second_parent": bc.get("second_parent"),
+                            "timestamp": bc.get("timestamp"),
+                            "type": "snapshot" if bc.get("snapshot") else "delta",
+                        })
+                        current = bc.get("parent")
+                        continue
+                except Exception:
+                    pass
+                history.append({
+                    "hash": current,
+                    "message": "(undecodable commit)",
+                    "parent": None, "second_parent": None,
+                    "timestamp": None, "type": "unknown",
+                })
+                break
+
+            entry_type = "merge" if commit.get("second_parent") else "commit"
+            history.append({
+                "hash": current,
+                "message": commit.get("message", ""),
+                "parent": commit.get("parent"),
+                "second_parent": commit.get("second_parent"),
+                "timestamp": commit.get("timestamp"),
+                "manifest": commit.get("manifest"),
+                "index": commit.get("index"),
+                "type": entry_type,
+            })
+            current = commit.get("parent")
+
+        return history
+
+    def diff(self, collection: str, commit_a: str, commit_b: str) -> dict:
+        """Compute the diff between two commits' manifests."""
+        ca = self._read_commit_blob(commit_a) or {}
+        cb = self._read_commit_blob(commit_b) or {}
+        ma = ca.get("manifest")
+        mb = cb.get("manifest")
+        if not ma or not mb:
+            return {"added": [], "removed": [], "modified": []}
+
+        manifest_a = CollectionManifest.load(self.kernel, ma)
+        manifest_b = CollectionManifest.load(self.kernel, mb)
+
+        entries_a = {rg.key: rg for rg in manifest_a.scan_with_pruning()}
+        entries_b = {rg.key: rg for rg in manifest_b.scan_with_pruning()}
+
+        added = sorted(entries_b.keys() - entries_a.keys())
+        removed = sorted(entries_a.keys() - entries_b.keys())
+        modified = sorted(
+            k for k in entries_a.keys() & entries_b.keys()
+            if entries_a[k].blob_hash != entries_b[k].blob_hash)
+
+        return {"added": added, "removed": removed, "modified": modified}
 
     # ------------------------------------------------------------------
     # WRITE — the ONE write path
@@ -683,37 +970,27 @@ class UnifiedStorage:
                 vtype = _detect_value_type_with_binary(sample)
                 schema_columns.append((col_name, vtype))
 
-        # Stage each row group
-        from prolly_tree import ProllyLensBase
-        base = ProllyLensBase(self.kernel, collection)
-
-        # Delete existing row group keys (overwrite semantics).
-        #
-        # Fix (Round 2 Issue #2a): the old code called base.read_all() which
-        # walks the ENTIRE Prolly tree — O(N) S3 GETs at PB scale. Now we
-        # use the EXISTING MANIFEST (1 GET) to discover the old row group
-        # keys, which is O(1) regardless of scale.
+        # write() has overwrite semantics — the new manifest replaces the
+        # old one entirely. No need to delete old row group keys from a
+        # ProllyTree (we no longer use one). The old blobs remain
+        # content-addressed (deduped); the old manifest is simply not
+        # referenced by the new commit.
         existing_manifest = self._load_manifest(collection)
-        if existing_manifest is not None:
-            for rg in existing_manifest.row_groups:
-                base.stage_delete(rg.key)
-            # Also handle PB-scale: if the manifest uses a stats tree,
-            # walk it to get all row group keys (still O(N) but unavoidable
-            # for full overwrite; users who want append should use append())
-            if existing_manifest.stats_tree_root:
-                from stats_tree import StatsTreeReader
-                reader = StatsTreeReader(self.kernel,
-                                          existing_manifest.stats_tree_root)
-                for rg in reader.scan_with_pruning():
-                    base.stage_delete(rg.key)
+        # (existing_manifest is read for schema inheritance if needed;
+        #  no deletion of old row group keys is required.)
 
         if n_rows == 0:
             # Fix (Round 11 Issue #1): empty write must still update the
             # manifest so the collection shows as empty (not stale data).
             # Build an empty manifest and commit it.
-            commit_hash = base.commit(message or f"write: empty table")
-            self._build_manifest(collection, [], schema_columns,
-                                  key_col or "", row_group_size)
+            manifest_hash = self._build_manifest(
+                collection, [], schema_columns,
+                key_col or "", row_group_size)
+            parent = self.kernel.resolve(self._head_ref(collection))
+            commit_hash = self._write_commit_blob(
+                collection, manifest_hash, parent=parent,
+                message=message or "write: empty table",
+                index=self._commit_index(collection))
             self._invalidate_manifest_cache(collection)
             return commit_hash
 
@@ -734,10 +1011,8 @@ class UnifiedStorage:
                 group_source, encoding_hints=encoding_hints)
             blob_hash = self.kernel.write(pnd2_bytes)
 
-            # Stage in the ProllyTreeIndex
-            base.stage(rg_key, blob_hash)
-
-            # Track for manifest building
+            # Track for manifest building (no ProllyTree staging —
+            # the manifest IS the index now)
             manifest_entries.append({
                 "rg_key": rg_key,
                 "blob_hash": blob_hash,
@@ -746,12 +1021,19 @@ class UnifiedStorage:
             })
 
         n_groups = (n_rows + row_group_size - 1) // row_group_size
-        commit_hash = base.commit(
-            message or f"unified write: {n_rows} rows in {n_groups} row groups")
 
         # Build the manifest (one blob, atomically with the commit)
-        self._build_manifest(collection, manifest_entries, schema_columns,
-                              key_col or "", row_group_size)
+        manifest_hash = self._build_manifest(collection, manifest_entries,
+                                              schema_columns,
+                                              key_col or "", row_group_size)
+
+        # Write the commit blob (manifest-based, no ProllyTree)
+        parent = self.kernel.resolve(self._head_ref(collection))
+        commit_hash = self._write_commit_blob(
+            collection, manifest_hash,
+            parent=parent,
+            message=message or f"unified write: {n_rows} rows in {n_groups} row groups",
+            index=self._commit_index(collection))
 
         self._invalidate_manifest_cache(collection)
         return commit_hash
@@ -824,9 +1106,7 @@ class UnifiedStorage:
                 vtype = _detect_value_type_with_binary(sample)
                 schema_columns.append((col_name, vtype))
 
-        # Stage new row groups (NO delete of existing ones)
-        from prolly_tree import ProllyLensBase
-        base = ProllyLensBase(self.kernel, collection)
+        # No ProllyTree staging — the manifest IS the index now.
         manifest_entries: list[dict] = []
 
         # Carry over existing row group entries from the old manifest.
@@ -883,7 +1163,6 @@ class UnifiedStorage:
             pnd2_bytes, col_stats = PND2.encode(
                 group_source, encoding_hints=encoding_hints)
             blob_hash = self.kernel.write(pnd2_bytes)
-            base.stage(rg_key, blob_hash)
 
             manifest_entries.append({
                 "rg_key": rg_key,
@@ -893,8 +1172,6 @@ class UnifiedStorage:
             })
 
         n_new_groups = (n_rows + row_group_size - 1) // row_group_size
-        commit_hash = base.commit(
-            message or f"append: {n_rows} rows in {n_new_groups} new row groups")
 
         # Fix (Round 9 Issue #1): SORT manifest entries by rg_key before
         # building the manifest. Without sorting, appended entries with
@@ -916,9 +1193,19 @@ class UnifiedStorage:
 
         # Build the manifest. If using delta mode, pass the parent hash.
         parent_hash = existing_manifest_hash if use_delta else None
-        self._build_manifest(collection, manifest_entries, schema_columns,
-                              key_col or "", row_group_size,
-                              parent_manifest_hash=parent_hash)
+        manifest_hash = self._build_manifest(
+            collection, manifest_entries, schema_columns,
+            key_col or "", row_group_size,
+            parent_manifest_hash=parent_hash)
+
+        # Write the commit blob (manifest-based, no ProllyTree)
+        parent_commit = self.kernel.resolve(self._head_ref(collection))
+        commit_hash = self._write_commit_blob(
+            collection, manifest_hash,
+            parent=parent_commit,
+            message=message or f"append: {n_rows} rows in {n_new_groups} new row groups",
+            index=self._commit_index(collection))
+
         self._invalidate_manifest_cache(collection)
 
         # Fix (Round 11 Issue #2): auto-compact if the delta chain is too deep.
@@ -1384,7 +1671,20 @@ class UnifiedStorage:
 
     def _resolve_commit_manifest(self, collection: str,
                                   commit_hash: str) -> Optional[str]:
-        """Resolve a commit hash to its manifest hash for time-travel reads."""
+        """Resolve a commit hash to its manifest hash for time-travel reads.
+
+        With the new manifest-based commit format, the manifest hash is
+        stored directly IN the commit blob. We read the commit blob (1
+        GET) and extract the "manifest" field.
+
+        Falls back to the legacy ref-based lookup for old collections
+        that used ProllyLensBase commits.
+        """
+        # New path: manifest hash is in the commit blob
+        commit = self._read_commit_blob(commit_hash)
+        if commit and commit.get("manifest"):
+            return commit["manifest"]
+        # Legacy path: ref-based lookup (ProllyLensBase collections)
         return self.kernel.resolve(
             f"collections/{collection}/commits/{commit_hash}__manifest")
 

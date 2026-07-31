@@ -93,29 +93,19 @@ class StreamingLens(PondLens):
 
         Args:
             kernel: the PondMinimal kernel instance
-            use_unified_storage: if True (DEFAULT), use UnifiedStorage
-                (PND2 format) as the storage backend. This is the
-                cross-lens default — any lens can read/write any
-                collection through the same PND2 format. Segments
-                stored as BINARY column values with offset as INT64
-                key_col. Setting this to False selects the legacy
-                ProllyTreeIndex + per-segment-blob path (kept for
-                backward compat, but produces collections that other
-                lenses cannot read through PND2).
-
-                Unified storage enables parallel fetch, predicate
-                pushdown, delta-manifest appends, and CROSS-LENS
-                access from any other lens.
+            use_unified_storage: IGNORED (kept for backward compat).
+                There is now only ONE storage path — the unified
+                manifest-based architecture. Segments stored as BINARY
+                column values with offset as INT64 key_col.
         """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
         self._unified_storage = None
-        if use_unified_storage:
-            try:
-                from unified_storage import UnifiedStorage
-                self._unified_storage = UnifiedStorage(kernel)
-            except ImportError:
-                pass
+        try:
+            from unified_storage import UnifiedStorage
+            self._unified_storage = UnifiedStorage(kernel)
+        except ImportError:
+            pass
 
     def _get_base(self, collection: str) -> ProllyLensBase:
         if collection not in self._bases:

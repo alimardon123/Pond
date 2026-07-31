@@ -114,23 +114,10 @@ class KeyValueLens(PondLens):
             kernel: the PondMinimal kernel instance
             name: OPTIONAL. If provided, enables backward-compatible
                   single-collection API.
-            use_unified_storage: if True (DEFAULT), use UnifiedStorage
-                  (PND2 format) as the storage backend. This is the
-                  cross-lens default: any lens can read/write any
-                  collection through the same PND2 format. Setting
-                  this to False selects the legacy ProllyTreeIndex +
-                  per-key JSON blob path (kept for backward compat,
-                  but produces collections that other lenses cannot
-                  read through PND2).
-
-                  Unified storage gives:
-                    - 4 GETs cold point lookup (vs O(log N))
-                    - Non-destructive append() (vs rewrite-on-commit)
-                    - Predicate pushdown via manifest stats
-                    - Range scans via start_key/end_key
-                    - CROSS-LENS: reads any collection (lakehouse,
-                      vector, streaming) transparently by inspecting
-                      the collection's metadata.key_col.
+            use_unified_storage: IGNORED (kept for backward compat).
+                  There is now only ONE storage path — the unified
+                  manifest-based architecture. All lenses use PND2
+                  blobs + CollectionManifest + JSON commit blobs.
         """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
@@ -140,15 +127,13 @@ class KeyValueLens(PondLens):
         # Attached indexer for auto-notify on commit (set via attach_indexer)
         self._attached_indexer = None
 
-        # Unified storage backend (default ON for cross-lens compatibility)
+        # Unified storage backend (the ONLY storage path now)
         self._unified_storage = None
-        if use_unified_storage:
-            try:
-                from unified_storage import UnifiedStorage
-                self._unified_storage = UnifiedStorage(kernel)
-            except ImportError:
-                # UnifiedStorage not available — fall back to legacy
-                pass
+        try:
+            from unified_storage import UnifiedStorage
+            self._unified_storage = UnifiedStorage(kernel)
+        except ImportError:
+            pass  # will fail on first I/O call
         # Unified storage write buffer: collection → {key → value}
         self._unified_buffer: dict[str, dict[str, Any]] = {}
         # Cross-lens metadata cache: collection → key_col (so cold lookup
@@ -488,9 +473,20 @@ class KeyValueLens(PondLens):
         return self.decode(self.kernel.read_blob(h)) if h else None
 
     def get_raw(self, *args) -> Optional[bytes]:
-        """Read raw bytes by key (no decode)."""
+        """Read raw bytes by key (no decode).
+
+        Unified path: reads the row via point_lookup and returns the
+        raw value bytes. Legacy path: ProllyTreeIndex lookup.
+        """
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
+        if self._unified_storage is not None:
+            row = self._unified_storage.point_lookup(collection, key=key)
+            if row is None:
+                return None
+            # Return the value bytes if present, else None
+            return row.get("value")
+        # Legacy path
         h = self._get_base(collection).lookup(key)
         return self.kernel.read_blob(h) if h else None
 
@@ -708,43 +704,58 @@ class KeyValueLens(PondLens):
         for row in reader.scan(decode_fn=self.decode, row_filter=row_filter):
             yield row
 
-    # --- Version control ---
+    # --- Version control (delegates to UnifiedStorage) ---
 
     def branch(self, *args) -> str:
         """Create a branch on the collection. O(1) — just a ref copy."""
         collection, rest = self._resolve_collection(*args)
+        if self._unified_storage is not None:
+            return self._unified_storage.branch(collection, rest[0])
         return self._get_base(collection).branch(rest[0])
 
     def checkout(self, *args) -> None:
         """Checkout a branch on the collection."""
         collection, rest = self._resolve_collection(*args)
+        if self._unified_storage is not None:
+            return self._unified_storage.checkout(collection, rest[0])
         self._get_base(collection).checkout(rest[0])
 
     def list_branches(self, *args) -> list[str]:
         """List all branches on the collection."""
         collection, rest = self._resolve_collection(*args)
+        if self._unified_storage is not None:
+            return self._unified_storage.list_branches(collection)
         return self._get_base(collection).list_branches()
 
     def merge(self, *args) -> str:
         """Merge a branch into the collection's HEAD. Union merge with 2-parent commit."""
         collection, rest = self._resolve_collection(*args)
+        msg = rest[1] if len(rest) > 1 else ""
+        if self._unified_storage is not None:
+            return self._unified_storage.merge(collection, rest[0], msg)
         return self._get_base(collection).merge(rest[0])
 
     def undo(self, *args) -> str:
         """Undo the last N commits on the collection."""
         collection, rest = self._resolve_collection(*args)
         steps = rest[0] if rest else 1
+        if self._unified_storage is not None:
+            return self._unified_storage.undo(collection, steps)
         return self._get_base(collection).undo(steps)
 
     def history(self, *args) -> list[dict]:
         """Walk the commit chain for the collection."""
         collection, rest = self._resolve_collection(*args)
         limit = rest[0] if rest else 100
+        if self._unified_storage is not None:
+            return self._unified_storage.history(collection, limit)
         return self._get_base(collection).history(limit)
 
     def diff(self, *args) -> dict:
         """Diff two commits on the collection."""
         collection, rest = self._resolve_collection(*args)
+        if self._unified_storage is not None:
+            return self._unified_storage.diff(collection, rest[0], rest[1])
         return self._get_base(collection).diff(rest[0], rest[1])
 
     # --- Serialization (override in subclass) ---

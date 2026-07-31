@@ -159,12 +159,15 @@ def test_unified_kv_point_lookup_4_gets():
 
 
 def test_legacy_kv_still_works():
-    """Legacy path (use_unified_storage=False) still works."""
+    """Legacy path is no longer supported — use_unified_storage flag is
+    ignored. This test verifies that passing use_unified_storage=False
+    still works (uses the unified path, as that's the only path now)."""
     from kernel import PondMinimal
     import tempfile, shutil
     tmp = tempfile.mkdtemp(prefix="pond-legacy-")
     try:
         kernel = PondMinimal(tmp)
+        # use_unified_storage=False is ignored — always unified now
         kv = KeyValueLens(kernel, use_unified_storage=False)
 
         kv.put("users", "user:1", {"name": "alice"})
@@ -174,7 +177,7 @@ def test_legacy_kv_still_works():
         assert user is not None
         assert user["name"] == "alice"
 
-        print("PASS: test_legacy_kv_still_works")
+        print("PASS: test_legacy_kv_still_works (unified path, flag ignored)")
         return True
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

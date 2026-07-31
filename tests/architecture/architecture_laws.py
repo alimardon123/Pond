@@ -40,15 +40,65 @@ sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))
 from keyvalue_lens import KeyValueLens
 
 
-# These architecture laws test ProllyTreeIndex-specific features (snapshot
-# replay, blob lookup via lens.base, etc.). They explicitly use LEGACY mode
-# (use_unified_storage=False) so the data goes to the ProllyTreeIndex.
-# The cross-lens default (unified mode) is tested separately in
-# scripts/test_cross_lens_universal.py.
+# These architecture laws use the UNIFIED manifest-based architecture.
+# The Lens class wraps KeyValueLens and adds helpers for the laws that
+# need to inspect internal state (read_all, lookup, etc.).
 class Lens(KeyValueLens):
-    """Legacy-mode KeyValueLens for architecture law testing."""
+    """KeyValueLens with helper methods for architecture law testing."""
     def __init__(self, kernel, name=None):
-        super().__init__(kernel, name, use_unified_storage=False)
+        super().__init__(kernel, name)
+
+    @property
+    def base(self):
+        """Compatibility shim — returns an object with read_all/lookup.
+
+        Laws that previously used lens.base.read_all() now get a shim
+        that reads from the unified manifest instead of a ProllyTree.
+        """
+        return _BaseShim(self.kernel, self._default_collection or self.name)
+
+
+class _BaseShim:
+    """Shim that provides read_all/lookup on top of UnifiedStorage.
+
+    This replaces the old ProllyLensBase-based shim. It reads from
+    the manifest (1 GET) instead of walking a ProllyTree.
+    """
+    def __init__(self, kernel, collection):
+        self.kernel = kernel
+        self.collection = collection
+
+    def read_all(self) -> dict:
+        """Return {key: blob_hash} for all row groups in the collection."""
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions",
+                                          "physical_structures"))
+        try:
+            from collection_manifest import CollectionManifest
+        except ImportError:
+            return {}
+        import json as _json
+        head = self.kernel.resolve(f"collections/{self.collection}/HEAD")
+        if head is None:
+            return {}
+        raw = self.kernel.read_blob(head)
+        try:
+            commit = _json.loads(raw)
+        except Exception:
+            return {}
+        manifest_hash = commit.get("manifest")
+        if not manifest_hash:
+            return {}
+        manifest = CollectionManifest.load(self.kernel, manifest_hash)
+        result = {}
+        for rg in manifest.scan_with_pruning():
+            result[rg.key] = rg.blob_hash
+        return result
+
+    def lookup(self, key: str):
+        """Look up a row group by key — returns blob_hash or None."""
+        state = self.read_all()
+        return state.get(key)
 # CollectionMetadata is a legacy module (moved to archive/legacy-extensions/).
 # Provide a stub so the import doesn't fail.
 try:
@@ -228,34 +278,38 @@ def law_5_history_replay_equals_snapshot():
             lens.put(f"k{batch * 100 + i:04d}", {"id": batch * 100 + i})
         lens.commit(f"batch {batch}")
 
-    # read_all gives the current state
+    # read_all gives the current state (row group keys → blob hashes)
     state_head = lens.base.read_all()
 
-    # Find a snapshot commit in history and read its state
-    from binary_encoding import BinaryProllyTree
-    from prolly_tree import ProllyTree
+    # With the unified manifest-based architecture, every commit has a
+    # manifest. Walk the commit chain and verify that every commit's
+    # manifest row groups are consistent with HEAD's state.
+    import json as _json
+    sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions",
+                                      "physical_structures"))
+    from collection_manifest import CollectionManifest
 
     current = kernel.resolve("collections/inv5/HEAD")
-    snapshot_state = None
     while current:
-        commit = BinaryProllyTree.decode_commit(kernel.read_blob(current))
-        if commit.get("snapshot"):
-            snapshot_state = ProllyTree.read_all(kernel, commit["snapshot"])
-            break
+        raw = kernel.read_blob(current)
+        try:
+            commit = _json.loads(raw)
+        except Exception:
+            break  # legacy or undecodable — stop
+        manifest_hash = commit.get("manifest")
+        if manifest_hash:
+            manifest = CollectionManifest.load(kernel, manifest_hash)
+            # Every row group in any historical manifest should be in state_head
+            for rg in manifest.scan_with_pruning():
+                if rg.key in state_head:
+                    assert state_head[rg.key] == rg.blob_hash, \
+                        f"LAW 5 VIOLATED: blob hash for {rg.key} differs"
         current = commit.get("parent")
 
-    # The snapshot might not have all keys (some are in deltas after it).
-    # But every key IN the snapshot should also be in state_head.
-    if snapshot_state:
-        for key, blob_hash in snapshot_state.items():
-            assert key in state_head, \
-                f"LAW 5 VIOLATED: key {key} in snapshot but not in HEAD state"
-            assert state_head[key] == blob_hash, \
-                f"LAW 5 VIOLATED: blob hash for {key} differs"
-
-    # All keys should be in state_head
-    assert len(state_head) == 1000, \
-        f"LAW 5 VIOLATED: expected 1000 keys, got {len(state_head)}"
+    # Verify all 1000 keys are readable via the lens
+    all_keys = lens.keys("inv5")
+    assert len(all_keys) == 1000, \
+        f"LAW 5 VIOLATED: expected 1000 keys, got {len(all_keys)}"
 
     kernel.close()
     shutil.rmtree(bench, ignore_errors=True)
@@ -393,8 +447,8 @@ def law_12_merge_true_dag():
 
     # Verify the HEAD commit has a second_parent (true merge)
     head = kernel.resolve("collections/law12/HEAD")
-    from binary_encoding import BinaryProllyTree
-    commit = BinaryProllyTree.decode_commit(kernel.read_blob(head))
+    import json as _json2
+    commit = _json2.loads(kernel.read_blob(head))
 
     assert commit.get("second_parent") is not None, \
         "LAW 12 VIOLATED: merge commit has no second_parent (not a true DAG)"

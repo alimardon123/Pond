@@ -163,72 +163,68 @@ class PondStorage:
         return self.kernel.resolve(name)
 
     # ==================================================================
-    # Section 2: Commit / branch / history (was ProllyLensBase)
+    # Section 2: Commit / branch / history (manifest-based — no ProllyTree)
+    #
+    # All version control operations delegate to UnifiedStorage, which
+    # uses a simple JSON commit blob format:
+    #   {parent, second_parent, manifest, message, timestamp, index}
+    #
+    # The commit chain is: HEAD ref → commit blob → manifest blob → data blobs
+    # Branches are ref copies. Merges create two-parent commits.
+    # History walks parent pointers. No ProllyTree involved.
     # ==================================================================
-
-    def _get_base(self, name: str) -> Optional["ProllyLensBase"]:
-        """Get or create the ProllyLensBase for a collection."""
-        if not _HAVE_PROLLY:
-            return None
-        return ProllyLensBase(self.kernel, name)
 
     def commit(self, name: str, message: str = "") -> str:
         """Commit staged changes for a collection.
 
-        For the unified storage path, commit is handled by write()/append().
-        For the legacy ProllyTreeIndex path, this delegates to ProllyLensBase.
+        With the unified manifest-based architecture, commits are
+        created automatically by write()/append(). This method is kept
+        for API compatibility — it's a no-op that returns the current HEAD.
         """
-        if not _HAVE_PROLLY:
-            raise RuntimeError("ProllyLensBase not available")
-        base = self._get_base(name)
-        return base.commit(message or f"{name} commit")
+        head = self.kernel.resolve(f"collections/{name}/HEAD")
+        return head or ""
 
     def branch(self, name: str, branch_name: str) -> str:
-        """Create a branch on a collection."""
-        if not _HAVE_PROLLY:
-            raise RuntimeError("ProllyLensBase not available")
-        base = self._get_base(name)
-        return base.branch(branch_name)
+        """Create a branch on a collection — O(1) ref copy."""
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.branch(name, branch_name)
 
     def checkout(self, name: str, branch_name: str) -> None:
-        """Checkout a branch."""
-        if not _HAVE_PROLLY:
-            raise RuntimeError("ProllyLensBase not available")
-        base = self._get_base(name)
-        base.checkout(branch_name)
+        """Checkout a branch — point HEAD at the branch's commit."""
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        self._unified.checkout(name, branch_name)
 
     def list_branches(self, name: str) -> list[str]:
         """List all branches for a collection."""
-        if not _HAVE_PROLLY:
+        if self._unified is None:
             return []
-        base = self._get_base(name)
-        return base.list_branches()
+        return self._unified.list_branches(name)
 
     def merge(self, name: str, branch_name: str, message: str = "") -> str:
-        """Merge a branch into HEAD."""
-        if not _HAVE_PROLLY:
-            raise RuntimeError("ProllyLensBase not available")
-        base = self._get_base(name)
-        return base.merge(branch_name, message)
+        """Merge a branch into HEAD — creates a two-parent merge commit."""
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.merge(name, branch_name, message)
 
     def undo(self, name: str, steps: int = 1) -> str:
-        """Undo the last N commits."""
-        if not _HAVE_PROLLY:
-            raise RuntimeError("ProllyLensBase not available")
-        base = self._get_base(name)
-        return base.undo(steps)
+        """Undo the last N commits — walk parent pointers."""
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.undo(name, steps)
 
     def history(self, name: str, limit: int = 100) -> list[dict]:
         """Walk the commit history for a collection."""
-        # Try unified history first (format-agnostic)
+        if self._unified is not None:
+            return self._unified.history(name, limit)
         return self._lens.history(name, limit)
 
     def diff(self, name: str, commit_a: str, commit_b: str) -> dict:
         """Compute the diff between two commits."""
-        if not _HAVE_PROLLY:
-            raise RuntimeError("ProllyLensBase not available")
-        base = self._get_base(name)
-        return base.diff(commit_a, commit_b)
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.diff(name, commit_a, commit_b)
 
     # ==================================================================
     # Section 3: Data I/O (was UnifiedStorage)
