@@ -851,42 +851,100 @@ class KeylessLens(KeyValueLens):
 
 
 # ===========================================================================
-# CrossLens — cross-collection read/write operations between KeyValueLenses
+# CrossLens — DEPRECATED (Round 25)
+#
+# CrossLens was a helper for cross-collection read/write between
+# KeyValueLens instances. As of Round 25, ANY lens can read/write ANY
+# collection created by ANY other lens directly through PondStorage —
+# no helper needed. Each collection carries cross-lens metadata
+# (lens_type, key_col, schema_hint) so any lens can interpret it.
+#
+# Replacement patterns:
+#   CrossLens.read_from(lens, "users", "k1")     →  lens.get("users", "k1")
+#   CrossLens.read_all_from(lens, "users")        →  lens.get_all("users")
+#   CrossLens.write_to(lens, "users", "k1", v)    →  lens.put("users", "k1", v)
+#   CrossLens.share_blob(src, "u", "k1", dst, "u2", "k1")
+#       →  src_blob = src._get_base("u").lookup("k1")
+#          dst.put_raw("u2", "k1", src_blob)  # zero-copy hash share
+#   CrossLens.pipe(src, "u", dst, "u2")
+#       →  for k, v in src.get_all("u").items():
+#              dst.put("u2", k, v)
+#           dst.commit("u2")
+#
+# This class is kept for backward compatibility but emits a
+# DeprecationWarning on instantiation. New code should use the direct
+# lens APIs shown above.
 # ===========================================================================
 
+import warnings as _warnings
+
+
 class CrossLens:
-    """Cross-collection read/write operations.
+    """DEPRECATED: cross-collection read/write operations.
 
-    These helpers operate on KeyValueLens instances. They do NOT work on
-    LakehouseLens or FeatureStoreLens because those lenses don't expose
-    per-key get/put (they use whole-table Parquet I/O).
+    As of Round 25, any lens can read/write any collection directly.
+    This class is kept for backward compatibility. Use the direct
+    lens APIs instead:
 
-    Semantics:
-    - Source = HEAD commit of the source collection.
-    - Tombstoned indexes are skipped.
-    - Zero-copy sharing: share_blob copies the blob HASH, not CONTENT.
-    - No cross-collection atomicity. Use a coordinator for multi-collection commits.
-    - Pipe is non-transactional. The target is NOT committed; caller must commit.
+        lens.get("any_collection", "key")
+        lens.put("any_collection", "key", value)
+        lens.get_all("any_collection")
     """
+
+    _DEPRECATED = True  # marker for tooling
+
+    def __init__(self):
+        _warnings.warn(
+            "CrossLens is deprecated (Round 25). Any lens can now read/write "
+            "any collection directly — use lens.get/put/get_all instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    # The static methods below are kept for backward compatibility.
+    # They do NOT emit a deprecation warning on each call (only on
+    # instantiation), to avoid spamming logs. They simply delegate
+    # to the lens's own methods.
+
     @staticmethod
     def read_from(lens: KeyValueLens, collection: str, key: str) -> Optional[Any]:
-        """Read a single key from the collection's current HEAD."""
+        """Read a single key from the collection's current HEAD.
+
+        DEPRECATED: use lens.get(collection, key) directly.
+        """
         return lens.get(collection, key)
 
     @staticmethod
     def read_all_from(lens: KeyValueLens, collection: str) -> dict[str, Any]:
-        """Read all non-internal keys from the collection's current HEAD."""
+        """Read all non-internal keys from the collection's current HEAD.
+
+        DEPRECATED: use lens.get_all(collection) directly.
+        """
         return lens.get_all(collection)
 
     @staticmethod
     def write_to(lens: KeyValueLens, collection: str, key: str, data: Any) -> str:
-        """Stage a write on the target collection. Does NOT commit."""
+        """Stage a write on the target collection. Does NOT commit.
+
+        DEPRECATED: use lens.put(collection, key, data) directly.
+        """
         return lens.put(collection, key, data)
 
     @staticmethod
     def share_blob(from_lens: KeyValueLens, from_collection: str, from_key: str,
                     to_lens: KeyValueLens, to_collection: str, to_key: str) -> bool:
         """Zero-copy: share a blob's HASH from one collection to another.
+
+        DEPRECATED: use direct lens APIs instead. For zero-copy hash
+        sharing between KV collections (legacy mode only):
+
+            h = from_lens._get_base(from_collection).lookup(from_key)
+            if h: to_lens.put_raw(to_collection, to_key, h)
+
+        Note: in unified mode (default), blob-level sharing across
+        collections is not meaningful — each collection has its own
+        PND2 blobs. Cross-lens reads happen at the row level via
+        PondStorage.read().
 
         Returns True if the source key existed and the share succeeded,
         False if the source key was not found.
@@ -902,6 +960,16 @@ class CrossLens:
              to_lens: KeyValueLens, to_collection: str,
              transformer: Optional[Callable] = None) -> int:
         """Copy all non-internal keys from source to target collection.
+
+        DEPRECATED: use direct lens APIs instead:
+
+            for k, v in from_lens.get_all(from_collection).items():
+                if transformer:
+                    new_k, new_v = transformer(k, v)
+                    to_lens.put(to_collection, new_k, new_v)
+                else:
+                    to_lens.put(to_collection, k, v)
+            to_lens.commit(to_collection)
 
         If transformer is None: zero-copy share (each blob hash is staged
         directly via put_raw, no re-encoding).
