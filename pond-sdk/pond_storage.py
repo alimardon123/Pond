@@ -260,8 +260,9 @@ class PondStorage:
                                      row_group_size=row_group_size,
                                      encoding_hints=encoding_hints,
                                      message=message)
-        # Save commit→manifest mapping for time-travel reads
-        self._save_commit_manifest(collection, commit_hash)
+        # Round 26: no need to save commit→manifest mapping separately.
+        # The commit blob stores the manifest hash directly, and
+        # _resolve_commit_manifest reads it from there (1 GET).
         return commit_hash
 
     def append(self, collection: str, rows,
@@ -292,8 +293,8 @@ class PondStorage:
                                       row_group_size=row_group_size,
                                       encoding_hints=encoding_hints,
                                       message=message)
-        # Save commit→manifest mapping for time-travel reads
-        self._save_commit_manifest(collection, commit_hash)
+        # Round 26: no need to save commit→manifest mapping separately.
+        # The commit blob stores the manifest hash directly.
         return commit_hash
 
     def read(self, collection: str,
@@ -422,10 +423,13 @@ class PondStorage:
                                   commit_hash: str) -> Optional[str]:
         """Resolve a commit hash to its manifest hash for time-travel reads.
 
-        Fix (Round 11 Issue #4): PondStorage.write() and .append() save
-        the commit→manifest mapping via _save_commit_manifest. This method
-        looks it up.
+        Round 26: the manifest hash is stored directly IN the commit blob
+        (JSON format). Read it from there (1 GET). Falls back to the
+        legacy ref-based lookup for old collections.
         """
+        if self._unified is not None:
+            return self._unified._resolve_commit_manifest(collection, commit_hash)
+        # Legacy fallback
         return self.kernel.resolve(
             f"collections/{collection}/commits/{commit_hash}__manifest")
 

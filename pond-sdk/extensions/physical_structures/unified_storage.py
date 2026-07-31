@@ -576,6 +576,9 @@ class UnifiedStorage:
     def __init__(self, kernel: PondMinimal):
         self.kernel = kernel
         self._manifest_cache: dict[str, CollectionManifest] = {}
+        # Cache the manifest HASH alongside the manifest object so we
+        # don't need a separate resolve() call to get the hash.
+        self._manifest_hash_cache: dict[str, str] = {}
         # Active branch per collection (set by checkout, cleared by undo/merge)
         self._active_branches: dict[str, str] = {}
 
@@ -623,12 +626,22 @@ class UnifiedStorage:
         try:
             manifest = CollectionManifest.load(self.kernel, resolved_hash)
             self._manifest_cache[collection] = manifest
+            self._manifest_hash_cache[collection] = resolved_hash
             return manifest
         except (ValueError, KeyError):
             return None
 
+    def _get_cached_manifest_hash(self, collection: str) -> Optional[str]:
+        """Return the cached manifest hash for a collection (0 GETs).
+
+        Returns None if the manifest is not cached. Call _load_manifest
+        first to populate the cache.
+        """
+        return self._manifest_hash_cache.get(collection)
+
     def _invalidate_manifest_cache(self, collection: str) -> None:
         self._manifest_cache.pop(collection, None)
+        self._manifest_hash_cache.pop(collection, None)
 
     # ------------------------------------------------------------------
     # VERSION CONTROL — manifest-based commit/branch/merge/history
@@ -986,11 +999,17 @@ class UnifiedStorage:
             manifest_hash = self._build_manifest(
                 collection, [], schema_columns,
                 key_col or "", row_group_size)
+            # Round 26 optimization: resolve HEAD once, read commit once
             parent = self.kernel.resolve(self._head_ref(collection))
+            commit_index = 0
+            if parent:
+                pc = self._read_commit_blob(parent)
+                if pc:
+                    commit_index = pc.get("index", 0) + 1
             commit_hash = self._write_commit_blob(
                 collection, manifest_hash, parent=parent,
                 message=message or "write: empty table",
-                index=self._commit_index(collection))
+                index=commit_index)
             self._invalidate_manifest_cache(collection)
             return commit_hash
 
@@ -999,11 +1018,6 @@ class UnifiedStorage:
             # Slice the source for this row group
             group_source = _slice_source(source, start, end)
             max_pk = key_array[end - 1]
-            # Zero-pad the key for correct lexicographic ordering.
-            # Fix (Round 3 Issue #1): without padding, "rg/9" > "rg/42"
-            # (because "9" > "4"), which silently breaks point_lookup
-            # and range scans for collections with >10 row groups.
-            # We pad to 20 digits — enough for 10^20 keys.
             rg_key = _format_rg_key(max_pk)
 
             # Encode as PND2 blob
@@ -1027,13 +1041,21 @@ class UnifiedStorage:
                                               schema_columns,
                                               key_col or "", row_group_size)
 
-        # Write the commit blob (manifest-based, no ProllyTree)
+        # Round 26 optimization: resolve HEAD ONCE and read the parent
+        # commit blob ONCE to get the index. Saves 2 GETs vs the old
+        # approach of calling _commit_index() separately.
         parent = self.kernel.resolve(self._head_ref(collection))
+        commit_index = 0
+        if parent:
+            pc = self._read_commit_blob(parent)
+            if pc:
+                commit_index = pc.get("index", 0) + 1
+
         commit_hash = self._write_commit_blob(
             collection, manifest_hash,
             parent=parent,
             message=message or f"unified write: {n_rows} rows in {n_groups} row groups",
-            index=self._commit_index(collection))
+            index=commit_index)
 
         self._invalidate_manifest_cache(collection)
         return commit_hash
@@ -1119,7 +1141,11 @@ class UnifiedStorage:
         # Strategy: if the existing manifest has >1000 row groups (or uses
         # a stats tree), use delta-manifest. Otherwise, rebuild the full
         # manifest (cheap at small scale).
-        existing_manifest_hash = self.kernel.resolve(self._manifest_ref(collection))
+        #
+        # Round 26 optimization: reuse the cached manifest hash instead
+        # of doing a separate resolve() call. The _load_manifest above
+        # already resolved and cached it. This saves 1 GET.
+        existing_manifest_hash = self._get_cached_manifest_hash(collection)
         use_delta = (
             existing_manifest.stats_tree_root is not None
             or len(existing_manifest.row_groups) > 1000
@@ -1198,29 +1224,56 @@ class UnifiedStorage:
             key_col or "", row_group_size,
             parent_manifest_hash=parent_hash)
 
-        # Write the commit blob (manifest-based, no ProllyTree)
+        # Round 26 optimization: resolve HEAD ONCE and reuse for both
+        # the commit index and the parent pointer. This saves 1 GET.
         parent_commit = self.kernel.resolve(self._head_ref(collection))
+
+        # Round 26 optimization: get the commit index from the parent
+        # commit blob WITHOUT a separate _commit_index() call. We already
+        # have parent_commit — read it once, extract the index, reuse.
+        # This saves 2 GETs (resolve HEAD + read_blob commit).
+        commit_index = 0
+        if parent_commit:
+            parent_commit_data = self._read_commit_blob(parent_commit)
+            if parent_commit_data:
+                commit_index = parent_commit_data.get("index", 0) + 1
+
         commit_hash = self._write_commit_blob(
             collection, manifest_hash,
             parent=parent_commit,
             message=message or f"append: {n_rows} rows in {n_new_groups} new row groups",
-            index=self._commit_index(collection))
+            index=commit_index)
 
         self._invalidate_manifest_cache(collection)
 
         # Fix (Round 11 Issue #2): auto-compact if the delta chain is too deep.
         # After DELTA_CHAIN_THRESHOLD appends, flatten the chain to avoid
         # O(chain_depth) read amplification.
-        DELTA_CHAIN_THRESHOLD = 8
-        new_manifest = self._load_manifest(collection)
-        if new_manifest and new_manifest.parent_manifest_hash:
-            chain_depth = 0
-            check = new_manifest
-            while check and check.parent_manifest_hash:
-                chain_depth += 1
+        #
+        # Round 26 optimization: we already have existing_manifest in
+        # memory. We can check the chain depth from it WITHOUT reading
+        # any additional manifests. The chain depth is:
+        #   0 if existing_manifest has no parent_manifest_hash (first delta)
+        #   1 + (depth of existing_manifest's parent) otherwise
+        # But we can't know the parent's depth without reading it.
+        # However, we stored the chain depth in the manifest's metadata
+        # when we built it (via the delta chain). For now, use the
+        # existing_manifest's parent_manifest_hash to decide:
+        #   - If None: this is the first delta, chain_depth = 0, skip
+        #   - If not None: walk the chain (unavoidable, but rare)
+        if use_delta and parent_hash and existing_manifest.parent_manifest_hash:
+            DELTA_CHAIN_THRESHOLD = 8
+            chain_depth = 1  # existing_manifest has a parent
+            check_hash = existing_manifest.parent_manifest_hash
+            while check_hash and chain_depth < DELTA_CHAIN_THRESHOLD:
                 try:
-                    check = CollectionManifest.load(
-                        self.kernel, check.parent_manifest_hash)
+                    check_manifest = CollectionManifest.load(
+                        self.kernel, check_hash)
+                    if check_manifest.parent_manifest_hash:
+                        chain_depth += 1
+                        check_hash = check_manifest.parent_manifest_hash
+                    else:
+                        break
                 except (ValueError, KeyError):
                     break
             if chain_depth >= DELTA_CHAIN_THRESHOLD:
