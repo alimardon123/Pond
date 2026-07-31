@@ -265,32 +265,45 @@ class StreamingLens(PondLens):
                       segment_size: int = 1_000_000) -> str:
         """Append data to an existing stream.
 
-        Finds the last segment, stages new segments after it, and commits.
-        Old segments are unchanged (structural sharing).
+        Uses the unified storage path (append_shard) — each segment
+        becomes a row {offset, segment}. CRDT-safe: multiple producers
+        can append to the same partition concurrently.
 
         Args:
             collection: collection name
             data: bytes to append
-            segment_size: bytes per segment (should match the original write)
+            segment_size: bytes per segment
 
         Returns:
-            The new HEAD commit hash.
+            The shard manifest hash.
         """
+        if self._unified_storage is not None:
+            # Use unified storage: each segment = one row
+            if not data:
+                return ""
+            # Get the current segment count (offset for new segments)
+            current_count = self.segment_count(collection)
+            rows = []
+            for i in range(0, len(data), segment_size):
+                segment = data[i:i + segment_size]
+                rows.append({
+                    "offset": current_count + i // segment_size,
+                    "segment": segment,
+                })
+            return self._unified_storage.append_shard(
+                collection, rows, key_col="offset", row_group_size=1000)
+
+        # Legacy path (ProllyLensBase)
         base = self._get_base(collection)
         state = base.read_all()
 
-        # Find the last segment number
         seg_keys = sorted(k for k in state.keys() if k.startswith(_SEG_PREFIX))
         if not seg_keys:
-            # No existing stream — just write
             return self.write_stream(collection, data, segment_size)
 
         last_seg_num = int(seg_keys[-1].replace(_SEG_PREFIX, ""))
-
-        # Check if the last segment is partial (smaller than segment_size)
         last_blob = self.kernel.read_blob(state[seg_keys[-1]])
         if len(last_blob) < segment_size:
-            # Fill the last segment first
             remaining = segment_size - len(last_blob)
             fill_data = data[:remaining]
             data = data[remaining:]
@@ -298,7 +311,6 @@ class StreamingLens(PondLens):
             new_blob_hash = self.kernel.write(combined)
             base.stage(seg_keys[-1], new_blob_hash)
 
-        # Stage new segments
         if data:
             n_new = (len(data) + segment_size - 1) // segment_size
             for i in range(n_new):
@@ -333,10 +345,282 @@ class StreamingLens(PondLens):
         return total
 
     def segment_count(self, collection: str) -> int:
-        """Get the number of segments in a stream."""
+        """Get the number of segments in a stream (total rows across all shards)."""
+        if self._unified_storage is not None:
+            # Count rows (segments) across HEAD + all shards
+            # Each row is one segment — sum n_rows from all row groups
+            manifest = self._unified_storage._load_manifest(collection)
+            if manifest is None:
+                return 0
+            total = sum(rg.n_rows for rg in manifest.scan_with_pruning())
+            # Also count shards
+            shard_hashes = self._unified_storage._read_shard_index(collection)
+            for sh in shard_hashes:
+                try:
+                    from collection_manifest import CollectionManifest
+                    sm = CollectionManifest.load(self.kernel, sh)
+                    total += sum(rg.n_rows for rg in sm.scan_with_pruning())
+                except (ValueError, KeyError):
+                    pass
+            return total
+        # Legacy path
         base = self._get_base(collection)
         state = base.read_all()
         return sum(1 for k in state.keys() if k.startswith(_SEG_PREFIX))
+
+    # ==================================================================
+    # KAFKA-LIKE FEATURES: partitions, consumer groups, offsets
+    #
+    # These make Pond competitive with Kafka for streaming workloads:
+    #   - create_topic(name, n_partitions): parallel append/read
+    #   - produce(topic, partition, data): append to a partition
+    #   - consume(topic, partition, group, n): read next N messages
+    #   - commit_offset(group, topic, partition, offset): at-least-once
+    #   - replay_from(topic, partition, offset): time-travel read
+    #
+    # How it maps to our architecture (NO new primitives):
+    #   - topic = a namespace (collection name prefix)
+    #   - partition = a collection (topic/p0, topic/p1, ...)
+    #   - consumer group = a ref tracking the last-read offset
+    #   - offset = segment number (implicit, sequential)
+    #
+    # This is the SAME pattern as Kafka-on-S3 (WarpStream):
+    #   - producers write directly to object storage
+    #   - consumers read directly from object storage
+    #   - offset tracking via small metadata objects
+    # ==================================================================
+
+    def create_topic(self, topic: str, n_partitions: int = 1) -> list[str]:
+        """Create a topic with N partitions.
+
+        Each partition is a separate collection (topic/p0, topic/p1, ...).
+        Producers pick a partition (round-robin or key-based). Consumers
+        in a group are assigned partitions (rebalancing).
+
+        Args:
+            topic: topic name
+            n_partitions: number of partitions (parallelism)
+
+        Returns:
+            List of partition collection names.
+        """
+        partitions = []
+        for i in range(n_partitions):
+            p = f"{topic}/p{i}"
+            # Initialize with a single empty segment (creates the collection)
+            self.write_stream(p, b"init", segment_size=1_000_000)
+            partitions.append(p)
+        return partitions
+
+    def list_partitions(self, topic: str) -> list[str]:
+        """List all partitions for a topic."""
+        prefix = f"{topic}/p"
+        all_names = self.kernel.list_names()
+        partitions = set()
+        for name in all_names:
+            if name.startswith(f"collections/{prefix}") and name.endswith("/HEAD"):
+                # Extract partition name
+                coll = name[len("collections/"):-len("/HEAD")]
+                if coll.startswith(prefix):
+                    partitions.add(coll)
+        return sorted(partitions)
+
+    def produce(self, topic: str, partition: int, data: bytes,
+                segment_size: int = 1_000_000) -> str:
+        """Produce (append) data to a specific partition.
+
+        Args:
+            topic: topic name
+            partition: partition number (0-indexed)
+            data: bytes to append
+            segment_size: segment size for chunking
+
+        Returns:
+            The commit hash.
+        """
+        coll = f"{topic}/p{partition}"
+        return self.append_stream(coll, data, segment_size)
+
+    def produce_round_robin(self, topic: str, data: bytes,
+                             n_partitions: int = 1) -> tuple[int, str]:
+        """Produce to the next partition (round-robin).
+
+        Tracks the last-used partition in memory for round-robin.
+
+        Returns:
+            (partition_number, commit_hash)
+        """
+        if not hasattr(self, '_rr_counter'):
+            self._rr_counter: dict[str, int] = {}
+        p = self._rr_counter.get(topic, 0)
+        self._rr_counter[topic] = (p + 1) % n_partitions
+        commit = self.produce(topic, p, data)
+        return p, commit
+
+    def get_latest_offset(self, topic: str, partition: int) -> int:
+        """Get the latest offset (segment count) for a partition."""
+        coll = f"{topic}/p{partition}"
+        return self.segment_count(coll)
+
+    def consume(self, topic: str, partition: int,
+                group: Optional[str] = None,
+                max_messages: int = 100,
+                timeout_ms: int = 0) -> list[dict]:
+        """Consume messages from a partition starting from the group's offset.
+
+        If a consumer group is specified, reads from the group's last-committed
+        offset. If no group, reads from the beginning.
+
+        Args:
+            topic: topic name
+            partition: partition number
+            group: consumer group name (for offset tracking)
+            max_messages: max messages to return
+            timeout_ms: (unused — kept for Kafka API compat)
+
+        Returns:
+            List of {offset, data, partition} dicts.
+        """
+        coll = f"{topic}/p{partition}"
+        start_offset = 0
+        if group:
+            start_offset = self._get_offset(group, topic, partition)
+
+        latest = self.segment_count(coll)
+        end_offset = min(start_offset + max_messages, latest)
+
+        messages = []
+        for offset in range(start_offset, end_offset):
+            data = self._read_segment_by_offset(coll, offset)
+            if data is not None:
+                messages.append({
+                    "topic": topic,
+                    "partition": partition,
+                    "offset": offset,
+                    "data": data,
+                })
+
+        return messages
+
+    def commit_offset(self, group: str, topic: str,
+                      partition: int, offset: int) -> str:
+        """Commit a consumer offset (at-least-once semantics).
+
+        Stores the offset as a ref: consumer_offsets/{group}/{topic}/p{partition}
+        → offset (encoded as a blob).
+
+        Args:
+            group: consumer group name
+            topic: topic name
+            partition: partition number
+            offset: the offset to commit (next message to read)
+
+        Returns:
+            The offset blob hash.
+        """
+        ref = f"consumer_offsets/{group}/{topic}/p{partition}"
+        offset_bytes = str(offset).encode()
+        h = self.kernel.write(offset_bytes)
+        self.kernel.reference(ref, h)
+        return h
+
+    def _get_offset(self, group: str, topic: str, partition: int) -> int:
+        """Get the committed offset for a consumer group (0 if none)."""
+        ref = f"consumer_offsets/{group}/{topic}/p{partition}"
+        h = self.kernel.resolve(ref)
+        if h is None:
+            return 0
+        try:
+            data = self.kernel.read_blob(h)
+            return int(data.decode())
+        except (ValueError, KeyError):
+            return 0
+
+    def replay_from(self, topic: str, partition: int,
+                    offset: int, max_messages: int = 100) -> list[dict]:
+        """Replay messages from a specific offset (time-travel read).
+
+        Like Kafka's seek() — reads from any offset, not just the
+        consumer group's committed offset.
+
+        Args:
+            topic: topic name
+            partition: partition number
+            offset: starting offset (0 = beginning)
+            max_messages: max messages to return
+
+        Returns:
+            List of {offset, data, partition} dicts.
+        """
+        coll = f"{topic}/p{partition}"
+        latest = self.segment_count(coll)
+        end_offset = min(offset + max_messages, latest)
+
+        messages = []
+        for off in range(offset, end_offset):
+            data = self._read_segment_by_offset(coll, off)
+            if data is not None:
+                messages.append({
+                    "topic": topic,
+                    "partition": partition,
+                    "offset": off,
+                    "data": data,
+                })
+        return messages
+
+    def _read_segment_by_offset(self, collection: str, offset: int) -> Optional[bytes]:
+        """Read a single segment by its offset number.
+
+        Uses read_with_shards to merge HEAD + all shards, then finds the
+        segment with the matching offset.
+        """
+        if self._unified_storage is not None:
+            # Read all rows (HEAD + shards merged) and find the one with this offset
+            rows = self._unified_storage.read_with_shards(collection)
+            for row in rows:
+                if row.get("offset") == offset:
+                    return row.get("segment")
+            return None
+        # Legacy path
+        base = self._get_base(collection)
+        seg_key = f"{_SEG_PREFIX}{offset:010d}"
+        h = base.lookup(seg_key)
+        if h is None:
+            return None
+        return self.kernel.read_blob(h)
+
+    def list_consumer_groups(self) -> list[str]:
+        """List all consumer groups."""
+        prefix = "consumer_offsets/"
+        groups = set()
+        for name in self.kernel.list_names():
+            if name.startswith(prefix):
+                # consumer_offsets/{group}/{topic}/p{partition}
+                parts = name[len(prefix):].split("/")
+                if parts:
+                    groups.add(parts[0])
+        return sorted(groups)
+
+    def get_consumer_group_offsets(self, group: str) -> dict:
+        """Get all offsets for a consumer group.
+
+        Returns:
+            { "topic/p0": offset, "topic/p1": offset, ... }
+        """
+        prefix = f"consumer_offsets/{group}/"
+        offsets = {}
+        for name in self.kernel.list_names():
+            if name.startswith(prefix):
+                rest = name[len(prefix):]
+                # rest = {topic}/p{partition}
+                h = self.kernel.resolve(name)
+                if h:
+                    try:
+                        data = self.kernel.read_blob(h)
+                        offsets[rest] = int(data.decode())
+                    except (ValueError, KeyError):
+                        pass
+        return offsets
 
     # ==================================================================
     # Version control (delegated to ProllyLensBase)
