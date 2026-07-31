@@ -588,6 +588,9 @@ class UnifiedStorage:
         # Cache the delta chain depth per collection so the compaction
         # check doesn't need to walk the parent chain on every append.
         self._delta_chain_depth_cache: dict[str, int] = {}
+        # Cache the schema per collection so append_shard doesn't need
+        # to read the existing manifest just for schema columns.
+        self._schema_cache: dict[str, tuple] = {}  # collection → (columns, key_col, rg_size)
         # Active branch per collection (set by checkout, cleared by undo/merge)
         self._active_branches: dict[str, str] = {}
 
@@ -683,6 +686,7 @@ class UnifiedStorage:
         self._head_cache.pop(collection, None)
         self._commit_index_cache.pop(collection, None)
         self._delta_chain_depth_cache.pop(collection, None)
+        self._schema_cache.pop(collection, None)
 
     def _update_caches_after_write(self, collection: str,
                                      manifest: CollectionManifest,
@@ -700,6 +704,12 @@ class UnifiedStorage:
         self._manifest_hash_cache[collection] = manifest_hash
         self._head_cache[collection] = commit_hash
         self._commit_index_cache[collection] = commit_index + 1
+        # Cache the schema so append_shard doesn't need to read the manifest
+        self._schema_cache[collection] = (
+            manifest.columns if manifest else [],
+            manifest.key_col if manifest else "",
+            manifest.row_group_size if manifest else 10_000,
+        )
         # Track delta chain depth for compaction check (0 GETs vs walking chain)
         if is_delta:
             self._delta_chain_depth_cache[collection] = \
@@ -1244,6 +1254,27 @@ class UnifiedStorage:
         idx_hash = self.kernel.write(data)
         self.kernel.reference(self._shard_index_ref(collection, branch), idx_hash)
 
+    def _append_to_shard_index(self, collection: str, shard_hash: str,
+                                branch: Optional[str] = None) -> None:
+        """Append one shard to the index — O(1) with in-memory tracking.
+
+        Tracks all shards written by this UnifiedStorage instance in memory.
+        On flush, writes the full list. Last-writer-wins is safe (G-Set CRDT).
+        Readers merge with listing anyway, so a stale index is harmless.
+        """
+        if branch is None:
+            branch = self._get_active_branch(collection)
+        key = f"{collection}/{branch}"
+        if not hasattr(self, '_shard_index_mem'):
+            self._shard_index_mem: dict[str, list[str]] = {}
+        if key not in self._shard_index_mem:
+            # Initialize from storage (one-time read)
+            self._shard_index_mem[key] = self._read_shard_index(collection, branch)
+        if shard_hash not in self._shard_index_mem[key]:
+            self._shard_index_mem[key].append(shard_hash)
+        # Flush to storage (1 PUT)
+        self._write_shard_index(collection, self._shard_index_mem[key], branch)
+
     def _parallel_fetch_shard_manifests(self, shard_hashes: list[str]) -> list:
         """Fetch all shard manifests in parallel (~1 RTT wall-clock).
 
@@ -1327,19 +1358,34 @@ class UnifiedStorage:
         if n_rows == 0:
             return ""  # nothing to append
 
-        # Read existing manifest for schema (cache-independent — read fresh)
-        existing_manifest = self._load_manifest(collection, skip_cache=True)
-        if existing_manifest is None:
-            # Collection doesn't exist — use write() instead
-            return self.write(collection, rows, key_col=key_col,
-                                row_group_size=row_group_size,
-                                encoding_hints=encoding_hints,
-                                message=message)
+        # Use cached schema if available (warm shard append = 0 GETs for schema)
+        cached_schema = self._schema_cache.get(collection)
+        if cached_schema:
+            schema_columns, existing_key_col, existing_rg_size = cached_schema
+            if key_col == "":
+                key_col = None
+            if key_col is None and existing_key_col:
+                key_col = existing_key_col
+        else:
+            # Cold: read existing manifest for schema
+            existing_manifest = self._load_manifest(collection, skip_cache=True)
+            if existing_manifest is None:
+                return self.write(collection, rows, key_col=key_col,
+                                    row_group_size=row_group_size,
+                                    encoding_hints=encoding_hints,
+                                    message=message)
+            schema_columns = existing_manifest.columns
+            if key_col == "":
+                key_col = None
+            if key_col is None and existing_manifest.key_col:
+                key_col = existing_manifest.key_col
+            # Cache the schema for future warm appends
+            self._schema_cache[collection] = (
+                schema_columns,
+                key_col or "",
+                existing_manifest.row_group_size,
+            )
 
-        if key_col == "":
-            key_col = None
-        if key_col is None and existing_manifest.key_col:
-            key_col = existing_manifest.key_col
         if key_col is not None and key_col in source.column_names():
             source = _sort_source_by(source, key_col)
             key_array = source.column_slice(key_col, 0, n_rows)
@@ -1348,7 +1394,6 @@ class UnifiedStorage:
         else:
             key_array = list(range(n_rows))
 
-        schema_columns = existing_manifest.columns
         if not schema_columns and n_rows > 0:
             for col_name in source.column_names():
                 sample = source.column_slice(col_name, 0, min(100, n_rows))
@@ -1416,22 +1461,20 @@ class UnifiedStorage:
         shard_ref = f"{self._shards_prefix(collection, branch)}{shard_id}"
         self.kernel.reference(shard_ref, shard_hash)
 
-        # Update the shard index (1 PUT) so readers can fetch all shard
-        # hashes in 1 GET instead of listing N refs. Last-writer-wins is
-        # safe here — the index is a G-Set, and concurrent updates produce
-        # a superset that the reader merges via CRDT anyway. Even if this
-        # update is lost (concurrent writer), the reader falls back to
-        # listing, so correctness is preserved.
+        # Update the shard index (1 PUT) using in-memory tracking for O(1).
+        # First append reads the existing index (cold); subsequent appends
+        # use the in-memory list (warm = 0 GETs for index).
         try:
-            existing_shards = self._read_shard_index(collection)
-            if shard_hash not in existing_shards:
-                existing_shards.append(shard_hash)
-                self._write_shard_index(collection, existing_shards)
+            self._append_to_shard_index(collection, shard_hash)
         except Exception:
             pass  # index update is best-effort — listing is the fallback
 
-        # Invalidate cache so the next read picks up the new shard
-        self._invalidate_manifest_cache(collection)
+        # Invalidate manifest cache (so next read picks up the new shard)
+        # but PRESERVE the schema cache (schema doesn't change on append)
+        self._manifest_cache.pop(collection, None)
+        self._manifest_hash_cache.pop(collection, None)
+        self._head_cache.pop(collection, None)
+        # Keep _schema_cache — it's valid across appends
 
         return shard_hash
 

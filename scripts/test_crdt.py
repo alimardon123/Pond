@@ -77,7 +77,7 @@ def test_delete_then_update():
 
     # Delete first
     storage.delete_shard("crdt_test", [rowid], key_col="id")
-    time.sleep(0.01)  # ensure update has later _version
+    time.sleep(0.05)  # ensure update has later _version (deterministic)
     # Update with later _version
     storage.upsert_shard("crdt_test",
         [{"_rowid": rowid, "id": 1, "name": "resurrected", "age": 99}],
@@ -100,7 +100,7 @@ def test_update_then_delete():
     storage.upsert_shard("crdt_test",
         [{"_rowid": rowid, "id": 1, "name": "updated", "age": 50}],
         key_col="id")
-    time.sleep(0.01)  # ensure delete has later _version
+    time.sleep(0.05)  # ensure delete has later _version
     # Delete with later _version
     storage.delete_shard("crdt_test", [rowid], key_col="id")
 
@@ -201,7 +201,7 @@ def test_compaction_preserves_crdt():
     # Update + delete
     storage.upsert_shard("compact_test",
         [{"_rowid": rowid, "id": 1, "name": "updated"}], key_col="id")
-    time.sleep(0.01)
+    time.sleep(0.05)
     storage.delete_shard("compact_test", [rowid], key_col="id")
 
     # Compact
