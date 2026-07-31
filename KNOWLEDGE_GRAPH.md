@@ -716,3 +716,4 @@ All active files in the repository (excluding archive/, __pycache__, .git):
 - scripts/test_cross_lens_universal.py
 - scripts/test_ivf.py
 - scripts/test_concurrency.py
+- scripts/test_crdt.py

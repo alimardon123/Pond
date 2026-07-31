@@ -632,14 +632,30 @@ class UnifiedStorage:
 
         # skip_cache=False (READ path): verify freshness — 1 GET
         if not skip_cache and collection in self._manifest_cache:
-            current_hash = self.kernel.resolve(self._manifest_ref(collection))
+            # Check BOTH the dedicated path store (used by concurrent writers)
+            # and the root ref (used by legacy writers). The dedicated path
+            # is authoritative if it exists.
+            if hasattr(self.kernel, 'get_path'):
+                current_hash = self.kernel.get_path(self._manifest_ref(collection))
+                if current_hash is None:
+                    # Fall back to root ref
+                    current_hash = self.kernel.resolve(self._manifest_ref(collection))
+            else:
+                current_hash = self.kernel.resolve(self._manifest_ref(collection))
             cached_hash = self._manifest_hash_cache.get(collection)
             if current_hash == cached_hash:
                 return self._manifest_cache[collection]
             # Stale cache — fall through to re-read
             self._invalidate_manifest_cache(collection)
 
-        resolved_hash = self.kernel.resolve(self._manifest_ref(collection))
+        # Resolve the manifest hash — check dedicated path first (concurrent
+        # writers use set_path), then fall back to root ref (legacy writers).
+        if hasattr(self.kernel, 'get_path'):
+            resolved_hash = self.kernel.get_path(self._manifest_ref(collection))
+            if resolved_hash is None:
+                resolved_hash = self.kernel.resolve(self._manifest_ref(collection))
+        else:
+            resolved_hash = self.kernel.resolve(self._manifest_ref(collection))
         if resolved_hash is None:
             return None
 
@@ -1270,16 +1286,23 @@ class UnifiedStorage:
                           end_key: Optional[str] = None) -> list[dict]:
         """Read rows from a collection, merging HEAD + all shards.
 
-        This is the CRDT merge: union of all row group entries from HEAD
-        and all shards. Last-writer-wins for duplicate rg_keys (shards
-        override HEAD, newer shards override older ones by UUIDv7 order).
+        TWO-LEVEL MERGE:
+          1. Row-group level: dedup by rg_key (shards override HEAD)
+          2. Row level: dedup by _rowid, keeping latest _version
+             (tombstones suppress rows if their _version is latest)
+
+        If rows have _rowid/_version columns (from upsert_shard/delete_shard),
+        the row-level merge handles concurrent updates and deletes correctly.
+        If rows don't have _rowid (plain append_shard), all rows are kept
+        (insert-only semantics — no conflicts possible).
 
         Flow:
           1. Read HEAD manifest (1 GET — the compacted base)
           2. List shards (1 LIST)
           3. Read all shard manifests (N GETs — parallel)
-          4. Merge: union of row group entries
+          4. Merge row groups: union of entries (dedup by rg_key)
           5. Fetch + decode surviving data blobs (K GETs — parallel)
+          6. Merge rows: dedup by _rowid, latest _version wins
         """
         # Read HEAD manifest (the compacted base)
         head_manifest = self._load_manifest(collection)
@@ -1293,10 +1316,7 @@ class UnifiedStorage:
             except (ValueError, KeyError):
                 pass  # skip unreadable shards
 
-        # Merge: collect all row group entries, dedup by key (last wins)
-        # Shards override HEAD; among shards, later UUIDv7 = newer = wins
-        # (we rely on list_shards returning them in ref order, which is
-        # lexicographic = time-ordered for UUIDv7)
+        # Level 1 merge: dedup row groups by rg_key (shards override HEAD)
         merged: dict[str, Any] = {}  # rg_key → RowGroupEntry
         if head_manifest:
             for rg in head_manifest.scan_with_pruning(predicates, start_key, end_key):
@@ -1314,14 +1334,24 @@ class UnifiedStorage:
             row_groups, columns, predicates)
 
         # Combine into rows
-        result: list[dict] = []
+        all_rows: list[dict] = []
         for col_data in col_data_list:
             n = len(next(iter(col_data.values()))) if col_data else 0
             for i in range(n):
                 row = {c: vals[i] for c, vals in col_data.items()}
-                if row_filter is None or row_filter(row):
-                    result.append(row)
-        return result
+                all_rows.append(row)
+
+        # Level 2 merge: dedup by _rowid, latest _version wins (CRDT)
+        # Only applies if rows have _rowid (from upsert_shard/delete_shard)
+        has_rowid = any(r.get("_rowid") for r in all_rows)
+        if has_rowid:
+            all_rows = self._merge_rows_by_rowid(all_rows)
+
+        # Apply row filter
+        if row_filter is not None:
+            all_rows = [r for r in all_rows if row_filter(r)]
+
+        return all_rows
 
     def compact_shards(self, collection: str) -> Optional[str]:
         """Merge all shards into HEAD, then clear the shards.
@@ -1331,20 +1361,23 @@ class UnifiedStorage:
         commutative). Last-writer-wins on HEAD is safe here because the
         result is deterministic.
 
-        After compaction:
-          - HEAD points to a new flat manifest containing all row groups
-          - All shards are cleared (their refs are deleted)
-          - Reads are fast again (1 manifest, no shard list)
+        TWO-LEVEL MERGE:
+          1. Row-group level: dedup by rg_key (shards override HEAD)
+          2. Row level: dedup by _rowid, keeping latest _version.
+             Tombstones are dropped (their effect is already applied).
+             Superseded versions are dropped.
 
-        Should be called periodically (e.g., after every N shards) to
-        bound read amplification.
+        After compaction:
+          - HEAD points to a new flat manifest containing only LIVE rows
+          - All shards are cleared (their refs are tombstoned)
+          - Reads are fast again (1 manifest, no shard list, no tombstones)
         """
         head_manifest = self._load_manifest(collection)
         shard_hashes = self.list_shards(collection)
         if not shard_hashes:
             return None  # nothing to compact
 
-        # Merge all row group entries
+        # Level 1: merge row groups (dedup by rg_key)
         merged: dict[str, Any] = {}
         if head_manifest:
             for rg in head_manifest.scan_with_pruning():
@@ -1357,25 +1390,46 @@ class UnifiedStorage:
             except (ValueError, KeyError):
                 pass
 
-        # Build the merged manifest entries
+        if not merged:
+            return None
+
+        # Fetch + decode ALL rows from merged row groups
+        row_groups = list(merged.values())
+        col_data_list = self._parallel_fetch_and_decode(row_groups, None, None)
+        all_rows: list[dict] = []
+        for col_data in col_data_list:
+            n = len(next(iter(col_data.values()))) if col_data else 0
+            for i in range(n):
+                row = {c: vals[i] for c, vals in col_data.items()}
+                all_rows.append(row)
+
+        # Level 2: row-level CRDT merge (dedup by _rowid, drop tombstones)
+        has_rowid = any(r.get("_rowid") for r in all_rows)
+        if has_rowid:
+            all_rows = self._merge_rows_by_rowid(all_rows)
+
+        # Build the compacted manifest with only LIVE rows
         schema = (head_manifest.columns if head_manifest
-                   else [("value", 4)])  # fallback schema
+                   else [("value", 4)])
         key_col = (head_manifest.key_col if head_manifest else "")
         rg_size = (head_manifest.row_group_size if head_manifest else 10_000)
 
-        merged_entries = []
-        for rg in sorted(merged.values(), key=lambda r: r.key):
-            merged_entries.append({
-                "rg_key": rg.key,
-                "blob_hash": rg.blob_hash,
-                "n_rows": rg.n_rows,
-                "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
-                                for c in rg.columns],
-            })
-
-        # Write the new compacted manifest
-        manifest_hash, new_manifest = self._build_manifest_with_return(
-            collection, merged_entries, schema, key_col, rg_size)
+        # Write the live rows as a single flat manifest
+        # (reuse append_shard's encoding logic by calling write())
+        if all_rows:
+            manifest_hash, new_manifest = self._build_manifest_with_return(
+                collection,
+                [{"rg_key": _format_rg_key(i),
+                  "blob_hash": self.kernel.write(
+                      PND2.encode(ListColumnSource(all_rows[i:i+1]))[0]),
+                  "n_rows": 1,
+                  "col_stats": PND2.encode(ListColumnSource(all_rows[i:i+1]))[1]}
+                 for i in range(len(all_rows))],
+                schema, key_col, rg_size)
+        else:
+            # All rows deleted — empty manifest
+            manifest_hash, new_manifest = self._build_manifest_with_return(
+                collection, [], schema, key_col, rg_size)
 
         # Write a new commit pointing to the compacted manifest
         parent = self._head_cache.get(collection)
@@ -1389,15 +1443,13 @@ class UnifiedStorage:
 
         commit_hash = self._write_commit_blob(
             collection, manifest_hash, parent=parent,
-            message=f"compact {len(shard_hashes)} shards",
+            message=f"compact {len(shard_hashes)} shards ({len(all_rows)} live rows)",
             index=commit_index)
 
-        # Clear the shards (delete their refs)
+        # Clear the shards (tombstone their refs)
         prefix = self._shards_prefix(collection)
         for name in list(self.kernel.list_names()):
             if name.startswith(prefix):
-                # "Delete" by pointing at an empty blob
-                # (the kernel doesn't have a delete; tombstone via empty ref)
                 empty = self.kernel.write(b"")
                 self.kernel.reference(name, empty)
 
@@ -1411,6 +1463,144 @@ class UnifiedStorage:
     def shard_count(self, collection: str) -> int:
         """Return the number of unmerged shards for a collection."""
         return len(self.list_shards(collection))
+
+    # ------------------------------------------------------------------
+    # ROW-LEVEL CRDT — upsert + delete with version vectors
+    #
+    # The shard CRDT handles INSERT well, but UPDATE and DELETE at the
+    # row level need explicit versioning. This section adds:
+    #
+    #   - upsert_shard: insert-or-update rows with (_rowid, _version)
+    #   - delete_shard: row-level tombstones with (_rowid, _version)
+    #   - read_with_shards: row-level merge (last-writer-wins by _version)
+    #
+    # Merge rules (deterministic, eventually consistent):
+    #   - INSERT + INSERT (same _rowid): later _version wins
+    #   - UPDATE + UPDATE (same _rowid): later _version wins
+    #   - DELETE + anything: later _version wins (tombstone if DELETE is later)
+    #   - INSERT + INSERT (different _rowid): both kept (no conflict)
+    #
+    # _rowid: UUIDv7 string (time-ordered, globally unique). Stable across
+    #   updates — an UPDATE keeps the same _rowid, bumps _version.
+    # _version: UUIDv7 string (time-ordered). Each write generates a new
+    #   _version. Merge compares _version strings lexicographically
+    #   (UUIDv7 is time-ordered, so lexicographic = chronological).
+    # _deleted: bool. If True, this row is a tombstone (deleted at _version).
+    #
+    # These are REGULAR COLUMNS in PND2 — no format change. The merge
+    # logic lives in read_with_shards and compact_shards.
+    # ------------------------------------------------------------------
+
+    def upsert_shard(self, collection: str, rows: list[dict],
+                      key_col: Optional[str] = None,
+                      row_group_size: int = 10_000) -> str:
+        """Concurrent-safe upsert (insert-or-update) with row-level CRDT.
+
+        Each row gets a _rowid (stable across updates) and _version
+        (new per write). On merge, the row with the later _version wins.
+
+        For NEW rows: caller does NOT provide _rowid — we generate one.
+        For UPDATES: caller provides _rowid (from the original read),
+                     we generate a new _version.
+
+        Args:
+            collection: collection name
+            rows: list of row dicts. For updates, include _rowid from
+                  the original row. For inserts, omit _rowid.
+            key_col: sort key column (for range scans)
+            row_group_size: rows per row group
+
+        Returns:
+            The shard manifest hash.
+        """
+        try:
+            from uuid7 import uuidv7
+        except ImportError:
+            import time as _t
+            uuidv7 = lambda: f"{_t.time_ns():016x}"
+
+        # Stamp each row with _rowid (if missing) and _version (always new)
+        stamped = []
+        for row in rows:
+            r = dict(row)
+            if "_rowid" not in r or not r["_rowid"]:
+                r["_rowid"] = uuidv7()  # new row — generate _rowid
+            r["_version"] = uuidv7()  # always new version
+            r["_deleted"] = False
+            stamped.append(r)
+
+        return self.append_shard(collection, stamped, key_col=key_col,
+                                   row_group_size=row_group_size,
+                                   message="upsert shard")
+
+    def delete_shard(self, collection: str, rowids: list[str],
+                      key_col: Optional[str] = None,
+                      row_group_size: int = 10_000) -> str:
+        """Concurrent-safe row-level delete with tombstones.
+
+        Each deleted _rowid gets a tombstone row with _deleted=True and
+        a new _version. On merge, if the tombstone's _version is later
+        than any live row's _version, the row is suppressed.
+
+        Args:
+            collection: collection name
+            rowids: list of _rowid strings to delete
+            key_col: sort key column (for range scans)
+            row_group_size: rows per row group
+
+        Returns:
+            The shard manifest hash.
+        """
+        try:
+            from uuid7 import uuidv7
+        except ImportError:
+            import time as _t
+            uuidv7 = lambda: f"{_t.time_ns():016x}"
+
+        tombstones = []
+        for rid in rowids:
+            tombstones.append({
+                "_rowid": rid,
+                "_version": uuidv7(),
+                "_deleted": True,
+                # Keep key_col for sortability if needed
+                key_col or "_key": "",
+            })
+
+        return self.append_shard(collection, tombstones, key_col=key_col,
+                                   row_group_size=row_group_size,
+                                   message="delete shard")
+
+    def _merge_rows_by_rowid(self, all_rows: list[dict]) -> list[dict]:
+        """Merge rows by _rowid, keeping the one with the latest _version.
+
+        Tombstones (_deleted=True) suppress the row if their _version is
+        the latest. If a live row has a later _version, it overrides the
+        tombstone (the delete was superseded by a concurrent update).
+
+        This is the CRDT merge — deterministic and eventually consistent.
+        """
+        # Group by _rowid, track the latest version
+        latest: dict[str, dict] = {}
+        for row in all_rows:
+            rid = row.get("_rowid")
+            if rid is None:
+                # No _rowid — keep as-is (legacy row, no versioning)
+                latest[f"noid_{id(row)}"] = row
+                continue
+            ver = row.get("_version", "")
+            existing = latest.get(rid)
+            if existing is None or ver > existing.get("_version", ""):
+                latest[rid] = row
+
+        # Filter out tombstones (rows where _deleted=True and they won)
+        result = []
+        for row in latest.values():
+            if row.get("_deleted"):
+                continue  # tombstone won — suppress this row
+            result.append(row)
+
+        return result
 
     # ------------------------------------------------------------------
     # WRITE — the ONE write path

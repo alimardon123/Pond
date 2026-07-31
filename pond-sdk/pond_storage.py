@@ -394,6 +394,42 @@ class PondStorage:
             return 0
         return self._unified.shard_count(collection)
 
+    def upsert_shard(self, collection: str, rows: list[dict],
+                      key_col: Optional[str] = None,
+                      row_group_size: int = 10_000) -> str:
+        """Concurrent-safe upsert (insert-or-update) with row-level CRDT.
+
+        Each row gets a _rowid (stable across updates) and _version
+        (new per write). On merge, the row with the later _version wins.
+
+        For NEW rows: caller does NOT provide _rowid — we generate one.
+        For UPDATES: caller provides _rowid (from the original read),
+                     we generate a new _version.
+
+        Merge semantics (deterministic, eventually consistent):
+          - INSERT + INSERT (same _rowid): later _version wins
+          - UPDATE + UPDATE (same _rowid): later _version wins
+          - DELETE + anything: later _version wins (tombstone if DELETE is later)
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.upsert_shard(collection, rows, key_col=key_col,
+                                            row_group_size=row_group_size)
+
+    def delete_shard(self, collection: str, rowids: list[str],
+                      key_col: Optional[str] = None,
+                      row_group_size: int = 10_000) -> str:
+        """Concurrent-safe row-level delete with tombstones.
+
+        Each deleted _rowid gets a tombstone with _deleted=True and a new
+        _version. On merge, if the tombstone's _version is later than any
+        live row's _version, the row is suppressed.
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.delete_shard(collection, rowids, key_col=key_col,
+                                            row_group_size=row_group_size)
+
     def read(self, collection: str,
              predicates: Optional[list[tuple[str, str, Any]]] = None,
              columns: Optional[list[str]] = None,

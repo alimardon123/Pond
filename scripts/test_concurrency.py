@@ -12,6 +12,10 @@ import sys
 import threading
 import time
 
+# Some tests create large manifests that hit Python's default recursion
+# limit during decode. Increase it to avoid false failures.
+sys.setrecursionlimit(10000)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "pond-core"))
