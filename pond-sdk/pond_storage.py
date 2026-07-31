@@ -626,6 +626,50 @@ class PondStorage:
             return 0
         return sum(rg.n_rows for rg in manifest.scan_with_pruning(predicates))
 
+    # ==================================================================
+    # GC / Vacuum — reclaim space from unreachable blobs
+    # ==================================================================
+
+    def gc(self, collection: Optional[str] = None) -> dict:
+        """Analyze reachability — returns live/dead blob counts (read-only).
+
+        Args:
+            collection: if None, analyze ALL collections. If specified,
+                analyze only that collection (faster for targeted GC).
+
+        Returns:
+            {"live": int, "dead": int, "dead_hashes": list, "dead_size_bytes": int}
+        """
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "extensions", "maintenance"))
+            from vacuum import GarbageCollector
+            gc = GarbageCollector(self.kernel)
+            return gc.collect(collection)
+        except ImportError:
+            return {"live": 0, "dead": 0, "dead_hashes": [], "dead_size_bytes": 0}
+
+    def vacuum(self, collection: Optional[str] = None,
+               dry_run: bool = False) -> dict:
+        """Delete unreachable blobs — reclaim storage space.
+
+        Args:
+            collection: if None, vacuum ALL collections. If specified,
+                vacuum only that collection.
+            dry_run: if True, report what would be deleted without deleting.
+
+        Returns:
+            {"deleted": int, "freed_bytes": int, "dry_run": bool}
+        """
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "extensions", "maintenance"))
+            from vacuum import GarbageCollector
+            gc = GarbageCollector(self.kernel)
+            return gc.vacuum(collection, dry_run)
+        except ImportError:
+            return {"deleted": 0, "freed_bytes": 0, "dry_run": dry_run}
+
     def delete_collection(self, collection: str) -> bool:
         """Delete a collection by tombstoning its HEAD and manifest refs.
 

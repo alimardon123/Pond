@@ -169,6 +169,35 @@ class InMemoryObjectStore:
         with self._lock:
             return hash_val in self._blobs
 
+    def delete_blob(self, hash_val: str) -> bool:
+        """Delete a blob by hash. Returns True if deleted, False if not found.
+
+        This is a MAINTENANCE operation (not a kernel primitive). Used by
+        the GC/vacuum system to reclaim space from unreachable blobs.
+
+        On S3, this maps to DELETE object. On local FS, unlink. The kernel
+        (Write/Read/Reference) stays FROZEN — deletion is a storage-backend
+        concern, not a kernel concern.
+        """
+        with self._lock:
+            if hash_val in self._blobs:
+                del self._blobs[hash_val]
+                # Also remove from paths that point at it
+                to_remove = [p for p, h in self._paths.items() if h == hash_val]
+                for p in to_remove:
+                    del self._paths[p]
+                return True
+            return False
+
+    def list_all_blob_hashes(self) -> list[str]:
+        """List all blob hashes in the store (for GC reachability analysis).
+
+        On S3, this is a list-objects-v2 with no prefix. On local FS,
+        it's a directory listing.
+        """
+        with self._lock:
+            return list(self._blobs.keys())
+
     def put_path(self, path: str, hash_val: str) -> None:
         """Bind a well-known path to a content hash.
 
@@ -446,6 +475,22 @@ class ObjectStoreNativeKernel:
         that are only written by the HEAD owner).
         """
         self.store.put_path(path, hash_val)
+
+    # ------------------------------------------------------------------
+    # MAINTENANCE operations (NOT kernel primitives)
+    #
+    # These are used by the GC/vacuum system to reclaim space. The kernel
+    # stays FROZEN at 3 primitives (Write/Read/Reference). Deletion is a
+    # storage-backend concern, exposed here for maintenance tools.
+    # ------------------------------------------------------------------
+
+    def delete_blob(self, hash_val: str) -> bool:
+        """Delete a blob by hash. MAINTENANCE operation (not a primitive)."""
+        return self.store.delete_blob(hash_val)
+
+    def list_all_blob_hashes(self) -> list[str]:
+        """List all blob hashes in the store. Used by GC reachability analysis."""
+        return self.store.list_all_blob_hashes()
 
     def _load_root_ref(self) -> dict[str, str]:
         """Load the root ref blob, using the cache if valid.
