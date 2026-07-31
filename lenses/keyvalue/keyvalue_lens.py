@@ -107,22 +107,30 @@ class KeyValueLens(PondLens):
     """
 
     def __init__(self, kernel: PondMinimal, name: Optional[str] = None,
-                 use_unified_storage: bool = False):
+                 use_unified_storage: bool = True):
         """Create a KeyValueLens.
 
         Args:
             kernel: the PondMinimal kernel instance
             name: OPTIONAL. If provided, enables backward-compatible
                   single-collection API.
-            use_unified_storage: if True, use UnifiedStorage (PND2 format)
-                  as the storage backend instead of the legacy ProllyTreeIndex
-                  + per-key JSON blobs. This gives:
+            use_unified_storage: if True (DEFAULT), use UnifiedStorage
+                  (PND2 format) as the storage backend. This is the
+                  cross-lens default: any lens can read/write any
+                  collection through the same PND2 format. Setting
+                  this to False selects the legacy ProllyTreeIndex +
+                  per-key JSON blob path (kept for backward compat,
+                  but produces collections that other lenses cannot
+                  read through PND2).
+
+                  Unified storage gives:
                     - 4 GETs cold point lookup (vs O(log N))
                     - Non-destructive append() (vs rewrite-on-commit)
                     - Predicate pushdown via manifest stats
                     - Range scans via start_key/end_key
-                  The lens API is IDENTICAL — only the storage backend changes.
-                  Default: False (legacy path, for backward compat).
+                    - CROSS-LENS: reads any collection (lakehouse,
+                      vector, streaming) transparently by inspecting
+                      the collection's metadata.key_col.
         """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
@@ -132,7 +140,7 @@ class KeyValueLens(PondLens):
         # Attached indexer for auto-notify on commit (set via attach_indexer)
         self._attached_indexer = None
 
-        # Unified storage backend (optional)
+        # Unified storage backend (default ON for cross-lens compatibility)
         self._unified_storage = None
         if use_unified_storage:
             try:
@@ -143,6 +151,29 @@ class KeyValueLens(PondLens):
                 pass
         # Unified storage write buffer: collection → {key → value}
         self._unified_buffer: dict[str, dict[str, Any]] = {}
+        # Cross-lens metadata cache: collection → key_col (so cold lookup
+        # costs 1 GET, subsequent lookups are free).
+        self._key_col_cache: dict[str, str] = {}
+
+    def _resolve_key_col(self, collection: str) -> str:
+        """Resolve the key column for a collection — cross-lens aware.
+
+        KV collections use "_key" as the key column. But a KV lens can
+        read/write ANY collection (lakehouse, vector, streaming, etc.).
+        For those, the key column comes from the collection's metadata.
+
+        Falls back to "_key" if no metadata is found (KV's own default).
+
+        CACHED: the metadata lookup is cached per-collection on the lens
+        instance, so subsequent reads pay 0 extra GETs. The first cold
+        lookup pays 1 extra GET (the metadata blob fetch).
+        """
+        if collection in self._key_col_cache:
+            return self._key_col_cache[collection]
+        md = self.get_collection_metadata(collection)
+        kc = md.get("key_col") or "_key"
+        self._key_col_cache[collection] = kc
+        return kc
 
     def _resolve_collection(self, *args) -> tuple:
         """Resolve the collection name from args or default.
@@ -297,15 +328,40 @@ class KeyValueLens(PondLens):
                     collection, result_rows, key_col="_key",
                     row_group_size=10_000,
                     message=message or f"{collection} unified commit (with deletes)")
+                # Stamp metadata if this is a new collection
+                if self.get_collection_metadata(collection).get("lens_type") is None:
+                    self.stamp_collection_metadata(
+                        collection, lens_type="keyvalue", key_col="_key",
+                        schema_hint={"_key": "string", "value": "bytes"})
             elif puts_only:
                 # No deletes — just append new puts
                 rows = [{"_key": k, "value": self.encode(v)}
                          for k, v in puts_only.items()]
                 rows.sort(key=lambda r: r["_key"])
-                commit_hash = self._unified_storage.append(
-                    collection, rows, key_col="_key",
-                    row_group_size=10_000,
-                    message=message or f"{collection} unified commit")
+                # Decide: append (existing collection) or write (new)?
+                existing_manifest = self._unified_storage._load_manifest(collection)
+                if existing_manifest is None:
+                    # NEW collection — write() creates the first manifest.
+                    # Stamp cross-lens metadata so other lenses know this
+                    # is a KV collection with key_col="_key".
+                    commit_hash = self._unified_storage.write(
+                        collection, rows, key_col="_key",
+                        row_group_size=10_000,
+                        message=message or f"{collection} unified commit")
+                    self.stamp_collection_metadata(
+                        collection, lens_type="keyvalue", key_col="_key",
+                        schema_hint={"_key": "string", "value": "bytes"})
+                else:
+                    # EXISTING collection — append (preserves existing
+                    # rows and key_col). Don't overwrite metadata; if
+                    # this is another lens's collection, the appended
+                    # rows will have only _key+value columns (other
+                    # columns become None — "ugly shape" but readable
+                    # by any lens).
+                    commit_hash = self._unified_storage.append(
+                        collection, rows, key_col="_key",
+                        row_group_size=10_000,
+                        message=message or f"{collection} unified commit")
             else:
                 commit_hash = ""
             del self._unified_buffer[collection]
@@ -405,17 +461,27 @@ class KeyValueLens(PondLens):
 
         Unified storage path (use_unified_storage=True): 4 GETs cold
         point lookup via manifest + encoded predicate eval.
+
+        CROSS-LENS: if the collection was created by another lens (e.g.
+        lakehouse "users" with key_col="id"), this reads metadata.key_col
+        and looks up the row by that column. The returned value is the
+        FULL ROW (as a dict), not just a "value" field — because a
+        lakehouse row has many columns, not just key+value.
         """
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
 
         # Unified storage path: point_lookup via manifest
         if self._unified_storage is not None:
-            row = self._unified_storage.point_lookup(
-                collection, key=key, columns=["_key", "value"])
+            key_col = self._resolve_key_col(collection)
+            row = self._unified_storage.point_lookup(collection, key=key)
             if row is None:
                 return None
-            return self.decode(row["value"])
+            # KV-created collection: return the decoded "value" field
+            if key_col == "_key" and "value" in row:
+                return self.decode(row["value"])
+            # Cross-lens: return the full row dict (caller sees all columns)
+            return row
 
         # Legacy path: ProllyTreeIndex lookup
         h = self._get_base(collection).lookup(key)
@@ -429,15 +495,25 @@ class KeyValueLens(PondLens):
         return self.kernel.read_blob(h) if h else None
 
     def get_all(self, *args) -> dict[str, Any]:
-        """Read all key→value pairs from the collection."""
+        """Read all key→value pairs from the collection.
+
+        CROSS-LENS: for a KV-created collection, returns {key: value}.
+        For any other lens's collection (lakehouse, vector, streaming),
+        returns {row[key_col]: full_row_dict} — the full row is the
+        "value" because the collection has more than just key+value.
+        """
         collection, rest = self._resolve_collection(*args)
 
         # Unified storage path
         if self._unified_storage is not None:
-            rows = self._unified_storage.read(collection,
-                                                columns=["_key", "value"])
-            return {r["_key"]: self.decode(r["value"])
-                    for r in rows if r.get("_key")}
+            key_col = self._resolve_key_col(collection)
+            rows = self._unified_storage.read(collection)
+            if key_col == "_key":
+                # KV-created: return decoded values
+                return {r["_key"]: self.decode(r["value"])
+                        for r in rows if r.get("_key")}
+            # Cross-lens: return full rows keyed by key_col
+            return {str(r.get(key_col)): r for r in rows if r.get(key_col) is not None}
 
         # Legacy path
         state = self._get_base(collection).read_all()
@@ -445,13 +521,18 @@ class KeyValueLens(PondLens):
                 for k, h in state.items() if not k.startswith("_")}
 
     def keys(self, *args) -> list[str]:
-        """List all user keys in the collection (excludes internal _ keys)."""
+        """List all user keys in the collection (excludes internal _ keys).
+
+        CROSS-LENS: works on any collection — returns the values of the
+        key_col column (from metadata), or "_key" if KV-created.
+        """
         collection, rest = self._resolve_collection(*args)
 
         # Unified storage path
         if self._unified_storage is not None:
-            rows = self._unified_storage.read(collection, columns=["_key"])
-            return [r["_key"] for r in rows if r.get("_key")]
+            key_col = self._resolve_key_col(collection)
+            rows = self._unified_storage.read(collection, columns=[key_col])
+            return [str(r[key_col]) for r in rows if r.get(key_col) is not None]
 
         # Legacy path
         return [k for k in self._get_base(collection).read_all() if not k.startswith("_")]
@@ -463,9 +544,8 @@ class KeyValueLens(PondLens):
 
         # Unified storage path
         if self._unified_storage is not None:
-            row = self._unified_storage.point_lookup(
-                collection, key=key, columns=["_key"])
-            return row is not None and row.get("_key") is not None
+            row = self._unified_storage.point_lookup(collection, key=key)
+            return row is not None
 
         # Legacy path
         return self._get_base(collection).lookup(key) is not None

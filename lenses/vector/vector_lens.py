@@ -74,7 +74,7 @@ class VectorLens(PondLens):
     """
 
     def __init__(self, kernel: PondMinimal, n_dimensions: int = 0,
-                 use_unified_storage: bool = False):
+                 use_unified_storage: bool = True):
         """Create a VectorLens.
 
         Args:
@@ -82,20 +82,28 @@ class VectorLens(PondLens):
             n_dimensions: number of dimensions per vector (required for
                 unified storage path — each dimension becomes a FLOAT64
                 column in PND2). Ignored on legacy path.
-            use_unified_storage: if True, use UnifiedStorage (PND2 format)
-                as the storage backend. This gives:
+            use_unified_storage: if True (DEFAULT), use UnifiedStorage
+                (PND2 format) as the storage backend. This is the
+                cross-lens default — any lens can read/write any
+                collection through the same PND2 format. Setting
+                this to False selects the legacy ProllyTreeIndex +
+                per-vector binary blob path (kept for backward compat,
+                but produces collections that other lenses cannot
+                read through PND2).
+
+                Unified storage gives:
                   - 4 GETs cold point lookup (vs O(log N))
                   - Bounding-box pruning via manifest stats
                   - Non-destructive append() semantics
+                  - CROSS-LENS: any lens can read this collection.
                 The lens API is IDENTICAL — only the storage backend changes.
-                Default: False (legacy path, for backward compat).
         """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
         self._attached_indexer = None
         self._n_dimensions = n_dimensions
 
-        # Unified storage backend (optional)
+        # Unified storage backend (default ON for cross-lens compatibility)
         self._unified_storage = None
         if use_unified_storage:
             try:
@@ -105,6 +113,26 @@ class VectorLens(PondLens):
                 pass
         # Buffer for uncommitted inserts: collection → list of (id, vector, metadata)
         self._unified_buffer: dict[str, list[tuple[str, list[float], dict]]] = {}
+        # Cross-lens metadata cache: collection → key_col (so cold lookup
+        # costs 1 GET, subsequent lookups are free).
+        self._key_col_cache: dict[str, str] = {}
+
+    def _resolve_key_col(self, collection: str) -> str:
+        """Resolve the key column for a collection — cross-lens aware.
+
+        Vector collections use "id" as the key column. But a VectorLens
+        can read ANY collection (lakehouse, KV, streaming). For those,
+        the key column comes from the collection's metadata.
+
+        CACHED: first cold lookup pays 1 extra GET; subsequent lookups
+        are free.
+        """
+        if collection in self._key_col_cache:
+            return self._key_col_cache[collection]
+        md = self.get_collection_metadata(collection)
+        kc = md.get("key_col") or "id"
+        self._key_col_cache[collection] = kc
+        return kc
 
     def attach_indexer(self, indexer) -> None:
         """Attach a CollectionMetadata or CollectionIndexer for auto-notify.
@@ -259,10 +287,32 @@ class VectorLens(PondLens):
             row["metadata"] = json.dumps(metadata) if metadata else "{}"
             rows.append(row)
 
-        commit_hash = self._unified_storage.append(
-            collection, rows, key_col="id",
-            row_group_size=10_000,
-            message=message or f"vector insert: {len(rows)} vectors")
+        # Decide: append (existing collection) or write (new)?
+        existing_manifest = self._unified_storage._load_manifest(collection)
+        if existing_manifest is None:
+            # NEW collection — write() creates the first manifest.
+            # Stamp cross-lens metadata so other lenses know this is a
+            # vector collection with key_col="id" and per-dim columns.
+            commit_hash = self._unified_storage.write(
+                collection, rows, key_col="id",
+                row_group_size=10_000,
+                message=message or f"vector insert: {len(rows)} vectors")
+            schema = {"id": "string", "metadata": "string"}
+            if self._n_dimensions:
+                for d in range(self._n_dimensions):
+                    schema[f"dim_{d}"] = "float64"
+            else:
+                schema["vector"] = "string"
+            self.stamp_collection_metadata(
+                collection, lens_type="vector", key_col="id",
+                schema_hint=schema,
+                extra={"n_dimensions": self._n_dimensions})
+        else:
+            # EXISTING collection — append (preserves existing rows).
+            commit_hash = self._unified_storage.append(
+                collection, rows, key_col="id",
+                row_group_size=10_000,
+                message=message or f"vector insert: {len(rows)} vectors")
         del self._unified_buffer[collection]
         return commit_hash
 
@@ -282,32 +332,51 @@ class VectorLens(PondLens):
 
         Unified storage path: 4 GETs cold point lookup.
         Fix (Round 24 Issue #3): reads per-dim FLOAT64 columns when available.
+
+        CROSS-LENS: if the collection was created by another lens, this
+        reads the full row by metadata.key_col and returns it as-is.
+        Vector-specific fields (vector, metadata) are best-effort: if
+        the row has dim_*/vector columns, they're parsed; otherwise
+        the row is returned with vector=[] and metadata={} (ugly shape
+        but full visibility).
         """
         # Unified storage path
         if self._unified_storage is not None:
-            # Fix (Round 24): convert numeric string ID to int for lookup
+            # Resolve the key column from metadata (cross-lens aware, cached)
+            key_col = self._resolve_key_col(collection)
+            # Convert numeric string ID to int for lookup if key_col is "id"
             try:
-                lookup_key = str(int(id))
+                lookup_key = str(int(id)) if key_col == "id" else str(id)
             except (ValueError, TypeError):
                 lookup_key = str(id)
-            # Build column list: id + dim_0..dim_N + metadata (or vector + metadata)
-            if self._n_dimensions:
-                cols = ["id"] + [f"dim_{d}" for d in range(self._n_dimensions)] + ["metadata"]
-            else:
-                cols = ["id", "vector", "metadata"]
-            row = self._unified_storage.point_lookup(
-                collection, key=lookup_key, columns=cols)
-            if row is None or row.get("id") is None:
+            # Read the row (no column projection — get everything)
+            row = self._unified_storage.point_lookup(collection, key=lookup_key)
+            if row is None or row.get(key_col) is None:
                 return None
-            # Reassemble vector from per-dim columns or JSON
-            if self._n_dimensions and f"dim_0" in row:
-                vector = [row.get(f"dim_{d}") for d in range(self._n_dimensions)]
-            else:
-                vector = json.loads(row["vector"]) if row.get("vector") else []
+            # Try to reassemble a vector from per-dim columns or vector column
+            vector = []
+            metadata = {}
+            if f"dim_0" in row:
+                # Per-dim columns
+                d = 0
+                while f"dim_{d}" in row:
+                    vector.append(row[f"dim_{d}"])
+                    d += 1
+            elif "vector" in row and isinstance(row["vector"], str):
+                try:
+                    vector = json.loads(row["vector"])
+                except (json.JSONDecodeError, TypeError):
+                    vector = []
+            if "metadata" in row and isinstance(row["metadata"], str):
+                try:
+                    metadata = json.loads(row["metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
             return {
-                "id": row["id"],
+                "id": row.get(key_col),
                 "vector": vector,
-                "metadata": json.loads(row["metadata"]) if row.get("metadata") else {},
+                "metadata": metadata,
+                "_row": row,  # full row for cross-lens visibility
             }
 
         # Legacy path
@@ -320,11 +389,16 @@ class VectorLens(PondLens):
         return self.kernel.read_blob(h) if h else None
 
     def list_vectors(self, collection: str) -> list[str]:
-        """List all vector IDs."""
+        """List all vector IDs.
+
+        CROSS-LENS: works on any collection — returns the values of the
+        key_col column (from metadata), defaulting to "id".
+        """
         # Unified storage path
         if self._unified_storage is not None:
-            rows = self._unified_storage.read(collection, columns=["id"])
-            return [r["id"] for r in rows if r.get("id")]
+            key_col = self._resolve_key_col(collection)
+            rows = self._unified_storage.read(collection, columns=[key_col])
+            return [str(r[key_col]) for r in rows if r.get(key_col) is not None]
 
         # Legacy path
         return [k for k in self._get_base(collection).read_all()
@@ -341,28 +415,46 @@ class VectorLens(PondLens):
                    if not k.startswith("_"))
 
     def get_all(self, collection: str) -> dict[str, dict]:
-        """Read all vectors from the collection."""
+        """Read all vectors from the collection.
+
+        CROSS-LENS: works on any collection. Reads all rows, tries to
+        reassemble vectors from dim_* or vector columns, falls back to
+        empty vectors for non-vector collections (ugly shape but full
+        visibility — caller sees the full row in _row).
+        """
         # Unified storage path
         if self._unified_storage is not None:
-            # Fix (Round 24): handle both per-dim and JSON-string vector formats
-            if self._n_dimensions:
-                cols = ["id"] + [f"dim_{d}" for d in range(self._n_dimensions)] + ["metadata"]
-            else:
-                cols = ["id", "vector", "metadata"]
-            rows = self._unified_storage.read(collection, columns=cols)
+            key_col = self._resolve_key_col(collection)
+            rows = self._unified_storage.read(collection)
             result = {}
             for r in rows:
-                if r.get("id") is not None:
-                    # Reassemble vector from per-dim columns or JSON
-                    if self._n_dimensions and f"dim_0" in r:
-                        vector = [r.get(f"dim_{d}") for d in range(self._n_dimensions)]
-                    else:
-                        vector = json.loads(r["vector"]) if r.get("vector") else []
-                    result[str(r["id"])] = {
-                        "id": r["id"],
-                        "vector": vector,
-                        "metadata": json.loads(r["metadata"]) if r.get("metadata") else {},
-                    }
+                k = r.get(key_col)
+                if k is None:
+                    continue
+                # Try to reassemble vector
+                vector = []
+                if f"dim_0" in r:
+                    d = 0
+                    while f"dim_{d}" in r:
+                        vector.append(r[f"dim_{d}"])
+                        d += 1
+                elif "vector" in r and isinstance(r["vector"], str):
+                    try:
+                        vector = json.loads(r["vector"])
+                    except (json.JSONDecodeError, TypeError):
+                        vector = []
+                metadata = {}
+                if "metadata" in r and isinstance(r["metadata"], str):
+                    try:
+                        metadata = json.loads(r["metadata"])
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                result[str(k)] = {
+                    "id": k,
+                    "vector": vector,
+                    "metadata": metadata,
+                    "_row": r,  # full row for cross-lens visibility
+                }
             return result
 
         # Legacy path

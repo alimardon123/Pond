@@ -37,7 +37,18 @@ sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 
 from kernel import PondMinimal
 sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))
-from keyvalue_lens import KeyValueLens as Lens
+from keyvalue_lens import KeyValueLens
+
+
+# These architecture laws test ProllyTreeIndex-specific features (snapshot
+# replay, blob lookup via lens.base, etc.). They explicitly use LEGACY mode
+# (use_unified_storage=False) so the data goes to the ProllyTreeIndex.
+# The cross-lens default (unified mode) is tested separately in
+# scripts/test_cross_lens_universal.py.
+class Lens(KeyValueLens):
+    """Legacy-mode KeyValueLens for architecture law testing."""
+    def __init__(self, kernel, name=None):
+        super().__init__(kernel, name, use_unified_storage=False)
 # CollectionMetadata is a legacy module (moved to archive/legacy-extensions/).
 # Provide a stub so the import doesn't fail.
 try:

@@ -140,6 +140,24 @@ class PondStorage:
         """Read lens-specific metadata for a collection."""
         return self._lens.get_definition(name)
 
+    def stamp_collection_metadata(self, name: str, **kwargs) -> str:
+        """Stamp cross-lens metadata on a collection. See base_lens.PondLens."""
+        return self._lens.stamp_collection_metadata(name, **kwargs)
+
+    def get_collection_metadata(self, name: str) -> dict:
+        """Read cross-lens metadata for a collection. See base_lens.PondLens."""
+        return self._lens.get_collection_metadata(name)
+
+    def list_collections_with_metadata(self) -> list[dict]:
+        """List ALL collections with their cross-lens metadata.
+
+        Returns a list of {"name", "lens_type", "key_col", "schema_hint",
+        "created_at"} for every collection in the pond, regardless of
+        which lens created it. Any lens can call this to see the entire
+        pond.
+        """
+        return self._lens.list_collections_with_metadata()
+
     def resolve_ref(self, name: str) -> Optional[str]:
         """Resolve a ref name to its current hash."""
         return self.kernel.resolve(name)

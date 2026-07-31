@@ -3878,3 +3878,62 @@ Final architecture summary:
   Full scan: 3 + K GETs, parallel fetch → ~1 RTT wall-clock
   Streaming read: O(batch_size) memory, suitable for 1B+ rows
   Time-travel: via manifest_hash (no ref mutation, no race condition)
+
+---
+Task ID: round-25-cross-lens-universal
+Agent: main
+Task: Make any lens able to read/write any collection created by any other lens — no CrossLens glue code. Each collection carries small metadata (lens_type, key_col, schema_hint) for visibility, but the access path is the same regardless of which lens created it. 8 lakehouse + 3 KV = 11 collections visible from every lens.
+
+Work Log:
+- Added cross-lens collection metadata contract to base_lens.py (PondLens):
+  * stamp_collection_metadata(name, lens_type=, key_col=, schema_hint=, extra=) — called by every lens on collection creation
+  * get_collection_metadata(name) → {lens_type, lens_version, key_col, schema_hint, created_at, extra, raw}
+  * list_collections_with_metadata() → [{name, lens_type, key_col, schema_hint, created_at}, ...] for ALL collections in the pond
+  * Stored at collections/{name}/definition (re-uses existing set_definition/get_definition — opaque JSON)
+- Added the same three methods to PondStorage (delegates to internal PondLens)
+- Flipped defaults: KeyValueLens, VectorLens, StreamingLens now default to use_unified_storage=True (cross-lens default). Legacy ProllyTreeIndex path kept as opt-in for backward compat.
+- KeyValueLens:
+  * Added _resolve_key_col(collection) — reads metadata.key_col, falls back to "_key" (KV's own default). Cached on the lens instance so cold lookup costs 1 extra GET, subsequent lookups are free.
+  * get/get_all/keys/exists/count all use _resolve_key_col → can read any collection (lakehouse, vector, streaming)
+  * get() on a non-KV collection returns the FULL row dict (cross-lens visibility)
+  * commit() stamps metadata on new collection creation (lens_type="keyvalue", key_col="_key", schema_hint={"_key":"string","value":"bytes"})
+  * commit() on existing collection appends without overwriting metadata (ugly shape: appended rows have only _key+value columns, others become None — but readable by any lens)
+- VectorLens:
+  * Added _resolve_key_col with caching (same pattern as KV)
+  * get_vector/list_vectors/get_all use _resolve_key_col → can read any collection
+  * get_vector on a non-vector collection returns {id, vector=[], metadata={}, _row=full_row_dict} — ugly shape but full visibility
+  * commit() stamps metadata (lens_type="vector", key_col="id", schema_hint with per-dim columns, extra={"n_dimensions": N})
+- StreamingLens:
+  * read_stream checks metadata.lens_type=="streaming" → uses native range scan
+  * read_stream on non-streaming collection → best-effort: reads all rows, concatenates bytes-typed column values (ugly but full visibility)
+  * write_stream stamps metadata (lens_type="streaming", key_col="offset", schema_hint={"offset":"int64","segment":"bytes"}, extra={"segment_size":..., "total_bytes":...})
+- LakehouseLens:
+  * create_table stamps metadata (lens_type="lakehouse", key_col, schema_hint from Arrow schema)
+  * insert reads metadata.key_col if not specified explicitly (cross-lens aware)
+  * Added list_collections_with_metadata() and get_collection_metadata() accessors
+- Added scripts/test_cross_lens_universal.py — 7 tests:
+  1. 8 lakehouse + 3 KV = 11 collections visible from all 4 lenses (PondStorage, KV, Vector, Streaming)
+  2. KV lens reads lakehouse collection (uses metadata.key_col="id")
+  3. Lakehouse/PondStorage reads KV collection
+  4. Vector lens reads lakehouse collection (empty vector, full row in _row)
+  5. Streaming lens reads KV collection (concatenates bytes columns)
+  6. KV lens appends to lakehouse collection (ugly shape, but readable)
+  7. PondStorage reads/writes any collection uniformly (4 different lens types, same API)
+- Updated scripts/test_keyvalue_unified.py and scripts/test_vector_unified.py:
+  * Cold point lookup now 5 GETs (first call, includes metadata fetch) — was 4
+  * Warm point lookup (subsequent) is 4 GETs — metadata is cached on the lens
+  * Added explicit warm-lookup assertion to prove caching works
+- Updated tests/architecture/architecture_laws.py:
+  * Created a local `Lens` subclass that explicitly uses use_unified_storage=False
+  * These laws test ProllyTreeIndex-specific features (snapshot replay, lens.base.lookup, etc.) so they need legacy mode
+  * Cross-lens universal access is tested separately in test_cross_lens_universal.py
+- Added scripts/test_cross_lens_universal.py to KNOWLEDGE_GRAPH.md
+
+Stage Summary:
+- ANY lens can now read/write ANY collection created by ANY other lens, with NO cross-lens glue code
+- Each collection carries small metadata (lens_type, key_col, schema_hint, created_at) so lenses know what shape to expect — the "small metadata about which lens created it" the user asked for
+- The "ugly shape" the user explicitly allowed: e.g., KV reading a lakehouse collection sees the full row dict (not just key+value); Vector reading a lakehouse collection sees empty vector + _row with full row; Streaming reading a non-streaming collection concatenates bytes columns
+- list_collections_with_metadata() returns ALL collections with their lens_type — any lens can see the entire pond
+- Performance: cold point lookup costs 1 extra GET (5 vs 4) for the metadata fetch on FIRST call; subsequent lookups on the same collection are 4 GETs (metadata cached on lens)
+- 7/7 cross-lens tests pass; 10/10 multi-workload tests pass; 4/4 KV unified tests pass; 4/4 vector unified tests pass; 12/12 architecture laws pass; 0 regressions in tests/test_all.py (3 pre-existing pyarrow failures remain unchanged)
+- CrossLens helper class in keyvalue_lens.py is now obsolete for the cross-lens use case — kept for backward compat, but new code should just use any lens directly on any collection

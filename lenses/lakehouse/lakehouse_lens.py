@@ -154,6 +154,10 @@ class LakehouseLens:
         Converts the PyArrow Table to list[dict] and writes via PondStorage.
         ONE write path (PND2), no zone maps, no separate manifests.
 
+        CROSS-LENS: stamps metadata (lens_type="lakehouse", key_col,
+        schema_hint from the Arrow schema) so other lenses can identify
+        this collection.
+
         Args:
             table_name: collection name
             data: PyArrow Table to store
@@ -170,6 +174,11 @@ class LakehouseLens:
                                      message=message or f"create {table_name}")
         # Save the manifest hash for time-travel (keyed by commit hash)
         self._save_commit_manifest(table_name, commit_hash)
+        # Stamp cross-lens metadata: schema_hint from Arrow schema
+        schema_hint = {field.name: str(field.type) for field in data.schema}
+        self._storage.stamp_collection_metadata(
+            table_name, lens_type="lakehouse", key_col=key_col,
+            schema_hint=schema_hint)
         return commit_hash
 
     def insert(self, table_name: str, new_data: pa.Table,
@@ -181,16 +190,27 @@ class LakehouseLens:
         Uses PondStorage.append() which preserves existing data —
         no read-rewrite cycle needed.
 
+        CROSS-LENS: works on any collection (lakehouse, KV, vector,
+        streaming). The new rows are appended as-is; if the target
+        collection was created by another lens, the appended rows
+        will have only the columns you provide (other columns become
+        None — "ugly shape" but readable by any lens).
+
         Args:
             table_name: collection name (must already exist)
             new_data: PyArrow Table to append
-            key_col: sort key column (should match create_table)
+            key_col: sort key column (defaults to collection's existing
+                key_col from metadata, or None if no metadata)
             row_group_size: rows per new row group
             message: commit message
 
         Returns:
             The new HEAD commit hash.
         """
+        # Cross-lens: if key_col not specified, try reading it from metadata
+        if key_col is None:
+            md = self._storage.get_collection_metadata(table_name)
+            key_col = md.get("key_col")  # may be None — that's OK
         rows = new_data.to_pylist()
         commit_hash = self._storage.append(table_name, rows, key_col=key_col,
                                       row_group_size=row_group_size,
@@ -564,8 +584,22 @@ class LakehouseLens:
     # ==================================================================
 
     def list_collections(self) -> list[str]:
-        """List all collections."""
+        """List all collections (any lens, any format)."""
         return self._storage.list_collections()
+
+    def list_collections_with_metadata(self) -> list[dict]:
+        """List ALL collections with cross-lens metadata.
+
+        Returns a list of {"name", "lens_type", "key_col", "schema_hint",
+        "created_at"} for every collection in the pond, regardless of
+        which lens created it. LakehouseLens can see and read any of
+        them.
+        """
+        return self._storage.list_collections_with_metadata()
+
+    def get_collection_metadata(self, name: str) -> dict:
+        """Read cross-lens metadata for a collection."""
+        return self._storage.get_collection_metadata(name)
 
     def collection_exists(self, name: str) -> bool:
         """Check if a collection exists."""

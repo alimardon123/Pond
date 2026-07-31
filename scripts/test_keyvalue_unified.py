@@ -113,7 +113,13 @@ def test_unified_kv_multi_commit():
 
 
 def test_unified_kv_point_lookup_4_gets():
-    """Cold point lookup is 4 GETs (vs O(log N) legacy)."""
+    """Cold point lookup is 4-5 GETs (vs O(log N) legacy).
+
+    Cross-lens awareness costs 1 extra GET on the FIRST cold lookup
+    (to fetch the collection's metadata.key_col). The metadata is
+    cached on the lens, so subsequent lookups on the same collection
+    are 4 GETs.
+    """
     kernel, _ = make_object_store_native_kernel()
     kv = KeyValueLens(kernel, use_unified_storage=True)
 
@@ -124,6 +130,7 @@ def test_unified_kv_point_lookup_4_gets():
     # Cold point lookup
     kernel.invalidate_root_cache()
     kv._unified_storage._manifest_cache.clear()
+    kv._key_col_cache.clear()  # cross-lens metadata cache
     kernel.reset_stats()
 
     v = kv.get("big", "k42")
@@ -131,9 +138,21 @@ def test_unified_kv_point_lookup_4_gets():
     assert v["v"] == 42
 
     total_gets = kernel.stats["reads"] + kernel.stats["ref_reads"]
-    print(f"\n  Cold point lookup (k42): {total_gets} GETs")
-    # 2 ref + 1 manifest + 1 data = 4 GETs
-    assert total_gets == 4, f"expected 4 GETs, got {total_gets}"
+    print(f"\n  Cold point lookup (k42): {total_gets} GETs (first call, includes metadata fetch)")
+    # 2 ref + 1 manifest + 1 data + 1 metadata ref = 5 GETs cold (first call)
+    # OR 4 GETs if metadata ref returned None (no definition blob to read)
+    assert total_gets in (4, 5), f"expected 4-5 GETs, got {total_gets}"
+
+    # Second lookup: metadata is cached, so should be 4 GETs
+    kernel.invalidate_root_cache()
+    kv._unified_storage._manifest_cache.clear()
+    kernel.reset_stats()
+    v2 = kv.get("big", "k42")
+    assert v2 is not None
+    assert v2["v"] == 42
+    total_gets_2 = kernel.stats["reads"] + kernel.stats["ref_reads"]
+    print(f"  Warm point lookup (k42): {total_gets_2} GETs (subsequent, metadata cached)")
+    assert total_gets_2 <= 4, f"expected <=4 GETs on warm lookup, got {total_gets_2}"
 
     print("PASS: test_unified_kv_point_lookup_4_gets")
     return True

@@ -88,15 +88,24 @@ class StreamingLens(PondLens):
         lens.append_stream("video_1", more_bytes)
     """
 
-    def __init__(self, kernel: PondMinimal, use_unified_storage: bool = False):
+    def __init__(self, kernel: PondMinimal, use_unified_storage: bool = True):
         """Create a StreamingLens.
 
         Args:
             kernel: the PondMinimal kernel instance
-            use_unified_storage: if True, use UnifiedStorage (PND2 format)
-                as the storage backend. Segments stored as BINARY column
-                values with offset as INT64 key_col. Enables parallel fetch,
-                predicate pushdown, and delta-manifest appends.
+            use_unified_storage: if True (DEFAULT), use UnifiedStorage
+                (PND2 format) as the storage backend. This is the
+                cross-lens default — any lens can read/write any
+                collection through the same PND2 format. Segments
+                stored as BINARY column values with offset as INT64
+                key_col. Setting this to False selects the legacy
+                ProllyTreeIndex + per-segment-blob path (kept for
+                backward compat, but produces collections that other
+                lenses cannot read through PND2).
+
+                Unified storage enables parallel fetch, predicate
+                pushdown, delta-manifest appends, and CROSS-LENS
+                access from any other lens.
         """
         super().__init__(kernel)
         self._bases: dict[str, ProllyLensBase] = {}
@@ -123,18 +132,26 @@ class StreamingLens(PondLens):
         # Unified storage path
         if self._unified_storage is not None:
             if not data:
-                return self._unified_storage.write(collection, [],
+                commit_hash = self._unified_storage.write(collection, [],
                     key_col="offset", message="write_stream: empty")
-            rows = []
-            n_segments = (len(data) + segment_size - 1) // segment_size
-            for i in range(n_segments):
-                start = i * segment_size
-                end = min(start + segment_size, len(data))
-                rows.append({"offset": start, "segment": data[start:end]})
-            return self._unified_storage.write(
-                collection, rows, key_col="offset",
-                row_group_size=max(1, 10_000_000 // segment_size),
-                message=f"write_stream: {len(data)} bytes in {n_segments} segments")
+            else:
+                rows = []
+                n_segments = (len(data) + segment_size - 1) // segment_size
+                for i in range(n_segments):
+                    start = i * segment_size
+                    end = min(start + segment_size, len(data))
+                    rows.append({"offset": start, "segment": data[start:end]})
+                commit_hash = self._unified_storage.write(
+                    collection, rows, key_col="offset",
+                    row_group_size=max(1, 10_000_000 // segment_size),
+                    message=f"write_stream: {len(data)} bytes in {n_segments} segments")
+            # Stamp cross-lens metadata so other lenses know this is a
+            # streaming collection with key_col="offset".
+            self.stamp_collection_metadata(
+                collection, lens_type="streaming", key_col="offset",
+                schema_hint={"offset": "int64", "segment": "bytes"},
+                extra={"segment_size": segment_size, "total_bytes": len(data)})
+            return commit_hash
 
         # Legacy path
         base = self._get_base(collection)
@@ -164,24 +181,50 @@ class StreamingLens(PondLens):
 
         Unified path: uses PondStorage.read with start_key/end_key for
         range scan. Only fetches segments that overlap the byte range.
+
+        CROSS-LENS: works on any collection. If the collection has
+        "offset" and "segment" columns (streaming-native), uses range
+        scan. Otherwise reads all rows and concatenates any bytes-typed
+        column values it can find (ugly shape, but full visibility).
         """
         # Unified storage path
         if self._unified_storage is not None:
-            rows = self._unified_storage.read(collection,
-                start_key=start_byte, end_key=end_byte,
-                columns=["offset", "segment"])
+            # Inspect metadata — is this a streaming-native collection?
+            md = self.get_collection_metadata(collection)
+            is_streaming = md.get("lens_type") == "streaming"
+            if is_streaming:
+                rows = self._unified_storage.read(collection,
+                    start_key=start_byte, end_key=end_byte,
+                    columns=["offset", "segment"])
+                result = b""
+                for row in rows:
+                    seg_offset = row.get("offset", 0)
+                    seg_data = row.get("segment", b"")
+                    if seg_data is None:
+                        continue
+                    # Slice the segment to the requested range
+                    seg_start = max(0, (start_byte or 0) - seg_offset)
+                    seg_end = min(len(seg_data),
+                                  (end_byte or float('inf')) - seg_offset)
+                    if seg_end > seg_start:
+                        result += seg_data[seg_start:int(seg_end)]
+                return result
+            # Cross-lens: not a streaming collection. Best-effort read:
+            # concatenate any bytes-valued columns from all rows.
+            try:
+                rows = self._unified_storage.read(collection)
+            except Exception:
+                return b""
             result = b""
             for row in rows:
-                seg_offset = row.get("offset", 0)
-                seg_data = row.get("segment", b"")
-                if seg_data is None:
-                    continue
-                # Slice the segment to the requested range
-                seg_start = max(0, (start_byte or 0) - seg_offset)
-                seg_end = min(len(seg_data),
-                              (end_byte or float('inf')) - seg_offset)
-                if seg_end > seg_start:
-                    result += seg_data[seg_start:int(seg_end)]
+                for v in row.values():
+                    if isinstance(v, (bytes, bytearray)):
+                        result += bytes(v)
+            # Apply byte range if requested
+            if start_byte is not None and end_byte is not None:
+                return result[start_byte:end_byte]
+            elif start_byte is not None:
+                return result[start_byte:]
             return result
 
         # Legacy path

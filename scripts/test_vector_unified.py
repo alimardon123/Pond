@@ -44,7 +44,12 @@ def test_unified_vector_basic():
 
 
 def test_unified_vector_point_lookup_4_gets():
-    """Cold point lookup is 4 GETs."""
+    """Cold point lookup is 4-5 GETs.
+
+    Cross-lens awareness costs 1 extra GET on the FIRST cold lookup
+    (to fetch the collection's metadata.key_col). Subsequent lookups
+    on the same collection are 4 GETs (metadata cached).
+    """
     kernel, _ = make_object_store_native_kernel()
     vl = VectorLens(kernel, n_dimensions=3, use_unified_storage=True)
 
@@ -62,8 +67,18 @@ def test_unified_vector_point_lookup_4_gets():
     assert vec["vector"] == [42.0, 0.0, 0.0]
 
     total_gets = kernel.stats["reads"] + kernel.stats["ref_reads"]
-    print(f"\n  Cold point lookup (id=42): {total_gets} GETs")
-    assert total_gets == 4, f"expected 4 GETs, got {total_gets}"
+    print(f"\n  Cold point lookup (id=42): {total_gets} GETs (first call, includes metadata fetch)")
+    assert total_gets in (4, 5), f"expected 4-5 GETs, got {total_gets}"
+
+    # Second lookup: metadata cached
+    kernel.invalidate_root_cache()
+    vl._unified_storage._manifest_cache.clear()
+    kernel.reset_stats()
+    vec2 = vl.get_vector("vecs", "42")
+    assert vec2 is not None
+    total_gets_2 = kernel.stats["reads"] + kernel.stats["ref_reads"]
+    print(f"  Warm point lookup (id=42): {total_gets_2} GETs (subsequent, metadata cached)")
+    assert total_gets_2 <= 4, f"expected <=4 GETs on warm lookup, got {total_gets_2}"
 
     print("PASS: test_unified_vector_point_lookup_4_gets")
     return True
