@@ -630,45 +630,130 @@ class PondStorage:
     # GC / Vacuum — reclaim space from unreachable blobs
     # ==================================================================
 
-    def gc(self, collection: Optional[str] = None) -> dict:
+    def gc(self, collection: Optional[str] = None,
+           compute_size: bool = False) -> dict:
         """Analyze reachability — returns live/dead blob counts (read-only).
 
         Args:
             collection: if None, analyze ALL collections. If specified,
-                analyze only that collection (faster for targeted GC).
+                analyze only that collection.
+            compute_size: if True, read each dead blob to compute its size.
+                Default False — skips O(dead) reads. At PB scale, this is
+                the difference between seconds and hours.
 
         Returns:
             {"live": int, "dead": int, "dead_hashes": list, "dead_size_bytes": int}
+            dead_size_bytes is -1 if compute_size=False.
         """
         try:
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                               "extensions", "maintenance"))
             from vacuum import GarbageCollector
             gc = GarbageCollector(self.kernel)
-            return gc.collect(collection)
+            return gc.collect(collection, compute_size)
         except ImportError:
-            return {"live": 0, "dead": 0, "dead_hashes": [], "dead_size_bytes": 0}
+            return {"live": 0, "dead": 0, "dead_hashes": [], "dead_size_bytes": -1}
 
-    def vacuum(self, collection: Optional[str] = None,
+    def vacuum(self, collections: Optional[list] = None,
+               preserve_days: int = 0,
                dry_run: bool = False) -> dict:
         """Delete unreachable blobs — reclaim storage space.
 
+        Delta/Iceberg-style vacuum with preservation:
+
         Args:
-            collection: if None, vacuum ALL collections. If specified,
-                vacuum only that collection.
+            collections: list of collection names to vacuum. If None,
+                vacuum ALL collections. Example: ["events", "users"].
+            preserve_days: keep commits younger than N days. Commits
+                older than this are eligible for deletion. Default 0
+                (only current HEAD + live refs preserved).
+
+                Like Delta/Iceberg vacuum — preserves recent history
+                for time-travel queries. Set to 7 to keep last week.
+
+                Content-addressed blobs shared between preserved and
+                non-preserved commits are NEVER deleted (they're live).
             dry_run: if True, report what would be deleted without deleting.
 
         Returns:
-            {"deleted": int, "freed_bytes": int, "dry_run": bool}
+            {"deleted": int, "preserved": int, "freed_bytes": int, ...}
+
+        Examples:
+            # Vacuum everything (aggressive)
+            storage.vacuum()
+
+            # Vacuum specific collections
+            storage.vacuum(collections=["events", "users"])
+
+            # Vacuum but keep last 7 days for time-travel
+            storage.vacuum(preserve_days=7)
+
+            # Dry run — see what would be deleted
+            storage.vacuum(dry_run=True)
         """
         try:
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                               "extensions", "maintenance"))
             from vacuum import GarbageCollector
             gc = GarbageCollector(self.kernel)
-            return gc.vacuum(collection, dry_run)
+            return gc.vacuum(collections, preserve_days, dry_run)
         except ImportError:
-            return {"deleted": 0, "freed_bytes": 0, "dry_run": dry_run}
+            return {"deleted": 0, "preserved": 0, "freed_bytes": -1,
+                    "dry_run": dry_run, "collections": collections,
+                    "preserve_days": preserve_days}
+
+    def optimize(self, collection: Optional[str] = None) -> dict:
+        """Optimize storage — compact shards + flatten delta manifests.
+
+        Delta/Iceberg-style optimize: merges small files into larger ones
+        for better read performance.
+
+        Does TWO things:
+          1. compact_shards: merge all shards into HEAD (clears shard list)
+          2. compact_manifest: flatten delta-manifest chains into one flat manifest
+
+        Args:
+            collection: if None, optimize ALL collections. If specified,
+                optimize only that collection.
+
+        Returns:
+            {"collections_optimized": int, "shards_compacted": int,
+             "manifests_flattened": int}
+        """
+        if self._unified is None:
+            return {"collections_optimized": 0, "shards_compacted": 0,
+                    "manifests_flattened": 0}
+
+        if collection:
+            collections = [collection]
+        else:
+            collections = self.list_collections()
+
+        shards_compacted = 0
+        manifests_flattened = 0
+        optimized = 0
+
+        for coll in collections:
+            # Check active branch (default main)
+            try:
+                # Compact shards on the active branch
+                shard_count = self._unified.shard_count(coll)
+                if shard_count > 0:
+                    self._unified.compact_shards(coll)
+                    shards_compacted += shard_count
+                # Flatten delta-manifest chain if deep
+                result = self._unified.compact_manifest(coll)
+                if result is not None:
+                    manifests_flattened += 1
+                optimized += 1
+            except Exception:
+                pass
+
+        return {
+            "collections_optimized": optimized,
+            "shards_compacted": shards_compacted,
+            "manifests_flattened": manifests_flattened,
+        }
 
     def delete_collection(self, collection: str) -> bool:
         """Delete a collection by tombstoning its HEAD and manifest refs.
