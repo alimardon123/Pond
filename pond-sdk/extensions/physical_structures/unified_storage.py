@@ -900,18 +900,36 @@ class UnifiedStorage:
         self._sync_manifest_ref_to_head(collection)
 
     def list_branches(self, collection: str) -> list[str]:
-        """List all branches for a collection."""
+        """List all branches for a collection.
+
+        Filters out the shard subpaths (branches/{name}/shards/...) so
+        only actual branch names are returned.
+        """
         prefix = f"collections/{collection}/branches/"
-        return [n[len(prefix):] for n in self.kernel.list_names()
-                if n.startswith(prefix)]
+        branches = set()
+        for n in self.kernel.list_names():
+            if n.startswith(prefix):
+                # Extract branch name: branches/{branch}/...  →  {branch}
+                rest = n[len(prefix):]
+                branch_name = rest.split("/")[0]
+                # Skip the branch HEAD ref itself (it's just "{branch}")
+                if "/" not in rest or rest.endswith("HEAD") or "shards" in rest:
+                    branches.add(branch_name)
+                else:
+                    branches.add(branch_name)
+        return sorted(branches)
 
     def merge(self, collection: str, branch_name: str,
               message: str = "") -> str:
         """Merge a branch into HEAD.
 
-        Reads both manifests, unions row group entries (last-writer-wins
-        for duplicate keys), writes a new manifest + merge commit with
-        two parents.
+        THREE-LEVEL MERGE:
+          1. Row-group level: union HEAD + branch HEAD + all shards from both
+          2. Row level: dedup by _rowid, latest _version wins
+          3. Branch level: writes merge commit with two parents
+
+        Also merges the branch's shards into the target's HEAD and clears
+        the branch's shards (they're now in HEAD).
         """
         branch_head = self.kernel.resolve(
             self._branch_ref(collection, branch_name))
@@ -932,7 +950,7 @@ class UnifiedStorage:
             branch_manifest = CollectionManifest.load(
                 self.kernel, branch_commit["manifest"])
 
-        # Union row group entries (branch wins on conflict)
+        # Union row group entries from HEAD + branch HEAD
         seen: dict[str, RowGroupEntry] = {}
         if head_manifest:
             for rg in head_manifest.scan_with_pruning():
@@ -940,6 +958,18 @@ class UnifiedStorage:
         if branch_manifest:
             for rg in branch_manifest.scan_with_pruning():
                 seen[rg.key] = rg  # branch wins
+
+        # Also merge shards from BOTH branches (target's active branch
+        # and the source branch being merged)
+        target_branch = self._get_active_branch(collection)
+        for shard_manifest in self._parallel_fetch_shard_manifests(
+                self._read_shard_index(collection, target_branch)):
+            for rg in shard_manifest.scan_with_pruning():
+                seen[rg.key] = rg
+        for shard_manifest in self._parallel_fetch_shard_manifests(
+                self._read_shard_index(collection, branch_name)):
+            for rg in shard_manifest.scan_with_pruning():
+                seen[rg.key] = rg
 
         # Build merged manifest
         merged_entries = []
@@ -968,6 +998,22 @@ class UnifiedStorage:
             second_parent=branch_head,
             message=message or f"merge '{branch_name}'",
             index=self._commit_index(collection))
+
+        # Clear the source branch's shards (they're now in HEAD)
+        src_prefix = self._shards_prefix(collection, branch_name)
+        for name in list(self.kernel.list_names()):
+            if name.startswith(src_prefix):
+                empty = self.kernel.write(b"")
+                self.kernel.reference(name, empty)
+        self._write_shard_index(collection, [], branch_name)
+
+        # Also clear the target branch's shards (they're now in HEAD)
+        tgt_prefix = self._shards_prefix(collection, target_branch)
+        for name in list(self.kernel.list_names()):
+            if name.startswith(tgt_prefix):
+                empty = self.kernel.write(b"")
+                self.kernel.reference(name, empty)
+        self._write_shard_index(collection, [], target_branch)
 
         self._active_branches.pop(collection, None)  # merge detaches from branch
         self._invalidate_manifest_cache(collection)
@@ -1109,53 +1155,65 @@ class UnifiedStorage:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _shards_prefix(collection: str) -> str:
-        return f"collections/{collection}/shards/"
+    def _shards_prefix(collection: str, branch: str = "main") -> str:
+        """Shards live UNDER branches — each branch has its own shard set.
+
+        This enables concurrent work on different branches:
+          - 2 writers on feature1 → shards under branches/feature1/shards/
+          - 3 writers on main     → shards under branches/main/shards/
+          - A writer can switch branches mid-work — next shard goes to
+            the new branch automatically (just like git checkout).
+        """
+        return f"collections/{collection}/branches/{branch}/shards/"
+
+    def _get_active_branch(self, collection: str) -> str:
+        """Get the active branch for a collection (default: main)."""
+        active = self._active_branches.get(collection)
+        if active:
+            # active is stored as the full ref path — extract branch name
+            # collections/{name}/branches/{branch} → {branch}
+            prefix = f"collections/{collection}/branches/"
+            if active.startswith(prefix):
+                return active[len(prefix):]
+        return "main"
 
     @staticmethod
-    def _shard_index_ref(collection: str) -> str:
-        """The shard index — a single small blob listing all current shard hashes.
+    def _shard_index_ref(collection: str, branch: str = "main") -> str:
+        """The shard index for a specific branch."""
+        return f"collections/{collection}/branches/{branch}/shard_index"
 
-        Readers fetch this (1 GET) instead of listing + resolving N shard
-        refs (N+1 GETs). Updated on each append_shard via last-writer-wins
-        (idempotent — the index is a G-Set of shard hashes, so concurrent
-        updates produce a superset that the reader merges anyway).
-        """
-        return f"collections/{collection}/shard_index"
-
-    def _read_shard_index(self, collection: str) -> list[str]:
+    def _read_shard_index(self, collection: str, branch: Optional[str] = None) -> list[str]:
         """Read the shard index (1 GET) → list of shard manifest hashes.
 
         Merges the index with a listing to catch any shards written by
-        concurrent writers that haven't updated the index yet. The index
-        is an optimization — listing is the source of truth.
-
-        At PB scale, the listing is filtered to the shard prefix and
-        parallelized, so it's still fast.
+        concurrent writers that haven't updated the index yet.
         """
+        if branch is None:
+            branch = self._get_active_branch(collection)
         # Always do the listing (source of truth) — it's prefix-filtered
-        listed = self.list_shards(collection)
+        listed = self.list_shards(collection, branch)
         # Also try the index (may have shards that are mid-write)
         try:
             import json as _json
-            idx_hash = self.kernel.resolve(self._shard_index_ref(collection))
+            idx_hash = self.kernel.resolve(self._shard_index_ref(collection, branch))
             if idx_hash is not None:
                 data = self.kernel.read_blob(idx_hash)
                 indexed = list(_json.loads(data))
-                # Merge — union (G-Set CRDT)
                 return list(set(listed) | set(indexed))
         except (ValueError, KeyError, Exception):
             pass
         return listed
 
-    def _write_shard_index(self, collection: str, shard_hashes: list[str]) -> None:
+    def _write_shard_index(self, collection: str, shard_hashes: list[str],
+                            branch: Optional[str] = None) -> None:
         """Write the shard index (1 PUT). Last-writer-wins is safe because
-        the index is a G-Set — concurrent updates produce a superset that
-        the reader merges via CRDT anyway."""
+        the index is a G-Set."""
+        if branch is None:
+            branch = self._get_active_branch(collection)
         import json as _json
         data = _json.dumps(sorted(set(shard_hashes))).encode()
         idx_hash = self.kernel.write(data)
-        self.kernel.reference(self._shard_index_ref(collection), idx_hash)
+        self.kernel.reference(self._shard_index_ref(collection, branch), idx_hash)
 
     def _parallel_fetch_shard_manifests(self, shard_hashes: list[str]) -> list:
         """Fetch all shard manifests in parallel (~1 RTT wall-clock).
@@ -1324,7 +1382,9 @@ class UnifiedStorage:
             import time as _t
             shard_id = f"{_t.time_ns()}_{id(rows)}"
 
-        shard_ref = f"{self._shards_prefix(collection)}{shard_id}"
+        # Write the shard ref to the ACTIVE BRANCH's shard path
+        branch = self._get_active_branch(collection)
+        shard_ref = f"{self._shards_prefix(collection, branch)}{shard_id}"
         self.kernel.reference(shard_ref, shard_hash)
 
         # Update the shard index (1 PUT) so readers can fetch all shard
@@ -1346,8 +1406,8 @@ class UnifiedStorage:
 
         return shard_hash
 
-    def list_shards(self, collection: str) -> list[str]:
-        """List all shard manifest hashes for a collection.
+    def list_shards(self, collection: str, branch: Optional[str] = None) -> list[str]:
+        """List all shard manifest hashes for a collection's branch.
 
         Returns a list of manifest hashes (not refs). Each hash can be
         loaded via CollectionManifest.load().
@@ -1355,23 +1415,21 @@ class UnifiedStorage:
         Filters out "deleted" shards (those pointing at empty blobs from
         compaction's tombstone).
         """
-        prefix = self._shards_prefix(collection)
-        # Use the kernel's list_names to find shard refs
+        if branch is None:
+            branch = self._get_active_branch(collection)
+        prefix = self._shards_prefix(collection, branch)
         all_names = self.kernel.list_names()
         shard_hashes = []
         for name in all_names:
             if name.startswith(prefix):
                 h = self.kernel.resolve(name)
                 if h is not None:
-                    # Skip tombstoned shards (empty blobs from compaction)
-                    # We check by trying to load as a manifest — if it fails,
-                    # it's not a valid shard manifest
                     try:
                         from collection_manifest import CollectionManifest as _CM
-                        _CM.load(self.kernel, h)  # validate it's a real manifest
+                        _CM.load(self.kernel, h)
                         shard_hashes.append(h)
                     except (ValueError, KeyError):
-                        pass  # tombstoned or invalid — skip
+                        pass
         return shard_hashes
 
     def read_with_shards(self, collection: str,
@@ -1540,13 +1598,15 @@ class UnifiedStorage:
             index=commit_index)
 
         # Clear the shards (tombstone their refs) + reset the shard index
-        prefix = self._shards_prefix(collection)
+        # for the ACTIVE BRANCH
+        branch = self._get_active_branch(collection)
+        prefix = self._shards_prefix(collection, branch)
         for name in list(self.kernel.list_names()):
             if name.startswith(prefix):
                 empty = self.kernel.write(b"")
                 self.kernel.reference(name, empty)
-        # Reset the shard index to empty
-        self._write_shard_index(collection, [])
+        # Reset the shard index to empty for this branch
+        self._write_shard_index(collection, [], branch)
 
         # Update caches
         self._update_caches_after_write(
