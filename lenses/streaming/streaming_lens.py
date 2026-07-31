@@ -371,16 +371,21 @@ class StreamingLens(PondLens):
     # ==================================================================
     # KAFKA-LIKE FEATURES: partitions, consumer groups, offsets
     #
-    # These make Pond competitive with Kafka for streaming workloads:
-    #   - create_topic(name, n_partitions): parallel append/read
-    #   - produce(topic, partition, data): append to a partition
-    #   - consume(topic, partition, group, n): read next N messages
-    #   - commit_offset(group, topic, partition, offset): at-least-once
-    #   - replay_from(topic, partition, offset): time-travel read
+    # UNIFIED DESIGN: topic = collection. Partitions = branches.
+    #
+    # A streaming topic IS a Pond collection. Each partition is a branch
+    # within that collection (branch "p0", "p1", ...). This follows our
+    # architecture: ONE collection, MANY branches, unified storage.
+    #
+    #   create_topic(collection, n_partitions): create collection + N branch partitions
+    #   produce(collection, partition, data): append_shard to branch "p{partition}"
+    #   consume(collection, partition, group, n): read_with_shards from branch
+    #   commit_offset(group, collection, partition, offset): at-least-once
+    #   replay_from(collection, partition, offset): time-travel read
     #
     # How it maps to our architecture (NO new primitives):
-    #   - topic = a namespace (collection name prefix)
-    #   - partition = a collection (topic/p0, topic/p1, ...)
+    #   - topic = a collection (just like any other Pond collection)
+    #   - partition = a branch within the collection (p0, p1, ...)
     #   - consumer group = a ref tracking the last-read offset
     #   - offset = segment number (implicit, sequential)
     #
@@ -390,79 +395,78 @@ class StreamingLens(PondLens):
     #   - offset tracking via small metadata objects
     # ==================================================================
 
-    def create_topic(self, topic: str, n_partitions: int = 1) -> list[str]:
-        """Create a topic with N partitions.
+    def create_topic(self, collection: str, n_partitions: int = 1) -> list[str]:
+        """Create a streaming topic (collection) with N partitions.
 
-        Each partition is a separate collection (topic/p0, topic/p1, ...).
-        Producers pick a partition (round-robin or key-based). Consumers
-        in a group are assigned partitions (rebalancing).
+        The topic IS the collection. Partitions are branches within it
+        (p0, p1, ...). This follows Pond's unified architecture: ONE
+        collection, MANY branches.
 
         Args:
-            topic: topic name
+            collection: collection name (the topic)
             n_partitions: number of partitions (parallelism)
 
         Returns:
-            List of partition collection names.
+            List of partition branch names.
         """
+        # Initialize the collection
+        self.write_stream(collection, b"init", segment_size=1_000_000)
+        # Create partition branches
         partitions = []
         for i in range(n_partitions):
-            p = f"{topic}/p{i}"
-            # Initialize with a single empty segment (creates the collection)
-            self.write_stream(p, b"init", segment_size=1_000_000)
+            p = f"p{i}"
+            if self._unified_storage is not None:
+                self._unified_storage.branch(collection, p)
             partitions.append(p)
         return partitions
 
-    def list_partitions(self, topic: str) -> list[str]:
-        """List all partitions for a topic."""
-        prefix = f"{topic}/p"
-        all_names = self.kernel.list_names()
-        partitions = set()
-        for name in all_names:
-            if name.startswith(f"collections/{prefix}") and name.endswith("/HEAD"):
-                # Extract partition name
-                coll = name[len("collections/"):-len("/HEAD")]
-                if coll.startswith(prefix):
-                    partitions.add(coll)
-        return sorted(partitions)
+    def list_partitions(self, collection: str) -> list[str]:
+        """List all partitions (branches) for a topic (collection)."""
+        if self._unified_storage is not None:
+            branches = self._unified_storage.list_branches(collection)
+            return [b for b in branches if b.startswith("p") and b[1:].isdigit()]
+        return []
 
-    def produce(self, topic: str, partition: int, data: bytes,
+    def produce(self, collection: str, partition: int, data: bytes,
                 segment_size: int = 1_000_000) -> str:
         """Produce (append) data to a specific partition.
 
         Args:
-            topic: topic name
+            collection: collection name (the topic)
             partition: partition number (0-indexed)
             data: bytes to append
             segment_size: segment size for chunking
 
         Returns:
-            The commit hash.
+            The shard manifest hash.
         """
-        coll = f"{topic}/p{partition}"
-        return self.append_stream(coll, data, segment_size)
+        if self._unified_storage is not None:
+            # Checkout the partition branch, then append_shard
+            self._unified_storage.checkout(collection, f"p{partition}")
+            return self.append_stream(collection, data, segment_size)
+        return self.append_stream(collection, data, segment_size)
 
-    def produce_round_robin(self, topic: str, data: bytes,
+    def produce_round_robin(self, collection: str, data: bytes,
                              n_partitions: int = 1) -> tuple[int, str]:
         """Produce to the next partition (round-robin).
 
-        Tracks the last-used partition in memory for round-robin.
-
         Returns:
-            (partition_number, commit_hash)
+            (partition_number, shard_hash)
         """
         if not hasattr(self, '_rr_counter'):
             self._rr_counter: dict[str, int] = {}
-        p = self._rr_counter.get(topic, 0)
-        self._rr_counter[topic] = (p + 1) % n_partitions
-        commit = self.produce(topic, p, data)
+        p = self._rr_counter.get(collection, 0)
+        self._rr_counter[collection] = (p + 1) % n_partitions
+        commit = self.produce(collection, p, data)
         return p, commit
 
-    def get_latest_offset(self, topic: str, partition: int) -> int:
+    def get_latest_offset(self, collection: str, partition: int) -> int:
         """Get the latest offset (segment count) for a partition."""
-        coll = f"{topic}/p{partition}"
-        return self.segment_count(coll)
+        if self._unified_storage is not None:
+            self._unified_storage.checkout(collection, f"p{partition}")
+        return self.segment_count(collection)
 
-    def consume(self, topic: str, partition: int,
+    def consume(self, collection: str, partition: int,
                 group: Optional[str] = None,
                 max_messages: int = 100,
                 timeout_ms: int = 0) -> list[dict]:
@@ -472,7 +476,7 @@ class StreamingLens(PondLens):
         offset. If no group, reads from the beginning.
 
         Args:
-            topic: topic name
+            collection: collection name (the topic)
             partition: partition number
             group: consumer group name (for offset tracking)
             max_messages: max messages to return
@@ -481,20 +485,21 @@ class StreamingLens(PondLens):
         Returns:
             List of {offset, data, partition} dicts.
         """
-        coll = f"{topic}/p{partition}"
+        if self._unified_storage is not None:
+            self._unified_storage.checkout(collection, f"p{partition}")
         start_offset = 0
         if group:
-            start_offset = self._get_offset(group, topic, partition)
+            start_offset = self._get_offset(group, collection, partition)
 
-        latest = self.segment_count(coll)
+        latest = self.segment_count(collection)
         end_offset = min(start_offset + max_messages, latest)
 
         messages = []
         for offset in range(start_offset, end_offset):
-            data = self._read_segment_by_offset(coll, offset)
+            data = self._read_segment_by_offset(collection, offset)
             if data is not None:
                 messages.append({
-                    "topic": topic,
+                    "collection": collection,
                     "partition": partition,
                     "offset": offset,
                     "data": data,
@@ -502,31 +507,31 @@ class StreamingLens(PondLens):
 
         return messages
 
-    def commit_offset(self, group: str, topic: str,
+    def commit_offset(self, group: str, collection: str,
                       partition: int, offset: int) -> str:
         """Commit a consumer offset (at-least-once semantics).
 
-        Stores the offset as a ref: consumer_offsets/{group}/{topic}/p{partition}
+        Stores the offset as a ref: consumer_offsets/{group}/{collection}/p{partition}
         → offset (encoded as a blob).
 
         Args:
             group: consumer group name
-            topic: topic name
+            collection: collection name (the topic)
             partition: partition number
             offset: the offset to commit (next message to read)
 
         Returns:
             The offset blob hash.
         """
-        ref = f"consumer_offsets/{group}/{topic}/p{partition}"
+        ref = f"consumer_offsets/{group}/{collection}/p{partition}"
         offset_bytes = str(offset).encode()
         h = self.kernel.write(offset_bytes)
         self.kernel.reference(ref, h)
         return h
 
-    def _get_offset(self, group: str, topic: str, partition: int) -> int:
+    def _get_offset(self, group: str, collection: str, partition: int) -> int:
         """Get the committed offset for a consumer group (0 if none)."""
-        ref = f"consumer_offsets/{group}/{topic}/p{partition}"
+        ref = f"consumer_offsets/{group}/{collection}/p{partition}"
         h = self.kernel.resolve(ref)
         if h is None:
             return 0
@@ -536,7 +541,7 @@ class StreamingLens(PondLens):
         except (ValueError, KeyError):
             return 0
 
-    def replay_from(self, topic: str, partition: int,
+    def replay_from(self, collection: str, partition: int,
                     offset: int, max_messages: int = 100) -> list[dict]:
         """Replay messages from a specific offset (time-travel read).
 
@@ -544,7 +549,7 @@ class StreamingLens(PondLens):
         consumer group's committed offset.
 
         Args:
-            topic: topic name
+            collection: collection name (the topic)
             partition: partition number
             offset: starting offset (0 = beginning)
             max_messages: max messages to return
@@ -552,16 +557,17 @@ class StreamingLens(PondLens):
         Returns:
             List of {offset, data, partition} dicts.
         """
-        coll = f"{topic}/p{partition}"
-        latest = self.segment_count(coll)
+        if self._unified_storage is not None:
+            self._unified_storage.checkout(collection, f"p{partition}")
+        latest = self.segment_count(collection)
         end_offset = min(offset + max_messages, latest)
 
         messages = []
         for off in range(offset, end_offset):
-            data = self._read_segment_by_offset(coll, off)
+            data = self._read_segment_by_offset(collection, off)
             if data is not None:
                 messages.append({
-                    "topic": topic,
+                    "collection": collection,
                     "partition": partition,
                     "offset": off,
                     "data": data,

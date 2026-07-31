@@ -1076,6 +1076,56 @@ class UnifiedStorage:
         self._sync_manifest_ref_to_head(collection)
         return head[:12] if head else ""
 
+    def revert(self, collection: str, commit_hash: str) -> str:
+        """Revert HEAD to a specific commit — like `git revert` / `git reset`.
+
+        Points HEAD at the given commit_hash, regardless of how many
+        steps back it is. Unlike undo (which walks N steps), revert
+        takes an explicit commit hash.
+
+        The commit must be in the collection's history (verified by
+        walking the chain). This prevents reverting to an unrelated
+        commit from a different collection.
+
+        Args:
+            collection: collection name
+            commit_hash: the commit hash to revert to
+
+        Returns:
+            The commit hash that HEAD now points to.
+
+        Raises:
+            ValueError: if the commit is not in the collection's history.
+        """
+        head = self.kernel.resolve(self._head_ref(collection))
+        if head is None:
+            raise ValueError(f"Collection '{collection}' has no commits")
+
+        # Verify the commit is in our history (safety check)
+        current = head
+        found = False
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            if current == commit_hash:
+                found = True
+                break
+            commit = self._read_commit_blob(current)
+            if commit is None:
+                break
+            current = commit.get("parent")
+
+        if not found:
+            raise ValueError(
+                f"Commit {commit_hash[:12]} is not in the history of "
+                f"collection '{collection}'")
+
+        # Revert HEAD to the specified commit
+        self.kernel.reference(self._head_ref(collection), commit_hash)
+        self._active_branches.pop(collection, None)  # detach from branch
+        self._sync_manifest_ref_to_head(collection)
+        return commit_hash[:12]
+
     def history(self, collection: str, limit: int = 100) -> list[dict]:
         """Walk the commit chain from HEAD backwards."""
         head = self.kernel.resolve(self._head_ref(collection))
@@ -1559,9 +1609,17 @@ class UnifiedStorage:
         # Combine into rows
         all_rows: list[dict] = []
         for col_data in col_data_list:
-            n = len(next(iter(col_data.values()))) if col_data else 0
+            if not col_data:
+                continue
+            # Get the row count from the first column (all should be same length)
+            n = len(next(iter(col_data.values())))
             for i in range(n):
-                row = {c: vals[i] for c, vals in col_data.items()}
+                row = {}
+                for c, vals in col_data.items():
+                    if i < len(vals):
+                        row[c] = vals[i]
+                    else:
+                        row[c] = None
                 all_rows.append(row)
 
         # Level 2 merge: dedup by _rowid, latest _version wins (CRDT)
@@ -1621,9 +1679,16 @@ class UnifiedStorage:
         col_data_list = self._parallel_fetch_and_decode(row_groups, None, None)
         all_rows: list[dict] = []
         for col_data in col_data_list:
-            n = len(next(iter(col_data.values()))) if col_data else 0
+            if not col_data:
+                continue
+            n = len(next(iter(col_data.values())))
             for i in range(n):
-                row = {c: vals[i] for c, vals in col_data.items()}
+                row = {}
+                for c, vals in col_data.items():
+                    if i < len(vals):
+                        row[c] = vals[i]
+                    else:
+                        row[c] = None
                 all_rows.append(row)
 
         # Level 2: row-level CRDT merge (dedup by _rowid, drop tombstones)

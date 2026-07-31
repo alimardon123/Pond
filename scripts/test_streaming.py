@@ -13,15 +13,17 @@ from streaming_lens import StreamingLens
 
 
 def test_create_topic_partitions():
-    """Create topic with N partitions."""
+    """Create topic with N partitions (topic = collection, partitions = branches)."""
     kernel, _ = make_object_store_native_kernel()
     sl = StreamingLens(kernel)
     partitions = sl.create_topic("events", n_partitions=3)
     assert len(partitions) == 3
-    assert "events/p0" in partitions
+    assert "p0" in partitions
+    assert "p1" in partitions
+    assert "p2" in partitions
     listed = sl.list_partitions("events")
     assert len(listed) == 3
-    print(f"PASS: test_create_topic_partitions — {len(partitions)} partitions")
+    print(f"PASS: test_create_topic_partitions — {len(partitions)} partitions (branches)")
     return True
 
 

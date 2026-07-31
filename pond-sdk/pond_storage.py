@@ -254,6 +254,32 @@ class PondStorage:
             raise RuntimeError("UnifiedStorage not available")
         return self._unified.undo(name, steps)
 
+    def revert(self, name: str, commit_hash: str) -> str:
+        """Revert HEAD to a specific commit — like `git revert` / `git reset`.
+
+        Points HEAD at the given commit_hash, regardless of how many
+        steps back it is. Unlike undo (which walks N steps), revert
+        takes an explicit commit hash.
+
+        Args:
+            name: collection name
+            commit_hash: the commit hash to revert to (must be in history)
+
+        Returns:
+            The commit hash that HEAD now points to.
+
+        Example:
+            # Get a specific commit from history
+            hist = storage.history("users")
+            old_commit = hist[5]["hash"]  # 5 commits ago
+
+            # Revert to that commit
+            storage.revert("users", old_commit)
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.revert(name, commit_hash)
+
     def history(self, name: str, limit: int = 100) -> list[dict]:
         """Walk the commit history for a collection."""
         if self._unified is not None:
