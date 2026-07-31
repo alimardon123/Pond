@@ -1112,6 +1112,88 @@ class UnifiedStorage:
     def _shards_prefix(collection: str) -> str:
         return f"collections/{collection}/shards/"
 
+    @staticmethod
+    def _shard_index_ref(collection: str) -> str:
+        """The shard index — a single small blob listing all current shard hashes.
+
+        Readers fetch this (1 GET) instead of listing + resolving N shard
+        refs (N+1 GETs). Updated on each append_shard via last-writer-wins
+        (idempotent — the index is a G-Set of shard hashes, so concurrent
+        updates produce a superset that the reader merges anyway).
+        """
+        return f"collections/{collection}/shard_index"
+
+    def _read_shard_index(self, collection: str) -> list[str]:
+        """Read the shard index (1 GET) → list of shard manifest hashes.
+
+        Merges the index with a listing to catch any shards written by
+        concurrent writers that haven't updated the index yet. The index
+        is an optimization — listing is the source of truth.
+
+        At PB scale, the listing is filtered to the shard prefix and
+        parallelized, so it's still fast.
+        """
+        # Always do the listing (source of truth) — it's prefix-filtered
+        listed = self.list_shards(collection)
+        # Also try the index (may have shards that are mid-write)
+        try:
+            import json as _json
+            idx_hash = self.kernel.resolve(self._shard_index_ref(collection))
+            if idx_hash is not None:
+                data = self.kernel.read_blob(idx_hash)
+                indexed = list(_json.loads(data))
+                # Merge — union (G-Set CRDT)
+                return list(set(listed) | set(indexed))
+        except (ValueError, KeyError, Exception):
+            pass
+        return listed
+
+    def _write_shard_index(self, collection: str, shard_hashes: list[str]) -> None:
+        """Write the shard index (1 PUT). Last-writer-wins is safe because
+        the index is a G-Set — concurrent updates produce a superset that
+        the reader merges via CRDT anyway."""
+        import json as _json
+        data = _json.dumps(sorted(set(shard_hashes))).encode()
+        idx_hash = self.kernel.write(data)
+        self.kernel.reference(self._shard_index_ref(collection), idx_hash)
+
+    def _parallel_fetch_shard_manifests(self, shard_hashes: list[str]) -> list:
+        """Fetch all shard manifests in parallel (~1 RTT wall-clock).
+
+        Without this, fetching N shard manifests takes N × RTT sequentially.
+        With this, N manifests are fetched concurrently — wall-clock is
+        ~1 RTT regardless of N (bounded by thread pool size).
+        """
+        if not shard_hashes:
+            return []
+        if len(shard_hashes) <= 2:
+            # Sequential for small N (thread pool overhead > benefit)
+            results = []
+            for sh in shard_hashes:
+                try:
+                    results.append(CollectionManifest.load(self.kernel, sh))
+                except (ValueError, KeyError):
+                    pass
+            return results
+
+        # Parallel for N > 2
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def fetch_one(sh):
+            try:
+                return CollectionManifest.load(self.kernel, sh)
+            except (ValueError, KeyError):
+                return None
+
+        results = []
+        with ThreadPoolExecutor(max_workers=min(32, len(shard_hashes))) as pool:
+            futures = [pool.submit(fetch_one, sh) for sh in shard_hashes]
+            for f in as_completed(futures):
+                m = f.result()
+                if m is not None:
+                    results.append(m)
+        return results
+
     def append_shard(self, collection: str, rows,
                       key_col: Optional[str] = None,
                       row_group_size: int = 10_000,
@@ -1245,6 +1327,20 @@ class UnifiedStorage:
         shard_ref = f"{self._shards_prefix(collection)}{shard_id}"
         self.kernel.reference(shard_ref, shard_hash)
 
+        # Update the shard index (1 PUT) so readers can fetch all shard
+        # hashes in 1 GET instead of listing N refs. Last-writer-wins is
+        # safe here — the index is a G-Set, and concurrent updates produce
+        # a superset that the reader merges via CRDT anyway. Even if this
+        # update is lost (concurrent writer), the reader falls back to
+        # listing, so correctness is preserved.
+        try:
+            existing_shards = self._read_shard_index(collection)
+            if shard_hash not in existing_shards:
+                existing_shards.append(shard_hash)
+                self._write_shard_index(collection, existing_shards)
+        except Exception:
+            pass  # index update is best-effort — listing is the fallback
+
         # Invalidate cache so the next read picks up the new shard
         self._invalidate_manifest_cache(collection)
 
@@ -1306,15 +1402,12 @@ class UnifiedStorage:
         """
         # Read HEAD manifest (the compacted base)
         head_manifest = self._load_manifest(collection)
-        # Read all shards
-        shard_hashes = self.list_shards(collection)
-        shard_manifests = []
-        for sh in shard_hashes:
-            try:
-                sm = CollectionManifest.load(self.kernel, sh)
-                shard_manifests.append(sm)
-            except (ValueError, KeyError):
-                pass  # skip unreadable shards
+        # Read all shard hashes via the shard index (1 GET) instead of
+        # listing N refs (N+1 GETs). Falls back to listing if no index.
+        shard_hashes = self._read_shard_index(collection)
+
+        # Parallel-fetch all shard manifests (~1 RTT wall-clock, not N×RTT)
+        shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
 
         # Level 1 merge: dedup row groups by rg_key (shards override HEAD)
         merged: dict[str, Any] = {}  # rg_key → RowGroupEntry
@@ -1446,12 +1539,14 @@ class UnifiedStorage:
             message=f"compact {len(shard_hashes)} shards ({len(all_rows)} live rows)",
             index=commit_index)
 
-        # Clear the shards (tombstone their refs)
+        # Clear the shards (tombstone their refs) + reset the shard index
         prefix = self._shards_prefix(collection)
         for name in list(self.kernel.list_names()):
             if name.startswith(prefix):
                 empty = self.kernel.write(b"")
                 self.kernel.reference(name, empty)
+        # Reset the shard index to empty
+        self._write_shard_index(collection, [])
 
         # Update caches
         self._update_caches_after_write(

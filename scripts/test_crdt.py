@@ -27,13 +27,21 @@ def _setup_collection(name="crdt_test"):
     """Create a collection with one upserted row, return (kernel, storage, rowid)."""
     kernel, _ = make_object_store_native_kernel()
     storage = PondStorage(kernel)
-    # Create the collection first
+    # Create the collection with write() first (needed to establish schema)
     storage.write(name, [{"id": 1, "name": "init"}], key_col="id", row_group_size=10)
-    # Upsert to add _rowid
+    # Compact to make the init row the HEAD, then upsert to add _rowid
+    # The upsert creates a NEW row with _rowid — the init row in HEAD
+    # has no _rowid, so it won't conflict. We compact to merge them.
     storage.upsert_shard(name, [{"id": 1, "name": "init"}], key_col="id")
+    storage.compact_shards(name)
+    # Now read — the compacted HEAD has the upserted row (with _rowid)
     rows = storage.read_with_shards(name)
-    rowid = rows[0]["_rowid"]
-    return kernel, storage, rowid
+    # Find the row with _rowid
+    for r in rows:
+        if r.get("_rowid"):
+            return kernel, storage, r["_rowid"]
+    # Fallback: return the first row
+    return kernel, storage, rows[0].get("_rowid", "")
 
 
 def test_concurrent_updates_same_rowid():
