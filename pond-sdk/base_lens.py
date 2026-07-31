@@ -120,20 +120,91 @@ class PondLens:
         """Check if a collection has a HEAD ref."""
         return self.kernel.resolve(self._head_ref(name)) is not None
 
-    def list_collections(self) -> list[str]:
+    def list_collections(self, namespace: Optional[str] = None) -> list[str]:
         """List ALL collections (any lens, any format).
 
         Collections are identified by the `collections/{name}/HEAD` ref
         pattern. This works for any lens because they all share the
         same namespace convention.
+
+        HIERARCHICAL NAMESPACES:
+            Collection names can contain `/` for hierarchical organization:
+              "events"              → top-level
+              "dev/events"          → under "dev" namespace
+              "dev/team1/events"    → under "dev/team1" namespace
+              "prod/analytics/2024/events"  → 4 levels deep
+
+            This is dynamic depth — use as many levels as you need.
+
+        Args:
+            namespace: optional namespace prefix to filter by.
+                e.g., "dev" returns ["dev/events", "dev/users"] but not
+                "prod/events" or "events".
+
+        Returns:
+            Sorted list of collection names.
         """
         names = self.kernel.list_names()
         collections = set()
         for n in names:
-            if n.startswith("collections/") and n.endswith("/HEAD"):
-                coll = n[len("collections/"):-len("/HEAD")]
-                collections.add(coll)
+            # Must start with "collections/" and end with "/HEAD"
+            if not (n.startswith("collections/") and n.endswith("/HEAD")):
+                continue
+            # Extract the collection name between "collections/" and "/HEAD"
+            coll = n[len("collections/"):-len("/HEAD")]
+            # Filter out non-collection HEADs (branches are at
+            # collections/{name}/branches/{branch}, not .../HEAD)
+            # The collection HEAD is the ONLY ref that ends with "/HEAD"
+            # at the collection level. Branch HEADs don't exist as refs.
+            if namespace:
+                # Filter by namespace prefix
+                if not (coll == namespace or coll.startswith(namespace + "/")):
+                    continue
+            collections.add(coll)
         return sorted(collections)
+
+    def list_namespaces(self, parent: Optional[str] = None) -> list[str]:
+        """List namespaces (one level deep) under a parent namespace.
+
+        HIERARCHICAL NAMESPACES:
+            Namespaces are derived from collection names using `/` as
+            the separator. This method returns the distinct namespace
+            names at the next level.
+
+        Examples:
+            Collections: ["dev/events", "dev/users", "prod/events", "logs"]
+            list_namespaces() → ["dev", "logs", "prod"]
+            list_namespaces("dev") → ["events", "users"]
+            list_namespaces("dev/events") → []  (no sub-namespaces)
+
+        Args:
+            parent: optional parent namespace. If None, returns top-level
+                namespaces.
+
+        Returns:
+            Sorted list of namespace names at the next level.
+        """
+        all_collections = self.list_collections()
+        namespaces = set()
+        for coll in all_collections:
+            parts = coll.split("/")
+            if parent:
+                # Filter: collection must be under the parent namespace
+                parent_parts = parent.split("/")
+                if len(parts) <= len(parent_parts):
+                    continue
+                if parts[:len(parent_parts)] != parent_parts:
+                    continue
+                # The next level is parts[len(parent_parts)]
+                namespaces.add(parts[len(parent_parts)])
+            else:
+                # Top level: first path segment
+                if len(parts) > 1:
+                    namespaces.add(parts[0])
+                else:
+                    # Top-level collection (no namespace) — include it
+                    namespaces.add(coll)
+        return sorted(namespaces)
 
     def set_definition(self, name: str, definition: dict) -> str:
         """Store Lens-specific metadata for a collection (optional).

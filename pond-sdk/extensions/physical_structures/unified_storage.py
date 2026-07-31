@@ -889,8 +889,8 @@ class UnifiedStorage:
     def checkout(self, collection: str, branch_name: str) -> None:
         """Checkout a branch — point HEAD at the branch's commit.
 
-        Sets the active branch so subsequent commits/append update the
-        branch ref too (git-like behavior).
+        Sets the active branch so subsequent commits/append/shard writes
+        go to this branch (git-like behavior).
         """
         h = self.kernel.resolve(self._branch_ref(collection, branch_name))
         if h is None:
@@ -898,6 +898,24 @@ class UnifiedStorage:
         self.kernel.reference(self._head_ref(collection), h)
         self._active_branches[collection] = self._branch_ref(collection, branch_name)
         self._sync_manifest_ref_to_head(collection)
+
+    def checkout_new(self, collection: str, branch_name: str) -> str:
+        """Create a branch AND checkout — like `git checkout -b`.
+
+        Combines branch() + checkout() in one call:
+          1. Creates the branch from current HEAD
+          2. Checks it out (sets active branch)
+
+        Args:
+            collection: collection name
+            branch_name: name of the new branch
+
+        Returns:
+            The new branch's HEAD commit hash.
+        """
+        self.branch(collection, branch_name)
+        self.checkout(collection, branch_name)
+        return self.kernel.resolve(self._head_ref(collection))
 
     def list_branches(self, collection: str) -> list[str]:
         """List all branches for a collection.
@@ -919,18 +937,30 @@ class UnifiedStorage:
                     branches.add(branch_name)
         return sorted(branches)
 
-    def merge(self, collection: str, branch_name: str,
+    def merge(self, collection: str, source_branch: str,
+              target_branch: Optional[str] = None,
               message: str = "") -> str:
-        """Merge a branch into HEAD.
+        """Merge a source branch into a target branch.
+
+        Args:
+            collection: collection name
+            source_branch: the branch to merge FROM
+            target_branch: the branch to merge INTO. If None, uses the
+                currently active branch (backward compat).
+            message: commit message for the merge
 
         THREE-LEVEL MERGE:
-          1. Row-group level: union HEAD + branch HEAD + all shards from both
+          1. Row-group level: union target HEAD + source HEAD + all shards from both
           2. Row level: dedup by _rowid, latest _version wins
-          3. Branch level: writes merge commit with two parents
+          3. Branch level: writes merge commit with two parents, clears shards
 
-        Also merges the branch's shards into the target's HEAD and clears
-        the branch's shards (they're now in HEAD).
+        Also merges both branches' shards into the target's HEAD and clears
+        the shards from both branches.
         """
+        branch_name = source_branch  # for backward compat with internal code
+        if target_branch is None:
+            target_branch = self._get_active_branch(collection)
+
         branch_head = self.kernel.resolve(
             self._branch_ref(collection, branch_name))
         if branch_head is None:
@@ -959,9 +989,8 @@ class UnifiedStorage:
             for rg in branch_manifest.scan_with_pruning():
                 seen[rg.key] = rg  # branch wins
 
-        # Also merge shards from BOTH branches (target's active branch
+        # Also merge shards from BOTH branches (target branch
         # and the source branch being merged)
-        target_branch = self._get_active_branch(collection)
         for shard_manifest in self._parallel_fetch_shard_manifests(
                 self._read_shard_index(collection, target_branch)):
             for rg in shard_manifest.scan_with_pruning():

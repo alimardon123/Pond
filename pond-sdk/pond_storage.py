@@ -124,9 +124,23 @@ class PondStorage:
     # Section 1: Namespace operations (was PondLens)
     # ==================================================================
 
-    def list_collections(self) -> list[str]:
-        """List all collections (any lens, any format)."""
-        return self._lens.list_collections()
+    def list_collections(self, namespace: Optional[str] = None) -> list[str]:
+        """List all collections (any lens, any format).
+
+        Args:
+            namespace: optional namespace prefix to filter by.
+                e.g., "dev" returns ["dev/events", "dev/users"].
+        """
+        return self._lens.list_collections(namespace)
+
+    def list_namespaces(self, parent: Optional[str] = None) -> list[str]:
+        """List namespaces (one level deep) under a parent namespace.
+
+        Examples:
+            list_namespaces() → ["dev", "logs", "prod"]
+            list_namespaces("dev") → ["events", "users"]
+        """
+        return self._lens.list_namespaces(parent)
 
     def collection_exists(self, name: str) -> bool:
         """Check if a collection has a HEAD ref."""
@@ -196,17 +210,43 @@ class PondStorage:
             raise RuntimeError("UnifiedStorage not available")
         self._unified.checkout(name, branch_name)
 
+    def checkout_new(self, name: str, branch_name: str) -> str:
+        """Create a branch AND checkout — like `git checkout -b`.
+
+        Combines branch() + checkout() in one call.
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.checkout_new(name, branch_name)
+
     def list_branches(self, name: str) -> list[str]:
         """List all branches for a collection."""
         if self._unified is None:
             return []
         return self._unified.list_branches(name)
 
-    def merge(self, name: str, branch_name: str, message: str = "") -> str:
-        """Merge a branch into HEAD — creates a two-parent merge commit."""
+    def merge(self, name: str, source_branch: str,
+              target_branch: Optional[str] = None,
+              message: str = "") -> str:
+        """Merge a source branch into a target branch.
+
+        Args:
+            name: collection name
+            source_branch: the branch to merge FROM
+            target_branch: the branch to merge INTO. If None, uses the
+                currently active branch.
+            message: commit message for the merge
+
+        Examples:
+            # Merge feature1 into the currently active branch
+            storage.merge("events", "feature1")
+
+            # Merge feature1 into main explicitly (no checkout needed)
+            storage.merge("events", "feature1", "main")
+        """
         if self._unified is None:
             raise RuntimeError("UnifiedStorage not available")
-        return self._unified.merge(name, branch_name, message)
+        return self._unified.merge(name, source_branch, target_branch, message)
 
     def undo(self, name: str, steps: int = 1) -> str:
         """Undo the last N commits — walk parent pointers."""
