@@ -799,18 +799,11 @@ class CollectionManifest:
             RowGroupEntry objects for row groups that might match.
             The caller fetches only these data blobs.
         """
-        # P10 fix: LAZY stats tree build — if the manifest has many row
-        # groups but no stats_tree_root, build one on first read.
-        # This keeps writes fast (no O(N log N) tree build on write path)
-        # and only pays the cost when a read actually needs pruning.
-        if not self._stats_tree_root and not self._parent_manifest_hash:
-            try:
-                from stats_tree import should_use_stats_tree, build_stats_tree
-                if should_use_stats_tree(len(self._row_groups)):
-                    root = build_stats_tree(self.kernel, self._row_groups)
-                    self._stats_tree_root = root
-            except ImportError:
-                pass
+        # P10 fix: StatsTree is built during compact/optimize (writer-side),
+        # NOT on the read path. Readers just find it pre-built in the manifest.
+        # If no stats_tree_root exists, fall through to the flat manifest path
+        # (works correctly, just slower at PB scale — O(N) instead of O(log N)).
+        # The read path NEVER writes to storage (read-only consumers are safe).
 
         # PB-scale path: delegate to the stats tree reader
         if self._stats_tree_root:

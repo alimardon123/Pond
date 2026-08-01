@@ -13,8 +13,8 @@
 | Lakehouse full scan | 3+K GETs (parallel, ~1 RTT) | 101 GETs (Iceberg) | ✅ **Competitive** |
 | Vector k-NN @ 10M | ~100K GETs (IVF, 100× reduction) | 5-100 GETs (HNSW) | ⚠️ **Competitive** (IVF, not HNSW) |
 | KV point lookup | 3 GETs (cold) / 0 GETs (warm shard) | <1ms (Redis) | ⚠️ **Competitive** (S3-bound, not in-memory) |
-| Streaming append | 2 PUTs, 0 GETs (warm shard) | <5ms (Kafka) | ✅ **Competitive** |
-| Streaming consumer groups | ✅ partitions + offsets + replay | Kafka consumer groups | ✅ **Feature-complete** |
+| Streaming append | 2 PUTs, 0 GETs (warm shard) | <5ms (Kafka/Fluss) | ✅ **Competitive** |
+| Streaming consumer groups | ✅ partitions + offsets + replay | Kafka/Fluss consumer groups | ✅ **Feature-complete** |
 | Concurrent multi-writer | ✅ CRDT shards, no CAS | Kafka partitions | ✅ **Competitive** |
 | Versioning (branch/merge) | ✅ built-in, manifest-based | Git-like (Dolt, LakeFS) | ✅ **Competitive** |
 | GC/Vacuum | ✅ O(live), preserve_days | Delta/Iceberg vacuum | ✅ **Feature-complete** |
@@ -120,11 +120,22 @@ consumer groups, and GC provides a complete storage platform.
 - **WarpStream (Kafka-on-S3):** same architecture as Pond — direct-to-S3,
   no brokers. Pond is a generalization (works for any workload, not just Kafka).
 - **Redpanda:** Kafka-compatible, no JVM. Pond is not Kafka-protocol-compatible.
+- **Apache Fluss (Ververica):** streaming storage for real-time analytics.
+  Fluss unifies streaming + lakehouse on object storage — similar vision to Pond.
+  Fluss has: columnar log storage, primary key tables, log-table duality
+  (same data as streaming log + lakehouse table), tiered storage to S3.
+  Pond has: unified PND2 format for ALL workloads (not just streaming+table),
+  CRDT multi-writer (Fluss uses Raft/leader-based), branch/merge versioning
+  (Fluss has no versioning), cross-lens access (Fluss is streaming+table only).
+  Fluss wins on: Flink integration, Kafka protocol compat, production maturity.
+  Pond wins on: unified architecture (any workload, not just streaming+table),
+  CRDT concurrency (no leader), git-like versioning, cross-lens access.
 
 ### Remaining gap
 - No Kafka wire-protocol adapter (can't drop-in replace Kafka clients)
 - No consumer group rebalancing (manual partition assignment)
 - No exactly-once semantics (at-least-once only)
+- No Flink connector (Fluss has native Flink integration)
 
 ---
 
