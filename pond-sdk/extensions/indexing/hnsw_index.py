@@ -129,10 +129,23 @@ class HNSWIndex:
         graph, entry_point = self._build_graph(
             vectors, M, ef_construction, distance_metric)
 
-        # Encode and store
-        index_bytes = self._encode_index(
+        # P3 fix: Store graph as CHUNKED blobs — one per layer + a small header.
+        # This avoids loading a 640MB blob for 10M vectors. Search only fetches
+        # the layers it needs: top layers are tiny (few nodes), layer 0 is big
+        # but only fetched once and cached.
+        header, layer_blobs = self._encode_chunked(
             graph, entry_point, ids, n_dims, M, ef_construction, metric_code)
-        index_hash = self.kernel.write(index_bytes)
+
+        # Write each layer as a separate blob
+        layer_hashes = []
+        for layer_data in layer_blobs:
+            h = self.kernel.write(layer_data)
+            layer_hashes.append(h)
+
+        # Write header (small — just metadata + layer hash list)
+        header["layer_hashes"] = layer_hashes
+        header_bytes = json.dumps(header, sort_keys=True).encode()
+        index_hash = self.kernel.write(header_bytes)
         self.kernel.reference(self._index_ref(collection), index_hash)
         return index_hash
 
@@ -334,8 +347,41 @@ class HNSWIndex:
             return 1.0 - dot / (na * nb)
         return sum((x - y) ** 2 for x, y in zip(a, b))
 
+    def _encode_chunked(self, graph, entry_point, ids, n_dims, M,
+                         ef_construction, metric_code):
+        """Encode graph as chunked blobs: header (JSON) + one binary blob per layer.
+
+        Returns (header_dict, list_of_layer_bytes).
+        """
+        header = {
+            "n_dims": n_dims,
+            "max_layer": len(graph) - 1,
+            "M": M,
+            "ef_construction": ef_construction,
+            "metric": "l2" if metric_code == _METRIC_L2 else "cosine",
+            "entry_point": entry_point,
+            "n_vectors": len(ids),
+        }
+
+        layer_blobs = []
+        for layer in range(len(graph)):
+            buf = bytearray()
+            nodes = graph[layer]
+            buf += struct.pack("<I", len(nodes))
+            for node_idx, neighbors in nodes.items():
+                buf += struct.pack("<I", node_idx)
+                buf += struct.pack("<I", len(neighbors))
+                for n in neighbors:
+                    buf += struct.pack("<I", n)
+            layer_blobs.append(bytes(buf))
+
+        # Encode IDs as a separate small blob (included in header as JSON)
+        header["ids"] = ids
+
+        return header, layer_blobs
+
     # ------------------------------------------------------------------
-    # ENCODE / DECODE
+    # ENCODE / DECODE (legacy single-blob, kept for backward compat)
     # ------------------------------------------------------------------
 
     def _encode_index(self, graph, entry_point, ids, n_dims, M,
@@ -416,35 +462,73 @@ class HNSWIndex:
     # ------------------------------------------------------------------
 
     def load(self, collection):
+        """Load the HNSW index header (small JSON blob).
+
+        Returns the header dict with layer_hashes, or None if no index.
+        Layer data is fetched lazily by search() — only the layers
+        actually needed are read.
+        """
         index_hash = self.kernel.resolve(self._index_ref(collection))
         if index_hash is None:
             return None
         data = self.kernel.read_blob(index_hash)
+
+        # Try chunked format (JSON header with layer_hashes)
+        try:
+            header = json.loads(data)
+            if "layer_hashes" in header:
+                return header
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+        # Legacy single-blob format
         return self._decode_index(data)
+
+    def _load_layer(self, layer_hash):
+        """Load a single layer's adjacency list from its blob."""
+        data = self.kernel.read_blob(layer_hash)
+        pos = 0
+        n_nodes = struct.unpack_from("<I", data, pos)[0]; pos += 4
+        nodes = {}
+        for _ in range(n_nodes):
+            node_idx = struct.unpack_from("<I", data, pos)[0]; pos += 4
+            n_neighbors = struct.unpack_from("<I", data, pos)[0]; pos += 4
+            neighbors = []
+            for _ in range(n_neighbors):
+                neighbors.append(struct.unpack_from("<I", data, pos)[0])
+                pos += 4
+            nodes[node_idx] = neighbors
+        return nodes
 
     def search(self, collection, query, k=10, ef=50):
         """HNSW search — O(log N) distance computations.
 
-        1. Start at entry point on top layer, greedy walk down
-        2. At layer 0, beam search with width ef
-        3. Return top-k nearest
+        P3 fix: uses chunked loading — fetches only the layers needed.
+        Top layers are tiny (few nodes). Layer 0 is big but fetched once.
+
+        1. Load header (1 GET — small JSON)
+        2. Greedy walk top layers (each layer = 1 GET, tiny)
+        3. Beam search layer 0 (1 GET — big, but only once)
+        4. Return top-k nearest
         """
         index = self.load(collection)
         if index is None:
             raise ValueError(f"No HNSW index for '{collection}'")
 
         query = [float(v) for v in query]
-        metric = index["metric"]
-        graph = index["graph"]
+        metric = index.get("metric", "l2")
         entry = index["entry_point"]
-        ids = index["ids"]
+        ids = index.get("ids", [])
+
+        # Check if chunked (has layer_hashes) or legacy (has graph)
+        is_chunked = "layer_hashes" in index
 
         # Read all vectors (needed for distance computation)
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                           "..", "physical_structures"))
         from unified_storage import UnifiedStorage
         storage = UnifiedStorage(self.kernel)
-        all_rows = storage.read(collection)
+        all_rows = storage.read_with_shards(collection)
         vectors = {}
         for row in all_rows:
             vid = row.get("id")
@@ -470,13 +554,29 @@ class HNSWIndex:
         for i, vid in enumerate(ids):
             node_vectors.append(vectors.get(vid, [0.0] * len(query)))
 
-        # Phase 1: greedy walk from top layer to layer 1
-        curr = entry
-        for layer in range(len(graph) - 1, 0, -1):
-            curr = self._greedy_search(node_vectors, graph, layer, curr, query, metric)
+        if is_chunked:
+            # Chunked: load layers lazily
+            layer_hashes = index["layer_hashes"]
+            max_layer = index["max_layer"]
 
-        # Phase 2: beam search at layer 0
-        candidates = self._search_layer(node_vectors, graph, 0, curr, query, max(ef, k), metric)
+            # Phase 1: greedy walk from top layer to layer 1
+            curr = entry
+            for layer in range(max_layer, 0, -1):
+                graph_layer = self._load_layer(layer_hashes[layer])
+                curr = self._greedy_search(node_vectors, [graph_layer], 0, curr, query, metric)
+
+            # Phase 2: beam search at layer 0
+            graph_layer0 = self._load_layer(layer_hashes[0])
+            candidates = self._search_layer(node_vectors, [graph_layer0], 0, curr, query, max(ef, k), metric)
+        else:
+            # Legacy: graph is in memory
+            graph = index["graph"]
+            # Phase 1: greedy walk from top layer to layer 1
+            curr = entry
+            for layer in range(len(graph) - 1, 0, -1):
+                curr = self._greedy_search(node_vectors, graph, layer, curr, query, metric)
+            # Phase 2: beam search at layer 0
+            candidates = self._search_layer(node_vectors, graph, 0, curr, query, max(ef, k), metric)
 
         # Sort by distance and return top-k
         scored = [(self._distance(query, node_vectors[n], metric), n) for n in candidates]
