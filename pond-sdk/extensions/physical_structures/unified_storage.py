@@ -2428,15 +2428,9 @@ class UnifiedStorage:
                 ))
             new_manifest.add_row_group(rg)
 
-        # Check if we need a stats tree
-        try:
-            from stats_tree import should_use_stats_tree, build_stats_tree
-            if should_use_stats_tree(len(all_entries)):
-                stats_tree_root = build_stats_tree(
-                    self.kernel, new_manifest.row_groups)
-                new_manifest.set_stats_tree_root(stats_tree_root)
-        except ImportError:
-            pass
+        # P10 fix: StatsTree is NOT built eagerly on the write path.
+        # It's built lazily on first read when scan_with_pruning detects
+        # a large manifest without a stats_tree_root. This keeps writes fast.
 
         new_hash = new_manifest.commit()
         self.kernel.reference(self._manifest_ref(collection), new_hash)
@@ -2479,14 +2473,7 @@ class UnifiedStorage:
             manifest.add_row_group(rg)
             rg_entries.append(rg)
 
-        try:
-            from stats_tree import should_use_stats_tree, build_stats_tree
-            if should_use_stats_tree(len(rg_entries)):
-                stats_tree_root = build_stats_tree(self.kernel, rg_entries)
-                manifest.set_stats_tree_root(stats_tree_root)
-        except ImportError:
-            pass
-
+        # P10 fix: StatsTree is NOT built eagerly — lazy on first read.
         if parent_manifest_hash is not None:
             manifest.set_parent_manifest(parent_manifest_hash)
 
@@ -2542,16 +2529,7 @@ class UnifiedStorage:
             manifest.add_row_group(rg)
             rg_entries.append(rg)
 
-        # PB-scale check: if we have >25K row groups, build a stats tree
-        # and delegate scan/find_row_group to it. The manifest blob stays
-        # small (just schema + stats_tree_root).
-        try:
-            from stats_tree import should_use_stats_tree, build_stats_tree
-            if should_use_stats_tree(len(rg_entries)):
-                stats_tree_root = build_stats_tree(self.kernel, rg_entries)
-                manifest.set_stats_tree_root(stats_tree_root)
-        except ImportError:
-            pass  # stats_tree not available — fall back to flat manifest
+        # P10 fix: StatsTree is NOT built eagerly — lazy on first read.
 
         # Delta-manifest: set parent pointer for O(1) appends at PB scale
         if parent_manifest_hash is not None:
