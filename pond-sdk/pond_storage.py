@@ -4,7 +4,7 @@ PondStorage — the ONE unified storage SDK.
 This is the single entry point for all storage operations in Pond.
 It unifies what was previously three separate classes:
   - PondLens (namespace ops: list_collections, set_definition, etc.)
-  - ProllyLensBase (commit/branch/merge/history)
+  - ProllyLensBase (commit/branch/merge/history) — LEGACY, removed
   - UnifiedStorage (PND2 write/read/point_lookup)
 
 Into ONE class with three clear sections:
@@ -20,7 +20,8 @@ Into ONE class with three clear sections:
 ARCHITECTURE:
   Lenses (Lakehouse, KV, Vector) compose PondStorage.
   PondStorage delegates to UnifiedStorage (PND2 + CollectionManifest)
-  and ProllyLensBase (commit/branch/history).
+  for both data I/O and commit/branch/history (manifest-based JSON
+  commit blobs — no ProllyTree involved).
   The kernel (PondMinimal or ObjectStoreNativeKernel) is FROZEN.
 
 USAGE:
@@ -40,13 +41,13 @@ USAGE:
     storage.merge("users", "dev")
     storage.history("users")
 
-This class is a thin orchestrator — it delegates to the existing
-UnifiedStorage + ProllyLensBase internally. No behavior change, just
-a unified API surface so lens authors see ONE class instead of three.
+This class is a thin orchestrator — it delegates to UnifiedStorage
+internally. The legacy ProllyLensBase path has been removed;
+UnifiedStorage is the ONLY storage backend.
 
-MIGRATION: Existing lenses that use PondLens/ProllyLensBase/UnifiedStorage
-directly still work. PondStorage is the recommended new API. Over time,
-lenses will migrate to compose PondStorage instead of the individual classes.
+MIGRATION: Existing lenses that use PondLens/UnifiedStorage directly
+still work. PondStorage is the recommended new API. Over time, lenses
+will migrate to compose PondStorage instead of the individual classes.
 """
 
 from __future__ import annotations
@@ -66,21 +67,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 from kernel import PondMinimal  # noqa: E402
 from base_lens import PondLens  # noqa: E402
 
-# Import the unified storage layer (PND2 + CollectionManifest)
+# Import the unified storage layer (PND2 + CollectionManifest).
+# This is the ONLY storage backend — the legacy ProllyTreeIndex /
+# ProllyLensBase path has been removed.
 try:
     from unified_storage import UnifiedStorage, PND2  # noqa: E402
     from collection_manifest import CollectionManifest  # noqa: E402
     _HAVE_UNIFIED = True
 except ImportError:
     _HAVE_UNIFIED = False
-
-# Import ProllyLensBase for commit/branch/history
-try:
-    from prolly_tree import ProllyLensBase, ProllyTree  # noqa: E402
-    from binary_encoding import BinaryProllyTree  # noqa: E402
-    _HAVE_PROLLY = True
-except ImportError:
-    _HAVE_PROLLY = False
 
 
 class PondStorage:
@@ -282,9 +277,9 @@ class PondStorage:
 
     def history(self, name: str, limit: int = 100) -> list[dict]:
         """Walk the commit history for a collection."""
-        if self._unified is not None:
-            return self._unified.history(name, limit)
-        return self._lens.history(name, limit)
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.history(name, limit)
 
     def diff(self, name: str, commit_a: str, commit_b: str) -> dict:
         """Compute the diff between two commits."""
@@ -622,15 +617,12 @@ class PondStorage:
                                   commit_hash: str) -> Optional[str]:
         """Resolve a commit hash to its manifest hash for time-travel reads.
 
-        Round 26: the manifest hash is stored directly IN the commit blob
-        (JSON format). Read it from there (1 GET). Falls back to the
-        legacy ref-based lookup for old collections.
+        The manifest hash is stored directly IN the commit blob (JSON
+        format). Read it from there (1 GET).
         """
-        if self._unified is not None:
-            return self._unified._resolve_commit_manifest(collection, commit_hash)
-        # Legacy fallback
-        return self.kernel.resolve(
-            f"collections/{collection}/commits/{commit_hash}__manifest")
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified._resolve_commit_manifest(collection, commit_hash)
 
     def _save_commit_manifest(self, name: str, commit_hash: str) -> None:
         """Save the current manifest hash keyed by commit hash for time-travel."""

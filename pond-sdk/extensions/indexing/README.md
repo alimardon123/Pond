@@ -14,7 +14,7 @@ the cross-lens sharing contract (Track 2 proved it works).
 | File | Exports | Status |
 |---|---|---|
 | `collection_index.py` | `CollectionIndexer` | **Recommended.** Data-side, lens-independent. |
-| `auto_index.py` | `AutoIndexMixin`, `AutoIndex`, `IndexedLens` (lazy) | **Deprecated.** Lens-mixin approach. Kept for backward compat. |
+| `
 
 ## CollectionIndexer (recommended)
 

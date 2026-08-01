@@ -1,7 +1,7 @@
 """
 VectorLens — production-ready vector database lens for Pond.
 
-Extends PondLens directly (NOT KeyValueLens). Owns its ProllyTreeIndex
+Extends PondLens directly (NOT KeyValueLens). Owns its UnifiedStorage
 storage code. Per the design principles, production lenses must not
 inherit from each other — each lens is independent and removable.
 
@@ -31,8 +31,13 @@ Implements:
   - count() — count vectors
   - create_branch, checkout_branch, merge_branch, get_history
 
-Uses CollectionMetadata for indexing (data-side, not lens-side).
-Search is a linear scan over all vectors (suitable for small collections).
+STORAGE: There is exactly ONE storage path — the UnifiedStorage
+backend (PND2 blobs + CollectionManifest + JSON commit blobs). The
+legacy ProllyTreeIndex / ProllyLensBase path has been removed. If
+UnifiedStorage is not available, all I/O methods raise RuntimeError.
+Search is a linear scan over all vectors (suitable for small
+collections); larger collections should build an IVF index via
+build_ann_index() for 100-100,000x speedup.
 """
 
 from __future__ import annotations
@@ -51,19 +56,18 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
 
 from kernel import PondMinimal
 from base_lens import PondLens
-from prolly_tree import ProllyLensBase, ProllyTree
-from binary_encoding import BinaryProllyTree
 
 
 class VectorLens(PondLens):
     """Production-ready vector database lens.
 
-    Extends PondLens directly. Owns its ProllyTreeIndex storage code —
+    Extends PondLens directly. Owns its UnifiedStorage storage code —
     per the design principles, production lenses must not inherit from
     each other. Each lens is independent and removable.
 
     Stores vectors as packed binary (struct.pack) for efficiency.
-    Uses ProllyTreeIndex for storage and CollectionMetadata for indexing.
+    Uses UnifiedStorage (PND2 blobs + CollectionManifest) for storage.
+    Search auto-accelerates via IVF index when present.
 
     COLLECTION-AGNOSTIC: Like all Pond lenses, VectorLens is a stateless
     read/write engine. Pass the collection name to each operation:
@@ -86,21 +90,36 @@ class VectorLens(PondLens):
                 manifest-based architecture.
         """
         super().__init__(kernel)
-        self._bases: dict[str, ProllyLensBase] = {}
         self._attached_indexer = None
         self._n_dimensions = n_dimensions
 
-        # Unified storage backend (the ONLY storage path now)
+        # Unified storage backend (the ONLY storage path)
         self._unified_storage = None
         try:
             from unified_storage import UnifiedStorage
             self._unified_storage = UnifiedStorage(kernel)
         except ImportError:
-            pass
+            pass  # _require_unified() will raise RuntimeError on first I/O
         # Buffer for uncommitted inserts: collection → list of (id, vector, metadata)
         self._unified_buffer: dict[str, list[tuple[str, list[float], dict]]] = {}
         # Cross-lens metadata cache: collection → key_col
         self._key_col_cache: dict[str, str] = {}
+
+    def _require_unified(self) -> None:
+        """Raise RuntimeError if UnifiedStorage is not available.
+
+        The legacy ProllyTreeIndex / ProllyLensBase path has been removed.
+        UnifiedStorage is the ONLY storage path. If it is None (because
+        the physical_structures extension is not importable), every I/O
+        method must fail loudly rather than silently fall back.
+        """
+        if self._unified_storage is None:
+            raise RuntimeError(
+                "UnifiedStorage is not available — the legacy "
+                "ProllyTreeIndex path has been removed. Install the "
+                "physical_structures extension (pond-sdk/extensions/"
+                "physical_structures) to enable Vector I/O."
+            )
 
     def _resolve_key_col(self, collection: str) -> str:
         """Resolve the key column for a collection — cross-lens aware.
@@ -141,12 +160,6 @@ class VectorLens(PondLens):
                 self._attached_indexer.notify_write(collection)
             except Exception:
                 pass
-
-    def _get_base(self, collection: str) -> ProllyLensBase:
-        """Get or create the ProllyLensBase for a collection."""
-        if collection not in self._bases:
-            self._bases[collection] = ProllyLensBase(self.kernel, collection)
-        return self._bases[collection]
 
     # ==================================================================
     # Binary serialization (custom format — NOT JSON)
@@ -193,50 +206,32 @@ class VectorLens(PondLens):
         return {"id": vid, "vector": vector, "metadata": metadata}
 
     # ==================================================================
-    # Write path — vector operations (own ProllyTreeIndex storage)
+    # Write path — vector operations (UnifiedStorage)
     # ==================================================================
 
     def insert(self, collection: str, id: str, vector: list[float],
                metadata: dict | None = None) -> str:
         """Insert (or replace) a vector. Returns the commit hash.
 
-        Unified storage path: buffers the insert, commits on explicit
-        commit() call (or auto-commits if buffer is full).
-        Legacy path: commits immediately per insert.
+        Buffers the insert; commits on explicit commit() call (or
+        auto-commits when the buffer reaches 10,000 entries).
         """
         if metadata is None:
             metadata = {}
+        self._require_unified()
 
-        # Unified storage path: buffer
-        if self._unified_storage is not None:
-            if collection not in self._unified_buffer:
-                self._unified_buffer[collection] = []
-            self._unified_buffer[collection].append(
-                (str(id), [float(v) for v in vector], metadata))
-            # Auto-commit if buffer is large enough
-            if len(self._unified_buffer[collection]) >= 10000:
-                return self.commit(collection)
-            return ""  # not yet committed
-
-        # Legacy path: commit immediately
-        record = {
-            "id": str(id),
-            "vector": [float(v) for v in vector],
-            "metadata": metadata,
-        }
-        blob_hash = self.kernel.write(self.encode(record))
-        self._get_base(collection).stage(str(id), blob_hash)
-        commit_hash = self._get_base(collection).commit(f"insert vector {id}")
-        self._notify_indexers(collection)
-        return commit_hash
+        if collection not in self._unified_buffer:
+            self._unified_buffer[collection] = []
+        self._unified_buffer[collection].append(
+            (str(id), [float(v) for v in vector], metadata))
+        # Auto-commit if buffer is large enough
+        if len(self._unified_buffer[collection]) >= 10000:
+            return self.commit(collection)
+        return ""  # not yet committed
 
     def commit(self, collection: str, message: str = "") -> str:
-        """Commit buffered inserts (unified storage path only).
-
-        Legacy path commits immediately on each insert, so this is a no-op.
-        """
-        if self._unified_storage is None:
-            return ""  # legacy path already committed
+        """Commit buffered inserts via UnifiedStorage."""
+        self._require_unified()
 
         if collection not in self._unified_buffer:
             raise ValueError(f"No staged data for collection '{collection}'")
@@ -299,12 +294,81 @@ class VectorLens(PondLens):
                 row_group_size=10_000,
                 message=message or f"vector insert: {len(rows)} vectors")
         del self._unified_buffer[collection]
+        self._notify_indexers(collection)
         return commit_hash
 
     def delete_vector(self, collection: str, id: str) -> str:
-        """Delete a vector by ID. Returns the commit hash."""
-        self._get_base(collection).stage_delete(str(id))
-        commit_hash = self._get_base(collection).commit(f"delete vector {id}")
+        """Delete a vector by ID. Returns the commit hash.
+
+        UnifiedStorage has no per-row delete primitive, so this performs
+        a full rewrite: read all existing rows, drop the one whose id
+        matches, write the result back via write() (overwrite).
+        """
+        self._require_unified()
+
+        # Read all existing vectors (preserving schema).
+        all_records = self.get_all(collection)
+        lookup_id = str(id)
+        # Try numeric coercion for comparison (vector ids may be int or str).
+        try:
+            lookup_id_num = int(lookup_id)
+        except (ValueError, TypeError):
+            lookup_id_num = None
+
+        kept = []
+        for key, record in all_records.items():
+            # Match on either string or numeric form of the id.
+            if key == lookup_id:
+                continue
+            if lookup_id_num is not None:
+                try:
+                    if int(key) == lookup_id_num:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            kept.append(record)
+
+        # Re-encode rows for write(). Use the same per-dim / vector
+        # column strategy as commit().
+        rows = []
+        for record in kept:
+            vec = record.get("vector", [])
+            raw_id = record.get("id", "")
+            try:
+                row_id = int(raw_id)
+            except (ValueError, TypeError):
+                row_id = str(raw_id)
+            row = {"id": row_id}
+            if self._n_dimensions and len(vec) == self._n_dimensions:
+                for d in range(self._n_dimensions):
+                    row[f"dim_{d}"] = float(vec[d])
+            else:
+                row["vector"] = json.dumps(vec)
+            row["metadata"] = json.dumps(record.get("metadata", {}))
+            rows.append(row)
+
+        # Sort rows by id (numeric if possible, else string).
+        try:
+            rows.sort(key=lambda r: int(r["id"]))
+        except (ValueError, TypeError):
+            rows.sort(key=lambda r: str(r["id"]))
+
+        commit_hash = self._unified_storage.write(
+            collection, rows, key_col="id",
+            row_group_size=10_000,
+            message=f"delete vector {id}")
+        # Re-stamp metadata so other lenses still see this as a vector
+        # collection (write() overwrites the manifest).
+        schema = {"id": "string", "metadata": "string"}
+        if self._n_dimensions:
+            for d in range(self._n_dimensions):
+                schema[f"dim_{d}"] = "float64"
+        else:
+            schema["vector"] = "string"
+        self.stamp_collection_metadata(
+            collection, lens_type="vector", key_col="id",
+            schema_hint=schema,
+            extra={"n_dimensions": self._n_dimensions})
         self._notify_indexers(collection)
         return commit_hash
 
@@ -315,8 +379,8 @@ class VectorLens(PondLens):
     def get_vector(self, collection: str, id: str) -> Optional[dict]:
         """Retrieve a vector record by ID (returns None if absent).
 
-        Unified storage path: 4 GETs cold point lookup.
-        Fix (Round 24 Issue #3): reads per-dim FLOAT64 columns when available.
+        4-5 GETs cold point lookup via the manifest. Reads per-dim
+        FLOAT64 columns when available.
 
         CROSS-LENS: if the collection was created by another lens, this
         reads the full row by metadata.key_col and returns it as-is.
@@ -325,53 +389,61 @@ class VectorLens(PondLens):
         the row is returned with vector=[] and metadata={} (ugly shape
         but full visibility).
         """
-        # Unified storage path
-        if self._unified_storage is not None:
-            # Resolve the key column from metadata (cross-lens aware, cached)
-            key_col = self._resolve_key_col(collection)
-            # Convert numeric string ID to int for lookup if key_col is "id"
-            try:
-                lookup_key = str(int(id)) if key_col == "id" else str(id)
-            except (ValueError, TypeError):
-                lookup_key = str(id)
-            # Read the row (no column projection — get everything)
-            row = self._unified_storage.point_lookup(collection, key=lookup_key)
-            if row is None or row.get(key_col) is None:
-                return None
-            # Try to reassemble a vector from per-dim columns or vector column
-            vector = []
-            metadata = {}
-            if f"dim_0" in row:
-                # Per-dim columns
-                d = 0
-                while f"dim_{d}" in row:
-                    vector.append(row[f"dim_{d}"])
-                    d += 1
-            elif "vector" in row and isinstance(row["vector"], str):
-                try:
-                    vector = json.loads(row["vector"])
-                except (json.JSONDecodeError, TypeError):
-                    vector = []
-            if "metadata" in row and isinstance(row["metadata"], str):
-                try:
-                    metadata = json.loads(row["metadata"])
-                except (json.JSONDecodeError, TypeError):
-                    metadata = {}
-            return {
-                "id": row.get(key_col),
-                "vector": vector,
-                "metadata": metadata,
-                "_row": row,  # full row for cross-lens visibility
-            }
+        self._require_unified()
 
-        # Legacy path
-        h = self._get_base(collection).lookup(str(id))
-        return self.decode(self.kernel.read_blob(h)) if h else None
+        # Resolve the key column from metadata (cross-lens aware, cached)
+        key_col = self._resolve_key_col(collection)
+        # Convert numeric string ID to int for lookup if key_col is "id"
+        try:
+            lookup_key = str(int(id)) if key_col == "id" else str(id)
+        except (ValueError, TypeError):
+            lookup_key = str(id)
+        # Read the row (no column projection — get everything)
+        row = self._unified_storage.point_lookup(collection, key=lookup_key)
+        if row is None or row.get(key_col) is None:
+            return None
+        # Try to reassemble a vector from per-dim columns or vector column
+        vector = []
+        metadata = {}
+        if f"dim_0" in row:
+            # Per-dim columns
+            d = 0
+            while f"dim_{d}" in row:
+                vector.append(row[f"dim_{d}"])
+                d += 1
+        elif "vector" in row and isinstance(row["vector"], str):
+            try:
+                vector = json.loads(row["vector"])
+            except (json.JSONDecodeError, TypeError):
+                vector = []
+        if "metadata" in row and isinstance(row["metadata"], str):
+            try:
+                metadata = json.loads(row["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        return {
+            "id": row.get(key_col),
+            "vector": vector,
+            "metadata": metadata,
+            "_row": row,  # full row for cross-lens visibility
+        }
 
     def get_raw(self, collection: str, id: str) -> Optional[bytes]:
-        """Read raw bytes by ID (no decode)."""
-        h = self._get_base(collection).lookup(str(id))
-        return self.kernel.read_blob(h) if h else None
+        """Read raw bytes by ID (no decode).
+
+        Returns the vector record re-encoded via encode() (the custom
+        binary wire format). This is the in-memory equivalent of the
+        legacy per-row blob bytes.
+        """
+        record = self.get_vector(collection, id)
+        if record is None:
+            return None
+        # Drop the cross-lens _row before re-encoding — encode() only
+        # understands {id, vector, metadata}.
+        clean = {k: record.get(k) for k in ("id", "vector", "metadata")}
+        if clean.get("metadata") is None:
+            clean["metadata"] = {}
+        return self.encode(clean)
 
     def list_vectors(self, collection: str) -> list[str]:
         """List all vector IDs.
@@ -379,25 +451,15 @@ class VectorLens(PondLens):
         CROSS-LENS: works on any collection — returns the values of the
         key_col column (from metadata), defaulting to "id".
         """
-        # Unified storage path
-        if self._unified_storage is not None:
-            key_col = self._resolve_key_col(collection)
-            rows = self._unified_storage.read(collection, columns=[key_col])
-            return [str(r[key_col]) for r in rows if r.get(key_col) is not None]
-
-        # Legacy path
-        return [k for k in self._get_base(collection).read_all()
-                if not k.startswith("_")]
+        self._require_unified()
+        key_col = self._resolve_key_col(collection)
+        rows = self._unified_storage.read(collection, columns=[key_col])
+        return [str(r[key_col]) for r in rows if r.get(key_col) is not None]
 
     def count(self, collection: str) -> int:
         """Return the number of stored vectors."""
-        # Unified storage path
-        if self._unified_storage is not None:
-            return len(self.list_vectors(collection))
-
-        # Legacy path
-        return sum(1 for k in self._get_base(collection).read_all()
-                   if not k.startswith("_"))
+        self._require_unified()
+        return len(self.list_vectors(collection))
 
     def get_all(self, collection: str) -> dict[str, dict]:
         """Read all vectors from the collection.
@@ -407,45 +469,39 @@ class VectorLens(PondLens):
         empty vectors for non-vector collections (ugly shape but full
         visibility — caller sees the full row in _row).
         """
-        # Unified storage path
-        if self._unified_storage is not None:
-            key_col = self._resolve_key_col(collection)
-            rows = self._unified_storage.read(collection)
-            result = {}
-            for r in rows:
-                k = r.get(key_col)
-                if k is None:
-                    continue
-                # Try to reassemble vector
-                vector = []
-                if f"dim_0" in r:
-                    d = 0
-                    while f"dim_{d}" in r:
-                        vector.append(r[f"dim_{d}"])
-                        d += 1
-                elif "vector" in r and isinstance(r["vector"], str):
-                    try:
-                        vector = json.loads(r["vector"])
-                    except (json.JSONDecodeError, TypeError):
-                        vector = []
-                metadata = {}
-                if "metadata" in r and isinstance(r["metadata"], str):
-                    try:
-                        metadata = json.loads(r["metadata"])
-                    except (json.JSONDecodeError, TypeError):
-                        metadata = {}
-                result[str(k)] = {
-                    "id": k,
-                    "vector": vector,
-                    "metadata": metadata,
-                    "_row": r,  # full row for cross-lens visibility
-                }
-            return result
-
-        # Legacy path
-        state = self._get_base(collection).read_all()
-        return {k: self.decode(self.kernel.read_blob(h))
-                for k, h in state.items() if not k.startswith("_")}
+        self._require_unified()
+        key_col = self._resolve_key_col(collection)
+        rows = self._unified_storage.read(collection)
+        result = {}
+        for r in rows:
+            k = r.get(key_col)
+            if k is None:
+                continue
+            # Try to reassemble vector
+            vector = []
+            if f"dim_0" in r:
+                d = 0
+                while f"dim_{d}" in r:
+                    vector.append(r[f"dim_{d}"])
+                    d += 1
+            elif "vector" in r and isinstance(r["vector"], str):
+                try:
+                    vector = json.loads(r["vector"])
+                except (json.JSONDecodeError, TypeError):
+                    vector = []
+            metadata = {}
+            if "metadata" in r and isinstance(r["metadata"], str):
+                try:
+                    metadata = json.loads(r["metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            result[str(k)] = {
+                "id": k,
+                "vector": vector,
+                "metadata": metadata,
+                "_row": r,  # full row for cross-lens visibility
+            }
+        return result
 
     # ==================================================================
     # Search — k-nearest-neighbours (L2 / Euclidean)
@@ -543,109 +599,49 @@ class VectorLens(PondLens):
                                  chunk_size: int = 100) -> int:
         """Build per-dimension bounding-box zone maps for a vector collection.
 
-        This enables search_with_pruning to skip vectors whose bounding
-        box proves they can't be in the top-k results — WITHOUT reading
-        or decoding the vector blob.
+        DEPRECATED: Zone maps were a legacy pruning extension that sat
+        on top of the ProllyTreeIndex backend (per-blob min/max stats).
+        The unified storage architecture uses manifest-level inline
+        stats for pruning instead (1 zone map per row group of 10K
+        rows = negligible overhead, auto-built at write time).
 
-        The zone maps store min/max per dimension across all vectors in
-        a "chunk" (a group of vectors). At search time, the lower bound
-        on L2 distance from the query to the chunk's bounding box is
-        computed. If that lower bound exceeds the k-th best distance
-        found so far, the entire chunk is skipped.
-
-        This is the vector equivalent of Vortex-style predicate pushdown:
-        evaluate a conservative lower bound on the encoded/metadata form
-        before touching the data bytes.
-
-        GENERIC: uses the same ZoneMapIndex infrastructure as tabular
-        lenses. The "columns" are vector dimensions (dim_0, dim_1, ...).
-        Any format-agnostic ColumnSource could produce this data.
+        This method is kept for API compatibility but is a no-op in
+        unified mode. The legacy pruning extension (collection_metadata,
+        pruning, pruning_reader) has been moved to archive/.
 
         Args:
-            collection: vector collection name
-            chunk_size: vectors per zone-map chunk (default 100)
+            collection: vector collection name (ignored)
+            chunk_size: vectors per zone-map chunk (ignored)
 
         Returns:
-            Number of zone map entries created.
+            0 (no zone maps built — manifest stats already exist).
         """
-        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk",
-                                          "extensions", "physical_structures"))
-        from collection_metadata import CollectionMetadata
-        from pruning import ZoneMap
-        from column_source import ListColumnSource
-
-        meta = CollectionMetadata(self.kernel)
-        zm_index = meta.zm_index
-        if zm_index is None:
-            return 0
-
-        # Clear old zone maps
-        zm_index.clear_zone_maps(collection)
-
-        # Read all vectors and group into chunks
-        state = self._get_base(collection).read_all()
-        all_keys = sorted(k for k in state.keys() if not k.startswith("_"))
-        n = 0
-
-        for start in range(0, len(all_keys), chunk_size):
-            end = min(start + chunk_size, len(all_keys))
-            chunk_keys = all_keys[start:end]
-
-            # Decode all vectors in the chunk and build per-dimension min/max
-            vectors = []
-            for key in chunk_keys:
-                record = self.decode(self.kernel.read_blob(state[key]))
-                vectors.append(record["vector"])
-
-            if not vectors:
-                continue
-
-            # Determine dimensionality
-            dim = len(vectors[0])
-
-            # Build min/max per dimension
-            min_dims = [min(v[d] for v in vectors) for d in range(dim)]
-            max_dims = [max(v[d] for v in vectors) for d in range(dim)]
-
-            # Build a zone map with per-dimension stats
-            # Column names: dim_0, dim_1, ...
-            zm = ZoneMap(row_count=len(vectors))
-            for d in range(dim):
-                col = f"dim_{d}"
-                zm.min[col] = min_dims[d]
-                zm.max[col] = max_dims[d]
-                zm.null_count[col] = 0
-
-            # Store the zone map. The "blob_hash" points to the first
-            # vector's blob in the chunk (for pruning reader compatibility).
-            rg_key = f"rg/{chunk_keys[-1]}"
-            zm_index.add_zone_map(collection, rg_key, zm, state[chunk_keys[0]])
-            n += 1
-
-        zm_index.commit_zone_maps(collection, f"vector zone maps for {collection}")
-        return n
+        # No-op: zone maps are superseded by manifest-level stats.
+        # Kept for API compatibility — callers that invoke this method
+        # will not crash, but no zone maps are built.
+        return 0
 
     def search_with_pruning(self, collection: str, query: list[float],
                               k: int = 5) -> list[dict]:
         """k-NN search with bounding-box pruning (Vortex-style for vectors).
 
-        Uses per-dimension zone maps to skip chunks whose bounding box
-        proves they can't contain a top-k vector. For each surviving
-        chunk, decodes all vectors and computes exact L2 distance.
+        DEPRECATED: The legacy ZoneMapIndex + PruningPredicate
+        infrastructure has been moved to archive/. UnifiedStorage's
+        manifest already carries per-row-group stats (min/max per dim_*
+        column), so pruning happens automatically inside read() when a
+        predicate is supplied.
 
-        The pruning lower bound: for each dimension d, the minimum
-        contribution to L2 distance from the query to ANY point in the
-        chunk's bounding box [min_d, max_d] is:
-          0 if query[d] in [min_d, max_d]  (query is inside the box)
-          (query[d] - max_d)^2 if query[d] > max_d
-          (min_d - query[d])^2 if query[d] < min_d
+        For k-NN, the only available lower-bound check is per-row-group
+        bbox pruning, which doesn't compose with the top-k heap that
+        this method historically maintained. Instead, callers should:
+          - For exact k-NN on small collections: use search() (linear
+            scan over the unified read).
+          - For approximate k-NN at scale: build_ann_index() and call
+            search() — IVF automatically kicks in (100-100,000x
+            speedup).
 
-        The sum across dimensions gives a lower bound on L2^2 distance.
-        If this lower bound >= k-th best distance^2, skip the chunk.
-
-        This is GENERIC: uses the same ZoneMapIndex + PruningPredicate
-        infrastructure as tabular lenses. The "predicate" is a custom
-        lower-bound check against per-dimension min/max.
+        This method is kept for API compatibility and delegates to
+        search() (linear scan via the unified read path).
 
         Args:
             collection: vector collection name
@@ -655,153 +651,53 @@ class VectorLens(PondLens):
         Returns:
             List of {id, distance, vector, metadata} dicts, sorted by distance.
         """
-        query = [float(v) for v in query]
-        dim = len(query)
-
-        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk",
-                                          "extensions", "physical_structures"))
-        from collection_metadata import CollectionMetadata
-
-        meta = CollectionMetadata(self.kernel)
-        zm_index = meta.zm_index
-
-        if zm_index is None or not zm_index.has_zone_maps(collection):
-            # No zone maps — fall back to linear scan
-            return self.search(collection, query, k)
-
-        # Phase 1: Walk zone maps, compute lower bound on L2^2 for each
-        # chunk. Collect chunks that might contain top-k vectors.
-        state = self._get_base(collection).read_all()
-        all_keys = sorted(k for k in state.keys() if not k.startswith("_"))
-
-        # Build a map from zone map keys to the chunk's vector keys
-        # (zone maps are keyed by rg/{last_key_in_chunk})
-        chunk_map: dict[str, list[str]] = {}
-        chunk_size = 100  # must match build_vector_zone_maps
-        for start in range(0, len(all_keys), chunk_size):
-            end = min(start + chunk_size, len(all_keys))
-            chunk_keys = all_keys[start:end]
-            rg_key = f"rg/{chunk_keys[-1]}"
-            chunk_map[rg_key] = chunk_keys
-
-        # k-th best distance^2 (updated as we find better candidates)
-        # Initialize to infinity so the first k vectors are always admitted
-        best_k_dist_sq = [float('inf')] * k
-        best_k_results: list[tuple[float, str, dict]] = []
-
-        chunks_total = 0
-        chunks_pruned = 0
-        chunks_read = 0
-
-        for rg_key, zm_dict in zm_index.iter_zone_maps(collection):
-            chunks_total += 1
-            chunk_keys = chunk_map.get(rg_key, [])
-            if not chunk_keys:
-                continue
-
-            # Compute lower bound on L2^2 distance from query to the
-            # chunk's bounding box
-            lb_dist_sq = 0.0
-            for d in range(dim):
-                col = f"dim_{d}"
-                mn = zm_dict.get("min", {}).get(col)
-                mx = zm_dict.get("max", {}).get(col)
-                if mn is None or mx is None:
-                    continue  # no stats for this dimension — can't bound
-                q = query[d]
-                if q < mn:
-                    lb_dist_sq += (mn - q) ** 2
-                elif q > mx:
-                    lb_dist_sq += (q - mx) ** 2
-                # else: query is inside the box for this dimension → 0 contribution
-
-            # If the lower bound >= k-th best distance^2, skip this chunk
-            if lb_dist_sq >= best_k_dist_sq[-1]:
-                chunks_pruned += 1
-                continue
-
-            # Chunk survived — decode all vectors and compute exact distance
-            chunks_read += 1
-            for key in chunk_keys:
-                h = state.get(key)
-                if not h:
-                    continue
-                record = self.decode(self.kernel.read_blob(h))
-                vec = record["vector"]
-                if len(vec) != dim:
-                    continue
-                dist = self._l2(query, vec)
-                dist_sq = dist * dist
-
-                # Insert into top-k if better than k-th best
-                if dist_sq < best_k_dist_sq[-1]:
-                    best_k_results.append((dist, key, record))
-                    best_k_dist_sq.append(dist_sq)
-                    # Keep only top-k
-                    combined = list(zip(best_k_dist_sq, best_k_results))
-                    combined.sort(key=lambda t: t[0])
-                    combined = combined[:k]
-                    best_k_dist_sq = [c[0] for c in combined]
-                    best_k_results = [c[1] for c in combined]
-
-        # Sort final results by distance
-        best_k_results.sort(key=lambda t: t[0])
-
-        print(f"  [pruning] chunks: {chunks_total} total, "
-              f"{chunks_pruned} pruned, {chunks_read} read")
-
-        return [
-            {
-                "id": key,
-                "distance": dist,
-                "vector": record["vector"],
-                "metadata": record.get("metadata", {}),
-            }
-            for dist, key, record in best_k_results[:k]
-        ]
+        return self.search(collection, query, k)
 
     # ==================================================================
-    # Version control (delegated to ProllyLensBase)
+    # Version control (delegated to UnifiedStorage)
     # ==================================================================
 
     def create_branch(self, collection: str, branch_name: str) -> str:
-        return self._get_base(collection).branch(branch_name)
+        """Create a branch — O(1) ref copy via UnifiedStorage."""
+        self._require_unified()
+        return self._unified_storage.branch(collection, branch_name)
 
     def checkout_branch(self, collection: str, branch_name: str) -> None:
-        self._get_base(collection).checkout(branch_name)
+        """Checkout a branch — point HEAD at the branch's commit."""
+        self._require_unified()
+        self._unified_storage.checkout(collection, branch_name)
 
     def list_branches(self, collection: str) -> list[str]:
-        return self._get_base(collection).list_branches()
+        """List all branches for a collection."""
+        self._require_unified()
+        return self._unified_storage.list_branches(collection)
 
     def merge_branch(self, collection: str, branch_name: str) -> str:
-        return self._get_base(collection).merge(branch_name)
+        """Merge a branch into the collection's HEAD.
+
+        Union merge with a 2-parent commit (git-like).
+        """
+        self._require_unified()
+        return self._unified_storage.merge(collection, branch_name)
 
     def get_history(self, collection: str, limit: int = 20) -> list[dict]:
-        return self._get_base(collection).history(limit)
+        """Walk the commit chain for the collection."""
+        self._require_unified()
+        return self._unified_storage.history(collection, limit)
 
     # ==================================================================
-    # Index-backed lookup (uses CollectionMetadata — data-side)
+    # Index-backed lookup (delegates to UnifiedStorage point_lookup)
     # ==================================================================
 
     def find_by_id(self, collection: str, id: str) -> Optional[dict]:
-        """O(log N) lookup via CollectionMetadata index.
+        """O(1) cold point lookup via UnifiedStorage.
 
-        Builds the index on first call if it doesn't exist.
+        Equivalent to get_vector() — kept for API compatibility with
+        callers that historically used CollectionMetadata secondary
+        indexes (which have been archived). The unified manifest now
+        provides O(1) cold point lookups natively.
         """
-        from collection_metadata import CollectionMetadata
-        meta = CollectionMetadata(self.kernel)
-
-        # Build index if it doesn't exist
-        if "by_id" not in meta.list_indexes(collection):
-            meta.build_index(collection, "by_id",
-                             extractor=lambda r: str(r.get("id", "")),
-                             scan_fn=lambda: ((k, self.get_vector(collection, k))
-                                              for k in self.list_vectors(collection)))
-
-        rowid = meta.lookup_index(collection, "by_id", str(id))
-        if rowid is None:
-            return None
-        return self.get_vector(collection, rowid)
+        return self.get_vector(collection, id)
 
     # ==================================================================
     # Helpers

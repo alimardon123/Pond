@@ -10,39 +10,35 @@ DESIGN GOALS COMPLIANCE:
 - Principle 1 (Simple): Kernel stays FROZEN at 3 primitives (Write, Read, Ref).
   Range-read is NOT a kernel primitive — it's a Lens pattern.
 - Principle 2 (Powerful): Range-read emerges from composition:
-  ProllyTreeIndex (segment index) + multiple kernel blobs (segments).
+  UnifiedStorage manifest (segment index) + multiple kernel blobs (segments).
 - Principle 4 (Scalable): Any lens can implement the same pattern.
 - Principle 7 (Functional): Video, music, logs, streaming — all possible.
 
 HOW IT WORKS:
 A large object (video, music, log file) is split into fixed-size segments.
-Each segment is stored as a separate kernel blob (content-addressed).
-The ProllyTreeIndex maps segment_number → blob_hash.
+Each segment is stored as a row {offset, segment} in a PND2 blob via
+UnifiedStorage. The manifest maps offset ranges → blob_hash.
 
-  write_stream(name, data, segment_size):
+  write_stream(collection, data, segment_size):
     1. Split data into segments of segment_size bytes
-    2. Write each segment as a kernel blob
-    3. Stage segment_0 → blob_hash_0, segment_1 → blob_hash_1, ...
-    4. Commit to ProllyTreeIndex
+    2. Write rows {offset, segment} to a PND2 blob
+    3. Commit manifest + JSON commit blob via UnifiedStorage
 
-  read_stream(name, start_byte, end_byte):
-    1. Compute which segments overlap [start_byte, end_byte]
-    2. Look up those segments in ProllyTreeIndex (O(log N))
-    3. Read only those blobs from the kernel
+  read_stream(collection, start_byte, end_byte):
+    1. Read manifest (1 GET)
+    2. Range scan [start_byte, end_byte] over the manifest (in-memory)
+    3. Fetch only the overlapping PND2 blobs (K GETs)
     4. Concatenate + slice to exact [start_byte, end_byte]
 
-  append_stream(name, data):
-    1. Find the last segment number
-    2. Stage new segments after it
-    3. Commit (structural sharing — old segments unchanged)
+  append_stream(collection, data):
+    1. Get current segment count (the next offset)
+    2. append_shard() new {offset, segment} rows
+    3. CRDT-safe: multiple producers can append concurrently
 
-This is the SAME pattern as LakehouseLens.range_write/range_read:
-  - Lakehouse: table → row groups → Parquet blobs → ProllyTreeIndex
-  - Streaming: stream → segments → raw bytes blobs → ProllyTreeIndex
-
-The kernel doesn't need to know about ranges. The Lens composes
-existing primitives (Write for segments, Read for individual blobs,
-Ref for the ProllyTreeIndex commit chain) to provide range-read.
+This is the SAME pattern as LakehouseLens, but with BINARY segment
+columns instead of typed tabular columns. The kernel doesn't need to
+know about ranges — UnifiedStorage composes Write (PND2 blobs) +
+Read (manifest + blob) + Ref (commit chain) to provide range-read.
 
 GENERIC: works for any large-blob workload:
   - Video: segment_size = 10MB (one segment per video chunk)
@@ -51,8 +47,14 @@ GENERIC: works for any large-blob workload:
   - Any future streaming workload
 
 VERSIONING: each commit creates a new snapshot. Old segments are
-content-addressed (deduped). Time-travel: read_stream at a specific
-commit hash reads the segment index at that commit.
+content-addressed (deduped). Time-travel via replay_from() reads
+from any offset; create_branch()/merge_branch() provide git-style
+version control.
+
+STORAGE: There is exactly ONE storage path — the UnifiedStorage
+backend (PND2 blobs + CollectionManifest + JSON commit blobs). The
+legacy ProllyTreeIndex / ProllyLensBase path has been removed. If
+UnifiedStorage is not available, all I/O methods raise RuntimeError.
 """
 
 from __future__ import annotations
@@ -67,9 +69,10 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
 
 from kernel import PondMinimal
 from base_lens import PondLens
-from prolly_tree import ProllyLensBase
 
-# Segment key prefix in the ProllyTreeIndex (like _RG_PREFIX in Lakehouse)
+# Segment key prefix used by the legacy ProllyTreeIndex backend (kept for
+# documentation; the unified path stores segments as rows keyed by INT64
+# 'offset' columns and does not use this prefix).
 _SEG_PREFIX = "seg/"
 
 
@@ -77,8 +80,9 @@ class StreamingLens(PondLens):
     """Streaming/media lens — chunked storage for large objects.
 
     Splits large objects (video, music, logs) into fixed-size segments.
-    Each segment is a separate kernel blob. The ProllyTreeIndex maps
-    segment_number → blob_hash, enabling O(log N) range reads.
+    Each segment is stored as a row {offset, segment} in a PND2 blob via
+    UnifiedStorage. The manifest maps offset ranges → blob_hash, enabling
+    efficient range reads.
 
     COLLECTION-AGNOSTIC: pass the collection name to each operation.
 
@@ -99,69 +103,60 @@ class StreamingLens(PondLens):
                 column values with offset as INT64 key_col.
         """
         super().__init__(kernel)
-        self._bases: dict[str, ProllyLensBase] = {}
         self._unified_storage = None
         try:
             from unified_storage import UnifiedStorage
             self._unified_storage = UnifiedStorage(kernel)
         except ImportError:
-            pass
+            pass  # _require_unified() will raise RuntimeError on first I/O
 
-    def _get_base(self, collection: str) -> ProllyLensBase:
-        if collection not in self._bases:
-            self._bases[collection] = ProllyLensBase(self.kernel, collection)
-        return self._bases[collection]
+    def _require_unified(self) -> None:
+        """Raise RuntimeError if UnifiedStorage is not available.
+
+        The legacy ProllyTreeIndex / ProllyLensBase path has been removed.
+        UnifiedStorage is the ONLY storage path. If it is None (because
+        the physical_structures extension is not importable), every I/O
+        method must fail loudly rather than silently fall back.
+        """
+        if self._unified_storage is None:
+            raise RuntimeError(
+                "UnifiedStorage is not available — the legacy "
+                "ProllyTreeIndex path has been removed. Install the "
+                "physical_structures extension (pond-sdk/extensions/"
+                "physical_structures) to enable Streaming I/O."
+            )
 
     def write_stream(self, collection: str, data: bytes,
                      segment_size: int = 1_000_000) -> str:
         """Write a stream as chunked segments.
 
-        Unified path: stores segments as rows {'offset': int, 'segment': bytes}
-        via PondStorage. PND2 BINARY column for segment data, INT64 for offset.
+        Stores segments as rows {'offset': int, 'segment': bytes} via
+        UnifiedStorage. PND2 BINARY column for segment data, INT64 for
+        offset. This overwrites any existing stream with the same name.
         """
-        # Unified storage path
-        if self._unified_storage is not None:
-            if not data:
-                commit_hash = self._unified_storage.write(collection, [],
-                    key_col="offset", message="write_stream: empty")
-            else:
-                rows = []
-                n_segments = (len(data) + segment_size - 1) // segment_size
-                for i in range(n_segments):
-                    start = i * segment_size
-                    end = min(start + segment_size, len(data))
-                    rows.append({"offset": start, "segment": data[start:end]})
-                commit_hash = self._unified_storage.write(
-                    collection, rows, key_col="offset",
-                    row_group_size=max(1, 10_000_000 // segment_size),
-                    message=f"write_stream: {len(data)} bytes in {n_segments} segments")
-            # Stamp cross-lens metadata so other lenses know this is a
-            # streaming collection with key_col="offset".
-            self.stamp_collection_metadata(
-                collection, lens_type="streaming", key_col="offset",
-                schema_hint={"offset": "int64", "segment": "bytes"},
-                extra={"segment_size": segment_size, "total_bytes": len(data)})
-            return commit_hash
+        self._require_unified()
 
-        # Legacy path
-        base = self._get_base(collection)
-        existing = base.read_all()
-        for k in existing.keys():
-            if k.startswith(_SEG_PREFIX):
-                base.stage_delete(k)
         if not data:
-            return base.commit("write_stream: empty")
-        n_segments = (len(data) + segment_size - 1) // segment_size
-        for i in range(n_segments):
-            start = i * segment_size
-            end = min(start + segment_size, len(data))
-            segment = data[start:end]
-            blob_hash = self.kernel.write(segment)
-            seg_key = f"{_SEG_PREFIX}{i:010d}"
-            base.stage(seg_key, blob_hash)
-        return base.commit(
-            f"write_stream: {len(data)} bytes in {n_segments} segments "
-            f"(segment_size={segment_size})")
+            commit_hash = self._unified_storage.write(collection, [],
+                key_col="offset", message="write_stream: empty")
+        else:
+            rows = []
+            n_segments = (len(data) + segment_size - 1) // segment_size
+            for i in range(n_segments):
+                start = i * segment_size
+                end = min(start + segment_size, len(data))
+                rows.append({"offset": start, "segment": data[start:end]})
+            commit_hash = self._unified_storage.write(
+                collection, rows, key_col="offset",
+                row_group_size=max(1, 10_000_000 // segment_size),
+                message=f"write_stream: {len(data)} bytes in {n_segments} segments")
+        # Stamp cross-lens metadata so other lenses know this is a
+        # streaming collection with key_col="offset".
+        self.stamp_collection_metadata(
+            collection, lens_type="streaming", key_col="offset",
+            schema_hint={"offset": "int64", "segment": "bytes"},
+            extra={"segment_size": segment_size, "total_bytes": len(data)})
+        return commit_hash
 
     def read_stream(self, collection: str,
                     start_byte: Optional[int] = None,
@@ -169,105 +164,76 @@ class StreamingLens(PondLens):
                     commit_hash: Optional[str] = None) -> bytes:
         """Read a range of bytes from a stream.
 
-        Unified path: uses PondStorage.read with start_key/end_key for
-        range scan. Only fetches segments that overlap the byte range.
+        Uses UnifiedStorage.read with start_key/end_key for range scan.
+        Only fetches segments that overlap the byte range.
 
         CROSS-LENS: works on any collection. If the collection has
         "offset" and "segment" columns (streaming-native), uses range
         scan. Otherwise reads all rows and concatenates any bytes-typed
         column values it can find (ugly shape, but full visibility).
+
+        Args:
+            collection: collection name
+            start_byte: optional inclusive start byte (None = 0)
+            end_byte: optional exclusive end byte (None = end of stream)
+            commit_hash: IGNORED in the unified path. The legacy
+                ProllyTreeIndex backend supported time-travel reads at
+                an arbitrary commit; the unified path reads from the
+                collection's current HEAD (+ shards). Use replay_from()
+                for offset-based time-travel on partitioned topics.
+
+        Returns:
+            The concatenated bytes in [start_byte, end_byte).
         """
-        # Unified storage path
-        if self._unified_storage is not None:
-            # Inspect metadata — is this a streaming-native collection?
-            md = self.get_collection_metadata(collection)
-            is_streaming = md.get("lens_type") == "streaming"
-            if is_streaming:
-                rows = self._unified_storage.read(collection,
-                    start_key=start_byte, end_key=end_byte,
-                    columns=["offset", "segment"])
-                result = b""
-                for row in rows:
-                    seg_offset = row.get("offset", 0)
-                    seg_data = row.get("segment", b"")
-                    if seg_data is None:
-                        continue
-                    # Slice the segment to the requested range
-                    seg_start = max(0, (start_byte or 0) - seg_offset)
-                    seg_end = min(len(seg_data),
-                                  (end_byte or float('inf')) - seg_offset)
-                    if seg_end > seg_start:
-                        result += seg_data[seg_start:int(seg_end)]
-                return result
-            # Cross-lens: not a streaming collection. Best-effort read:
-            # concatenate any bytes-valued columns from all rows.
-            try:
-                rows = self._unified_storage.read(collection)
-            except Exception:
-                return b""
+        self._require_unified()
+        # commit_hash is accepted for API compatibility but ignored —
+        # unified reads always use HEAD (+ shards). See docstring above.
+
+        # Inspect metadata — is this a streaming-native collection?
+        md = self.get_collection_metadata(collection)
+        is_streaming = md.get("lens_type") == "streaming"
+        if is_streaming:
+            rows = self._unified_storage.read(collection,
+                start_key=start_byte, end_key=end_byte,
+                columns=["offset", "segment"])
             result = b""
             for row in rows:
-                for v in row.values():
-                    if isinstance(v, (bytes, bytearray)):
-                        result += bytes(v)
-            # Apply byte range if requested
-            if start_byte is not None and end_byte is not None:
-                return result[start_byte:end_byte]
-            elif start_byte is not None:
-                return result[start_byte:]
+                seg_offset = row.get("offset", 0)
+                seg_data = row.get("segment", b"")
+                if seg_data is None:
+                    continue
+                # Slice the segment to the requested range
+                seg_start = max(0, (start_byte or 0) - seg_offset)
+                seg_end = min(len(seg_data),
+                              (end_byte or float('inf')) - seg_offset)
+                if seg_end > seg_start:
+                    result += seg_data[seg_start:int(seg_end)]
             return result
-
-        # Legacy path
-        base = self._get_base(collection)
-        if commit_hash:
-            state = base.read_state_at_commit(commit_hash)
-        else:
-            state = base.read_all()
-
-        # Find segment keys (sorted)
-        seg_keys = sorted(k for k in state.keys() if k.startswith(_SEG_PREFIX))
-        if not seg_keys:
+        # Cross-lens: not a streaming collection. Best-effort read:
+        # concatenate any bytes-valued columns from all rows.
+        try:
+            rows = self._unified_storage.read(collection)
+        except Exception:
             return b""
-
-        # Determine segment size from the first segment
-        first_blob = self.kernel.read_blob(state[seg_keys[0]])
-        segment_size = len(first_blob)
-
-        # Compute which segments overlap [start_byte, end_byte]
-        if start_byte is None:
-            start_byte = 0
-        if end_byte is None:
-            # Read all segments
-            result = b""
-            for k in seg_keys:
-                result += self.kernel.read_blob(state[k])
-            return result[start_byte:]
-
-        # Calculate segment indices that overlap the range
-        start_seg = start_byte // segment_size
-        end_seg = (end_byte - 1) // segment_size if end_byte > 0 else 0
-
-        # Read only the overlapping segments
         result = b""
-        for i in range(start_seg, end_seg + 1):
-            seg_key = f"{_SEG_PREFIX}{i:010d}"
-            if seg_key in state:
-                result += self.kernel.read_blob(state[seg_key])
-
-        # Slice to exact byte range
-        # The first segment may start before start_byte
-        offset_in_first = start_byte - (start_seg * segment_size)
-        # The total bytes we need from the concatenated result
-        total_needed = end_byte - start_byte
-        return result[offset_in_first:offset_in_first + total_needed]
+        for row in rows:
+            for v in row.values():
+                if isinstance(v, (bytes, bytearray)):
+                    result += bytes(v)
+        # Apply byte range if requested
+        if start_byte is not None and end_byte is not None:
+            return result[start_byte:end_byte]
+        elif start_byte is not None:
+            return result[start_byte:]
+        return result
 
     def append_stream(self, collection: str, data: bytes,
                       segment_size: int = 1_000_000) -> str:
         """Append data to an existing stream.
 
-        Uses the unified storage path (append_shard) — each segment
-        becomes a row {offset, segment}. CRDT-safe: multiple producers
-        can append to the same partition concurrently.
+        Uses UnifiedStorage.append_shard — each segment becomes a row
+        {offset, segment}. CRDT-safe: multiple producers can append to
+        the same partition concurrently.
 
         Args:
             collection: collection name
@@ -277,96 +243,79 @@ class StreamingLens(PondLens):
         Returns:
             The shard manifest hash.
         """
-        if self._unified_storage is not None:
-            # Use unified storage: each segment = one row
-            if not data:
-                return ""
-            # Get the current segment count (offset for new segments)
-            current_count = self.segment_count(collection)
-            rows = []
-            for i in range(0, len(data), segment_size):
-                segment = data[i:i + segment_size]
-                rows.append({
-                    "offset": current_count + i // segment_size,
-                    "segment": segment,
-                })
-            return self._unified_storage.append_shard(
-                collection, rows, key_col="offset", row_group_size=1000)
+        self._require_unified()
 
-        # Legacy path (ProllyLensBase)
-        base = self._get_base(collection)
-        state = base.read_all()
-
-        seg_keys = sorted(k for k in state.keys() if k.startswith(_SEG_PREFIX))
-        if not seg_keys:
-            return self.write_stream(collection, data, segment_size)
-
-        last_seg_num = int(seg_keys[-1].replace(_SEG_PREFIX, ""))
-        last_blob = self.kernel.read_blob(state[seg_keys[-1]])
-        if len(last_blob) < segment_size:
-            remaining = segment_size - len(last_blob)
-            fill_data = data[:remaining]
-            data = data[remaining:]
-            combined = last_blob + fill_data
-            new_blob_hash = self.kernel.write(combined)
-            base.stage(seg_keys[-1], new_blob_hash)
-
-        if data:
-            n_new = (len(data) + segment_size - 1) // segment_size
-            for i in range(n_new):
-                start = i * segment_size
-                end = min(start + segment_size, len(data))
-                segment = data[start:end]
-                blob_hash = self.kernel.write(segment)
-                seg_num = last_seg_num + 1 + i
-                seg_key = f"{_SEG_PREFIX}{seg_num:010d}"
-                base.stage(seg_key, blob_hash)
-
-        return base.commit(
-            f"append_stream: {len(data)} bytes appended")
+        if not data:
+            return ""
+        # Get the current segment count (offset for new segments)
+        current_count = self.segment_count(collection)
+        rows = []
+        for i in range(0, len(data), segment_size):
+            segment = data[i:i + segment_size]
+            rows.append({
+                "offset": current_count + i // segment_size,
+                "segment": segment,
+            })
+        return self._unified_storage.append_shard(
+            collection, rows, key_col="offset", row_group_size=1000)
 
     def stream_size(self, collection: str,
                     commit_hash: Optional[str] = None) -> int:
-        """Get the total size of a stream in bytes."""
-        base = self._get_base(collection)
-        if commit_hash:
-            state = base.read_state_at_commit(commit_hash)
-        else:
-            state = base.read_all()
+        """Get the total size of a stream in bytes.
 
-        seg_keys = sorted(k for k in state.keys() if k.startswith(_SEG_PREFIX))
-        if not seg_keys:
+        Reads HEAD (+ shards merged) via read_with_shards and sums the
+        length of every bytes-typed 'segment' column value.
+
+        Args:
+            collection: collection name
+            commit_hash: IGNORED in the unified path. Kept for API
+                compatibility with the legacy time-travel signature.
+                Unified reads always use the current HEAD (+ shards).
+
+        Returns:
+            Total stream size in bytes (0 if the collection is empty
+            or doesn't have any bytes-typed columns).
+        """
+        self._require_unified()
+        # commit_hash is accepted for API compatibility but ignored.
+        try:
+            rows = self._unified_storage.read_with_shards(collection)
+        except Exception:
             return 0
-
         total = 0
-        for k in seg_keys:
-            blob = self.kernel.read_blob(state[k])
-            total += len(blob)
+        for row in rows:
+            seg = row.get("segment")
+            if isinstance(seg, (bytes, bytearray)):
+                total += len(seg)
+            else:
+                # Cross-lens: sum any bytes-typed column.
+                for v in row.values():
+                    if isinstance(v, (bytes, bytearray)):
+                        total += len(v)
         return total
 
     def segment_count(self, collection: str) -> int:
-        """Get the number of segments in a stream (total rows across all shards)."""
-        if self._unified_storage is not None:
-            # Count rows (segments) across HEAD + all shards
-            # Each row is one segment — sum n_rows from all row groups
-            manifest = self._unified_storage._load_manifest(collection)
-            if manifest is None:
-                return 0
-            total = sum(rg.n_rows for rg in manifest.scan_with_pruning())
-            # Also count shards
-            shard_hashes = self._unified_storage._read_shard_index(collection)
-            for sh in shard_hashes:
-                try:
-                    from collection_manifest import CollectionManifest
-                    sm = CollectionManifest.load(self.kernel, sh)
-                    total += sum(rg.n_rows for rg in sm.scan_with_pruning())
-                except (ValueError, KeyError):
-                    pass
-            return total
-        # Legacy path
-        base = self._get_base(collection)
-        state = base.read_all()
-        return sum(1 for k in state.keys() if k.startswith(_SEG_PREFIX))
+        """Get the number of segments in a stream (total rows across all shards).
+
+        Each row is one segment — sum n_rows from all row groups in the
+        HEAD manifest + every shard manifest.
+        """
+        self._require_unified()
+        # Count rows (segments) across HEAD + all shards
+        manifest = self._unified_storage._load_manifest(collection)
+        if manifest is None:
+            return 0
+        total = sum(rg.n_rows for rg in manifest.scan_with_pruning())
+        # Also count shards
+        shard_hashes = self._unified_storage._read_shard_index(collection)
+        for sh in shard_hashes:
+            try:
+                from collection_manifest import CollectionManifest
+                sm = CollectionManifest.load(self.kernel, sh)
+                total += sum(rg.n_rows for rg in sm.scan_with_pruning())
+            except (ValueError, KeyError):
+                pass
+        return total
 
     # ==================================================================
     # KAFKA-LIKE FEATURES: partitions, consumer groups, offsets
@@ -412,20 +361,19 @@ class StreamingLens(PondLens):
         # Initialize the collection
         self.write_stream(collection, b"init", segment_size=1_000_000)
         # Create partition branches
+        self._require_unified()
         partitions = []
         for i in range(n_partitions):
             p = f"p{i}"
-            if self._unified_storage is not None:
-                self._unified_storage.branch(collection, p)
+            self._unified_storage.branch(collection, p)
             partitions.append(p)
         return partitions
 
     def list_partitions(self, collection: str) -> list[str]:
         """List all partitions (branches) for a topic (collection)."""
-        if self._unified_storage is not None:
-            branches = self._unified_storage.list_branches(collection)
-            return [b for b in branches if b.startswith("p") and b[1:].isdigit()]
-        return []
+        self._require_unified()
+        branches = self._unified_storage.list_branches(collection)
+        return [b for b in branches if b.startswith("p") and b[1:].isdigit()]
 
     def produce(self, collection: str, partition: int, data: bytes,
                 segment_size: int = 1_000_000) -> str:
@@ -440,10 +388,9 @@ class StreamingLens(PondLens):
         Returns:
             The shard manifest hash.
         """
-        if self._unified_storage is not None:
-            # Checkout the partition branch, then append_shard
-            self._unified_storage.checkout(collection, f"p{partition}")
-            return self.append_stream(collection, data, segment_size)
+        self._require_unified()
+        # Checkout the partition branch, then append_shard
+        self._unified_storage.checkout(collection, f"p{partition}")
         return self.append_stream(collection, data, segment_size)
 
     def produce_round_robin(self, collection: str, data: bytes,
@@ -462,8 +409,8 @@ class StreamingLens(PondLens):
 
     def get_latest_offset(self, collection: str, partition: int) -> int:
         """Get the latest offset (segment count) for a partition."""
-        if self._unified_storage is not None:
-            self._unified_storage.checkout(collection, f"p{partition}")
+        self._require_unified()
+        self._unified_storage.checkout(collection, f"p{partition}")
         return self.segment_count(collection)
 
     def consume(self, collection: str, partition: int,
@@ -485,8 +432,8 @@ class StreamingLens(PondLens):
         Returns:
             List of {offset, data, partition} dicts.
         """
-        if self._unified_storage is not None:
-            self._unified_storage.checkout(collection, f"p{partition}")
+        self._require_unified()
+        self._unified_storage.checkout(collection, f"p{partition}")
         start_offset = 0
         if group:
             start_offset = self._get_offset(group, collection, partition)
@@ -557,8 +504,8 @@ class StreamingLens(PondLens):
         Returns:
             List of {offset, data, partition} dicts.
         """
-        if self._unified_storage is not None:
-            self._unified_storage.checkout(collection, f"p{partition}")
+        self._require_unified()
+        self._unified_storage.checkout(collection, f"p{partition}")
         latest = self.segment_count(collection)
         end_offset = min(offset + max_messages, latest)
 
@@ -580,20 +527,13 @@ class StreamingLens(PondLens):
         Uses read_with_shards to merge HEAD + all shards, then finds the
         segment with the matching offset.
         """
-        if self._unified_storage is not None:
-            # Read all rows (HEAD + shards merged) and find the one with this offset
-            rows = self._unified_storage.read_with_shards(collection)
-            for row in rows:
-                if row.get("offset") == offset:
-                    return row.get("segment")
-            return None
-        # Legacy path
-        base = self._get_base(collection)
-        seg_key = f"{_SEG_PREFIX}{offset:010d}"
-        h = base.lookup(seg_key)
-        if h is None:
-            return None
-        return self.kernel.read_blob(h)
+        self._require_unified()
+        # Read all rows (HEAD + shards merged) and find the one with this offset
+        rows = self._unified_storage.read_with_shards(collection)
+        for row in rows:
+            if row.get("offset") == offset:
+                return row.get("segment")
+        return None
 
     def list_consumer_groups(self) -> list[str]:
         """List all consumer groups."""
@@ -629,14 +569,23 @@ class StreamingLens(PondLens):
         return offsets
 
     # ==================================================================
-    # Version control (delegated to ProllyLensBase)
+    # Version control (delegated to UnifiedStorage)
     # ==================================================================
 
     def create_branch(self, collection: str, branch_name: str) -> str:
-        return self._get_base(collection).branch(branch_name)
+        """Create a branch — O(1) ref copy via UnifiedStorage."""
+        self._require_unified()
+        return self._unified_storage.branch(collection, branch_name)
 
     def merge_branch(self, collection: str, branch_name: str) -> str:
-        return self._get_base(collection).merge(branch_name)
+        """Merge a branch into the collection's HEAD.
+
+        Union merge with a 2-parent commit (git-like).
+        """
+        self._require_unified()
+        return self._unified_storage.merge(collection, branch_name)
 
     def get_history(self, collection: str, limit: int = 20) -> list[dict]:
-        return self._get_base(collection).history(limit)
+        """Walk the commit chain for the collection."""
+        self._require_unified()
+        return self._unified_storage.history(collection, limit)

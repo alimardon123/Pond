@@ -32,7 +32,7 @@ pond_repo/
 │       ├── indexing/            # Collection-level indexing
 │       │   ├── base.py          # CollectionIndexerInterface (abstract)
 │       │   ├── collection_index.py # CollectionIndexer (RECOMMENDED)
-│       │   └── auto_index.py    # AutoIndexMixin (DEPRECATED)
+│       │   └── 
 │       ├── semantic/            # Semantic model management
 │       │   ├── base.py          # SemanticModelAdapter (abstract)
 │       │   └── ossie.py         # SemanticMixin + OssieAdapter

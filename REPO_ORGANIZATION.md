@@ -62,7 +62,7 @@ versions of this document incorrectly listed it under pond-sdk.
 
 **Contains:** Lenses that are production-quality and ready for use.
 **Current:**
-- `lenses/keyvalue/` (`KeyValueLens`, `KeylessLens`, `CrossLens`)
+- `lenses/keyvalue/` (`KeyValueLens`, `KeylessLens`)
 - `lenses/lakehouse/` (`LakehouseLens`)
 - `lenses/streaming/` (`StreamingLens`)
 - `lenses/vector/` (`VectorLens`)

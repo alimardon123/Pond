@@ -682,18 +682,18 @@ def law_17_lakehouse_range_ops():
     print("PASS: Law 17 (LakehouseLens range ops) — range_write/read/point_lookup all work")
 
 
-def law_18_lakehouse_prolly_tree_index_storage():
-    """LAW 18: LakehouseLens uses ProllyTreeIndex for ALL writes.
+def law_18_lakehouse_manifest_storage():
+    """LAW 18: LakehouseLens uses manifest-based JSON commits (not ProllyTree).
 
-    Verify that create_table (not just range_write) stores row groups
-    in the ProllyTreeIndex (binary commit format, type byte 3), not
-    as a direct JSON+parquet commit.
+    Updated for the unified architecture: commits are JSON blobs with
+    {parent, manifest, message, timestamp, index}. The manifest contains
+    row group entries with rg/ keys.
     """
-    import shutil
+    import shutil, json as _json
     try:
         import pyarrow as pa
     except ImportError:
-        print("SKIP: Law 18 (LakehouseLens ProllyTreeIndex storage) — pyarrow not installed")
+        print("SKIP: Law 18 (LakehouseLens manifest storage) — pyarrow not installed")
         return
 
     kernel, lens, bench, LakehouseLens = _make_lakehouse()
@@ -704,28 +704,26 @@ def law_18_lakehouse_prolly_tree_index_storage():
         head = kernel.resolve("collections/users/HEAD")
         raw = kernel.read_blob(head)
 
-        # The commit MUST be binary (type byte 3 = BinaryProllyTree commit).
-        # If it were JSON, it would start with '{' (byte 0x7B).
-        assert len(raw) > 0 and raw[0] == 3, \
-            f"LAW 18 VIOLATED: create_table commit is not binary ProllyLensBase format (first byte: {raw[0] if raw else 'empty'})"
+        # The commit MUST be JSON (starts with '{').
+        assert len(raw) > 0 and raw[0:1] == b'{', \
+            f"LAW 18 VIOLATED: commit is not JSON (first byte: {raw[0] if raw else 'empty'})"
 
-        # Decode and verify it has a snapshot (Prolly tree root)
-        from binary_encoding import BinaryProllyTree
-        commit = BinaryProllyTree.decode_commit(raw)
-        assert commit.get("snapshot") is not None, \
-            "LAW 18 VIOLATED: create_table commit has no snapshot tree root"
+        commit = _json.loads(raw)
+        assert commit.get("manifest") is not None, \
+            "LAW 18 VIOLATED: commit has no manifest hash"
 
-        # Verify the snapshot contains row group keys (rg/...)
-        from prolly_tree import ProllyTree
-        state = ProllyTree.read_all(kernel, commit["snapshot"])
-        rg_keys = [k for k in state.keys() if k.startswith("rg/")]
-        assert len(rg_keys) >= 1, \
-            f"LAW 18 VIOLATED: no row group keys in snapshot (keys: {list(state.keys())})"
+        # Verify the manifest contains row group entries
+        sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_structures"))
+        from collection_manifest import CollectionManifest
+        manifest = CollectionManifest.load(kernel, commit["manifest"])
+        rg_count = len(list(manifest.scan_with_pruning()))
+        assert rg_count >= 1, \
+            f"LAW 18 VIOLATED: no row groups in manifest (got {rg_count})"
 
         kernel.close()
     finally:
         shutil.rmtree(bench, ignore_errors=True)
-    print("PASS: Law 18 (LakehouseLens ProllyTreeIndex storage) — create_table uses binary ProllyLensBase commits with rg/ row groups")
+    print("PASS: Law 18 (LakehouseLens manifest storage) — JSON commit + manifest with row groups")
 
 
 def _run_all():
@@ -752,7 +750,7 @@ def _run_all():
     law_15_lakehouse_merge_true_dag()
     law_16_lakehouse_time_travel()
     law_17_lakehouse_range_ops()
-    law_18_lakehouse_prolly_tree_index_storage()
+    law_18_lakehouse_manifest_storage()
 
     print("\n=== ALL 18 ARCHITECTURE LAWS HOLD ===")
 

@@ -2,7 +2,7 @@
 KeyValueLens — the app-facing KEY-VALUE lens.
 
 This is one of three peer app-facing lenses in Pond:
-  - KeyValueLens  (this file)        — per-row key→blob storage over ProllyTreeIndex
+  - KeyValueLens  (this file)        — per-row key→blob storage over UnifiedStorage
   - LakehouseLens (lenses/lakehouse)  — whole-table Parquet I/O + range read/write
   - FeatureStoreLens (pond-labs)      — versioned ML feature store on Parquet
 
@@ -23,21 +23,22 @@ each operation:
 This matches LakehouseLens's API (create_table(name, data), read_table(name)).
 The same lens instance can operate on ANY collection.
 
-KeyValueLens stores each row as a single blob in the ProllyTreeIndex,
-keyed by a user-supplied primary key (or auto-generated UUIDv7 for
+KeyValueLens stores each row as a single value column in a PND2 row group
+(keyed by a user-supplied primary key, or auto-generated UUIDv7 for
 KeylessLens). This makes it suitable for:
-  - OLTP workloads (point lookups via Prolly tree, O(log N))
+  - OLTP workloads (point lookups via manifest, O(1) cold)
   - Streaming/event logs (KeylessLens variant with auto-UUIDv7 keys)
   - Document storage (each blob is a JSON document)
-  - Cross-lens blob sharing (CrossLens helpers below)
+  - Cross-lens row sharing (any lens can read any collection via metadata)
 
 Backward-compat: the old API `KeyValueLens(kernel, name)` still works via
 a compatibility wrapper that binds to a single collection. New code should
 use the collection-agnostic API.
 
-Backward-compat aliases (defined at the END of this file):
-  Lens = KeyValueLens  (old name, kept for compat)
-  View = KeyValueLens  (older name, kept for compat)
+STORAGE: There is exactly ONE storage path — the UnifiedStorage backend
+(PND2 blobs + CollectionManifest + JSON commit blobs). The legacy
+ProllyTreeIndex / ProllyLensBase path has been removed. If UnifiedStorage
+is not available, all I/O methods raise RuntimeError.
 """
 
 from __future__ import annotations
@@ -52,10 +53,9 @@ from typing import Optional, Any, Callable, Union
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-sdk"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "pond-sdk", "extensions", "physical_structures"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kernel import PondMinimal
-from prolly_tree import ProllyLensBase, ProllyTree
-from binary_encoding import BinaryProllyTree
 from maintenance import (drop_name, is_dropped, resolve_active,
                          TOMBSTONE_HASH)
 from row_query import LensQuery
@@ -68,7 +68,7 @@ from uuid7 import uuidv7
 # ===========================================================================
 
 class KeyValueLens(PondLens):
-    """App-facing KEY-VALUE lens with ProllyTreeIndex backing.
+    """App-facing KEY-VALUE lens with UnifiedStorage backing.
 
     COLLECTION-AGNOSTIC: This lens is a stateless read/write engine. It
     does NOT bind to a single collection. Pass the collection name to
@@ -85,7 +85,7 @@ class KeyValueLens(PondLens):
     Key-value operations (all take collection as first arg):
       - put(collection, key, data): stage a key→blob mapping
       - put_auto(collection, data): stage with auto-generated UUIDv7 key
-      - get(collection, key): read a single value by key (O(log N))
+      - get(collection, key): read a single value by key (O(1) cold)
       - get_raw(collection, key): read raw bytes (no decode)
       - delete(collection, key): stage a deletion
       - commit(collection, message): atomically commit all staged changes
@@ -98,7 +98,7 @@ class KeyValueLens(PondLens):
       - map(collection, fn)
       - join(collection, other, on='field')
 
-    Version control (delegated to ProllyLensBase):
+    Version control (delegated to UnifiedStorage):
       - branch(collection, branch_name), checkout(collection, branch_name)
       - list_branches(collection)
       - merge(collection, branch_name) [union merge with 2-parent commit]
@@ -120,25 +120,40 @@ class KeyValueLens(PondLens):
                   blobs + CollectionManifest + JSON commit blobs.
         """
         super().__init__(kernel)
-        self._bases: dict[str, ProllyLensBase] = {}
         self._default_collection = name
         if name is not None:
             self.name = name
         # Attached indexer for auto-notify on commit (set via attach_indexer)
         self._attached_indexer = None
 
-        # Unified storage backend (the ONLY storage path now)
+        # Unified storage backend (the ONLY storage path)
         self._unified_storage = None
         try:
             from unified_storage import UnifiedStorage
             self._unified_storage = UnifiedStorage(kernel)
         except ImportError:
-            pass  # will fail on first I/O call
+            pass  # _require_unified() will raise RuntimeError on first I/O
         # Unified storage write buffer: collection → {key → value}
         self._unified_buffer: dict[str, dict[str, Any]] = {}
         # Cross-lens metadata cache: collection → key_col (so cold lookup
         # costs 1 GET, subsequent lookups are free).
         self._key_col_cache: dict[str, str] = {}
+
+    def _require_unified(self) -> None:
+        """Raise RuntimeError if UnifiedStorage is not available.
+
+        The legacy ProllyTreeIndex / ProllyLensBase path has been removed.
+        UnifiedStorage is the ONLY storage path. If it is None (because
+        the physical_structures extension is not importable), every I/O
+        method must fail loudly rather than silently fall back.
+        """
+        if self._unified_storage is None:
+            raise RuntimeError(
+                "UnifiedStorage is not available — the legacy "
+                "ProllyTreeIndex path has been removed. Install the "
+                "physical_structures extension (pond-sdk/extensions/"
+                "physical_structures) to enable KV I/O."
+            )
 
     def _resolve_key_col(self, collection: str) -> str:
         """Resolve the key column for a collection — cross-lens aware.
@@ -176,27 +191,6 @@ class KeyValueLens(PondLens):
                 raise TypeError("Collection name required (lens is not bound to a default collection)")
             return args[0], args[1:]
 
-    def _get_base(self, collection: str) -> ProllyLensBase:
-        """Get or create the ProllyLensBase for a collection.
-
-        ProllyLensBase holds per-collection staging state (_staged_add,
-        _staged_del). We cache one instance per collection so staged
-        changes persist across calls until commit.
-        """
-        if collection not in self._bases:
-            self._bases[collection] = ProllyLensBase(self.kernel, collection)
-        return self._bases[collection]
-
-    @property
-    def base(self) -> ProllyLensBase:
-        """Backward compat: return the ProllyLensBase for the default collection.
-
-        New code should use _get_base(collection) instead.
-        """
-        if self._default_collection is None:
-            raise TypeError("lens is not bound to a default collection; use _get_base(collection)")
-        return self._get_base(self._default_collection)
-
     # --- Write path ---
 
     def put(self, *args) -> str:
@@ -207,18 +201,13 @@ class KeyValueLens(PondLens):
         """
         collection, rest = self._resolve_collection(*args)
         key, data = rest[0], rest[1]
+        self._require_unified()
 
-        # Unified storage path: buffer the put, commit later
-        if self._unified_storage is not None:
-            if collection not in self._unified_buffer:
-                self._unified_buffer[collection] = {}
-            self._unified_buffer[collection][key] = data
-            return key  # placeholder — real hash assigned at commit
-
-        # Legacy path: write blob immediately, stage in ProllyTreeIndex
-        blob_hash = self.kernel.write(self.encode(data))
-        self._get_base(collection).stage(key, blob_hash)
-        return blob_hash
+        # Buffer the put; commit later writes a PND2 row group.
+        if collection not in self._unified_buffer:
+            self._unified_buffer[collection] = {}
+        self._unified_buffer[collection][key] = data
+        return key  # placeholder — real hash assigned at commit
 
     def put_auto(self, *args) -> str:
         """Stage data with an auto-generated UUIDv7 key. Returns the key.
@@ -228,9 +217,12 @@ class KeyValueLens(PondLens):
         """
         collection, rest = self._resolve_collection(*args)
         data = rest[0]
+        self._require_unified()
+
         key = uuidv7()
-        blob_hash = self.kernel.write(self.encode(data))
-        self._get_base(collection).stage(key, blob_hash)
+        if collection not in self._unified_buffer:
+            self._unified_buffer[collection] = {}
+        self._unified_buffer[collection][key] = data
         return key
 
     def put_raw(self, *args) -> None:
@@ -238,10 +230,25 @@ class KeyValueLens(PondLens):
 
         Collection-agnostic API: put_raw(collection, key, blob_hash)
         Backward compat API:    put_raw(key, blob_hash)  [requires name in __init__]
+
+        NOTE: The legacy ProllyTreeIndex path supported zero-copy hash
+        sharing (staging a blob_hash without re-encoding). UnifiedStorage
+        writes PND2 row groups, so this method now reads the blob's bytes
+        and stages them as the value. Cross-collection zero-copy hash
+        sharing is no longer meaningful — each collection has its own
+        PND2 blobs. Cross-lens reads happen at the row level via
+        UnifiedStorage.read().
         """
         collection, rest = self._resolve_collection(*args)
         key, blob_hash = rest[0], rest[1]
-        self._get_base(collection).stage(key, blob_hash)
+        self._require_unified()
+
+        if collection not in self._unified_buffer:
+            self._unified_buffer[collection] = {}
+        # Read the existing blob bytes and stage them as the value.
+        # The bytes are re-encoded at commit (encode() passes bytes through).
+        raw_bytes = self.kernel.read_blob(blob_hash)
+        self._unified_buffer[collection][key] = raw_bytes
 
     def delete(self, *args) -> None:
         """Stage a deletion for the given key.
@@ -249,23 +256,19 @@ class KeyValueLens(PondLens):
         Collection-agnostic API: delete(collection, key)
         Backward compat API:    delete(key)  [requires name in __init__]
 
-        Fix (Round 16 Issue #2): in unified mode, stage the delete by
-        marking the key in the buffer with a tombstone sentinel.
-        commit() then skips tombstoned keys when writing.
+        In unified mode, deletes are staged by marking the key in the
+        buffer with a tombstone sentinel (value=None). commit() then
+        performs a full rewrite: read existing data, drop deleted keys,
+        add new puts, write the result via write() (overwrite).
         """
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
+        self._require_unified()
 
-        # Unified storage path: mark key for deletion in the buffer
-        if self._unified_storage is not None:
-            if collection not in self._unified_buffer:
-                self._unified_buffer[collection] = {}
-            # Tombstone: set value to None (commit skips None values)
-            self._unified_buffer[collection][key] = None
-            return
-
-        # Legacy path: stage delete on ProllyLensBase
-        self._get_base(collection).stage_delete(key)
+        if collection not in self._unified_buffer:
+            self._unified_buffer[collection] = {}
+        # Tombstone: set value to None (commit skips None values)
+        self._unified_buffer[collection][key] = None
 
     def commit(self, *args) -> str:
         """Atomically commit all staged changes for the collection.
@@ -280,82 +283,78 @@ class KeyValueLens(PondLens):
         """
         collection, rest = self._resolve_collection(*args)
         message = rest[0] if rest else ""
+        self._require_unified()
 
-        # Unified storage path: flush buffer via UnifiedStorage
-        if self._unified_storage is not None:
-            if collection not in self._unified_buffer:
-                raise ValueError(f"No staged data for collection '{collection}'")
-            buffer = self._unified_buffer[collection]
+        if collection not in self._unified_buffer:
+            raise ValueError(f"No staged data for collection '{collection}'")
+        buffer = self._unified_buffer[collection]
 
-            # Fix (Round 17 Issue #1): deletes must actually remove data.
-            # UnifiedStorage.append() only adds — it can't delete old keys.
-            # If there are tombstones (value=None), we must do a full rewrite:
-            # read all existing data, remove deleted keys, add new puts,
-            # write the result via write() (overwrite).
-            has_deletes = any(v is None for v in buffer.values())
-            puts_only = {k: v for k, v in buffer.items() if v is not None}
+        # Deletes must actually remove data. UnifiedStorage.append() only
+        # adds — it can't delete old keys. If there are tombstones
+        # (value=None), we must do a full rewrite: read all existing data,
+        # remove deleted keys, add new puts, write the result via write()
+        # (overwrite).
+        has_deletes = any(v is None for v in buffer.values())
+        puts_only = {k: v for k, v in buffer.items() if v is not None}
 
-            if has_deletes:
-                # Full rewrite: read existing data, apply deletes + puts
-                existing_rows = self._unified_storage.read(collection,
-                                                             columns=["_key", "value"])
-                deleted_keys = {k for k, v in buffer.items() if v is None}
-                # Keep existing rows that aren't deleted and aren't being overwritten
-                result_rows = []
-                for row in existing_rows:
-                    if row["_key"] not in deleted_keys and row["_key"] not in puts_only:
-                        result_rows.append(row)
-                # Add new puts
-                for k, v in puts_only.items():
-                    result_rows.append({"_key": k, "value": self.encode(v)})
-                result_rows.sort(key=lambda r: r["_key"])
+        if has_deletes:
+            # Full rewrite: read existing data, apply deletes + puts
+            existing_rows = self._unified_storage.read(collection,
+                                                         columns=["_key", "value"])
+            deleted_keys = {k for k, v in buffer.items() if v is None}
+            # Keep existing rows that aren't deleted and aren't being overwritten
+            result_rows = []
+            for row in existing_rows:
+                if row["_key"] not in deleted_keys and row["_key"] not in puts_only:
+                    result_rows.append(row)
+            # Add new puts
+            for k, v in puts_only.items():
+                result_rows.append({"_key": k, "value": self.encode(v)})
+            result_rows.sort(key=lambda r: r["_key"])
+            commit_hash = self._unified_storage.write(
+                collection, result_rows, key_col="_key",
+                row_group_size=10_000,
+                message=message or f"{collection} unified commit (with deletes)")
+            # Stamp metadata if this is a new collection
+            if self.get_collection_metadata(collection).get("lens_type") is None:
+                self.stamp_collection_metadata(
+                    collection, lens_type="keyvalue", key_col="_key",
+                    schema_hint={"_key": "string", "value": "bytes"})
+        elif puts_only:
+            # No deletes — just append new puts
+            rows = [{"_key": k, "value": self.encode(v)}
+                     for k, v in puts_only.items()]
+            rows.sort(key=lambda r: r["_key"])
+            # Decide: append (existing collection) or write (new)?
+            existing_manifest = self._unified_storage._load_manifest(collection)
+            if existing_manifest is None:
+                # NEW collection — write() creates the first manifest.
+                # Stamp cross-lens metadata so other lenses know this
+                # is a KV collection with key_col="_key".
                 commit_hash = self._unified_storage.write(
-                    collection, result_rows, key_col="_key",
+                    collection, rows, key_col="_key",
                     row_group_size=10_000,
-                    message=message or f"{collection} unified commit (with deletes)")
-                # Stamp metadata if this is a new collection
-                if self.get_collection_metadata(collection).get("lens_type") is None:
-                    self.stamp_collection_metadata(
-                        collection, lens_type="keyvalue", key_col="_key",
-                        schema_hint={"_key": "string", "value": "bytes"})
-            elif puts_only:
-                # No deletes — just append new puts
-                rows = [{"_key": k, "value": self.encode(v)}
-                         for k, v in puts_only.items()]
-                rows.sort(key=lambda r: r["_key"])
-                # Decide: append (existing collection) or write (new)?
-                existing_manifest = self._unified_storage._load_manifest(collection)
-                if existing_manifest is None:
-                    # NEW collection — write() creates the first manifest.
-                    # Stamp cross-lens metadata so other lenses know this
-                    # is a KV collection with key_col="_key".
-                    commit_hash = self._unified_storage.write(
-                        collection, rows, key_col="_key",
-                        row_group_size=10_000,
-                        message=message or f"{collection} unified commit")
-                    self.stamp_collection_metadata(
-                        collection, lens_type="keyvalue", key_col="_key",
-                        schema_hint={"_key": "string", "value": "bytes"})
-                else:
-                    # EXISTING collection — append (preserves existing
-                    # rows and key_col). Don't overwrite metadata; if
-                    # this is another lens's collection, the appended
-                    # rows will have only _key+value columns (other
-                    # columns become None — "ugly shape" but readable
-                    # by any lens).
-                    commit_hash = self._unified_storage.append(
-                        collection, rows, key_col="_key",
-                        row_group_size=10_000,
-                        message=message or f"{collection} unified commit")
+                    message=message or f"{collection} unified commit")
+                self.stamp_collection_metadata(
+                    collection, lens_type="keyvalue", key_col="_key",
+                    schema_hint={"_key": "string", "value": "bytes"})
             else:
-                commit_hash = ""
-            del self._unified_buffer[collection]
-            return commit_hash
+                # EXISTING collection — append (preserves existing
+                # rows and key_col). Don't overwrite metadata; if
+                # this is another lens's collection, the appended
+                # rows will have only _key+value columns (other
+                # columns become None — "ugly shape" but readable
+                # by any lens).
+                commit_hash = self._unified_storage.append(
+                    collection, rows, key_col="_key",
+                    row_group_size=10_000,
+                    message=message or f"{collection} unified commit")
+        else:
+            commit_hash = ""
 
-        # Legacy path: ProllyTreeIndex commit
-        commit_hash = self._get_base(collection).commit(message or f"{collection} commit")
+        del self._unified_buffer[collection]
 
-        # Notify attached indexer (EAGER mode auto-refresh)
+        # Notify attached indexer (EAGER mode auto-refresh).
         # This is a no-op if no indexer is attached.
         if self._attached_indexer is not None:
             try:
@@ -385,67 +384,32 @@ class KeyValueLens(PondLens):
         Collection-agnostic API: build_zone_maps(collection)
         Backward compat API:    build_zone_maps()  [uses default collection]
 
-        Zone maps are NOT built automatically for KV commits because KV
-        entries are individual blobs (1 zone map per blob = 2x writes).
-        Instead, call this method explicitly when you want pruning support.
+        DEPRECATED: Zone maps were a legacy pruning extension for the
+        ProllyTreeIndex backend (per-blob min/max stats). The unified
+        storage architecture uses manifest-level inline stats for
+        pruning instead (1 zone map per row group of 10K rows = negligible
+        overhead, auto-built at write time).
 
-        For LakehouseLens, zone maps ARE auto-built (1 zone map per row
-        group of 10K rows = negligible overhead).
+        This method is kept for API compatibility but is a no-op in
+        unified mode. The legacy pruning extension (collection_metadata,
+        pruning, pruning_reader) has been moved to archive/.
         """
         collection, rest = self._resolve_collection(*args)
-        try:
-            from collection_metadata import CollectionMetadata
-            from pruning import ZoneMap
-        except ImportError:
-            return  # pruning extension not available
-
-        meta = CollectionMetadata(self.kernel)
-        zm_index = meta.zm_index
-        if zm_index is None:
-            return
-        base = self._get_base(collection)
-        state = base.read_all()
-        had_changes = False
-
-        for key, blob_hash in state.items():
-            if key.startswith("_"):
-                continue
-            rg_key = f"kv/{key}"
-            existing_zm = zm_index.get_zone_map(collection, rg_key)
-            if existing_zm is not None:
-                continue
-            try:
-                raw = self.kernel.read_blob(blob_hash)
-                row = json.loads(raw)
-                if not isinstance(row, dict):
-                    continue
-                zm = ZoneMap(row_count=1)
-                for col, val in row.items():
-                    if val is None:
-                        zm.null_count[col] = 1
-                    elif isinstance(val, (int, float, str)):
-                        zm.min[col] = val
-                        zm.max[col] = val
-                        zm.null_count[col] = 0
-                if zm.min:
-                    zm_index.add_zone_map(collection, rg_key, zm, blob_hash)
-                    had_changes = True
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-
-        if had_changes:
-            zm_index.commit_zone_maps(collection, f"zone maps for {collection}")
+        # No-op: zone maps are superseded by manifest-level stats.
+        # Kept for API compatibility — callers that invoke this method
+        # will not crash, but no zone maps are built.
+        return
 
     # --- Read path ---
 
     def get(self, *args) -> Optional[Any]:
-        """Read a single value by key. O(log N) via ProllyTreeIndex.
+        """Read a single value by key. O(1) cold via manifest point_lookup.
 
         Collection-agnostic API: get(collection, key)
         Backward compat API:    get(key)  [requires name in __init__]
 
-        Unified storage path (use_unified_storage=True): 4 GETs cold
-        point lookup via manifest + encoded predicate eval.
+        Unified storage path: 4 GETs cold point lookup via manifest +
+        encoded predicate eval.
 
         CROSS-LENS: if the collection was created by another lens (e.g.
         lakehouse "users" with key_col="id"), this reads metadata.key_col
@@ -455,40 +419,32 @@ class KeyValueLens(PondLens):
         """
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
+        self._require_unified()
 
-        # Unified storage path: point_lookup via manifest
-        if self._unified_storage is not None:
-            key_col = self._resolve_key_col(collection)
-            row = self._unified_storage.point_lookup(collection, key=key)
-            if row is None:
-                return None
-            # KV-created collection: return the decoded "value" field
-            if key_col == "_key" and "value" in row:
-                return self.decode(row["value"])
-            # Cross-lens: return the full row dict (caller sees all columns)
-            return row
-
-        # Legacy path: ProllyTreeIndex lookup
-        h = self._get_base(collection).lookup(key)
-        return self.decode(self.kernel.read_blob(h)) if h else None
+        key_col = self._resolve_key_col(collection)
+        row = self._unified_storage.point_lookup(collection, key=key)
+        if row is None:
+            return None
+        # KV-created collection: return the decoded "value" field
+        if key_col == "_key" and "value" in row:
+            return self.decode(row["value"])
+        # Cross-lens: return the full row dict (caller sees all columns)
+        return row
 
     def get_raw(self, *args) -> Optional[bytes]:
         """Read raw bytes by key (no decode).
 
-        Unified path: reads the row via point_lookup and returns the
-        raw value bytes. Legacy path: ProllyTreeIndex lookup.
+        Reads the row via point_lookup and returns the raw value bytes.
         """
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
-        if self._unified_storage is not None:
-            row = self._unified_storage.point_lookup(collection, key=key)
-            if row is None:
-                return None
-            # Return the value bytes if present, else None
-            return row.get("value")
-        # Legacy path
-        h = self._get_base(collection).lookup(key)
-        return self.kernel.read_blob(h) if h else None
+        self._require_unified()
+
+        row = self._unified_storage.point_lookup(collection, key=key)
+        if row is None:
+            return None
+        # Return the value bytes if present, else None
+        return row.get("value")
 
     def get_all(self, *args) -> dict[str, Any]:
         """Read all key→value pairs from the collection.
@@ -499,22 +455,16 @@ class KeyValueLens(PondLens):
         "value" because the collection has more than just key+value.
         """
         collection, rest = self._resolve_collection(*args)
+        self._require_unified()
 
-        # Unified storage path
-        if self._unified_storage is not None:
-            key_col = self._resolve_key_col(collection)
-            rows = self._unified_storage.read(collection)
-            if key_col == "_key":
-                # KV-created: return decoded values
-                return {r["_key"]: self.decode(r["value"])
-                        for r in rows if r.get("_key")}
-            # Cross-lens: return full rows keyed by key_col
-            return {str(r.get(key_col)): r for r in rows if r.get(key_col) is not None}
-
-        # Legacy path
-        state = self._get_base(collection).read_all()
-        return {k: self.decode(self.kernel.read_blob(h))
-                for k, h in state.items() if not k.startswith("_")}
+        key_col = self._resolve_key_col(collection)
+        rows = self._unified_storage.read(collection)
+        if key_col == "_key":
+            # KV-created: return decoded values
+            return {r["_key"]: self.decode(r["value"])
+                    for r in rows if r.get("_key")}
+        # Cross-lens: return full rows keyed by key_col
+        return {str(r.get(key_col)): r for r in rows if r.get(key_col) is not None}
 
     def keys(self, *args) -> list[str]:
         """List all user keys in the collection (excludes internal _ keys).
@@ -523,39 +473,26 @@ class KeyValueLens(PondLens):
         key_col column (from metadata), or "_key" if KV-created.
         """
         collection, rest = self._resolve_collection(*args)
+        self._require_unified()
 
-        # Unified storage path
-        if self._unified_storage is not None:
-            key_col = self._resolve_key_col(collection)
-            rows = self._unified_storage.read(collection, columns=[key_col])
-            return [str(r[key_col]) for r in rows if r.get(key_col) is not None]
-
-        # Legacy path
-        return [k for k in self._get_base(collection).read_all() if not k.startswith("_")]
+        key_col = self._resolve_key_col(collection)
+        rows = self._unified_storage.read(collection, columns=[key_col])
+        return [str(r[key_col]) for r in rows if r.get(key_col) is not None]
 
     def exists(self, *args) -> bool:
         """Check if a key exists in the collection."""
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
+        self._require_unified()
 
-        # Unified storage path
-        if self._unified_storage is not None:
-            row = self._unified_storage.point_lookup(collection, key=key)
-            return row is not None
-
-        # Legacy path
-        return self._get_base(collection).lookup(key) is not None
+        row = self._unified_storage.point_lookup(collection, key=key)
+        return row is not None
 
     def count(self, *args) -> int:
         """Count user keys in the collection."""
         collection, rest = self._resolve_collection(*args)
-
-        # Unified storage path
-        if self._unified_storage is not None:
-            return len(self.keys(collection))
-
-        # Legacy path
-        return sum(1 for k in self._get_base(collection).read_all() if not k.startswith("_"))
+        self._require_unified()
+        return len(self.keys(collection))
 
     # ------------------------------------------------------------------
     # Collection-like API — make a collection feel like an iterable of rows.
@@ -569,33 +506,17 @@ class KeyValueLens(PondLens):
         Backward compat:    iterate()  [uses default collection]
         """
         collection, rest = self._resolve_collection(*args)
+        self._require_unified()
 
-        # Unified storage path: read all rows via manifest
-        if self._unified_storage is not None:
-            rows = self._unified_storage.read(collection,
-                                                columns=["_key", "value"])
-            for row in rows:
-                yield self.decode(row["value"])
-            return
-
-        # Legacy path: ProllyTreeIndex
-        # Fix (Round 22): call _get_base directly to avoid _resolve_collection
-        # misinterpreting the key as the collection in bound mode.
-        base = self._get_base(collection)
-        for key in self.keys(collection):
-            h = base.lookup(key)
-            if h:
-                row = self.decode(self.kernel.read_blob(h))
-                if row is not None:
-                    yield row
+        rows = self._unified_storage.read(collection,
+                                            columns=["_key", "value"])
+        for row in rows:
+            yield self.decode(row["value"])
 
     def __iter__(self):
         """Backward compat: iterate over default collection."""
         if self._default_collection is None:
             raise TypeError("lens is not bound to a default collection; use iterate(collection)")
-        # Fix (Round 22): pass NO args — _resolve_collection will use
-        # _default_collection automatically. Passing it explicitly causes
-        # it to be treated as a key by _resolve_collection.
         return self.iterate()
 
     def __len__(self):
@@ -608,8 +529,6 @@ class KeyValueLens(PondLens):
         """Backward compat: key in lens == lens.exists(key)."""
         if self._default_collection is None:
             raise TypeError("lens is not bound to a default collection; use exists(collection, key)")
-        # Fix (Round 22): pass only the key — _resolve_collection will
-        # use _default_collection automatically.
         return self.exists(key)
 
     def where(self, *args, **kwargs) -> LensQuery:
@@ -709,66 +628,59 @@ class KeyValueLens(PondLens):
     def branch(self, *args) -> str:
         """Create a branch on the collection. O(1) — just a ref copy."""
         collection, rest = self._resolve_collection(*args)
-        if self._unified_storage is not None:
-            return self._unified_storage.branch(collection, rest[0])
-        return self._get_base(collection).branch(rest[0])
+        self._require_unified()
+        return self._unified_storage.branch(collection, rest[0])
 
     def checkout(self, *args) -> None:
         """Checkout a branch on the collection."""
         collection, rest = self._resolve_collection(*args)
-        if self._unified_storage is not None:
-            return self._unified_storage.checkout(collection, rest[0])
-        self._get_base(collection).checkout(rest[0])
+        self._require_unified()
+        self._unified_storage.checkout(collection, rest[0])
 
     def list_branches(self, *args) -> list[str]:
         """List all branches on the collection."""
         collection, rest = self._resolve_collection(*args)
-        if self._unified_storage is not None:
-            return self._unified_storage.list_branches(collection)
-        return self._get_base(collection).list_branches()
+        self._require_unified()
+        return self._unified_storage.list_branches(collection)
 
     def merge(self, *args) -> str:
         """Merge a branch into the collection's HEAD. Union merge with 2-parent commit."""
         collection, rest = self._resolve_collection(*args)
         msg = rest[1] if len(rest) > 1 else ""
-        if self._unified_storage is not None:
-            return self._unified_storage.merge(collection, rest[0], msg)
-        return self._get_base(collection).merge(rest[0])
+        self._require_unified()
+        return self._unified_storage.merge(collection, rest[0], msg)
 
     def undo(self, *args) -> str:
         """Undo the last N commits on the collection."""
         collection, rest = self._resolve_collection(*args)
         steps = rest[0] if rest else 1
-        if self._unified_storage is not None:
-            return self._unified_storage.undo(collection, steps)
-        return self._get_base(collection).undo(steps)
+        self._require_unified()
+        return self._unified_storage.undo(collection, steps)
 
     def history(self, *args) -> list[dict]:
         """Walk the commit chain for the collection."""
         collection, rest = self._resolve_collection(*args)
         limit = rest[0] if rest else 100
-        if self._unified_storage is not None:
-            return self._unified_storage.history(collection, limit)
-        return self._get_base(collection).history(limit)
+        self._require_unified()
+        return self._unified_storage.history(collection, limit)
 
     def diff(self, *args) -> dict:
         """Diff two commits on the collection."""
         collection, rest = self._resolve_collection(*args)
-        if self._unified_storage is not None:
-            return self._unified_storage.diff(collection, rest[0], rest[1])
-        return self._get_base(collection).diff(rest[0], rest[1])
+        self._require_unified()
+        return self._unified_storage.diff(collection, rest[0], rest[1])
 
     # --- Serialization (override in subclass) ---
 
     def encode(self, data: Any) -> bytes:
-        # Fix (Round 24 Issue #4): handle raw bytes natively for git blobs,
-        # notebook attachments, video segments, etc.
+        # Handle raw bytes natively for git blobs, notebook attachments,
+        # video segments, etc.
         if isinstance(data, (bytes, bytearray)):
             return bytes(data)
         return json.dumps(data, sort_keys=True).encode()
 
     def decode(self, data: bytes) -> Any:
-        # Fix (Round 24 Issue #4): return raw bytes if not JSON
+        # Return raw bytes if not JSON
         try:
             return json.loads(data)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
@@ -815,7 +727,7 @@ class KeylessLens(KeyValueLens):
     receives the key from put() and can use it for later retrieval.
 
     UUIDv7 is time-ordered, making it suitable for distributed generation
-    and range scans via ProllyTreeIndex.
+    and range scans via UnifiedStorage.
 
     COLLECTION-AGNOSTIC: Like KeyValueLens, KeylessLens is a stateless
     engine. Pass the collection name to each operation:
@@ -859,169 +771,6 @@ class KeylessLens(KeyValueLens):
         collection, rest = self._resolve_collection(*args)
         rows = rest[0]
         return [self.put_auto(collection, row) for row in rows]
-
-
-# ===========================================================================
-# CrossLens — DEPRECATED (Round 25)
-#
-# CrossLens was a helper for cross-collection read/write between
-# KeyValueLens instances. As of Round 25, ANY lens can read/write ANY
-# collection created by ANY other lens directly through PondStorage —
-# no helper needed. Each collection carries cross-lens metadata
-# (lens_type, key_col, schema_hint) so any lens can interpret it.
-#
-# Replacement patterns:
-#   CrossLens.read_from(lens, "users", "k1")     →  lens.get("users", "k1")
-#   CrossLens.read_all_from(lens, "users")        →  lens.get_all("users")
-#   CrossLens.write_to(lens, "users", "k1", v)    →  lens.put("users", "k1", v)
-#   CrossLens.share_blob(src, "u", "k1", dst, "u2", "k1")
-#       →  src_blob = src._get_base("u").lookup("k1")
-#          dst.put_raw("u2", "k1", src_blob)  # zero-copy hash share
-#   CrossLens.pipe(src, "u", dst, "u2")
-#       →  for k, v in src.get_all("u").items():
-#              dst.put("u2", k, v)
-#           dst.commit("u2")
-#
-# This class is kept for backward compatibility but emits a
-# DeprecationWarning on instantiation. New code should use the direct
-# lens APIs shown above.
-# ===========================================================================
-
-import warnings as _warnings
-
-
-class CrossLens:
-    """DEPRECATED: cross-collection read/write operations.
-
-    As of Round 25, any lens can read/write any collection directly.
-    This class is kept for backward compatibility. Use the direct
-    lens APIs instead:
-
-        lens.get("any_collection", "key")
-        lens.put("any_collection", "key", value)
-        lens.get_all("any_collection")
-    """
-
-    _DEPRECATED = True  # marker for tooling
-
-    def __init__(self):
-        _warnings.warn(
-            "CrossLens is deprecated (Round 25). Any lens can now read/write "
-            "any collection directly — use lens.get/put/get_all instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-    # The static methods below are kept for backward compatibility.
-    # They do NOT emit a deprecation warning on each call (only on
-    # instantiation), to avoid spamming logs. They simply delegate
-    # to the lens's own methods.
-
-    @staticmethod
-    def read_from(lens: KeyValueLens, collection: str, key: str) -> Optional[Any]:
-        """Read a single key from the collection's current HEAD.
-
-        DEPRECATED: use lens.get(collection, key) directly.
-        """
-        return lens.get(collection, key)
-
-    @staticmethod
-    def read_all_from(lens: KeyValueLens, collection: str) -> dict[str, Any]:
-        """Read all non-internal keys from the collection's current HEAD.
-
-        DEPRECATED: use lens.get_all(collection) directly.
-        """
-        return lens.get_all(collection)
-
-    @staticmethod
-    def write_to(lens: KeyValueLens, collection: str, key: str, data: Any) -> str:
-        """Stage a write on the target collection. Does NOT commit.
-
-        DEPRECATED: use lens.put(collection, key, data) directly.
-        """
-        return lens.put(collection, key, data)
-
-    @staticmethod
-    def share_blob(from_lens: KeyValueLens, from_collection: str, from_key: str,
-                    to_lens: KeyValueLens, to_collection: str, to_key: str) -> bool:
-        """Zero-copy: share a blob's HASH from one collection to another.
-
-        DEPRECATED: use direct lens APIs instead. For zero-copy hash
-        sharing between KV collections (legacy mode only):
-
-            h = from_lens._get_base(from_collection).lookup(from_key)
-            if h: to_lens.put_raw(to_collection, to_key, h)
-
-        Note: in unified mode (default), blob-level sharing across
-        collections is not meaningful — each collection has its own
-        PND2 blobs. Cross-lens reads happen at the row level via
-        PondStorage.read().
-
-        Returns True if the source key existed and the share succeeded,
-        False if the source key was not found.
-        """
-        h = from_lens._get_base(from_collection).lookup(from_key)
-        if h is None:
-            return False
-        to_lens.put_raw(to_collection, to_key, h)
-        return True
-
-    @staticmethod
-    def pipe(from_lens: KeyValueLens, from_collection: str,
-             to_lens: KeyValueLens, to_collection: str,
-             transformer: Optional[Callable] = None) -> int:
-        """Copy all non-internal keys from source to target collection.
-
-        DEPRECATED: use direct lens APIs instead:
-
-            for k, v in from_lens.get_all(from_collection).items():
-                if transformer:
-                    new_k, new_v = transformer(k, v)
-                    to_lens.put(to_collection, new_k, new_v)
-                else:
-                    to_lens.put(to_collection, k, v)
-            to_lens.commit(to_collection)
-
-        If transformer is None: zero-copy share (each blob hash is staged
-        directly via put_raw, no re-encoding).
-        If transformer is provided: re-encode path. The transformer
-        receives (key, decoded_data) and returns (new_key, new_data).
-
-        Returns the number of keys copied. Target is NOT committed.
-        """
-        state = from_lens._get_base(from_collection).read_all()
-        count = 0
-        for key, h in state.items():
-            if key.startswith("_"):
-                continue
-            if transformer:
-                data = from_lens.decode(from_lens.kernel.read_blob(h))
-                to_key, to_data = transformer(key, data)
-                to_lens.put(to_collection, to_key, to_data)
-            else:
-                to_lens.put_raw(to_collection, key, h)
-            count += 1
-        return count
-
-
-# ===========================================================================
-# Backward-compatible aliases.
-#
-# This file was previously called `lens_sdk.py` and the class was called
-# `Lens` (and earlier, `View`). The class was renamed to `KeyValueLens`
-# to make its role explicit.
-#
-# New code should use `KeyValueLens`:
-#   from keyvalue_lens import KeyValueLens, KeylessLens, CrossLens
-#
-# Old code that imports `Lens` or `View` continues to work via the
-# aliases below.
-# ===========================================================================
-
-Lens = KeyValueLens  # backward-compatible alias (old class name)
-View = KeyValueLens  # backward-compatible alias (older class name)
-KeylessView = KeylessLens  # backward-compatible alias
-CrossView = CrossLens  # backward-compatible alias
 
 
 # SemanticLens/OssieAdapter are in extensions/semantic/. CollectionIndexer is in

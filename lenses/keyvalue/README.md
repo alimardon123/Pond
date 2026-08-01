@@ -34,7 +34,7 @@ instance operate on any collection.
 
 | File | Purpose |
 |---|---|
-| `keyvalue_lens.py` | `KeyValueLens`, `KeylessLens` (UUIDv7 keys), `CrossLens` helpers |
+| `keyvalue_lens.py` | `KeyValueLens`, `KeylessLens` (UUIDv7 keys) |
 | `__init__.py` | Package exports |
 
 ## Architecture
