@@ -53,13 +53,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kernel import PondMinimal  # noqa: E402
 
-# Binary commit decoding is needed by history() to walk KV commit chains.
-# Imported lazily inside history() so this file stays importable even if
-# binary_encoding is not yet on the path (e.g. during bootstrap).
-try:
-    from binary_encoding import BinaryProllyTree  # noqa: E402
-except ImportError:
-    BinaryProllyTree = None
+# BinaryProllyTree import removed — unified architecture uses JSON commits only.
+# Legacy binary commits are handled by UnifiedStorage.history() which tries
+# JSON first, then falls back to binary decode if needed.
+BinaryProllyTree = None
 
 
 class PondLens:
