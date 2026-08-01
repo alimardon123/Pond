@@ -253,6 +253,9 @@ class InMemoryObjectStore:
 
     def list_paths(self, prefix: str = "") -> list[str]:
         """List all paths with the given prefix (like S3 list-objects-v2)."""
+        if self._latency_ms > 0:
+            time.sleep(self._latency_ms / 1000.0)
+            self.stats["latency_ms_total"] += self._latency_ms
         with self._lock:
             return sorted(p for p in self._paths if p.startswith(prefix))
 
@@ -467,6 +470,15 @@ class ObjectStoreNativeKernel:
         root ref blob — enables cache-independent reads.
         """
         return self.store.get_path(path)
+
+    def list_paths_with_prefix(self, prefix: str) -> list[str]:
+        """List all paths with a given prefix — O(matching) not O(total).
+
+        P2 fix: this avoids loading the entire root ref blob to filter
+        client-side. On S3, this maps to list-objects-v2 with a Prefix
+        parameter. On the in-memory store, it filters the paths dict.
+        """
+        return self.store.list_paths(prefix)
 
     def set_path(self, path: str, hash_val: str) -> None:
         """Set a dedicated path (last-writer-wins, no CAS).

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(REPO, "lenses", "oltp"))
 
 from object_store_native_kernel import make_object_store_native_kernel
 from pond_storage import PondStorage
-from oltp_lens import OTTPLens
+from oltp_lens import OLTPLens
 
 
 def _setup(collection="kv"):
@@ -32,7 +32,7 @@ def _setup(collection="kv"):
 def test_basic_put_get():
     """Basic put/get works in-memory."""
     kernel, storage = _setup()
-    ottp = OTTPLens(storage, "kv", flush_threshold=100)
+    ottp = OLTPLens(storage, "kv", flush_threshold=100)
     ottp.put("user:1", {"name": "alice", "age": 30})
     ottp.put("user:2", {"name": "bob", "age": 25})
     assert ottp.get("user:1")["name"] == "alice"
@@ -45,7 +45,7 @@ def test_basic_put_get():
 def test_delete():
     """Delete works as tombstone in memtable."""
     kernel, storage = _setup()
-    ottp = OTTPLens(storage, "kv", flush_threshold=100)
+    ottp = OLTPLens(storage, "kv", flush_threshold=100)
     ottp.put("user:1", {"name": "alice"})
     ottp.delete("user:1")
     assert ottp.get("user:1") is None
@@ -56,7 +56,7 @@ def test_delete():
 def test_flush_visible_to_cold_reader():
     """After flush, data is visible to a new connection (cold read)."""
     kernel, storage = _setup()
-    ottp = OTTPLens(storage, "kv", flush_threshold=100)
+    ottp = OLTPLens(storage, "kv", flush_threshold=100)
     ottp.put("user:1", {"name": "alice"})
     ottp.put("user:2", {"name": "bob"})
     ottp.flush()
@@ -81,7 +81,7 @@ def test_cold_concurrent_multi_app():
     def app_writer(app_id, n_writes):
         try:
             local_storage = PondStorage(kernel)
-            ottp = OTTPLens(local_storage, "kv", flush_threshold=50)
+            ottp = OLTPLens(local_storage, "kv", flush_threshold=50)
             for i in range(n_writes):
                 ottp.put(f"app{app_id}:key{i}", {"v": i, "app": app_id})
             ottp.flush()  # flush remaining
@@ -115,7 +115,7 @@ def test_cold_concurrent_multi_app():
 def test_read_your_writes():
     """Writes to memtable are immediately visible to reads."""
     kernel, storage = _setup()
-    ottp = OTTPLens(storage, "kv", flush_threshold=10000)  # high threshold = no auto-flush
+    ottp = OLTPLens(storage, "kv", flush_threshold=10000)  # high threshold = no auto-flush
     ottp.put("user:1", {"name": "alice"})
     assert ottp.get("user:1")["name"] == "alice"  # read-your-writes
     ottp.put("user:1", {"name": "alice_v2"})  # update
@@ -141,7 +141,7 @@ def test_performance_memtable_vs_direct():
     direct_ms = (t1 - t0) * 1000
 
     # Memtable writes (sub-µs each, 1 flush at end)
-    ottp = OTTPLens(storage, "kv", flush_threshold=10000)
+    ottp = OLTPLens(storage, "kv", flush_threshold=10000)
     t0 = time.time()
     for i in range(N):
         ottp.put(f"k{i}", f"v{i}")
@@ -166,7 +166,7 @@ def test_performance_memtable_vs_direct():
 def test_compact():
     """Compact merges all shards into HEAD."""
     kernel, storage = _setup()
-    ottp = OTTPLens(storage, "kv", flush_threshold=10)
+    ottp = OLTPLens(storage, "kv", flush_threshold=10)
     for i in range(50):
         ottp.put(f"k{i}", {"v": i})
     ottp.flush()

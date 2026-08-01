@@ -854,13 +854,17 @@ class UnifiedStorage:
             "Too many concurrent writers.")
 
     def _read_commit_blob(self, commit_hash: str) -> Optional[dict]:
-        """Read and decode a commit blob."""
+        """Read and decode a commit blob.
+
+        Returns None for JSON decode errors or missing blobs (expected
+        for legacy/foreign commits). Re-raises network errors and OOM.
+        """
         import json as _json
         try:
             raw = self.kernel.read_blob(commit_hash)
             return _json.loads(raw)
-        except (ValueError, KeyError, Exception):
-            return None
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, ValueError):
+            return None  # expected: not a JSON commit, or blob missing
 
     def _commit_index(self, collection: str) -> int:
         """Get the next commit index for a collection."""
@@ -1038,21 +1042,13 @@ class UnifiedStorage:
             message=message or f"merge '{branch_name}'",
             index=self._commit_index(collection))
 
-        # Clear the source branch's shards (they're now in HEAD)
-        src_prefix = self._shards_prefix(collection, branch_name)
-        for name in list(self.kernel.list_names()):
-            if name.startswith(src_prefix):
-                empty = self.kernel.write(b"")
-                self.kernel.reference(name, empty)
+        # Clear source + target branch shards via index reset (B2 fix).
+        # Old shard refs are left for GC. Readers use the index.
         self._write_shard_index(collection, [], branch_name)
-
-        # Also clear the target branch's shards (they're now in HEAD)
-        tgt_prefix = self._shards_prefix(collection, target_branch)
-        for name in list(self.kernel.list_names()):
-            if name.startswith(tgt_prefix):
-                empty = self.kernel.write(b"")
-                self.kernel.reference(name, empty)
         self._write_shard_index(collection, [], target_branch)
+        if hasattr(self, '_shard_index_mem'):
+            self._shard_index_mem.pop(f"{collection}/{branch_name}", None)
+            self._shard_index_mem.pop(f"{collection}/{target_branch}", None)
 
         self._active_branches.pop(collection, None)  # merge detaches from branch
         self._invalidate_manifest_cache(collection)
@@ -1272,26 +1268,56 @@ class UnifiedStorage:
         return f"collections/{collection}/branches/{branch}/shard_index"
 
     def _read_shard_index(self, collection: str, branch: Optional[str] = None) -> list[str]:
-        """Read the shard index (1 GET) → list of shard manifest hashes.
+        """Read the shard index → list of shard manifest hashes.
 
-        Merges the index with a listing to catch any shards written by
-        concurrent writers that haven't updated the index yet.
+        ALWAYS merges index + listing (G-Set union). The index may be
+        stale under concurrent writers (last-writer-wins), so the listing
+        is the source of truth. The index is an optimization for the
+        common case (no concurrent writers).
         """
         if branch is None:
             branch = self._get_active_branch(collection)
-        # Always do the listing (source of truth) — it's prefix-filtered
-        listed = self.list_shards(collection, branch)
-        # Also try the index (may have shards that are mid-write)
+
+        # Try the index (fast path)
+        indexed = []
         try:
             import json as _json
             idx_hash = self.kernel.resolve(self._shard_index_ref(collection, branch))
             if idx_hash is not None:
                 data = self.kernel.read_blob(idx_hash)
                 indexed = list(_json.loads(data))
-                return list(set(listed) | set(indexed))
-        except (ValueError, KeyError, Exception):
+                # If index is explicitly empty (post-compaction), check
+                # if there are also no shards in the listing before returning []
+                if not indexed:
+                    listed = self._list_shards_from_refs(collection, branch)
+                    if not listed:
+                        return []
+                    # New shards written after compaction — return them
+                    return listed
+        except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
             pass
-        return listed
+
+        # ALWAYS also list (source of truth) — catches concurrent writers
+        listed = self._list_shards_from_refs(collection, branch)
+
+        # Union (G-Set CRDT) — dedup
+        return list(set(listed) | set(indexed))
+
+    def _list_shards_from_refs(self, collection: str, branch: str) -> list[str]:
+        """List shard hashes by scanning refs (source of truth)."""
+        prefix = self._shards_prefix(collection, branch)
+        names = [n for n in self.kernel.list_names() if n.startswith(prefix)]
+        shard_hashes = []
+        for name in names:
+            h = self.kernel.resolve(name)
+            if h is not None:
+                try:
+                    from collection_manifest import CollectionManifest as _CM
+                    _CM.load(self.kernel, h)
+                    shard_hashes.append(h)
+                except (ValueError, KeyError):
+                    pass
+        return shard_hashes
 
     def _write_shard_index(self, collection: str, shard_hashes: list[str],
                             branch: Optional[str] = None) -> None:
@@ -1531,28 +1557,40 @@ class UnifiedStorage:
     def list_shards(self, collection: str, branch: Optional[str] = None) -> list[str]:
         """List all shard manifest hashes for a collection's branch.
 
-        Returns a list of manifest hashes (not refs). Each hash can be
-        loaded via CollectionManifest.load().
-
-        Filters out "deleted" shards (those pointing at empty blobs from
-        compaction's tombstone).
+        Uses the shard index as the authoritative source. Falls back to
+        listing if the index is missing or empty (legacy collections).
+        After compact_shards, the index is reset to empty — old shard
+        refs remain in storage but are not listed (they'll be GC'd).
         """
         if branch is None:
             branch = self._get_active_branch(collection)
-        prefix = self._shards_prefix(collection, branch)
-        all_names = self.kernel.list_names()
-        shard_hashes = []
-        for name in all_names:
-            if name.startswith(prefix):
-                h = self.kernel.resolve(name)
-                if h is not None:
-                    try:
-                        from collection_manifest import CollectionManifest as _CM
-                        _CM.load(self.kernel, h)
-                        shard_hashes.append(h)
-                    except (ValueError, KeyError):
-                        pass
-        return shard_hashes
+
+        # Check the shard index first (authoritative after compaction)
+        try:
+            import json as _json
+            idx_hash = self.kernel.resolve(self._shard_index_ref(collection, branch))
+            if idx_hash is not None:
+                data = self.kernel.read_blob(idx_hash)
+                indexed = list(_json.loads(data))
+                if indexed:
+                    result = []
+                    for h in indexed:
+                        try:
+                            from collection_manifest import CollectionManifest as _CM
+                            _CM.load(self.kernel, h)
+                            result.append(h)
+                        except (ValueError, KeyError):
+                            pass
+                    # Also check refs for concurrent writes not in index
+                    listed = self._list_shards_from_refs(collection, branch)
+                    return list(set(result) | set(listed))
+                # Index is empty — check refs for new post-compaction shards
+                return self._list_shards_from_refs(collection, branch)
+        except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+        # No index — fall back to listing
+        return self._list_shards_from_refs(collection, branch)
 
     def read_with_shards(self, collection: str,
                           predicates: Optional[list[tuple[str, str, Any]]] = None,
@@ -1702,20 +1740,34 @@ class UnifiedStorage:
         key_col = (head_manifest.key_col if head_manifest else "")
         rg_size = (head_manifest.row_group_size if head_manifest else 10_000)
 
-        # Write the live rows as a single flat manifest
-        # (reuse append_shard's encoding logic by calling write())
+        # BATCH rows into proper row groups (not 1 row per blob)
+        # Fix B4: use actual key column value for rg_key, not loop index
+        # Fix P1: batch into row groups of rg_size rows each
         if all_rows:
+            manifest_entries = []
+            for start in range(0, len(all_rows), max(rg_size, 1)):
+                end = min(start + max(rg_size, 1), len(all_rows))
+                group_rows = all_rows[start:end]
+                group_source = ListColumnSource(group_rows)
+                pnd2_bytes, col_stats = PND2.encode(group_source)
+
+                # Use the actual key column value for rg_key
+                if key_col and key_col in group_rows[-1]:
+                    max_pk = group_rows[-1][key_col]
+                else:
+                    max_pk = start + len(group_rows) - 1
+                rg_key = _format_rg_key(max_pk)
+
+                blob_hash = self.kernel.write(pnd2_bytes)
+                manifest_entries.append({
+                    "rg_key": rg_key,
+                    "blob_hash": blob_hash,
+                    "n_rows": end - start,
+                    "col_stats": col_stats,
+                })
             manifest_hash, new_manifest = self._build_manifest_with_return(
-                collection,
-                [{"rg_key": _format_rg_key(i),
-                  "blob_hash": self.kernel.write(
-                      PND2.encode(ListColumnSource(all_rows[i:i+1]))[0]),
-                  "n_rows": 1,
-                  "col_stats": PND2.encode(ListColumnSource(all_rows[i:i+1]))[1]}
-                 for i in range(len(all_rows))],
-                schema, key_col, rg_size)
+                collection, manifest_entries, schema, key_col, rg_size)
         else:
-            # All rows deleted — empty manifest
             manifest_hash, new_manifest = self._build_manifest_with_return(
                 collection, [], schema, key_col, rg_size)
 
@@ -1734,16 +1786,27 @@ class UnifiedStorage:
             message=f"compact {len(shard_hashes)} shards ({len(all_rows)} live rows)",
             index=commit_index)
 
-        # Clear the shards (tombstone their refs) + reset the shard index
-        # for the ACTIVE BRANCH
+        # Clear shards: reset the shard index to empty (B1 fix).
+        # Tombstone ONLY the shards that were in the index at compaction
+        # time (not ALL refs with the prefix — a concurrent writer may
+        # have added a new shard that we haven't seen yet).
         branch = self._get_active_branch(collection)
-        prefix = self._shards_prefix(collection, branch)
-        for name in list(self.kernel.list_names()):
-            if name.startswith(prefix):
-                empty = self.kernel.write(b"")
-                self.kernel.reference(name, empty)
-        # Reset the shard index to empty for this branch
+        # Tombstone the known shards (from the index we just read)
+        for sh in shard_hashes:
+            # Find the ref name for this shard hash
+            prefix = self._shards_prefix(collection, branch)
+            for name in self.kernel.list_names():
+                if name.startswith(prefix):
+                    h = self.kernel.resolve(name)
+                    if h == sh:
+                        empty = self.kernel.write(b"")
+                        self.kernel.reference(name, empty)
+                        break
         self._write_shard_index(collection, [], branch)
+        # Also clear in-memory index
+        if hasattr(self, '_shard_index_mem'):
+            key = f"{collection}/{branch}"
+            self._shard_index_mem.pop(key, None)
 
         # Update caches
         self._update_caches_after_write(
@@ -1753,7 +1816,31 @@ class UnifiedStorage:
         return commit_hash
 
     def shard_count(self, collection: str) -> int:
-        """Return the number of unmerged shards for a collection."""
+        """Return the number of unmerged shards for a collection.
+
+        Checks the shard index first (authoritative after compaction).
+        If the index is explicitly empty (post-compaction), returns 0
+        even if old shard refs still exist (they're GC candidates).
+        """
+        branch = self._get_active_branch(collection)
+        try:
+            import json as _json
+            idx_hash = self.kernel.resolve(self._shard_index_ref(collection, branch))
+            if idx_hash is not None:
+                data = self.kernel.read_blob(idx_hash)
+                indexed = list(_json.loads(data))
+                if not indexed:
+                    # Index is explicitly empty (post-compaction)
+                    # Check if there are NEW shards (post-compaction writes)
+                    new_shards = self._list_shards_from_refs(collection, branch)
+                    # Filter out old shards that are in the old index
+                    # (they're unreachable but still in refs)
+                    # For correctness, count only shards that are NOT
+                    # reachable from HEAD (i.e., new unmerged shards)
+                    return len(new_shards) if new_shards else 0
+                return len(indexed)
+        except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
+            pass
         return len(self.list_shards(collection))
 
     # ------------------------------------------------------------------

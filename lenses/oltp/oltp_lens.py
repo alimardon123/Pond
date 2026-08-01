@@ -21,12 +21,12 @@ DESIGN FOR COLD CONCURRENT MULTI-APP:
 
 USAGE:
     from pond_storage import PondStorage
-    from oltp_lens import OTTPLens
+    from oltp_lens import OLTPLens
 
     storage = PondStorage(kernel)
     storage.write("kv", [{"_key": "init", "value": b""}], key_col="_key")
 
-    ottp = OTTPLens(storage, "kv", flush_threshold=1000)
+    ottp = OLTPLens(storage, "kv", flush_threshold=1000)
 
     # Fast writes (sub-µs, in-memory)
     ottp.put("user:1", {"name": "alice", "age": 30})
@@ -55,10 +55,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "physical_structures"))
 
 
-class OTTPLens:
+class OLTPLens:
     """Fast key-value lens with in-memory memtable + batch flush.
 
-    Each app process creates its own OTTPLens instance. Writes go to
+    Each app process creates its own OLTPLens instance. Writes go to
     the in-memory memtable (sub-µs). When full or flush() is called,
     it flushes to object storage as a CRDT shard.
 

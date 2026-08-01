@@ -1,1 +1,1 @@
-from .oltp_lens import OTTPLens
+from .oltp_lens import OLTPLens

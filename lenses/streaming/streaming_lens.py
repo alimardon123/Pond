@@ -419,18 +419,8 @@ class StreamingLens(PondLens):
                 timeout_ms: int = 0) -> list[dict]:
         """Consume messages from a partition starting from the group's offset.
 
-        If a consumer group is specified, reads from the group's last-committed
-        offset. If no group, reads from the beginning.
-
-        Args:
-            collection: collection name (the topic)
-            partition: partition number
-            group: consumer group name (for offset tracking)
-            max_messages: max messages to return
-            timeout_ms: (unused — kept for Kafka API compat)
-
-        Returns:
-            List of {offset, data, partition} dicts.
+        B9 fix: reads ALL segments at once (1 read_with_shards call) instead
+        of N individual _read_segment_by_offset calls (each doing a full scan).
         """
         self._require_unified()
         self._unified_storage.checkout(collection, f"p{partition}")
@@ -438,19 +428,24 @@ class StreamingLens(PondLens):
         if group:
             start_offset = self._get_offset(group, collection, partition)
 
-        latest = self.segment_count(collection)
-        end_offset = min(start_offset + max_messages, latest)
+        # Read all segments at once (1 read_with_shards = 1 scan)
+        all_rows = self._unified_storage.read_with_shards(collection)
+        # Sort by offset and filter to the requested range
+        all_rows.sort(key=lambda r: r.get("offset", 0))
+        end_offset = min(start_offset + max_messages, len(all_rows))
 
         messages = []
-        for offset in range(start_offset, end_offset):
-            data = self._read_segment_by_offset(collection, offset)
-            if data is not None:
-                messages.append({
-                    "collection": collection,
-                    "partition": partition,
-                    "offset": offset,
-                    "data": data,
-                })
+        for i in range(start_offset, end_offset):
+            if i < len(all_rows):
+                row = all_rows[i]
+                data = row.get("segment")
+                if data is not None:
+                    messages.append({
+                        "collection": collection,
+                        "partition": partition,
+                        "offset": i,
+                        "data": data,
+                    })
 
         return messages
 
