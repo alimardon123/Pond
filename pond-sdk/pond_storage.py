@@ -773,6 +773,150 @@ class PondStorage:
             "manifests_flattened": manifests_flattened,
         }
 
+    def alter_table(self, collection: str,
+                     add_columns: Optional[list[str]] = None,
+                     drop_columns: Optional[list[str]] = None,
+                     rename: Optional[dict[str, str]] = None) -> dict:
+        """Schema evolution — add/drop/rename columns (Iceberg-style).
+
+        Does NOT rewrite data — just updates the manifest's schema.
+        New columns appear as None in old row groups. Dropped columns
+        are removed from the schema (old data remains but is invisible).
+
+        Args:
+            collection: collection name
+            add_columns: list of column names to add (type auto-detected on next write)
+            drop_columns: list of column names to drop
+            rename: dict of {old_name: new_name}
+
+        Returns:
+            {"added": int, "dropped": int, "renamed": int, "schema_version": int}
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        manifest = self._unified._load_manifest(collection, skip_cache=False)
+        if manifest is None:
+            raise ValueError(f"Collection '{collection}' not found")
+
+        added = dropped = renamed_count = 0
+        old_columns = list(manifest.columns)
+        new_columns = []
+        existing_names = {name for name, _ in old_columns}
+
+        # Process drops
+        drop_set = set(drop_columns or [])
+        # Process renames
+        rename_map = rename or {}
+
+        for name, vtype in old_columns:
+            if name in drop_set:
+                dropped += 1
+                continue
+            if name in rename_map:
+                new_columns.append((rename_map[name], vtype))
+                renamed_count += 1
+            else:
+                new_columns.append((name, vtype))
+
+        # Process adds
+        for col_name in (add_columns or []):
+            if col_name not in {n for n, _ in new_columns}:
+                new_columns.append((col_name, 4))  # NULL type — will be detected on next write
+                added += 1
+
+        # Build a new manifest with the updated schema
+        new_version = manifest.schema_version + 1
+        manifest_entries = []
+        for rg in manifest.scan_with_pruning():
+            manifest_entries.append({
+                "rg_key": rg.key,
+                "blob_hash": rg.blob_hash,
+                "n_rows": rg.n_rows,
+                "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                for c in rg.columns],
+            })
+
+        manifest_hash, new_manifest = self._unified._build_manifest_with_return(
+            collection, manifest_entries, new_columns,
+            manifest.key_col, manifest.row_group_size)
+        new_manifest.set_schema_version(new_version)
+
+        # Write commit
+        parent = self.kernel.resolve(f"collections/{collection}/HEAD")
+        commit_index = 0
+        if parent:
+            pc = self._unified._read_commit_blob(parent)
+            if pc:
+                commit_index = pc.get("index", 0) + 1
+        commit_hash = self._unified._write_commit_blob(
+            collection, manifest_hash, parent=parent,
+            message=f"alter_table: +{added} -{dropped} ~{renamed_count}",
+            index=commit_index)
+
+        self._unified._update_caches_after_write(
+            collection, new_manifest, manifest_hash, commit_hash,
+            commit_index, is_delta=False)
+
+        return {"added": added, "dropped": dropped,
+                "renamed": renamed_count, "schema_version": new_version}
+
+    def set_partition_spec(self, collection: str,
+                            partition_cols: list[str],
+                            transform: str = "identity") -> str:
+        """Set hidden partitioning spec on a collection (Iceberg-style).
+
+        Hidden partitions are stored in the manifest — no separate
+        partition collections. Reads with predicates on partition columns
+        get automatic partition pruning via the manifest's inline stats.
+
+        Args:
+            collection: collection name
+            partition_cols: columns to partition by
+            transform: "identity", "hour", "day", "month", "bucket:N"
+
+        Returns:
+            The new commit hash.
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        manifest = self._unified._load_manifest(collection, skip_cache=False)
+        if manifest is None:
+            raise ValueError(f"Collection '{collection}' not found")
+
+        spec = {"columns": partition_cols, "transform": transform}
+        manifest_entries = []
+        for rg in manifest.scan_with_pruning():
+            manifest_entries.append({
+                "rg_key": rg.key,
+                "blob_hash": rg.blob_hash,
+                "n_rows": rg.n_rows,
+                "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                for c in rg.columns],
+            })
+
+        manifest_hash, new_manifest = self._unified._build_manifest_with_return(
+            collection, manifest_entries, manifest.columns,
+            manifest.key_col, manifest.row_group_size)
+        new_manifest.set_partition_spec(spec)
+        new_manifest.set_schema_version(manifest.schema_version)
+
+        parent = self.kernel.resolve(f"collections/{collection}/HEAD")
+        commit_index = 0
+        if parent:
+            pc = self._unified._read_commit_blob(parent)
+            if pc:
+                commit_index = pc.get("index", 0) + 1
+        commit_hash = self._unified._write_commit_blob(
+            collection, manifest_hash, parent=parent,
+            message=f"set_partition_spec: {partition_cols} {transform}",
+            index=commit_index)
+
+        self._unified._update_caches_after_write(
+            collection, new_manifest, manifest_hash, commit_hash,
+            commit_index, is_delta=False)
+
+        return commit_hash
+
     def delete_collection(self, collection: str) -> bool:
         """Delete a collection by tombstoning its HEAD and manifest refs.
 

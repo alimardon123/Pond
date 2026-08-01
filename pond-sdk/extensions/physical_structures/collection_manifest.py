@@ -352,10 +352,13 @@ class CollectionManifest:
         self._row_groups: list[RowGroupEntry] = []
         self._stats_tree_root: Optional[str] = None
         self._bloom_filter_ref: Optional[str] = None
-        # Delta-manifest support (Round 9 Issue #5): for O(1) appends at PB scale,
-        # a manifest can reference a PARENT manifest instead of duplicating all
-        # row groups. The reader walks the parent chain to find all entries.
         self._parent_manifest_hash: Optional[str] = None
+        # Hidden partitioning: partition spec stored in the manifest
+        # (Iceberg-style). None = no partitioning.
+        # Format: {"columns": ["date"], "transform": "identity"|"hour"|"day"|"month"|"bucket:N"}
+        self._partition_spec: Optional[dict] = None
+        # Schema evolution: version number for schema changes
+        self._schema_version: int = 0
 
     # ------------------------------------------------------------------
     # Builder API — write side
@@ -386,6 +389,19 @@ class CollectionManifest:
     def set_stats_tree_root(self, root_hash: str) -> None:
         """Attach a hierarchical stats tree root (for PB scale)."""
         self._stats_tree_root = root_hash
+
+    def set_partition_spec(self, spec: Optional[dict]) -> None:
+        """Set the hidden partition spec (Iceberg-style).
+
+        Args:
+            spec: {"columns": ["date"], "transform": "identity"|"day"|"hour"|"month"|"bucket:N"}
+                  None = no partitioning
+        """
+        self._partition_spec = spec
+
+    def set_schema_version(self, version: int) -> None:
+        """Set the schema version (for schema evolution tracking)."""
+        self._schema_version = version
 
     def set_bloom_filter_ref(self, ref: str) -> None:
         """Attach a bloom filter ref (for membership queries)."""
@@ -420,7 +436,8 @@ class CollectionManifest:
     def encode(self) -> bytes:
         """Encode the manifest as binary bytes.
 
-        Format: see module docstring.
+        Format: see module docstring. Extended with partition_spec and
+        schema_version (appended at the end — backward compatible).
         """
         flags = 0
         if self._stats_tree_root:
@@ -433,11 +450,6 @@ class CollectionManifest:
         buf = bytearray()
         buf += _MANIFEST_MAGIC
         buf += struct.pack("<BB", _MANIFEST_VERSION, flags)
-        # When stats_tree_root is set (PB scale), we DON'T encode the row
-        # groups inline — they live in the stats tree. The manifest blob
-        # stays small (just schema + sort_order + stats_tree_root).
-        # When parent_manifest_hash is set (delta-append), we only encode
-        # the NEW row groups (not the parent's). The reader walks the chain.
         n_inline_row_groups = 0 if self._stats_tree_root else len(self._row_groups)
         buf += struct.pack("<IH", n_inline_row_groups, len(self._columns))
 
@@ -462,10 +474,21 @@ class CollectionManifest:
         if self._parent_manifest_hash:
             buf += bytes.fromhex(self._parent_manifest_hash)
 
-        # Row group entries — ONLY when no stats tree (small-manifest path)
+        # Row group entries
         if not self._stats_tree_root:
             for rg in self._row_groups:
                 buf += self._encode_row_group(rg)
+
+        # Extended fields (appended — backward compatible with older readers)
+        # Schema version (4 bytes)
+        buf += struct.pack("<I", self._schema_version)
+        # Partition spec (optional, JSON-encoded)
+        if self._partition_spec:
+            spec_json = json.dumps(self._partition_spec).encode("utf-8")
+            buf += struct.pack("<I", len(spec_json))
+            buf += spec_json
+        else:
+            buf += struct.pack("<I", 0)  # no partition spec
 
         return bytes(buf)
 
@@ -582,6 +605,21 @@ class CollectionManifest:
             rg, pos = cls._decode_row_group(data, pos, columns)
             manifest._row_groups.append(rg)
 
+        # Extended fields (appended — backward compatible)
+        # Try to read schema_version + partition_spec if available
+        try:
+            manifest._schema_version = struct.unpack_from("<I", data, pos)[0]
+            pos += 4
+            spec_len = struct.unpack_from("<I", data, pos)[0]
+            pos += 4
+            if spec_len > 0:
+                manifest._partition_spec = json.loads(data[pos:pos+spec_len].decode("utf-8"))
+                pos += spec_len
+        except (struct.error, json.JSONDecodeError, UnicodeDecodeError, IndexError):
+            # Older manifest without extended fields — use defaults
+            manifest._schema_version = 0
+            manifest._partition_spec = None
+
         return manifest
 
     @classmethod
@@ -674,6 +712,16 @@ class CollectionManifest:
     def parent_manifest_hash(self) -> Optional[str]:
         """The parent manifest hash (for delta-appends). None if this is a base manifest."""
         return self._parent_manifest_hash
+
+    @property
+    def partition_spec(self) -> Optional[dict]:
+        """The hidden partition spec (Iceberg-style). None = no partitioning."""
+        return self._partition_spec
+
+    @property
+    def schema_version(self) -> int:
+        """The schema version (for schema evolution tracking)."""
+        return self._schema_version
 
     def find_row_group(self, key: str) -> Optional[RowGroupEntry]:
         """Find the row group whose key matches `key` (smallest key >= target).
