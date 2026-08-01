@@ -773,7 +773,7 @@ class PondStorage:
             "manifests_flattened": manifests_flattened,
         }
 
-    def alter_table(self, collection: str,
+    def alter_collection(self, collection: str,
                      add_columns: Optional[list] = None,
                      drop_columns: Optional[list[str]] = None,
                      rename: Optional[dict[str, str]] = None) -> dict:
@@ -879,7 +879,7 @@ class PondStorage:
                 commit_index = pc.get("index", 0) + 1
         commit_hash = self._unified._write_commit_blob(
             collection, manifest_hash, parent=parent,
-            message=f"alter_table: +{added} -{dropped} ~{renamed_count}",
+            message=f"alter_collection: +{added} -{dropped} ~{renamed_count}",
             index=commit_index)
 
         self._unified._update_caches_after_write(

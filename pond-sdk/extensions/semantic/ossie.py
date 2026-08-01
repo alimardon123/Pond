@@ -93,7 +93,7 @@ class OssieAdapter(SemanticModelAdapter):
 
 
 # ---------------------------------------------------------------------------
-# SemanticMixin — composable with any KV-style lens backed by ProllyTreeIndex
+# SemanticMixin — composable with any KV-style lens backed by UnifiedStorage
 # ---------------------------------------------------------------------------
 
 class SemanticMixin:
@@ -102,22 +102,22 @@ class SemanticMixin:
     EXTENSION METADATA:
       extension_type: "mixin"
       supported_lens_types: ["KeyValueLens", "KeylessLens", "CollectionIndexer"]
-      supported_storage: ["ProllyTreeIndex"]
+      supported_storage: ["UnifiedStorage"]
       not_supported: ["LakehouseLens", "FeatureStoreLens"]  # tabular lenses use column-level semantics
 
     GENERIC: works with any lens that exposes:
       - self.kernel         — the PondMinimal kernel
       - self.name           — the collection name
-      - self.base           — a persistent ProllyLensBase (for read_all/lookup)
+      - self.base           — a persistent UnifiedStorage (for read_all/lookup)
       - self.put(key, data) — stage a key→value mapping
       - self.get(key)       — read a value by key
       - self.put_raw(key, blob_hash) — stage a pre-encoded blob
       - self.commit(msg)    — commit staged changes
       - self.decode(bytes)  — decode bytes to a value
 
-    Both KeyValueLens and any future KV-style lens that uses ProllyTreeIndex
+    Both KeyValueLens and any future KV-style lens that uses UnifiedStorage
     can use this mixin. Semantic definitions (metrics, dimensions, relationships)
-    are stored as key→value entries in the lens's ProllyTreeIndex, prefixed
+    are stored as key→value entries in the lens's UnifiedStorage, prefixed
     with "_semantic/".
 
     Use by mixing with a KV-style lens:
@@ -141,7 +141,7 @@ class SemanticMixin:
     # Extension metadata (for introspection / tooling)
     extension_type = "mixin"
     supported_lens_types = ["KeyValueLens", "KeylessLens", "CollectionIndexer"]
-    supported_storage = ["ProllyTreeIndex"]
+    supported_storage = ["UnifiedStorage"]
     not_supported = ["LakehouseLens", "FeatureStoreLens"]  # tabular lenses use column-level semantics
 
     def _init_semantic(self, adapter: Optional[SemanticModelAdapter] = None):

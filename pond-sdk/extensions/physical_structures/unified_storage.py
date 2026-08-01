@@ -752,7 +752,7 @@ class UnifiedStorage:
 
         The commit blob is a JSON dict linking to the manifest hash.
         This is the ONE commit format for ALL workloads — no more
-        BinaryProllyTree encoding.
+        JSON encoding (replaces the old BinaryProllyTree format).
 
         If the collection has an active branch (set by checkout), the
         branch ref is also updated to point to the new commit.
@@ -1136,24 +1136,6 @@ class UnifiedStorage:
             seen.add(current)
             commit = self._read_commit_blob(current)
             if commit is None:
-                # Could be a legacy BinaryProllyTree commit — try decoding
-                try:
-                    from binary_encoding import BinaryProllyTree
-                    raw = self.kernel.read_blob(current)
-                    if raw and raw[0] == 3:
-                        bc = BinaryProllyTree.decode_commit(raw)
-                        history.append({
-                            "hash": current,
-                            "message": bc.get("message", ""),
-                            "parent": bc.get("parent"),
-                            "second_parent": bc.get("second_parent"),
-                            "timestamp": bc.get("timestamp"),
-                            "type": "snapshot" if bc.get("snapshot") else "delta",
-                        })
-                        current = bc.get("parent")
-                        continue
-                except Exception:
-                    pass
                 history.append({
                     "hash": current,
                     "message": "(undecodable commit)",
@@ -2055,7 +2037,7 @@ class UnifiedStorage:
 
         # write() has overwrite semantics — the new manifest replaces the
         # old one entirely. No need to delete old row group keys from a
-        # ProllyTree (we no longer use one). The old blobs remain
+        # ProllyTree (removed — unified architecture uses manifest only).
         # content-addressed (deduped); the old manifest is simply not
         # referenced by the new commit.
         # skip_cache=True: for writes, the cache is authoritative (single-writer)
@@ -2853,15 +2835,13 @@ class UnifiedStorage:
         GET) and extract the "manifest" field.
 
         Falls back to the legacy ref-based lookup for old collections
-        that used ProllyLensBase commits.
+        that used the old commit format (now unified to JSON).
         """
-        # New path: manifest hash is in the commit blob
+        # Manifest hash is in the commit blob (unified architecture)
         commit = self._read_commit_blob(commit_hash)
         if commit and commit.get("manifest"):
             return commit["manifest"]
-        # Legacy path: ref-based lookup (ProllyLensBase collections)
-        return self.kernel.resolve(
-            f"collections/{collection}/commits/{commit_hash}__manifest")
+        return None
 
     def _parallel_fetch_and_decode(
             self,

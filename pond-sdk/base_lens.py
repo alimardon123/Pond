@@ -3,15 +3,15 @@ PondLens — the SHARED NAMESPACE base for all Lenses.
 
 This is NOT a format-aware base class. Per the design goals:
 
-  - ProllyTreeIndex (prolly_tree.py:ProllyLensBase) is the universal
-    storage backend for key-value collections. It supports OLTP, OLAP,
-    streaming, and point-lookup workloads.
+  - UnifiedStorage (PND2 + CollectionManifest) is the universal
+    storage backend for ALL workloads. It supports OLTP, OLAP,
+    streaming, vector, KV, and point-lookup workloads.
   - App-facing lenses (KeyValueLens, LakehouseLens, VectorLens,
     FeatureStoreLens) inherit from PondLens and add their OWN
     read/write APIs. The base class does NOT decide what to write —
     each lens decides for itself.
-  - LakehouseLens ADDS range reads/writes on top of the prolly tree
-    as a lens-specific extension. Other lenses do not get them.
+  - LakehouseLens ADDS SQL query (DuckDB) on top of the unified
+    storage as a lens-specific extension. Other lenses do not get it.
 
 What this base provides:
   - Shared ref namespace:
@@ -335,11 +335,9 @@ class PondLens:
     def history(self, name: str, limit: int = 100) -> list[dict]:
         """Walk the commit chain for ANY collection.
 
-        Works for both:
-          - Binary commits (ProllyLensBase KV collections) — decoded
-            via BinaryProllyTree.decode_commit
-          - JSON commits (Lakehouse, FeatureStore Parquet collections)
-            — decoded via json.loads
+        Works for JSON commits (the unified commit format).
+        Legacy binary commits are no longer supported (BinaryProllyTree
+        import removed).
 
         Returns a unified list of dicts:
           {hash, message, parent, second_parent, timestamp, type, ...}
@@ -380,28 +378,10 @@ class PondLens:
     def _decode_commit_entry(commit_hash: str, raw: bytes) -> Optional[dict]:
         """Decode a commit blob into a unified history entry.
 
-        Tries binary first (ProllyLensBase KV commits start with a
-        type byte of 3), then falls back to JSON (Lakehouse/
-        FeatureStore commits). Returns None if neither decoder
-        matches.
+        Tries JSON first (the unified commit format). Returns None if
+        the commit cannot be decoded as JSON.
         """
-        # Binary commit? Type byte 3 = commit (see binary_encoding.py).
-        if BinaryProllyTree is not None and len(raw) > 0 and raw[0] == 3:
-            try:
-                commit = BinaryProllyTree.decode_commit(raw)
-                return {
-                    "hash": commit_hash,
-                    "message": commit.get("message", ""),
-                    "parent": commit.get("parent"),
-                    "second_parent": commit.get("second_parent"),
-                    "timestamp": commit.get("timestamp"),
-                    "index": commit.get("index"),
-                    "type": "snapshot" if commit.get("snapshot") else "delta",
-                }
-            except (ValueError, IndexError):
-                pass
-
-        # JSON commit? (Lakehouse, FeatureStore)
+        # JSON commit (unified architecture — the only format)
         try:
             commit = json.loads(raw)
             if isinstance(commit, dict):

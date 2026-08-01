@@ -1,18 +1,20 @@
 """
 Pond SDK Extensions — pluggable modules that sit between the Lens and kernel.
 
-Extensions are OPTIONAL. The base Lens (lens_sdk.Lens) works without any
-extensions loaded. Extensions add domain-specific capabilities:
+Extensions are OPTIONAL. The base Lens works without any extensions loaded.
+Extensions add domain-specific capabilities:
 
   - semantic: semantic model adapters (Ossie, Cube, dbt, custom)
-  - physical_structures: acceleration structures (bloom, stats, zone maps)
+  - physical_structures: acceleration structures (PND2, manifest, stats tree)
+  - indexing: IVF, HNSW, CollectionIndexer
+  - maintenance: GC/Vacuum
 
 Architecture:
   Kernel (Write, Read, Ref) — FROZEN
       ↓
-  Lens SDK (Lens, ProllyLensBase, CollectionIndexer) — core, no extensions
+  Lens SDK (KeyValueLens, UnifiedStorage, CollectionIndexer) — core
       ↓
-  Extensions (semantic adapters, physical structures) — OPTIONAL, pluggable
+  Extensions (semantic, indexing, maintenance) — OPTIONAL, pluggable
       ↓
   Applications
 
