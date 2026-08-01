@@ -339,16 +339,15 @@ class KeyValueLens(PondLens):
                     collection, lens_type="keyvalue", key_col="_key",
                     schema_hint={"_key": "string", "value": "bytes"})
             else:
-                # EXISTING collection — append (preserves existing
-                # rows and key_col). Don't overwrite metadata; if
-                # this is another lens's collection, the appended
-                # rows will have only _key+value columns (other
-                # columns become None — "ugly shape" but readable
-                # by any lens).
+                # EXISTING collection — append via CRDT shard
                 commit_hash = self._unified_storage.append(
                     collection, rows, key_col="_key",
                     row_group_size=10_000,
                     message=message or f"{collection} unified commit")
+                # Compact shards into HEAD so branch/merge/history see
+                # the latest data (append uses shards, but version
+                # control needs HEAD to be current).
+                self._unified_storage.compact_shards(collection)
         else:
             commit_hash = ""
 
@@ -458,7 +457,7 @@ class KeyValueLens(PondLens):
         self._require_unified()
 
         key_col = self._resolve_key_col(collection)
-        rows = self._unified_storage.read(collection)
+        rows = self._unified_storage.read_with_shards(collection)
         if key_col == "_key":
             # KV-created: return decoded values
             return {r["_key"]: self.decode(r["value"])
@@ -471,22 +470,25 @@ class KeyValueLens(PondLens):
 
         CROSS-LENS: works on any collection — returns the values of the
         key_col column (from metadata), or "_key" if KV-created.
+        Uses read_with_shards to merge HEAD + all shards (CRDT).
         """
         collection, rest = self._resolve_collection(*args)
         self._require_unified()
 
         key_col = self._resolve_key_col(collection)
-        rows = self._unified_storage.read(collection, columns=[key_col])
+        rows = self._unified_storage.read_with_shards(collection, columns=[key_col])
         return [str(r[key_col]) for r in rows if r.get(key_col) is not None]
 
     def exists(self, *args) -> bool:
-        """Check if a key exists in the collection."""
+        """Check if a key exists in the collection (merges HEAD + shards)."""
         collection, rest = self._resolve_collection(*args)
         key = rest[0]
         self._require_unified()
 
-        row = self._unified_storage.point_lookup(collection, key=key)
-        return row is not None
+        # Use read_with_shards to see HEAD + all shards
+        key_col = self._resolve_key_col(collection)
+        rows = self._unified_storage.read_with_shards(collection, columns=[key_col])
+        return any(str(r.get(key_col)) == str(key) for r in rows)
 
     def count(self, *args) -> int:
         """Count user keys in the collection."""

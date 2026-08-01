@@ -2310,16 +2310,19 @@ class UnifiedStorage:
                row_group_size: int = 10_000,
                encoding_hints: Optional[dict[str, str]] = None,
                message: str = "") -> str:
-        """Append rows to an existing collection WITHOUT rewriting it.
+        """Append rows to an existing collection.
 
-        B3 fix: this method is now safe for multi-process use. When the
-        kernel supports CAS (cas_path), it uses optimistic concurrency:
-        reads HEAD, builds the delta, CAS HEAD from old→new. If CAS fails
-        (another process wrote), it retries by re-reading the manifest
-        and re-applying. This is transparent to the caller.
+        UNIFIED with CRDT shards — no CAS, no HEAD contention.
+
+        This method delegates to append_shard() (the CRDT shard model)
+        and auto-compacts when the shard count exceeds a threshold.
+        This makes it safe for multi-process use WITHOUT CAS:
+          - Each process writes its own shard (no coordination)
+          - Readers merge HEAD + all shards (CRDT union)
+          - Auto-compaction merges shards into HEAD periodically
 
         For single-process use (same UnifiedStorage instance), the
-        in-memory caches still give O(1) warm writes (0 GETs).
+        in-memory caches give O(1) warm shard writes (0 GETs).
 
         Args:
             collection: collection name (must already exist)
@@ -2330,312 +2333,24 @@ class UnifiedStorage:
             message: commit message
 
         Returns:
-            The new HEAD commit hash.
+            The shard manifest hash.
         """
-        # B3 fix: try CAS-based append first (safe for multi-process)
-        if hasattr(self.kernel, 'cas_path'):
+        # Delegate to append_shard (CRDT — no CAS, no HEAD contention)
+        result = self.append_shard(collection, rows, key_col=key_col,
+                                     row_group_size=row_group_size,
+                                     encoding_hints=encoding_hints,
+                                     message=message)
+
+        # Auto-compact when shard count exceeds threshold
+        # (bounds read amplification — readers see at most N shards)
+        AUTO_COMPACT_THRESHOLD = 16
+        if self.shard_count(collection) >= AUTO_COMPACT_THRESHOLD:
             try:
-                return self._append_cas(collection, rows, key_col,
-                                         row_group_size, encoding_hints, message)
-            except RuntimeError:
-                pass  # CAS not available or failed too many times — fall through
+                self.compact_shards(collection)
+            except Exception:
+                pass  # compaction is best-effort — shards still work
 
-        # Fallback: single-writer append (uses in-memory cache)
-        return self._append_single_writer(collection, rows, key_col,
-                                           row_group_size, encoding_hints, message)
-
-    def _append_cas(self, collection, rows, key_col, row_group_size,
-                     encoding_hints, message, max_retries=3):
-        """CAS-based append — safe for multi-process. Retries on conflict."""
-        for attempt in range(max_retries):
-            # Always read fresh (no cache) for CAS path
-            self._invalidate_manifest_cache(collection)
-            existing_manifest = self._load_manifest(collection, skip_cache=True)
-            if existing_manifest is None:
-                return self.write(collection, rows, key_col=key_col,
-                                    row_group_size=row_group_size,
-                                    encoding_hints=encoding_hints, message=message)
-
-            # Read fresh HEAD
-            parent_commit = self.kernel.resolve(self._head_ref(collection))
-
-            # Build the new row groups (immutable, concurrent-safe)
-            if isinstance(rows, list):
-                source = ListColumnSource(rows)
-            elif isinstance(rows, ColumnSource):
-                source = rows
-            else:
-                source = as_column_source(rows)
-            n_rows = source.num_rows()
-
-            if key_col == "":
-                key_col = None
-            if key_col is None and existing_manifest.key_col:
-                key_col = existing_manifest.key_col
-            if key_col is not None and key_col in source.column_names():
-                source = _sort_source_by(source, key_col)
-                key_array = source.column_slice(key_col, 0, n_rows)
-            elif key_col is not None:
-                raise KeyError(f"key column '{key_col}' not in source columns")
-            else:
-                key_array = list(range(n_rows))
-
-            schema_columns = existing_manifest.columns
-            existing_manifest_hash = self._get_cached_manifest_hash(collection)
-            use_delta = (
-                existing_manifest.stats_tree_root is not None
-                or len(existing_manifest.row_groups) > 1000
-                or existing_manifest.parent_manifest_hash is not None
-            )
-
-            manifest_entries = []
-            if use_delta:
-                pass  # delta — only new entries
-            elif not existing_manifest.stats_tree_root:
-                for rg in existing_manifest.row_groups:
-                    manifest_entries.append({
-                        "rg_key": rg.key, "blob_hash": rg.blob_hash,
-                        "n_rows": rg.n_rows,
-                        "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
-                                        for c in rg.columns],
-                    })
-            else:
-                from stats_tree import StatsTreeReader
-                reader = StatsTreeReader(self.kernel, existing_manifest.stats_tree_root)
-                for rg in reader.scan_with_pruning():
-                    manifest_entries.append({
-                        "rg_key": rg.key, "blob_hash": rg.blob_hash,
-                        "n_rows": rg.n_rows,
-                        "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
-                                        for c in rg.columns],
-                    })
-
-            for start in range(0, n_rows, row_group_size):
-                end = min(start + row_group_size, n_rows)
-                group_source = _slice_source(source, start, end)
-                max_pk = key_array[end - 1]
-                rg_key = _format_rg_key(max_pk)
-                pnd2_bytes, col_stats = PND2.encode(group_source, encoding_hints=encoding_hints)
-                blob_hash = self.kernel.write(pnd2_bytes)
-                manifest_entries.append({"rg_key": rg_key, "blob_hash": blob_hash,
-                                          "n_rows": end - start, "col_stats": col_stats})
-
-            manifest_entries.sort(key=lambda e: e["rg_key"])
-            seen = {}
-            for entry in manifest_entries:
-                seen[entry["rg_key"]] = entry
-            manifest_entries = list(seen.values())
-            manifest_entries.sort(key=lambda e: e["rg_key"])
-
-            parent_hash = existing_manifest_hash if use_delta else None
-            manifest_hash, new_manifest = self._build_manifest_with_return(
-                collection, manifest_entries, schema_columns,
-                key_col or "", row_group_size, parent_manifest_hash=parent_hash)
-
-            # Get commit index
-            commit_index = 0
-            if parent_commit:
-                pc = self._read_commit_blob(parent_commit)
-                if pc:
-                    commit_index = pc.get("index", 0) + 1
-
-            n_new_groups = (n_rows + row_group_size - 1) // row_group_size
-
-            # CAS: HEAD must still point to parent_commit
-            commit_hash = self._write_commit_cas(
-                collection, manifest_hash, parent=parent_commit,
-                message=message or f"append: {n_rows} rows in {n_new_groups} new row groups",
-                index=commit_index, max_retries=1)
-
-            self._update_caches_after_write(
-                collection, new_manifest, manifest_hash, commit_hash,
-                commit_index, is_delta=use_delta)
-            return commit_hash
-
-        raise RuntimeError(f"CAS append failed after {max_retries} retries on '{collection}'")
-
-    def _append_single_writer(self, collection, rows, key_col, row_group_size,
-                                encoding_hints, message):
-        """Single-writer append — uses in-memory cache for O(1) warm writes."""
-        # skip_cache=True: for writes, the cache is authoritative (single-writer)
-        existing_manifest = self._load_manifest(collection, skip_cache=True)
-        if existing_manifest is None:
-            # Collection doesn't exist — delegate to write()
-            return self.write(collection, rows, key_col=key_col,
-                                row_group_size=row_group_size,
-                                encoding_hints=encoding_hints,
-                                message=message)
-
-        # Coerce input
-        if isinstance(rows, list):
-            source = ListColumnSource(rows)
-        elif isinstance(rows, ColumnSource):
-            source = rows
-        else:
-            source = as_column_source(rows)
-        n_rows = source.num_rows()
-
-        # Sort by key_col if specified (empty string = no key col)
-        if key_col == "":
-            key_col = None
-        # Fix (Round 14 Issue #5): inherit existing manifest key_col
-        if key_col is None and existing_manifest.key_col:
-            key_col = existing_manifest.key_col
-        if key_col is not None and key_col in source.column_names():
-            source = _sort_source_by(source, key_col)
-            key_array = source.column_slice(key_col, 0, n_rows)
-        elif key_col is not None:
-            raise KeyError(f"key column '{key_col}' not in source columns")
-        else:
-            key_array = list(range(n_rows))
-
-        # Use the existing collection's schema
-        schema_columns = existing_manifest.columns
-        if not schema_columns and n_rows > 0:
-            for col_name in source.column_names():
-                sample = source.column_slice(col_name, 0, min(100, n_rows))
-                vtype = _detect_value_type_with_binary(sample)
-                schema_columns.append((col_name, vtype))
-
-        # No ProllyTree staging — the manifest IS the index now.
-        manifest_entries: list[dict] = []
-
-        # Carry over existing row group entries from the old manifest.
-        # Fix (Round 9 Issue #5): for large collections, use DELTA-MANIFEST
-        # instead of reading ALL existing entries. A delta-manifest stores
-        # only the NEW row groups + a pointer to the parent manifest.
-        # The reader walks the parent chain to find all entries.
-        # This makes append() O(new_row_groups) instead of O(total_row_groups).
-        #
-        # Strategy: if the existing manifest has >1000 row groups (or uses
-        # a stats tree), use delta-manifest. Otherwise, rebuild the full
-        # manifest (cheap at small scale).
-        #
-        # Round 26 optimization: reuse the cached manifest hash instead
-        # of doing a separate resolve() call. The _load_manifest above
-        # already resolved and cached it. This saves 1 GET.
-        existing_manifest_hash = self._get_cached_manifest_hash(collection)
-        use_delta = (
-            existing_manifest.stats_tree_root is not None
-            or len(existing_manifest.row_groups) > 1000
-            or existing_manifest.parent_manifest_hash is not None
-        )
-
-        if use_delta:
-            # DELTA path: only store NEW row groups + parent pointer
-            # No need to read existing entries — the parent chain has them
-            manifest_entries = []  # only new entries
-        elif not existing_manifest.stats_tree_root:
-            # FLAT path: carry over all existing entries (small collection)
-            for rg in existing_manifest.row_groups:
-                manifest_entries.append({
-                    "rg_key": rg.key,
-                    "blob_hash": rg.blob_hash,
-                    "n_rows": rg.n_rows,
-                    "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
-                                    for c in rg.columns],
-                })
-        else:
-            # PB-scale flat path: walk the stats tree
-            from stats_tree import StatsTreeReader
-            reader = StatsTreeReader(self.kernel, existing_manifest.stats_tree_root)
-            for rg in reader.scan_with_pruning():
-                manifest_entries.append({
-                    "rg_key": rg.key,
-                    "blob_hash": rg.blob_hash,
-                    "n_rows": rg.n_rows,
-                    "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
-                                    for c in rg.columns],
-                })
-
-        # Add new row groups
-        for start in range(0, n_rows, row_group_size):
-            end = min(start + row_group_size, n_rows)
-            group_source = _slice_source(source, start, end)
-            max_pk = key_array[end - 1]
-            rg_key = _format_rg_key(max_pk)
-
-            pnd2_bytes, col_stats = PND2.encode(
-                group_source, encoding_hints=encoding_hints)
-            blob_hash = self.kernel.write(pnd2_bytes)
-
-            manifest_entries.append({
-                "rg_key": rg_key,
-                "blob_hash": blob_hash,
-                "n_rows": end - start,
-                "col_stats": col_stats,
-            })
-
-        n_new_groups = (n_rows + row_group_size - 1) // row_group_size
-
-        # Fix (Round 9 Issue #1): SORT manifest entries by rg_key before
-        # building the manifest. Without sorting, appended entries with
-        # smaller keys sit at the end of the list, and find_row_group()
-        # (linear scan for first key >= target) returns the wrong row group.
-        # This causes point_lookup to silently return None for appended rows.
-        manifest_entries.sort(key=lambda e: e["rg_key"])
-
-        # Fix (Round 15 Issue #3): deduplicate by rg_key (last-writer-wins).
-        # Fix (Round 18 Issue #1): manifest_entries is [existing(OLD)..., new(NEW)...]
-        # after sort. For last-writer-wins we must keep the LAST entry (NEW)
-        # for each rg_key. Dict overwrite naturally keeps the last — which is
-        # the NEW entry since new entries are appended after old ones.
-        seen: dict[str, dict] = {}
-        for entry in manifest_entries:
-            seen[entry["rg_key"]] = entry  # last wins = NEW (correct for append)
-        manifest_entries = list(seen.values())
-        manifest_entries.sort(key=lambda e: e["rg_key"])
-
-        # Build the manifest. If using delta mode, pass the parent hash.
-        parent_hash = existing_manifest_hash if use_delta else None
-        manifest_hash, new_manifest = self._build_manifest_with_return(
-            collection, manifest_entries, schema_columns,
-            key_col or "", row_group_size,
-            parent_manifest_hash=parent_hash)
-
-        # O(1) warm write: use cached HEAD + commit_index if available.
-        # The manifest cache was populated by _load_manifest above (or
-        # by the previous write). HEAD and commit_index are cached by
-        # _update_caches_after_write.
-        parent_commit = self._head_cache.get(collection)
-        if parent_commit is None:
-            parent_commit = self.kernel.resolve(self._head_ref(collection))
-
-        commit_index = self._commit_index_cache.get(collection, -1)
-        if commit_index < 0 and parent_commit:
-            # Cold path: read parent commit blob to get the index
-            parent_commit_data = self._read_commit_blob(parent_commit)
-            if parent_commit_data:
-                commit_index = parent_commit_data.get("index", 0) + 1
-            else:
-                commit_index = 0
-        elif commit_index < 0:
-            commit_index = 0
-
-        commit_hash = self._write_commit_blob(
-            collection, manifest_hash,
-            parent=parent_commit,
-            message=message or f"append: {n_rows} rows in {n_new_groups} new row groups",
-            index=commit_index)
-
-        # Update caches (don't invalidate) → next append is O(1)
-        self._update_caches_after_write(
-            collection, new_manifest, manifest_hash, commit_hash, commit_index,
-            is_delta=use_delta)
-
-        # Fix (Round 11 Issue #2): auto-compact if the delta chain is too deep.
-        # After DELTA_CHAIN_THRESHOLD appends, flatten the chain to avoid
-        # O(chain_depth) read amplification.
-        #
-        # Round 26 optimization: use the cached delta chain depth instead
-        # of walking the parent chain. This is 0 GETs for the common case.
-        if use_delta:
-            chain_depth = self._delta_chain_depth_cache.get(collection, 0)
-            DELTA_CHAIN_THRESHOLD = 8
-            if chain_depth >= DELTA_CHAIN_THRESHOLD:
-                self.compact_manifest(collection)
-
-        return commit_hash
+        return result
 
     def compact_manifest(self, collection: str) -> Optional[str]:
         """Compact a delta-manifest chain into a single flat manifest.

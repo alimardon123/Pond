@@ -437,12 +437,18 @@ def law_12_merge_true_dag():
     lens.put("k1", {"v": 1})
     lens.commit("main")
 
+    # Create explicit branches
+    lens.branch("main")
     lens.branch("feature")
     lens.checkout("feature")
     lens.put("k2", {"v": 2})
     lens.commit("feature")
 
-    lens.undo(1)  # back to main HEAD
+    # Checkout main and make a DIFFERENT commit so the merge has two distinct parents
+    lens.checkout("main")
+    lens.put("k3", {"v": 3})
+    lens.commit("main commit 2")
+
     lens.merge("feature")
 
     # Verify the HEAD commit has a second_parent (true merge)

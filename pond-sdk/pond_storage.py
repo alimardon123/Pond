@@ -774,7 +774,7 @@ class PondStorage:
         }
 
     def alter_table(self, collection: str,
-                     add_columns: Optional[list[str]] = None,
+                     add_columns: Optional[list] = None,
                      drop_columns: Optional[list[str]] = None,
                      rename: Optional[dict[str, str]] = None) -> dict:
         """Schema evolution — add/drop/rename columns (Iceberg-style).
@@ -783,9 +783,20 @@ class PondStorage:
         New columns appear as None in old row groups. Dropped columns
         are removed from the schema (old data remains but is invisible).
 
+        GENERIC for ALL data types:
+          - add_columns accepts either:
+            - str: column name (type auto-detected on next write = NULL type)
+            - tuple: (name, type_str) where type_str is one of:
+              "int64", "float64", "string", "binary", "null"
+            - dict: {name: type_str} for batch add with types
+          - This works for structured (int, float, string),
+            semi-structured (JSON stored as string/binary),
+            and unstructured data (blobs stored as binary).
+
         Args:
             collection: collection name
-            add_columns: list of column names to add (type auto-detected on next write)
+            add_columns: list of column names, (name, type) tuples, or
+                         {name: type} dicts to add
             drop_columns: list of column names to drop
             rename: dict of {old_name: new_name}
 
@@ -818,10 +829,28 @@ class PondStorage:
             else:
                 new_columns.append((name, vtype))
 
-        # Process adds
-        for col_name in (add_columns or []):
+        # Process adds — supports str, (name, type) tuple, or {name: type} dict
+        TYPE_MAP = {"int64": 1, "float64": 2, "string": 3, "binary": 4, "null": 4}
+        for item in (add_columns or []):
+            if isinstance(item, str):
+                # Just a name — type auto-detected on next write (NULL)
+                col_name, col_type = item, 4
+            elif isinstance(item, tuple) and len(item) == 2:
+                # (name, type_str) — explicit type
+                col_name, type_str = item
+                col_type = TYPE_MAP.get(type_str.lower(), 4)
+            elif isinstance(item, dict):
+                # {name: type_str} — batch
+                for name, type_str in item.items():
+                    if name not in {n for n, _ in new_columns}:
+                        new_columns.append((name, TYPE_MAP.get(str(type_str).lower(), 4)))
+                        added += 1
+                continue
+            else:
+                continue  # skip invalid entries
+
             if col_name not in {n for n, _ in new_columns}:
-                new_columns.append((col_name, 4))  # NULL type — will be detected on next write
+                new_columns.append((col_name, col_type))
                 added += 1
 
         # Build a new manifest with the updated schema
