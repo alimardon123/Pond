@@ -193,9 +193,12 @@ class StreamingLens(PondLens):
         md = self.get_collection_metadata(collection)
         is_streaming = md.get("lens_type") == "streaming"
         if is_streaming:
-            rows = self._unified_storage.read(collection,
-                start_key=start_byte, end_key=end_byte,
+            # Read all segments (no start_key/end_key — those are byte
+            # offsets, not rg_keys). Filter in memory.
+            rows = self._unified_storage.read_with_shards(collection,
                 columns=["offset", "segment"])
+            # Sort by offset
+            rows.sort(key=lambda r: r.get("offset", 0))
             result = b""
             for row in rows:
                 seg_offset = row.get("offset", 0)
@@ -212,7 +215,7 @@ class StreamingLens(PondLens):
         # Cross-lens: not a streaming collection. Best-effort read:
         # concatenate any bytes-valued columns from all rows.
         try:
-            rows = self._unified_storage.read(collection)
+            rows = self._unified_storage.read_with_shards(collection)
         except Exception:
             return b""
         result = b""

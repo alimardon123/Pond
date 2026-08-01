@@ -49,8 +49,8 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
 from kernel import PondMinimal  # noqa: E402
 from base_lens import PondLens  # noqa: E402
-from prolly_tree import ProllyLensBase, ProllyTree  # noqa: E402
-from binary_encoding import BinaryProllyTree  # noqa: E402
+# ProllyTree imports removed — use UnifiedStorage instead
+# This lens is in pond-labs (experimental) and needs migration to UnifiedStorage
 
 try:
     import pyarrow as pa

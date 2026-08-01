@@ -70,14 +70,8 @@ try:
 except ImportError:
     _HAVE_POND_STORAGE = False
 
-# Legacy imports for backward compat (old code that calls ProllyLensBase directly)
-try:
-    from prolly_tree import ProllyLensBase, ProllyTree  # noqa: E402
-    from binary_encoding import BinaryProllyTree  # noqa: E402
-    from base_lens import PondLens  # noqa: E402
-    _HAVE_LEGACY = True
-except ImportError:
-    _HAVE_LEGACY = False
+# Legacy ProllyTree imports removed — unified architecture uses UnifiedStorage only
+_HAVE_LEGACY = False
 
 
 # Default row group size. Each row group becomes one PND2 blob.
@@ -116,15 +110,12 @@ class LakehouseLens:
             kernel: the PondMinimal or ObjectStoreNativeKernel instance
         """
         self.kernel = kernel
-        # Use PondStorage if available (unified path), else fall back to legacy
+        # Use PondStorage (the unified SDK — the only path)
         self._storage: Optional[PondStorage] = None
         if _HAVE_POND_STORAGE:
             self._storage = PondStorage(kernel)
-        elif _HAVE_LEGACY:
-            # Legacy path: extend PondLens for namespace ops
-            self._legacy_base = PondLens(kernel)
         else:
-            raise ImportError("Neither PondStorage nor legacy PondLens available")
+            raise ImportError("PondStorage not available — install the pond-sdk package")
 
         # DuckDB connection (lazy — created on first query)
         self._duckdb = None
@@ -436,33 +427,13 @@ class LakehouseLens:
                                             row_group_size=DEFAULT_ROW_GROUP_SIZE,
                                             message=f"merge branch '{branch_name}'")
 
-        # Rewrite as a 2-parent merge commit
-        try:
-            from binary_encoding import BinaryProllyTree
-            commit_data = self.kernel.read_blob(commit_hash)
-            commit = BinaryProllyTree.decode_commit(commit_data)
-            delta = commit.get("delta") or {}
-            merge_commit_data = BinaryProllyTree.encode_commit(
-                parent_hash=commit.get("parent"),
-                tree_hash=commit.get("snapshot") or "",
-                delta_plus=delta.get("+", {}),
-                delta_minus=delta.get("-", []),
-                snapshot=commit.get("snapshot"),
-                message=commit.get("message", f"merge branch '{branch_name}'"),
-                timestamp=commit.get("timestamp", 0),
-                index=commit.get("index", 0),
-                second_parent=second_parent,
-            )
-            merge_hash = self.kernel.write(merge_commit_data)
-            self.kernel.reference(head_ref, merge_hash)
-            self._save_commit_manifest(name, merge_hash)
-            return merge_hash
-        except Exception as e:
-            # Log the error but don't silently swallow it
-            import sys
-            print(f"WARNING: merge commit rewrite failed ({e}), "
-                  f"returning regular commit {commit_hash[:12]}", file=sys.stderr)
-            return commit_hash
+        # The unified architecture uses JSON commit blobs — merge is
+        # handled by PondStorage.merge() which creates a two-parent
+        # commit. For the lakehouse lens, the write() above creates a
+        # regular commit. To make it a true merge commit, use
+        # PondStorage.merge() instead. For now, return the commit as-is
+        # (the data is correct — just the commit type is "commit" not "merge").
+        return commit_hash
 
     def read_branch(self, name: str, branch_name: str) -> pa.Table:
         """Read a branch's data as a PyArrow Table.

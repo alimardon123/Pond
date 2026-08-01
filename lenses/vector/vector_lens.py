@@ -453,7 +453,7 @@ class VectorLens(PondLens):
         """
         self._require_unified()
         key_col = self._resolve_key_col(collection)
-        rows = self._unified_storage.read(collection, columns=[key_col])
+        rows = self._unified_storage.read_with_shards(collection, columns=[key_col])
         return [str(r[key_col]) for r in rows if r.get(key_col) is not None]
 
     def count(self, collection: str) -> int:
@@ -471,7 +471,7 @@ class VectorLens(PondLens):
         """
         self._require_unified()
         key_col = self._resolve_key_col(collection)
-        rows = self._unified_storage.read(collection)
+        rows = self._unified_storage.read_with_shards(collection)
         result = {}
         for r in rows:
             k = r.get(key_col)
