@@ -614,6 +614,134 @@ class LakehouseLens:
         return self._storage.get_definition(name)
 
     # ==================================================================
+    # PARTITIONING — Hive-style partition pruning
+    #
+    # Partitions use Pond's hierarchical namespaces: a table "events"
+    # partitioned by "date" becomes collections "events/2024-01-01",
+    # "events/2024-01-02", etc. Reads with partition predicates only
+    # fetch the relevant partition collections.
+    #
+    # This follows our design: partitions = namespaces, no new primitives.
+    # ==================================================================
+
+    def create_partitioned_table(self, table_name: str, data: pa.Table,
+                                  partition_cols: list[str],
+                                  key_col: Optional[str] = None,
+                                  row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
+                                  message: str = "") -> dict:
+        """Create a partitioned table — splits data by partition columns.
+
+        Each partition is a separate collection (Hive-style):
+          table_name/partition_value1/partition_value2/...
+
+        Args:
+            table_name: base table name
+            data: PyArrow Table to partition
+            partition_cols: columns to partition by (e.g., ["date", "region"])
+            key_col: sort key column
+            row_group_size: rows per row group
+            message: commit message
+
+        Returns:
+            {"partitions": [list of partition names], "rows": total rows}
+        """
+        rows = data.to_pylist()
+        # Group rows by partition values
+        partitions: dict[str, list[dict]] = {}
+        for row in rows:
+            # Build partition key from partition columns
+            parts = []
+            for col in partition_cols:
+                val = row.get(col, "null")
+                parts.append(f"{col}={val}")
+            partition_name = "/".join(parts)
+            if partition_name not in partitions:
+                partitions[partition_name] = []
+            partitions[partition_name].append(row)
+
+        # Write each partition as a separate collection
+        partition_names = []
+        total_rows = 0
+        for pname, prows in partitions.items():
+            coll = f"{table_name}/{pname}"
+            commit = self._storage.write(coll, prows, key_col=key_col,
+                                           row_group_size=row_group_size,
+                                           message=message or f"partition {pname}")
+            self._save_commit_manifest(coll, commit)
+            schema_hint = {field.name: str(field.type) for field in data.schema}
+            self._storage.stamp_collection_metadata(
+                coll, lens_type="lakehouse", key_col=key_col,
+                schema_hint=schema_hint,
+                extra={"partition": True, "partition_cols": partition_cols,
+                        "base_table": table_name})
+            partition_names.append(coll)
+            total_rows += len(prows)
+
+        # Stamp the base table metadata (points to partitions)
+        self._storage.stamp_collection_metadata(
+            table_name, lens_type="lakehouse_partitioned",
+            extra={"partition_cols": partition_cols,
+                    "partitions": partition_names})
+
+        return {"partitions": partition_names, "rows": total_rows}
+
+    def read_partitioned(self, table_name: str,
+                          partition_filters: Optional[dict] = None,
+                          columns: Optional[list[str]] = None,
+                          predicates: Optional[list] = None) -> pa.Table:
+        """Read from a partitioned table with partition pruning.
+
+        Args:
+            table_name: base table name
+            partition_filters: dict of {partition_col: value} to prune.
+                e.g., {"date": "2024-01-01"} reads only that partition.
+                None = read all partitions.
+            columns: projection pushdown
+            predicates: row-level predicates
+
+        Returns:
+            PyArrow Table with results from all matching partitions.
+        """
+        # List all partition collections
+        all_collections = self._storage.list_collections(table_name)
+        # Filter to partitions only (have / in the name after table_name)
+        partition_colls = [c for c in all_collections
+                           if c.startswith(f"{table_name}/") and c != table_name]
+
+        # Apply partition filters
+        if partition_filters:
+            filtered = []
+            for coll in partition_colls:
+                # coll = "table_name/date=2024-01-01/region=us"
+                parts = coll[len(table_name) + 1:].split("/")
+                match = True
+                for part in parts:
+                    if "=" in part:
+                        col, val = part.split("=", 1)
+                        if col in partition_filters and str(partition_filters[col]) != val:
+                            match = False
+                            break
+                if match:
+                    filtered.append(coll)
+            partition_colls = filtered
+
+        # Read each matching partition and combine
+        all_rows = []
+        for coll in partition_colls:
+            rows = self._storage.read(coll, predicates=predicates, columns=columns)
+            all_rows.extend(rows)
+
+        if not all_rows:
+            return pa.table({})
+        return pa.Table.from_pylist(all_rows)
+
+    def list_partitions(self, table_name: str) -> list[str]:
+        """List all partitions for a partitioned table."""
+        all_collections = self._storage.list_collections(table_name)
+        return [c for c in all_collections
+                if c.startswith(f"{table_name}/") and c != table_name]
+
+    # ==================================================================
     # DIAGNOSTICS
     # ==================================================================
 

@@ -508,34 +508,44 @@ class VectorLens(PondLens):
     # ==================================================================
 
     def search(self, collection: str, query: list[float], k: int = 5,
-               n_probe: int = 10) -> list[dict]:
+               n_probe: int = 10, ef: int = 50) -> list[dict]:
         """Return the k nearest vectors to query using L2 distance.
 
-        AUTO-ACCELERATED: if an IVF index exists for the collection,
-        uses approximate nearest neighbor search (100-100,000x faster
-        than linear scan at scale). Falls back to linear scan if no
-        index exists.
+        AUTO-ACCELERATED: tries HNSW first (O(log N)), then IVF
+        (O(n_probe × cluster_size)), then linear scan. Falls back
+        automatically if no index exists.
 
         Args:
             collection: collection name
             query: query vector
             k: number of nearest neighbors to return
-            n_probe: number of IVF clusters to search (higher = more
-                accurate, slower). Only used if an IVF index exists.
+            n_probe: IVF clusters to search (only if IVF index exists)
+            ef: HNSW search beam width (only if HNSW index exists).
+                Higher = better recall, slower.
 
         Each result dict has: id, distance, vector, metadata.
         """
-        # Try IVF index first (100-100,000x faster at scale)
+        indexing_path = os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk",
+                                       "extensions", "indexing")
+        sys.path.insert(0, indexing_path)
+
+        # Try HNSW first (O(log N) — best for high-recall at low latency)
         try:
-            sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk",
-                                              "extensions", "indexing"))
+            from hnsw_index import HNSWIndex
+            hnsw = HNSWIndex(self.kernel)
+            if hnsw.load(collection) is not None:
+                return hnsw.search(collection, query, k=k, ef=ef)
+        except (ImportError, Exception):
+            pass
+
+        # Try IVF second (O(n_probe × cluster_size))
+        try:
             from ivf_index import IVFIndex
             ivf = IVFIndex(self.kernel)
-            index = ivf.load(collection)
-            if index is not None:
+            if ivf.load(collection) is not None:
                 return ivf.search(collection, query, k=k, n_probe=n_probe)
         except (ImportError, Exception):
-            pass  # fall through to linear scan
+            pass
 
         # Linear scan fallback (fine for small collections)
         query = [float(v) for v in query]
@@ -558,6 +568,34 @@ class VectorLens(PondLens):
             }
             for dist, key, record in scored[:k]
         ]
+
+    def build_hnsw_index(self, collection: str, M: int = 16,
+                           ef_construction: int = 200,
+                           distance_metric: str = "l2") -> str:
+        """Build an HNSW (Hierarchical Navigable Small World) graph index.
+
+        HNSW is better than IVF for high-recall at low latency:
+          - HNSW: O(log N) distance computations
+          - IVF: O(n_probe × cluster_size) distance computations
+
+        After building, search() automatically uses HNSW first.
+
+        Args:
+            collection: collection name
+            M: max connections per node per layer (higher = better recall)
+            ef_construction: search beam width during construction
+            distance_metric: "l2" or "cosine"
+
+        Returns:
+            The index root hash.
+        """
+        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk",
+                                          "extensions", "indexing"))
+        from hnsw_index import HNSWIndex
+        hnsw = HNSWIndex(self.kernel)
+        return hnsw.build(collection, M=M, ef_construction=ef_construction,
+                           n_dimensions=self._n_dimensions or None,
+                           distance_metric=distance_metric)
 
     def build_ann_index(self, collection: str, n_clusters: int = 100,
                          distance_metric: str = "l2") -> str:
