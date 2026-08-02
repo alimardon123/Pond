@@ -1042,17 +1042,60 @@ class UnifiedStorage:
             message=message or f"merge '{branch_name}'",
             index=self._commit_index(collection))
 
-        # Clear source + target branch shards via index reset (B2 fix).
-        # Old shard refs are left for GC. Readers use the index.
-        self._write_shard_index(collection, [], branch_name)
-        self._write_shard_index(collection, [], target_branch)
-        if hasattr(self, '_shard_index_mem'):
-            self._shard_index_mem.pop(f"{collection}/{branch_name}", None)
-            self._shard_index_mem.pop(f"{collection}/{target_branch}", None)
+        # Clear source + target branch shards via index reset + ref tombstone.
+        # Tombstoning (overwriting with empty blob) is REQUIRED so that
+        # _list_shards_from_refs — which scans refs as the source of truth
+        # to catch concurrent writers — does NOT pick up the absorbed shards.
+        # Old shard refs that still point to valid manifests would otherwise
+        # be reported as "live" by shard_count and re-merged on next read.
+        self._clear_branch_shards(collection, branch_name)
+        self._clear_branch_shards(collection, target_branch)
 
         self._active_branches.pop(collection, None)  # merge detaches from branch
         self._invalidate_manifest_cache(collection)
         return commit_hash
+
+    def _tombstone_shard_refs(self, collection: str, branch: str,
+                               shard_hashes: list[str]) -> None:
+        """Tombstone shard refs by overwriting them with an empty blob.
+
+        This makes the ref resolve to an empty blob — _list_shards_from_refs
+        will skip it (CollectionManifest.load fails on empty). The ref name
+        is preserved so concurrent readers don't see a "new" shard appear.
+
+        Used by compact_shards and merge to retire absorbed shards.
+        """
+        if not shard_hashes:
+            return
+        prefix = self._shards_prefix(collection, branch)
+        # Index ref-names by their current hash for O(1) lookup
+        candidates = [n for n in self.kernel.list_names() if n.startswith(prefix)]
+        hash_to_name: dict[str, str] = {}
+        for name in candidates:
+            h = self.kernel.resolve(name)
+            if h is not None:
+                hash_to_name[h] = name
+        empty_hash = self.kernel.write(b"")
+        for sh in shard_hashes:
+            name = hash_to_name.get(sh)
+            if name is not None:
+                self.kernel.reference(name, empty_hash)
+
+    def _clear_branch_shards(self, collection: str, branch: str) -> None:
+        """Clear a branch's shards: tombstone refs + reset index.
+
+        Unified retire path used by compact_shards and merge. After this:
+          - Shard index for {branch} is explicitly empty
+          - Old shard refs are tombstoned (empty blob)
+          - In-memory shard index cache is dropped
+        Readers using _list_shards_from_refs see zero live shards because
+        tombstoned refs fail CollectionManifest.load and are skipped.
+        """
+        shard_hashes = self._read_shard_index(collection, branch)
+        self._tombstone_shard_refs(collection, branch, shard_hashes)
+        self._write_shard_index(collection, [], branch)
+        if hasattr(self, '_shard_index_mem'):
+            self._shard_index_mem.pop(f"{collection}/{branch}", None)
 
     def undo(self, collection: str, steps: int = 1) -> str:
         """Undo the last N commits — walk parent pointers.
@@ -1704,6 +1747,155 @@ class UnifiedStorage:
 
         return all_rows
 
+    def read_branch_with_shards(self, collection: str, branch: str,
+                                  predicates: Optional[list[tuple[str, str, Any]]] = None,
+                                  columns: Optional[list[str]] = None) -> list[dict]:
+        """Read a branch's full data: branch HEAD commit's manifest + branch's shards.
+
+        This is the branch-aware version of read_with_shards. It does NOT
+        mutate HEAD or the active branch — it resolves the branch's commit
+        directly and reads its manifest, then merges in the branch's shards.
+
+        Used by LakehouseLens.read_branch() to read a branch's full state
+        without checking out (which would race with concurrent readers).
+
+        Args:
+            collection: collection name
+            branch: branch name to read
+            predicates: optional predicate pushdown
+            columns: optional projection pushdown
+
+        Returns:
+            List of row dicts (HEAD + shards merged, row-level CRDT applied).
+        """
+        # Resolve the branch's commit
+        branch_commit_hash = self.kernel.resolve(
+            self._branch_ref(collection, branch))
+        if branch_commit_hash is None:
+            raise KeyError(f"Branch '{branch}' not found for collection '{collection}'")
+
+        # Read the branch's commit blob → manifest hash
+        branch_commit = self._read_commit_blob(branch_commit_hash)
+        if branch_commit is None or not branch_commit.get("manifest"):
+            return []
+        branch_manifest_hash = branch_commit["manifest"]
+
+        # Load the branch's manifest
+        try:
+            head_manifest = CollectionManifest.load(self.kernel, branch_manifest_hash)
+        except (ValueError, KeyError):
+            head_manifest = None
+
+        # Read the branch's shards
+        shard_hashes = self._read_shard_index(collection, branch)
+        shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
+
+        # Level 1 merge: dedup row groups by rg_key (shards override HEAD)
+        merged: dict[str, Any] = {}
+        if head_manifest:
+            for rg in head_manifest.scan_with_pruning(predicates):
+                merged[rg.key] = rg
+        for sm in shard_manifests:
+            for rg in sm.scan_with_pruning(predicates):
+                merged[rg.key] = rg
+
+        if not merged:
+            return []
+
+        # Fetch + decode
+        row_groups = list(merged.values())
+        col_data_list = self._parallel_fetch_and_decode(
+            row_groups, columns, predicates)
+
+        all_rows: list[dict] = []
+        for col_data in col_data_list:
+            if not col_data:
+                continue
+            n = len(next(iter(col_data.values())))
+            for i in range(n):
+                row = {}
+                for c, vals in col_data.items():
+                    if i < len(vals):
+                        row[c] = vals[i]
+                    else:
+                        row[c] = None
+                all_rows.append(row)
+
+        # Row-level CRDT merge
+        has_rowid = any(r.get("_rowid") for r in all_rows)
+        if has_rowid:
+            all_rows = self._merge_rows_by_rowid(all_rows)
+
+        return all_rows
+
+    def _read_as_columns_with_shards(self, collection: str,
+                                       predicates: Optional[list[tuple[str, str, Any]]] = None,
+                                       columns: Optional[list[str]] = None,
+                                       shard_hashes: Optional[list[str]] = None
+                                       ) -> dict[str, list]:
+        """Columnar read merging HEAD + unmerged shards.
+
+        Same merge semantics as read_with_shards, but returns columnar
+        data (dict[col_name, list[values]]) instead of row dicts. Used
+        by read_as_columns / read_as_arrow so they include unmerged shards.
+        """
+        if shard_hashes is None:
+            shard_hashes = self._read_shard_index(collection)
+
+        head_manifest = self._load_manifest(collection)
+        shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
+
+        # Level 1 merge: dedup row groups by rg_key
+        merged: dict[str, Any] = {}
+        if head_manifest:
+            for rg in head_manifest.scan_with_pruning(predicates):
+                merged[rg.key] = rg
+        for sm in shard_manifests:
+            for rg in sm.scan_with_pruning(predicates):
+                merged[rg.key] = rg
+
+        if not merged:
+            return {}
+
+        # Ensure predicate columns are decoded
+        eff_columns = list(columns) if columns is not None else None
+        if predicates and eff_columns is not None:
+            pred_cols = {p[0] for p in predicates}
+            missing = pred_cols - set(eff_columns)
+            if missing:
+                eff_columns = list(dict.fromkeys(eff_columns + list(missing)))
+
+        row_groups = list(merged.values())
+        col_results = self._parallel_fetch_and_decode(
+            row_groups, eff_columns, predicates)
+
+        auto_filter = self._build_predicate_filter(predicates)
+        result: dict[str, list] = {}
+        for col_data in col_results:
+            if auto_filter is None:
+                for col_name, values in col_data.items():
+                    if columns is not None and col_name not in columns:
+                        continue
+                    if col_name not in result:
+                        result[col_name] = list(values)
+                    else:
+                        result[col_name].extend(values)
+            else:
+                # Apply filter row by row
+                n = max((len(v) for v in col_data.values()), default=0)
+                for i in range(n):
+                    row = {c: col_data[c][i] if i < len(col_data[c]) else None
+                            for c in col_data}
+                    if auto_filter(row):
+                        for col_name, val in row.items():
+                            if columns is not None and col_name not in columns:
+                                continue
+                            if col_name not in result:
+                                result[col_name] = [val]
+                            else:
+                                result[col_name].append(val)
+        return result
+
     def compact_shards(self, collection: str) -> Optional[str]:
         """Merge all shards into HEAD, then clear the shards.
 
@@ -1833,27 +2025,15 @@ class UnifiedStorage:
             message=f"compact {len(shard_hashes)} shards ({len(all_rows)} live rows)",
             index=commit_index)
 
-        # Clear shards: reset the shard index to empty (B1 fix).
-        # Tombstone ONLY the shards that were in the index at compaction
-        # time (not ALL refs with the prefix — a concurrent writer may
-        # have added a new shard that we haven't seen yet).
+        # Clear shards: tombstone the absorbed shard refs and reset the index.
+        # The tombstone path overwrites each ref with an empty blob so that
+        # _list_shards_from_refs (which scans refs as source of truth) skips
+        # them. Only the shards that were in the index at compaction time
+        # are tombstoned — a concurrent writer that added a new shard after
+        # we read the index will still be visible (and will be picked up by
+        # the next compaction).
         branch = self._get_active_branch(collection)
-        # Tombstone the known shards (from the index we just read)
-        for sh in shard_hashes:
-            # Find the ref name for this shard hash
-            prefix = self._shards_prefix(collection, branch)
-            for name in self.kernel.list_names():
-                if name.startswith(prefix):
-                    h = self.kernel.resolve(name)
-                    if h == sh:
-                        empty = self.kernel.write(b"")
-                        self.kernel.reference(name, empty)
-                        break
-        self._write_shard_index(collection, [], branch)
-        # Also clear in-memory index
-        if hasattr(self, '_shard_index_mem'):
-            key = f"{collection}/{branch}"
-            self._shard_index_mem.pop(key, None)
+        self._clear_branch_shards(collection, branch)
 
         # Update caches
         self._update_caches_after_write(
@@ -2721,6 +2901,17 @@ class UnifiedStorage:
 
         Round trips: 3 + K S3 GETs cold (root pointer + root ref + manifest + K data blobs)
         """
+        # Live read: if there are unmerged shards, include them via
+        # read_with_shards. Time-travel queries (manifest_hash / commit_hash
+        # set) skip this and read the snapshot manifest directly.
+        if manifest_hash is None and commit_hash is None:
+            shard_hashes = self._read_shard_index(collection)
+            if shard_hashes:
+                return self.read_with_shards(
+                    collection, predicates=predicates,
+                    columns=columns, row_filter=row_filter,
+                    start_key=start_key, end_key=end_key)
+
         manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
         if manifest is None:
             return []
@@ -2903,6 +3094,15 @@ class UnifiedStorage:
         if manifest_hash is None and commit_hash is not None:
             manifest_hash = self._resolve_commit_manifest(collection, commit_hash)
 
+        # Live read: if there are unmerged shards, include them via a
+        # shard-aware path. Time-travel queries use the snapshot manifest only.
+        if manifest_hash is None and commit_hash is None:
+            shard_hashes = self._read_shard_index(collection)
+            if shard_hashes:
+                return self._read_as_columns_with_shards(
+                    collection, predicates=predicates, columns=columns,
+                    shard_hashes=shard_hashes)
+
         manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
         if manifest is None:
             return {}
@@ -3076,8 +3276,32 @@ class UnifiedStorage:
         Returns the row as a dict, or None if not found.
 
         Round trips: 2 S3 GETs (manifest + 1 data blob) — O(1) regardless
-        of collection scale.
+        of collection scale. When shards exist (unmerged appends) and the
+        key isn't found in HEAD, falls back to a shard-aware path that
+        checks each shard's manifest for a row group whose key range
+        contains the target.
         """
+        # Fast path: try HEAD manifest first (preserves the original
+        # 4-GET cold-lookup cost for keys that live in HEAD).
+        # Time-travel queries (manifest_hash set) use ONLY this path.
+        head_result = self._point_lookup_head(
+            collection, key, columns=columns, manifest_hash=manifest_hash)
+
+        # Live reads: if HEAD didn't have the key AND there are unmerged
+        # shards, the row may be in a shard. Search shards.
+        if head_result is None and manifest_hash is None:
+            shard_hashes = self._read_shard_index(collection)
+            if shard_hashes:
+                return self._point_lookup_with_shards(
+                    collection, key, columns=columns,
+                    shard_hashes=shard_hashes)
+
+        return head_result
+
+    def _point_lookup_head(self, collection: str, key: str,
+                            columns: Optional[list[str]] = None,
+                            manifest_hash: Optional[str] = None) -> Optional[dict]:
+        """Point lookup against the HEAD (or manifest_hash) manifest only."""
         manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
         if manifest is None:
             return None
@@ -3135,6 +3359,87 @@ class UnifiedStorage:
                 except (ValueError, TypeError):
                     pass
             # Don't return first row as fallback — that's a bug (R2 fix)
+        return None
+
+    def _point_lookup_with_shards(self, collection: str, key: str,
+                                    columns: Optional[list[str]],
+                                    shard_hashes: list[str]) -> Optional[dict]:
+        """Point lookup against HEAD + unmerged shards.
+
+        Searches each shard manifest in parallel for a row group whose key
+        range contains the target key. If found, fetches only that row group
+        blob and decodes with a key predicate. Falls back to HEAD manifest
+        if no shard contains the key.
+
+        Cost: O(shard_count) manifest GETs (parallel, ~1 RTT) + 1 data GET.
+        At low shard counts (<16), this is competitive with the no-shard
+        path. Compaction keeps shard counts low in steady state.
+        """
+        # Coerce key to int if numeric (matches point_lookup behavior)
+        try:
+            key_val = int(key) if key.lstrip("-").isdigit() else key
+        except (ValueError, AttributeError):
+            key_val = key
+
+        target = _format_rg_key(key)
+
+        # Search shards in parallel for the row group containing this key
+        shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
+
+        # Find a candidate row group from any shard
+        candidate_blob_hash = None
+        candidate_key_col = None
+        for sm in shard_manifests:
+            rg = sm.find_row_group(target)
+            if rg is not None:
+                # Verify the key is actually within this rg's column stats
+                # (defensive — find_row_group uses formatted key ordering)
+                candidate_blob_hash = rg.blob_hash
+                candidate_key_col = sm.key_col
+                break
+
+        # If not found in shards, try HEAD manifest
+        if candidate_blob_hash is None:
+            head_manifest = self._load_manifest(collection)
+            if head_manifest is None:
+                return None
+            rg = head_manifest.find_row_group(target)
+            if rg is None:
+                return None
+            candidate_blob_hash = rg.blob_hash
+            candidate_key_col = head_manifest.key_col
+
+        if candidate_blob_hash is None:
+            return None
+
+        # Fetch + decode with key predicate
+        blob_bytes = self.kernel.read_blob(candidate_blob_hash)
+        if not blob_bytes:
+            return None
+        key_col = candidate_key_col
+        if key_col:
+            eff_columns = list(columns) if columns is not None else None
+            if eff_columns is not None and key_col not in eff_columns:
+                eff_columns = eff_columns + [key_col]
+            col_data = PND2.decode(blob_bytes, columns=eff_columns,
+                                     predicates=[(key_col, "=", key_val)])
+        else:
+            col_data = PND2.decode(blob_bytes, columns=columns)
+
+        row_count = max((len(v) for v in col_data.values()), default=0)
+        col_names = list(col_data.keys())
+        for i in range(row_count):
+            row = {c: col_data[c][i] if i < len(col_data[c]) else None
+                    for c in col_names}
+            if key_col and key_col in row:
+                row_key = row[key_col]
+                try:
+                    if str(row_key) == str(key) or row_key == int(key):
+                        if columns is not None and key_col not in columns:
+                            row = {c: row[c] for c in columns if c in row}
+                        return row
+                except (ValueError, TypeError):
+                    pass
         return None
 
     def scan_with_pruning(self, collection: str,

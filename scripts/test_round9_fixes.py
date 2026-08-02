@@ -68,6 +68,11 @@ def test_time_travel_no_mutation():
 
     Before fix: swap manifest ref → read → restore (race condition + hidden PUTs)
     After fix: pass manifest_hash directly to _load_manifest (no mutation)
+
+    NOTE: in the CRDT shard model, append() writes a SHARD (HEAD manifest
+    ref is unchanged until compact_shards). Time-travel via manifest_hash
+    reads the snapshot at that manifest. The manifest ref NOT changing
+    after append is now the EXPECTED behavior, not a bug.
     """
     kernel, _ = make_object_store_native_kernel()
     storage = UnifiedStorage(kernel)
@@ -79,19 +84,21 @@ def test_time_travel_no_mutation():
     # Save the manifest hash for version 1
     manifest_v1 = kernel.resolve("collections/test/manifest")
 
-    # Append version 2 (2 more rows)
+    # Append version 2 (2 more rows) — appends go to shards, HEAD unchanged
     storage.append("test", [{"id": 3, "v": 2}, {"id": 4, "v": 2}],
                     key_col="id", row_group_size=10)
 
-    # The current manifest should be different from v1
+    # In the CRDT model, HEAD manifest is unchanged by append() — the new
+    # rows live in shards. read() merges HEAD + shards to return all 4.
     manifest_v2 = kernel.resolve("collections/test/manifest")
-    assert manifest_v1 != manifest_v2, "Manifest didn't change after append"
+    assert manifest_v1 == manifest_v2, \
+        "CRDT model: append() should NOT change HEAD manifest (uses shards)"
 
-    # Read version 1 via manifest_hash (time travel)
+    # Read version 1 via manifest_hash (time travel — snapshot at v1)
     rows_v1 = storage.read("test", manifest_hash=manifest_v1)
     assert len(rows_v1) == 2, f"Time travel v1: expected 2 rows, got {len(rows_v1)}"
 
-    # Read version 2 (current HEAD)
+    # Read version 2 (current HEAD + shards)
     rows_v2 = storage.read("test")
     assert len(rows_v2) == 4, f"Current v2: expected 4 rows, got {len(rows_v2)}"
 

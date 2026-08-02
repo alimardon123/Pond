@@ -6,6 +6,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "pond-core"))
 sys.path.insert(0, os.path.join(HERE, "..", "pond-sdk"))
 sys.path.insert(0, os.path.join(HERE, "..", "pond-sdk", "extensions", "physical_structures"))
+# Legacy extensions (pruning.ZoneMap) were moved to archive during the
+# ProllyTree cleanup. Keep them importable for the zone-map bridge test.
+sys.path.insert(0, os.path.join(HERE, "..", "archive", "legacy-extensions"))
 
 from kernel import PondMinimal
 from collection_manifest import (

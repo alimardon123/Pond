@@ -215,6 +215,11 @@ def test_round_trip_count():
 
         # Reset read counter
         kernel.stats["reads"] = 0
+        # Clear UnifiedStorage's manifest cache so the manifest is re-read
+        # from the kernel on this cold lookup (matches the test's expectation
+        # of 2 reads = manifest + data blob).
+        storage._manifest_cache.clear()
+        storage._head_cache.clear()
 
         # Point lookup — should be 2 reads (manifest + 1 blob)
         # Uses key="9" (first row group) for lexicographic correctness.

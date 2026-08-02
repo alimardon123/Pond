@@ -378,95 +378,38 @@ class LakehouseLens:
     def merge_branch(self, name: str, branch_name: str) -> str:
         """Merge a branch into HEAD.
 
-        Fix (Round 12 Issue #5):
-        - Deduplicates by key_col (last-writer-wins from branch)
-        - Preserves key_col from the existing collection's manifest
-        - Logs merge-commit rewrite errors instead of silently swallowing
+        Delegates to PondStorage.merge() which:
+          - Reads both branch HEAD + source HEAD + all shards from both
+          - Unions row groups (Level 1 CRDT merge)
+          - Applies row-level CRDT merge (_rowid + _version)
+          - Writes a TWO-PARENT merge commit (parent=HEAD, second_parent=branch)
+          - Clears shards on both branches
+
+        Returns:
+            The merge commit hash.
         """
-        # Read both branch and HEAD data
-        head_table = self.read_table(name)
-        branch_table = self.read_branch(name, branch_name)
-
-        try:
-            merged = pa.concat_tables([head_table, branch_table], promote_options="default")
-        except TypeError:
-            merged = pa.concat_tables([head_table, branch_table])
-
-        # Get the branch commit hash for the merge commit's second_parent
-        head_ref = f"collections/{name}/HEAD"
-        first_parent = self.kernel.resolve(head_ref)
-        branch_ref = f"collections/{name}/branches/{branch_name}"
-        second_parent = self.kernel.resolve(branch_ref)
-
-        # Get key_col from the existing manifest
-        manifest = self._storage._unified._load_manifest(name) if self._storage and self._storage._unified else None
-        key_col = manifest.key_col if manifest else None
-
-        # Deduplicate by key_col (last-writer-wins: branch data overrides HEAD)
-        # Fix (Round 18 Issue #3): don't drop rows with None key — they have
-        # no dedup key but should still be included in the merge result.
-        if key_col and key_col in merged.column_names:
-            merged = merged.sort_by(key_col)
-            rows = merged.to_pylist()
-            seen = {}
-            none_key_rows = []
-            for row in rows:
-                k = row.get(key_col)
-                if k is None:
-                    none_key_rows.append(row)
-                else:
-                    seen[k] = row
-            deduped = list(seen.values()) + none_key_rows
-            if deduped:
-                merged = pa.Table.from_pylist(deduped)
-
-        # Write the merged data as PND2 blobs + manifest
-        rows = merged.to_pylist()
-        commit_hash = self._storage.write(name, rows,
-                                            key_col=key_col,
-                                            row_group_size=DEFAULT_ROW_GROUP_SIZE,
-                                            message=f"merge branch '{branch_name}'")
-
-        # The unified architecture uses JSON commit blobs — merge is
-        # handled by PondStorage.merge() which creates a two-parent
-        # commit. For the lakehouse lens, the write() above creates a
-        # regular commit. To make it a true merge commit, use
-        # PondStorage.merge() instead. For now, return the commit as-is
-        # (the data is correct — just the commit type is "commit" not "merge").
-        return commit_hash
+        # Use the unified merge path — it creates a proper two-parent commit.
+        return self._storage.merge(name, branch_name)
 
     def read_branch(self, name: str, branch_name: str) -> pa.Table:
         """Read a branch's data as a PyArrow Table.
 
-        Uses the branch's manifest hash directly — NO ref mutation.
+        Uses the branch's commit + shards directly — NO ref mutation, NO
+        checkout. This is the CRDT-shard-aware path: it reads the branch's
+        HEAD commit's manifest AND the branch's shards, then merges them
+        (same as read_with_shards but for an arbitrary branch without
+        changing the active branch).
+
         Fix (Round 9 Issue #2): no more swap-then-restore race condition.
-        Fix (Round 13 Issue #4): falls back to HEAD manifest if no __manifest ref.
-        Fix (Round 15 Issue #1): resolve branch commit → commits/{hash}__manifest
-        instead of falling back to the LIVE HEAD manifest (which may have
-        advanced past the branch point).
+        Fix (Round 27): branch-aware shard merging — branches have their
+        own shard space; without this, appends via commit_to_branch were
+        invisible to read_branch.
         """
-        # Try branch-specific manifest ref first (set by commit_to_branch)
-        branch_manifest_ref = f"collections/{name}/branches/{branch_name}__manifest"
-        branch_manifest = self.kernel.resolve(branch_manifest_ref)
-
-        if branch_manifest is None:
-            # Fix (Round 15 Issue #1): resolve the branch's commit hash,
-            # then look up its manifest via the commit→manifest mapping.
-            # This correctly returns the branch's SNAPSHOT, not the live HEAD.
-            branch_commit_ref = f"collections/{name}/branches/{branch_name}"
-            branch_commit = self.kernel.resolve(branch_commit_ref)
-            if branch_commit is not None:
-                branch_manifest = self.kernel.resolve(
-                    f"collections/{name}/commits/{branch_commit}__manifest")
-
-        if branch_manifest is None:
-            # Last resort: fall back to HEAD manifest (branch == HEAD snapshot)
-            branch_manifest = self.kernel.resolve(f"collections/{name}/manifest")
-        if branch_manifest is None:
-            raise KeyError(f"Branch '{branch_name}' not found and no HEAD manifest exists")
-
-        # Read using the branch's manifest — no ref mutation, no race condition
-        return self._read_as_arrow_with_manifest(name, branch_manifest)
+        us = self._storage._unified
+        rows = us.read_branch_with_shards(name, branch_name)
+        if not rows:
+            return pa.table({})
+        return pa.Table.from_pylist(rows)
 
     def commit_to_branch(self, name: str, branch_name: str,
                          data: pa.Table,
@@ -474,67 +417,85 @@ class LakehouseLens:
                          row_group_size: int = DEFAULT_ROW_GROUP_SIZE) -> str:
         """Write data to a branch (NOT HEAD).
 
-        Strategy: write via storage.append (which creates a new manifest + commit),
-        then save BOTH the commit hash AND the manifest hash as branch refs.
-        Restore the original HEAD + manifest so main is unchanged.
+        Uses the proper CRDT branch mechanism: checkout the branch (so
+        subsequent writes — including the shard that append() creates —
+        go to this branch's shard space), call append(), then restore
+        the original active branch.
 
-        Fix (Round 17 Issue #3): if the collection is NEW (no prior HEAD),
-        we must still restore HEAD to its original state (None). A new
-        collection's HEAD should remain unset after commit_to_branch —
-        the data lives only in the branch ref.
+        This is the correct model in the CRDT-shard world:
+          - Shards are stored under collections/{name}/branches/{branch}/shards/
+          - read_branch reads HEAD + shards for that branch
+          - The branch's manifest advances as commits land on the branch
+          - Main is untouched because main's HEAD and shard space are
+            separate from the branch's.
+
+        Args:
+            name: collection name
+            branch_name: target branch
+            data: PyArrow Table to append to the branch
+            key_col: sort key column
+            row_group_size: rows per row group
+
+        Returns:
+            The new commit hash on the branch.
         """
-        head_ref = f"collections/{name}/HEAD"
-        manifest_ref = f"collections/{name}/manifest"
-        original_head = self.kernel.resolve(head_ref)
-        original_manifest = self.kernel.resolve(manifest_ref)
+        us = self._storage._unified
+        # Remember the originally active branch (if any) so we can restore it.
+        original_active = us._active_branches.get(name)
 
-        # Write via storage (this updates HEAD + manifest to the new commit)
+        # If the branch doesn't exist yet, create it from HEAD (git checkout -b).
+        # If it already exists, just checkout (switch to it).
+        branch_ref = us._branch_ref(name, branch_name)
+        if self.kernel.resolve(branch_ref) is None:
+            # Create branch from current HEAD
+            us.branch(name, branch_name)
+        us.checkout(name, branch_name)
+
+        # Now writes go to the branch's shard space and HEAD.
         rows = data.to_pylist()
-        commit_hash = self._storage.append(name, rows, key_col=key_col,
-                                            row_group_size=row_group_size,
-                                            message=f"branch {branch_name}: insert {data.num_rows} rows")
+        commit_hash = self._storage.append(
+            name, rows, key_col=key_col,
+            row_group_size=row_group_size,
+            message=f"branch {branch_name}: insert {data.num_rows} rows")
 
-        # Capture the NEW manifest hash (the branch's manifest)
-        branch_manifest = self.kernel.resolve(manifest_ref)
+        # Capture the new HEAD commit (created by append) and bind it to
+        # the branch ref. Without this, the new commit is only reachable
+        # via HEAD — and we're about to move HEAD back to main.
+        new_branch_commit = self.kernel.resolve(us._head_ref(name))
+        if new_branch_commit is not None:
+            self.kernel.reference(us._branch_ref(name, branch_name),
+                                   new_branch_commit)
 
-        # Point the branch refs at the new commit + manifest
-        self.kernel.reference(f"collections/{name}/branches/{branch_name}", commit_hash)
-        self.kernel.reference(f"collections/{name}/branches/{branch_name}__manifest", branch_manifest)
-
-        # RESTORE the original HEAD and manifest (so main is unchanged)
-        # Fix (Round 17 Issue #3): for new collections (original_head is None),
-        # tombstone HEAD so the collection doesn't appear to exist on main.
-        # Fix (Round 18 Issue #2): use actual TOMBSTONE_HASH from maintenance,
-        # not just an empty blob. Also fix collection_exists to check for it.
-        if original_head is not None:
-            self.kernel.reference(head_ref, original_head)
+        # Restore the original active branch (if any).
+        if original_active is None:
+            # Was on default (main) — detach and reset to main.
+            us._active_branches.pop(name, None)
+            # Re-sync HEAD + manifest to main's commit.
+            main_head = self.kernel.resolve(us._head_ref(name))
+            if main_head is not None:
+                # The HEAD ref may have been moved by checkout. Restore it
+                # to main's commit (the one before checkout).
+                # Actually, checkout moved HEAD to the branch's commit.
+                # We need to restore HEAD to main's commit.
+                main_commit = self.kernel.resolve(us._branch_ref(name, "main"))
+                if main_commit is not None:
+                    self.kernel.reference(us._head_ref(name), main_commit)
+                    us._sync_manifest_ref_to_head(name)
         else:
-            # New collection — tombstone HEAD
-            try:
-                from maintenance import TOMBSTONE_HASH, is_dropped
-                # Write the tombstone blob if it doesn't exist
-                if not self.kernel.resolve(head_ref):
-                    self.kernel.reference(head_ref, TOMBSTONE_HASH)
-                else:
-                    self.kernel.reference(head_ref, TOMBSTONE_HASH)
-            except ImportError:
-                # Fallback: use a known empty-marker
-                empty = self.kernel.write(b"__TOMBSTONE__")
-                self.kernel.reference(head_ref, empty)
+            # Restore the originally active branch.
+            # Parse the branch name out of the stored ref path.
+            prefix = f"collections/{name}/branches/"
+            if original_active.startswith(prefix):
+                orig_name = original_active[len(prefix):]
+                try:
+                    us.checkout(name, orig_name)
+                except ValueError:
+                    # Branch was deleted in the meantime — fall back to main.
+                    us._active_branches.pop(name, None)
 
-        if original_manifest is not None:
-            self.kernel.reference(manifest_ref, original_manifest)
-        else:
-            try:
-                from maintenance import TOMBSTONE_HASH
-                self.kernel.reference(manifest_ref, TOMBSTONE_HASH)
-            except ImportError:
-                empty = self.kernel.write(b"__TOMBSTONE__")
-                self.kernel.reference(manifest_ref, empty)
-
-        # Invalidate the storage's manifest cache
-        if self._storage and self._storage._unified:
-            self._storage._unified._invalidate_manifest_cache(name)
+        # Invalidate the storage's manifest cache so subsequent reads
+        # see the restored state.
+        us._invalidate_manifest_cache(name)
 
         return commit_hash
 
