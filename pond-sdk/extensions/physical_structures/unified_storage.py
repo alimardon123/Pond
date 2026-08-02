@@ -1081,7 +1081,8 @@ class UnifiedStorage:
             if name is not None:
                 self.kernel.reference(name, empty_hash)
 
-    def _clear_branch_shards(self, collection: str, branch: str) -> None:
+    def _clear_branch_shards(self, collection: str, branch: str,
+                               shard_hashes: Optional[list[str]] = None) -> None:
         """Clear a branch's shards: tombstone refs + reset index.
 
         Unified retire path used by compact_shards and merge. After this:
@@ -1090,8 +1091,16 @@ class UnifiedStorage:
           - In-memory shard index cache is dropped
         Readers using _list_shards_from_refs see zero live shards because
         tombstoned refs fail CollectionManifest.load and are skipped.
+
+        Args:
+            collection: collection name
+            branch: branch name
+            shard_hashes: if provided, skip the _read_shard_index call and
+                use these hashes directly. This avoids re-reading shard
+                manifests during compaction (the caller already has them).
         """
-        shard_hashes = self._read_shard_index(collection, branch)
+        if shard_hashes is None:
+            shard_hashes = self._read_shard_index(collection, branch)
         self._tombstone_shard_refs(collection, branch, shard_hashes)
         self._write_shard_index(collection, [], branch)
         if hasattr(self, '_shard_index_mem'):
@@ -1541,6 +1550,20 @@ class UnifiedStorage:
                 vtype = _detect_value_type_with_binary(sample)
                 schema_columns.append((col_name, vtype))
 
+        # If the source has CRDT columns (_rowid, _version, _deleted) that
+        # aren't in the existing schema, add them. This ensures the shard
+        # manifest's column stats include these columns, which is needed
+        # for _manifests_have_rowid() to detect row-level CRDT shards and
+        # trigger row-level compaction (instead of manifest-level).
+        if n_rows > 0:
+            source_cols = set(source.column_names())
+            schema_cols = {name for name, _ in schema_columns}
+            crdt_cols = {"_rowid", "_version", "_deleted"}
+            for col_name in source_cols & crdt_cols - schema_cols:
+                sample = source.column_slice(col_name, 0, min(100, n_rows))
+                vtype = _detect_value_type_with_binary(sample)
+                schema_columns.append((col_name, vtype))
+
         # Encode new row groups (concurrent-safe — immutable blobs)
         manifest_entries: list[dict] = []
         for start in range(0, n_rows, row_group_size):
@@ -1904,30 +1927,56 @@ class UnifiedStorage:
         commutative). Last-writer-wins on HEAD is safe here because the
         result is deterministic.
 
-        TWO-LEVEL MERGE:
-          1. Row-group level: dedup by rg_key (shards override HEAD)
-          2. Row level: dedup by _rowid, keeping latest _version.
-             Tombstones are dropped (their effect is already applied).
-             Superseded versions are dropped.
+        TWO COMPACTION MODES:
+          - Manifest-level (fast path): when no shards have _rowid columns
+            (insert-only appends), merge row group ENTRIES (metadata only)
+            without reading any data blobs. O(shard_count) GETs, ZERO data I/O.
+            Data blobs are immutable and content-addressed — the new manifest
+            simply references them directly from HEAD + shards.
+          - Row-level (fallback): when shards have _rowid columns (upserts/
+            deletes), decode all rows, apply CRDT merge by _rowid, re-encode.
+            O(total_rows) data I/O — same as before.
+
+        The fast path makes compaction viable at PB scale: merging 16 shards
+        each with 10K row groups costs 16 GETs (shard manifests) + 1 PUT
+        (merged manifest), regardless of total data volume.
 
         After compaction:
-          - HEAD points to a new flat manifest containing only LIVE rows
+          - HEAD points to a new flat manifest containing all row groups
           - All shards are cleared (their refs are tombstoned)
-          - Reads are fast again (1 manifest, no shard list, no tombstones)
+          - Reads are fast again (1 manifest, no shard list)
         """
         head_manifest = self._load_manifest(collection)
-        shard_hashes = self.list_shards(collection)
+        # Read the shard index directly (no listing merge — compaction
+        # doesn't need to catch concurrent writers, it just compacts
+        # the known shards). This avoids N verification reads from
+        # _list_shards_from_refs.
+        branch = self._get_active_branch(collection)
+        shard_hashes = []
+        try:
+            import json as _json
+            idx_hash = self.kernel.resolve(self._shard_index_ref(collection, branch))
+            if idx_hash is not None:
+                data = self.kernel.read_blob(idx_hash)
+                shard_hashes = list(_json.loads(data))
+        except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        # Fall back to full listing if index is empty/stale
+        if not shard_hashes:
+            shard_hashes = self.list_shards(collection)
         if not shard_hashes:
             return None  # nothing to compact
 
-        # Level 1: merge row groups (dedup by rg_key)
+        # Level 1: merge row group entries (dedup by rg_key, shards override HEAD)
         merged: dict[str, Any] = {}
         if head_manifest:
             for rg in head_manifest.scan_with_pruning():
                 merged[rg.key] = rg
+        shard_manifests = []
         for sh in shard_hashes:
             try:
                 sm = CollectionManifest.load(self.kernel, sh)
+                shard_manifests.append(sm)
                 for rg in sm.scan_with_pruning():
                     merged[rg.key] = rg
             except (ValueError, KeyError):
@@ -1936,6 +1985,117 @@ class UnifiedStorage:
         if not merged:
             return None
 
+        # Check if any shard has _rowid columns (row-level CRDT needed)
+        # by inspecting the schema of HEAD + all shard manifests.
+        needs_row_merge = self._manifests_have_rowid(head_manifest, shard_manifests)
+
+        if needs_row_merge:
+            return self._compact_shards_row_level(
+                collection, head_manifest, shard_hashes, merged)
+        else:
+            return self._compact_shards_manifest_level(
+                collection, head_manifest, shard_hashes, merged)
+
+    def _manifests_have_rowid(self, head_manifest, shard_manifests) -> bool:
+        """Check if any manifest has _rowid column (indicating row-level CRDT).
+
+        Checks BOTH the manifest's schema columns AND the row groups' column
+        stats. The schema may not include _rowid if the collection was created
+        via write() (which doesn't add _rowid) and later upserted via
+        upsert_shard (which adds _rowid to the data but not to the manifest's
+        schema). The row group column stats always reflect the actual encoded
+        columns, so they're the reliable signal.
+        """
+        manifests = [head_manifest] + shard_manifests
+        for m in manifests:
+            if m is None:
+                continue
+            # Check schema columns
+            for col_name, _vtype in m.columns:
+                if col_name == "_rowid":
+                    return True
+            # Check row group column stats (more reliable — reflects actual data)
+            for rg in m.row_groups:
+                for col in rg.columns:
+                    if col.name == "_rowid":
+                        return True
+        return False
+
+    def _compact_shards_manifest_level(self, collection, head_manifest,
+                                         shard_hashes, merged) -> Optional[str]:
+        """Fast-path compaction: merge manifest entries only, NO data I/O.
+
+        Data blobs are immutable and content-addressed. The new manifest
+        simply references the same blob_hash values from HEAD + shards.
+        This makes compaction O(shard_count) GETs + O(1) manifest PUT,
+        regardless of total data volume — viable at PB scale.
+        """
+        schema = (head_manifest.columns if head_manifest else [("value", 4)])
+        key_col = (head_manifest.key_col if head_manifest else "")
+        rg_size = (head_manifest.row_group_size if head_manifest else 10_000)
+
+        # Build manifest entries from merged row group entries
+        # (NO data blob reads — just metadata)
+        manifest_entries = []
+        for rg in sorted(merged.values(), key=lambda r: r.key):
+            manifest_entries.append({
+                "rg_key": rg.key,
+                "blob_hash": rg.blob_hash,
+                "n_rows": rg.n_rows,
+                "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                for c in rg.columns],
+            })
+
+        manifest_hash, new_manifest = self._build_manifest_with_return(
+            collection, manifest_entries, schema, key_col, rg_size)
+
+        # Build stats tree (writer-side, P10 fix)
+        try:
+            from stats_tree import should_use_stats_tree, build_stats_tree
+            if should_use_stats_tree(len(new_manifest.row_groups)):
+                stats_root = build_stats_tree(self.kernel, new_manifest.row_groups)
+                new_manifest.set_stats_tree_root(stats_root)
+                manifest_hash = new_manifest.commit()
+                self.kernel.reference(self._manifest_ref(collection), manifest_hash)
+        except ImportError:
+            pass
+
+        # Write commit
+        parent = self._head_cache.get(collection)
+        if parent is None:
+            parent = self.kernel.resolve(self._head_ref(collection))
+        commit_index = self._commit_index_cache.get(collection, 0)
+        if commit_index == 0 and parent:
+            pc = self._read_commit_blob(parent)
+            if pc:
+                commit_index = pc.get("index", 0) + 1
+
+        commit_hash = self._write_commit_blob(
+            collection, manifest_hash, parent=parent,
+            message=f"compact {len(shard_hashes)} shards (manifest-level, {len(manifest_entries)} row groups)",
+            index=commit_index)
+
+        # Clear shards
+        branch = self._get_active_branch(collection)
+        self._clear_branch_shards(collection, branch, shard_hashes=shard_hashes)
+
+        # Update caches
+        self._update_caches_after_write(
+            collection, new_manifest, manifest_hash, commit_hash,
+            commit_index, is_delta=False)
+
+        return commit_hash
+
+    def _compact_shards_row_level(self, collection, head_manifest,
+                                    shard_hashes, merged) -> Optional[str]:
+        """Fallback compaction: decode all rows, apply row-level CRDT merge.
+
+        Used when shards have _rowid columns (upserts/deletes). This path
+        reads ALL data blobs, merges by _rowid (latest _version wins),
+        drops tombstones, and re-encodes into new row groups.
+
+        O(total_rows) data I/O — same as the pre-optimization behavior.
+        """
         # Fetch + decode ALL rows from merged row groups
         row_groups = list(merged.values())
         col_data_list = self._parallel_fetch_and_decode(row_groups, None, None)
@@ -1965,8 +2125,6 @@ class UnifiedStorage:
         rg_size = (head_manifest.row_group_size if head_manifest else 10_000)
 
         # BATCH rows into proper row groups (not 1 row per blob)
-        # Fix B4: use actual key column value for rg_key, not loop index
-        # Fix P1: batch into row groups of rg_size rows each
         if all_rows:
             manifest_entries = []
             for start in range(0, len(all_rows), max(rg_size, 1)):
@@ -2033,7 +2191,7 @@ class UnifiedStorage:
         # we read the index will still be visible (and will be picked up by
         # the next compaction).
         branch = self._get_active_branch(collection)
-        self._clear_branch_shards(collection, branch)
+        self._clear_branch_shards(collection, branch, shard_hashes=shard_hashes)
 
         # Update caches
         self._update_caches_after_write(
