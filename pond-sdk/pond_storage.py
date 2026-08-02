@@ -392,29 +392,75 @@ class PondStorage:
                       key_col: Optional[str] = None,
                       row_group_size: int = 10_000,
                       encoding_hints: Optional[dict[str, str]] = None,
-                      message: str = "") -> str:
+                      message: str = "",
+                      tx_id: Optional[str] = None) -> str:
         """Concurrent-safe append — NO CAS, NO retry, NO coordination.
 
-        This is the BEAUTIFUL concurrency model. Each writer writes its
-        own shard to a unique path. Readers merge all shards (CRDT union).
-
-        Better than CAS because:
-        - No retry storms — writes always succeed
-        - No object-store-specific conditional PUTs — works on local FS too
-        - No boilerplate — just write your shard, you're done
-        - No coordination — writers don't know about each other
-
-        Works on ANY storage that supports listing (local FS, S3, GCS).
-
-        After writing shards, call compact_shards() periodically to merge
-        them into HEAD (bounds read amplification).
+        ACID: pass tx_id from begin_tx() to make the shard tentative
+        (invisible until commit_tx is called). Without tx_id, the shard
+        is immediately visible (normal CRDT).
         """
         if self._unified is None:
             raise RuntimeError("UnifiedStorage not available")
         return self._unified.append_shard(
             collection, rows, key_col=key_col,
             row_group_size=row_group_size,
-            encoding_hints=encoding_hints, message=message)
+            encoding_hints=encoding_hints, message=message, tx_id=tx_id)
+
+    # ==================================================================
+    # ACID Transactions — commit markers on top of CRDT shards
+    # ==================================================================
+
+    def begin_tx(self) -> str:
+        """Begin a transaction. Returns a tx_id.
+
+        Pass tx_id to append_shard() to make shards tentative.
+        Call commit_tx(tx_id) to make them visible atomically.
+
+        begin_tx is FREE — no storage operation. Just generates a unique ID.
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.begin_tx()
+
+    def commit_tx(self, tx_id: str, message: str = "") -> str:
+        """Commit a transaction — ALL tentative shards become visible.
+
+        1 PUT (commit marker) + 1 ref. Atomic: crash before = invisible,
+        crash after = all visible. No coordinator, no 2PC, no CAS.
+
+        Args:
+            tx_id: from begin_tx()
+            message: optional commit message
+
+        Returns:
+            The commit marker hash.
+
+        Example:
+            tx = storage.begin_tx()
+            storage.append_shard("users", user_rows, tx_id=tx)
+            storage.append_shard("orders", order_rows, tx_id=tx)
+            storage.commit_tx(tx)  # both visible atomically
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.commit_tx(tx_id, message)
+
+    def abort_tx(self, tx_id: str) -> None:
+        """Abort a transaction — tentative shards stay invisible.
+
+        Simply don't commit. Tentative shards remain in storage but are
+        invisible to readers. GC cleans them up after a timeout.
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        self._unified.abort_tx(tx_id)
+
+    def is_tx_committed(self, tx_id: str) -> bool:
+        """Check if a transaction has been committed."""
+        if self._unified is None:
+            return False
+        return self._unified.is_tx_committed(tx_id)
 
     def read_with_shards(self, collection: str,
                           predicates: Optional[list[tuple[str, str, Any]]] = None,

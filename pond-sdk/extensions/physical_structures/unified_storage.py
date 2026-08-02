@@ -1286,13 +1286,52 @@ class UnifiedStorage:
         return list(set(listed) | set(indexed))
 
     def _list_shards_from_refs(self, collection: str, branch: str) -> list[str]:
-        """List shard hashes by scanning refs (source of truth)."""
+        """List shard hashes by scanning refs (source of truth).
+
+        Returns ONLY committed shards (normal shards without tx_id, or
+        tentative shards whose transaction has been committed).
+        Tentative shards from uncommitted transactions are filtered out.
+        """
         prefix = self._shards_prefix(collection, branch)
         names = [n for n in self.kernel.list_names() if n.startswith(prefix)]
         shard_hashes = []
+        committed_tx_cache: set[str] = set()
+        checked_tx_cache: set[str] = set()
+
         for name in names:
             h = self.kernel.resolve(name)
-            if h is not None:
+            if h is None:
+                continue
+
+            # Check if this is a tentative shard (has tx_ prefix)
+            # Ref name format: collections/{coll}/branches/{branch}/shards/tx_{tx_id}_{shard_id}
+            shard_name = name[len(prefix):]
+            if shard_name.startswith("tx_"):
+                # Tentative shard — check if transaction is committed
+                # Extract tx_id: tx_{tx_id}_{shard_id}
+                parts = shard_name.split("_", 2)  # ["tx", "{tx_id}", "{shard_id}"]
+                if len(parts) < 3:
+                    continue
+                tx_id = parts[1]
+
+                # Check commit marker (cached)
+                if tx_id not in checked_tx_cache:
+                    checked_tx_cache.add(tx_id)
+                    tx_ref = f"transactions/{tx_id}"
+                    tx_hash = self.kernel.resolve(tx_ref)
+                    if tx_hash is not None:
+                        committed_tx_cache.add(tx_id)
+
+                # Only include if transaction is committed
+                if tx_id in committed_tx_cache:
+                    try:
+                        from collection_manifest import CollectionManifest as _CM
+                        _CM.load(self.kernel, h)
+                        shard_hashes.append(h)
+                    except (ValueError, KeyError):
+                        pass
+            else:
+                # Normal shard (no tx_id) — always visible
                 try:
                     from collection_manifest import CollectionManifest as _CM
                     _CM.load(self.kernel, h)
@@ -1374,7 +1413,8 @@ class UnifiedStorage:
                       key_col: Optional[str] = None,
                       row_group_size: int = 10_000,
                       encoding_hints: Optional[dict[str, str]] = None,
-                      message: str = "") -> str:
+                      message: str = "",
+                      tx_id: Optional[str] = None) -> str:
         """Concurrent-safe append — NO CAS, NO retry, NO coordination.
 
         This is the beautiful concurrency model. Each writer writes its
@@ -1515,17 +1555,27 @@ class UnifiedStorage:
             shard_id = f"{_t.time_ns()}_{id(rows)}"
 
         # Write the shard ref to the ACTIVE BRANCH's shard path
+        # If tx_id is set, the shard is TENTATIVE (not visible until
+        # the transaction commit marker is written). The tx_id is
+        # encoded in the ref path so readers can check it.
         branch = self._get_active_branch(collection)
-        shard_ref = f"{self._shards_prefix(collection, branch)}{shard_id}"
+        if tx_id:
+            # Tentative shard: ref path includes tx_id
+            shard_ref = f"{self._shards_prefix(collection, branch)}tx_{tx_id}_{shard_id}"
+        else:
+            # Normal shard: immediately visible
+            shard_ref = f"{self._shards_prefix(collection, branch)}{shard_id}"
         self.kernel.reference(shard_ref, shard_hash)
 
-        # Update the shard index (1 PUT) using in-memory tracking for O(1).
-        # First append reads the existing index (cold); subsequent appends
-        # use the in-memory list (warm = 0 GETs for index).
-        try:
-            self._append_to_shard_index(collection, shard_hash)
-        except Exception:
-            pass  # index update is best-effort — listing is the fallback
+        # Update the shard index (1 PUT) — ONLY for non-transactional shards.
+        # Tentative shards (tx_id set) are NOT added to the index — they're
+        # only visible after commit_tx, at which point they're in the refs
+        # and _list_shards_from_refs will find them via the commit marker check.
+        if not tx_id:
+            try:
+                self._append_to_shard_index(collection, shard_hash)
+            except Exception:
+                pass  # index update is best-effort — listing is the fallback
 
         # Invalidate manifest cache (so next read picks up the new shard)
         # but PRESERVE the schema cache (schema doesn't change on append)
@@ -1811,6 +1861,85 @@ class UnifiedStorage:
             commit_index, is_delta=False)
 
         return commit_hash
+
+    # ------------------------------------------------------------------
+    # ACID TRANSACTIONS — commit markers on top of CRDT shards
+    #
+    # ACID = CRDT + commit markers. Same model, thin extension.
+    #
+    #   tx = storage.begin_tx()
+    #   storage.append_shard("users", rows, tx_id=tx)
+    #   storage.append_shard("orders", orders, tx_id=tx)
+    #   storage.commit_tx(tx)   # 1 PUT — ALL shards become visible
+    #
+    # Readers automatically filter: shards with tx_id are only visible
+    # if the commit marker exists. No coordinator, no 2PC, no CAS.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tx_ref(tx_id: str) -> str:
+        """The commit marker ref path."""
+        return f"transactions/{tx_id}"
+
+    def begin_tx(self) -> str:
+        """Begin a transaction. Returns the tx_id.
+
+        The tx_id is a UUIDv7 (time-ordered, unique). Pass it to
+        append_shard(tx_id=...) to make shards tentative.
+
+        No storage operation is performed — begin_tx is free.
+        The tx_id is just a unique identifier until commit_tx.
+        """
+        try:
+            from uuid7 import uuidv7
+            return uuidv7()
+        except ImportError:
+            import time as _t
+            return f"{_t.time_ns():016x}"
+
+    def commit_tx(self, tx_id: str, message: str = "") -> str:
+        """Commit a transaction — ALL tentative shards become visible.
+
+        Writes a commit marker (1 PUT + 1 ref). Readers checking
+        tentative shards will find this marker and include them.
+
+        This is atomic: the commit marker is a single ref update.
+        Crash before = shards invisible. Crash after = all visible.
+
+        Args:
+            tx_id: the transaction ID (from begin_tx)
+            message: optional commit message
+
+        Returns:
+            The commit marker hash.
+        """
+        import json as _json
+        import time as _time
+
+        marker = {
+            "tx_id": tx_id,
+            "timestamp": _time.time(),
+            "message": message,
+        }
+        marker_bytes = _json.dumps(marker, sort_keys=True).encode()
+        marker_hash = self.kernel.write(marker_bytes)
+        self.kernel.reference(self._tx_ref(tx_id), marker_hash)
+        return marker_hash
+
+    def abort_tx(self, tx_id: str) -> None:
+        """Abort a transaction — tentative shards stay invisible.
+
+        Simply don't write the commit marker. Tentative shards remain
+        in storage but are invisible to readers (no commit marker).
+        GC cleans them up after a configurable timeout.
+
+        This is a no-op: abort = "don't commit". No storage operation.
+        """
+        pass  # Nothing to do — absence of commit marker = aborted
+
+    def is_tx_committed(self, tx_id: str) -> bool:
+        """Check if a transaction has been committed."""
+        return self.kernel.resolve(self._tx_ref(tx_id)) is not None
 
     def shard_count(self, collection: str) -> int:
         """Return the number of unmerged shards for a collection.

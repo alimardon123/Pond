@@ -214,8 +214,23 @@ class GarbageCollector:
             names = filtered
 
         # Walk every ref as a potential starting point
+        # ACID transactions: tentative shards from UNCOMMITTED transactions
+        # are NOT walked (their refs are walked but the tx commit marker
+        # doesn't exist, so the reader filters them out — and GC treats
+        # them as dead since no commit marker = unreachable).
         cutoff_time = time.time() - (preserve_days * 86400) if preserve_days > 0 else 0
         for name in names:
+            # Skip tentative shard refs from uncommitted transactions
+            # (shards with tx_ prefix where the tx commit marker doesn't exist)
+            if "/shards/tx_" in name:
+                # Extract tx_id: .../shards/tx_{tx_id}_{shard_id}
+                shard_part = name.split("/shards/tx_")[-1]
+                tx_id = shard_part.split("_", 1)[0] if "_" in shard_part else ""
+                if tx_id:
+                    tx_ref = f"transactions/{tx_id}"
+                    if self.kernel.resolve(tx_ref) is None:
+                        continue  # uncommitted — skip (will be cleaned up as dead)
+
             h = self.kernel.resolve(name)
             if h is not None and h not in live:
                 self._walk_reachable(h, live, cutoff_time)
