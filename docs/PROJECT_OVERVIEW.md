@@ -12,10 +12,11 @@
 4. [Cross-Lens Bidirectional Access (The Killer Feature)](#4-cross-lens-bidirectional-access-the-killer-feature)
 5. [Architecture & Design Goals](#5-architecture--design-goals)
 6. [Important Features](#6-important-features)
-7. [Currently Supported Apps](#7-currently-supported-apps)
-8. [Benchmarks vs Competitors](#8-benchmarks-vs-competitors)
-9. [Future Possibilities](#9-future-possibilities)
-10. [Methodologies & Components](#10-methodologies--components)
+7. [The Extension System](#7-the-extension-system)
+8. [Currently Supported Apps](#8-currently-supported-apps)
+9. [Benchmarks vs Competitors](#9-benchmarks-vs-competitors)
+10. [Future Possibilities](#10-future-possibilities)
+11. [Methodologies & Components](#11-methodologies--components)
 
 ---
 
@@ -347,7 +348,136 @@ VectorLens automatically tries HNSW first, then IVF, then linear scan. The best 
 
 ---
 
-## 7. Currently Supported Apps
+## 7. The Extension System
+
+Extensions are **pluggable modules** that sit between the Lens SDK and the kernel. They add domain-specific capabilities WITHOUT modifying the core. The base Lens works without any extensions loaded — extensions load only when imported.
+
+### Architecture
+
+```
+Kernel (Write, Read, Ref) — FROZEN, ~140 LOC
+    ↓
+Lens SDK (PondStorage, UnifiedStorage, base_lens) — core, no extension deps
+    ↓
+extensions/                    ← OPTIONAL, pluggable
+├── physical_structures/       — Storage engine (PND2, manifest, stats tree)
+├── indexing/                  — Secondary indexes (HNSW, IVF, CollectionIndexer)
+├── maintenance/               — GC + Vacuum
+└── semantic/                  — Semantic model adapters (Ossie, Cube, dbt)
+    ↓
+Applications
+```
+
+### Design Principles
+
+- **3.1 Simple:** The core SDK has ZERO extension dependencies. Extensions load only when imported.
+- **3.4 Scalable:** New extensions are added by implementing an abstract interface. No existing code changes.
+- **3.7 Functional:** Extensions make Pond functional for specific use cases without baking any single standard into the core.
+- **6 Beautiful:** Each extension has one responsibility. Extensions never depend on lenses (downward-only DAG).
+
+### Extension Types
+
+#### 1. Physical Structures (`physical_structures/`)
+
+The storage engine — the PND2 format, CollectionManifest, and all acceleration structures. This is the ONE storage layer that UnifiedStorage uses.
+
+| Module | Purpose | Complexity |
+|--------|---------|------------|
+| `unified_storage.py` | ONE write/read path (PND2 format) | 3,811 LOC |
+| `collection_manifest.py` | ONE index blob per commit, delta-manifests | 1,061 LOC |
+| `stats_tree.py` | PB-scale hierarchical index | 618 LOC |
+| `encoding.py` | 4 binary encodings (RAW/RLE/DICT/BITPACK) | 1,254 LOC |
+| `compression.py` | Transparent zstd/LZ4 | 133 LOC |
+| `column_source.py` | Format-agnostic data access | 232 LOC |
+| `embedded_stats.py` | Value-type constants + ColumnStats | 207 LOC |
+
+Each physical structure is `f(snapshot) → artifact` — deterministic, rebuildable, content-addressed. If deleted, it can be rebuilt from the data blobs. This is the Physical Structure algebra: derived structures are never a source of truth.
+
+#### 2. Indexing (`indexing/`)
+
+Collection-level secondary indexes. Indexes are **data-side** — they belong to the collection, not to any lens. Any lens reading a collection can use that collection's indexes.
+
+| Module | Purpose | Complexity | Use case |
+|--------|---------|------------|----------|
+| `collection_index.py` | Generic secondary index (JSON blob: key→rowid) | 226 LOC | `find_by_index("users", "by_email", "alice@x.com")` |
+| `hnsw_index.py` | Graph-based ANN (O(log N)) | 613 LOC | Vector search at scale (10M+ vectors) |
+| `ivf_index.py` | Cluster-based ANN (O(n_probe × cluster_size)) | 481 LOC | Vector search with tunable recall |
+| `base.py` | CollectionIndexerInterface (abstract) | 110 LOC | Contract for new index types |
+
+**Key design:** The indexer operates on `kernel + collection_name` — it does NOT know or care what lens is calling it. Indexes belong to collections (data-side), not lenses. A KV lens can build an index, and a Lakehouse lens can use it.
+
+#### 3. Maintenance (`maintenance/`)
+
+Garbage collection and space reclamation.
+
+| Module | Purpose | Complexity |
+|--------|---------|------------|
+| `vacuum.py` | GC (read-only reachability) + Vacuum (delete dead blobs) | 315 LOC |
+
+**Key design:** GC is O(live) — walks reachability from live refs, not a full scan. Vacuum protects in-flight transaction shards (TTL-based, default 1 hour) and supports `preserve_days` for time-travel safety (like Delta/Iceberg vacuum).
+
+#### 4. Semantic (`semantic/`)
+
+Pluggable adapters for different semantic model standards. Each adapter implements `SemanticModelAdapter` and translates between Pond's internal storage and an external format.
+
+| Module | Purpose | Complexity |
+|--------|---------|------------|
+| `ossie.py` | Apache Ossie semantic interchange spec adapter | ~330 LOC |
+| `base.py` | SemanticModelAdapter (abstract interface) | ~40 LOC |
+
+**Future adapters:** Cube.js, dbt metrics, custom. Adding a new adapter doesn't modify any existing code — just implement the interface and call `register_extension()`.
+
+### Extension Registry
+
+Extensions register themselves on import. Discover and load extensions programmatically:
+
+```python
+from extensions import list_extensions, load_extension, register_extension
+
+# List available extensions
+print(list_extensions())  # → ["semantic_ossie", ...]
+
+# Load by name (imports the module)
+ext = load_extension("semantic_ossie")
+
+# Register a custom extension
+register_extension("my_index", "my_module", {"MyIndex": MyIndex})
+```
+
+### How to Add a New Extension
+
+1. Create a new file or subfolder under `extensions/`
+2. Implement the abstract interface (`CollectionIndexerInterface`, `SemanticModelAdapter`, etc.)
+3. Call `register_extension()` at module level
+4. **No existing code needs to change** — this is the key design property
+
+Example — adding a new index type:
+```python
+# extensions/indexing/my_index.py
+from .base import CollectionIndexerInterface
+
+class MyIndex(CollectionIndexerInterface):
+    def build_index(self, collection, name, extractor, scan_rows): ...
+    def lookup(self, collection, name, key): ...
+    # ... implement the interface
+
+from extensions import register_extension
+register_extension("my_index", __name__, {"MyIndex": MyIndex})
+```
+
+### Cross-Extension Sharing
+
+Extensions share the same kernel namespace. A collection can have:
+- A CollectionManifest (physical_structure)
+- An HNSW index (indexing)
+- A secondary index by_email (indexing)
+- A semantic model definition (semantic)
+
+All coexist on the same collection, all content-addressed, all rebuildable. No extension owns the data — they all read/write the same PND2 blobs via the kernel.
+
+---
+
+## 8. Currently Supported Apps
 
 ### Production Lenses (5)
 
@@ -378,7 +508,7 @@ VectorLens automatically tries HNSW first, then IVF, then linear scan. The best 
 
 ---
 
-## 8. Benchmarks vs Competitors
+## 9. Benchmarks vs Competitors
 
 ### Performance Results (after Round 32 fixes)
 
@@ -430,7 +560,7 @@ VectorLens automatically tries HNSW first, then IVF, then linear scan. The best 
 
 ---
 
-## 9. Future Possibilities
+## 10. Future Possibilities
 
 ### Workloads Pond Could Support
 
@@ -464,7 +594,7 @@ VectorLens automatically tries HNSW first, then IVF, then linear scan. The best 
 
 ---
 
-## 10. Methodologies & Components
+## 11. Methodologies & Components
 
 ### Development Methodology
 - **Red Team first** — 13 attack attempts on the model before building
