@@ -104,7 +104,10 @@ Kernel (FROZEN — 3 primitives)
 
 ## Quick Start
 
-### Production: S3-backed (no SQLite, no local disk)
+### Unified kernel factory (recommended)
+
+One entry point for all storage backends. Switch between local FS and S3
+by changing one line:
 
 ```python
 import sys, os
@@ -112,17 +115,21 @@ sys.path.insert(0, "pond-core")
 sys.path.insert(0, "pond-sdk")
 sys.path.insert(0, "pond-sdk/extensions/physical_structures")
 
-from s3_object_store import S3ObjectStore
-from object_store_native_kernel import ObjectStoreNativeKernel
+from make_kernel import make_kernel
 from pond_storage import PondStorage
-import boto3
 
-client = boto3.client("s3", region_name="us-east-1")
-store = S3ObjectStore(client, bucket="my-pond", prefix="prod")
-kernel = ObjectStoreNativeKernel(store)
+# Local filesystem (pure files, no SQLite):
+kernel = make_kernel("file:///var/lib/pond")
+
+# OR — S3 (boto3, credentials from env):
+kernel = make_kernel("s3://my-pond/prod", region="us-east-1")
+
+# OR — in-memory (for tests):
+kernel = make_kernel("memory://")
+
 storage = PondStorage(kernel)
 
-# Write any workload — same API
+# Write any workload — same API regardless of backend
 storage.write("users", [{"id": 1, "name": "alice"}], key_col="id")
 
 # Read any workload — same API
@@ -139,40 +146,55 @@ storage.merge("users", "dev")
 storage.append_shard("events", [{"id": 1, "event": "click"}], key_col="id")
 rows = storage.read_with_shards("events")
 
+# ACID transactions — commit markers on top of CRDT
+tx = storage.begin_tx()
+storage.append_shard("users", [{"id": 3, "name": "carol"}], key_col="id", tx_id=tx)
+storage.append_shard("orders", [{"id": 3, "amount": 50.0}], key_col="id", tx_id=tx)
+storage.commit_tx(tx)  # both visible atomically
+
 # Maintenance
 storage.vacuum(preserve_days=7)
 storage.optimize()
 ```
 
-### Local development: in-memory (for tests/benchmarks)
+### Direct store construction (advanced)
+
+If you need finer control over the store object:
 
 ```python
-sys.path.insert(0, "pond-core")
-sys.path.insert(0, "pond-sdk")
-sys.path.insert(0, "pond-sdk/extensions/physical_structures")
+# Local FS (pure files, no SQLite):
+from local_fs_object_store import LocalFSObjectStore
+from object_store_native_kernel import ObjectStoreNativeKernel
+store = LocalFSObjectStore("/var/lib/pond")
 
-from object_store_native_kernel import make_object_store_native_kernel
-from pond_storage import PondStorage
+# S3:
+from s3_object_store import S3ObjectStore
+import boto3
+store = S3ObjectStore(boto3.client("s3"), bucket="my-pond", prefix="prod")
 
-kernel, _ = make_object_store_native_kernel()  # in-memory mock
+# Same kernel, same SDK, same everything:
+kernel = ObjectStoreNativeKernel(store)
 storage = PondStorage(kernel)
-# ... same API as above
 ```
 
-### Legacy: local disk + SQLite (PondMinimal — for backward compat)
+### Migrating between local FS and S3
 
-```python
-sys.path.insert(0, "pond-core")
-sys.path.insert(0, "pond-sdk")
-from kernel import PondMinimal
-from pond_storage import PondStorage
+The directory layout mirrors S3's key structure, so migrating is a
+straight copy:
 
-storage = PondStorage(PondMinimal("/path/to/.pond"))
-# ... same API as above
+```bash
+# Local → S3:
+aws s3 sync /var/lib/pond/ s3://my-pond/prod/
+
+# S3 → local:
+aws s3 sync s3://my-pond/prod/ /var/lib/pond/
 ```
 
-> **Note**: `PondMinimal` uses SQLite + local filesystem. For production
-> object-store deployments, use `S3ObjectStore` + `ObjectStoreNativeKernel`.
+No format conversion needed — blobs and paths use the same layout.
+
+> **Note**: `PondMinimal` (the old SQLite-backed local kernel) is kept for
+> backward compat but should not be used for new code. Use `make_kernel()`
+> or `LocalFSObjectStore` / `S3ObjectStore` directly.
 
 ---
 

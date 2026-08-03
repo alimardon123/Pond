@@ -567,13 +567,18 @@ class ObjectStoreNativeKernel:
     def base_dir(self) -> str:
         """Compat with CollectionMetadata's _detect_object_store check.
 
-        Returns a string identifying the storage backend. For S3-backed
-        stores, this is "s3://{bucket}/{prefix}". For in-memory, it's
-        "object-store://in-memory". This is used by PondConfig to detect
-        whether to use object-store-mode (config stored as blobs) or
-        local-disk-mode (config stored at .pond/config).
+        Returns a string identifying the storage backend:
+          - LocalFSObjectStore: the base_dir path
+          - S3ObjectStore: "s3://{bucket}/{prefix}"
+          - InMemoryObjectStore: "object-store://in-memory"
+
+        This is used by PondConfig to detect whether to use object-store-mode
+        (config stored as blobs) or local-disk-mode (config stored at .pond/config).
         """
-        # If the store has a bucket/prefix (S3ObjectStore), return the S3 URL
+        # LocalFSObjectStore
+        if hasattr(self.store, 'base_dir') and not hasattr(self.store, '_bucket'):
+            return self.store.base_dir
+        # S3ObjectStore
         if hasattr(self.store, '_bucket'):
             bucket = self.store._bucket
             prefix = getattr(self.store, '_prefix', '')
