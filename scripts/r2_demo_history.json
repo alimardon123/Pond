@@ -1,0 +1,16 @@
+{
+  "prefix": "pond-demo",
+  "bucket": "pondbucket",
+  "endpoint": "https://81425c4736b181e41dc82c32050a5207.r2.cloudflarestorage.com",
+  "history": {
+    "users_v1": "13e6512a3558f6ca9c13bd7a1f234bbd1a2db76228f3335a0608108e87fe2791",
+    "users_v2": "13e6512a3558f6ca9c13bd7a1f234bbd1a2db76228f3335a0608108e87fe2791",
+    "users_v3": "13e6512a3558f6ca9c13bd7a1f234bbd1a2db76228f3335a0608108e87fe2791",
+    "orders_v1": "da54a562acdffba2d9d491271b43bfbe2cae03793806c5fdd42142e2fd7cea30"
+  },
+  "collections": [
+    "users",
+    "orders",
+    "events"
+  ]
+}
