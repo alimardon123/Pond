@@ -1,6 +1,6 @@
 """Unified kernel factory — one entry point for all storage backends.
 
-Switching between local FS, S3, and in-memory is ONE line:
+Switching between local FS and S3 is ONE line:
 
     # Local filesystem (pure files, no SQLite):
     kernel = make_kernel("file:///path/to/.pond")
@@ -8,24 +8,20 @@ Switching between local FS, S3, and in-memory is ONE line:
     # S3:
     kernel = make_kernel("s3://my-bucket/prod", region="us-east-1")
 
-    # In-memory (for tests):
-    kernel = make_kernel("memory://")
-
-All three return an ObjectStoreNativeKernel backed by the appropriate
+Both return an ObjectStoreNativeKernel backed by the appropriate
 store. The kernel code, SDK, lenses — everything else is identical.
 
 URL schemes:
   file://      — LocalFSObjectStore (pure files, no SQLite)
   s3://        — S3ObjectStore (boto3)
-  memory://    — InMemoryObjectStore (in-process dict)
+
+For tests, use file:// with a tempdir — local FS is fast enough and
+exercises the real on-disk code path (catches layout bugs, validates
+restart persistence).
 
 For S3, credentials are picked up from the environment (AWS_ACCESS_KEY_ID,
 AWS_SECRET_ACCESS_KEY, AWS_REGION) or boto3's default credential chain.
 You can override with explicit kwargs.
-
-This is the recommended way to create a Pond kernel. PondMinimal (the
-old SQLite-backed local kernel) is kept for backward compat but should
-not be used for new code.
 """
 from __future__ import annotations
 
@@ -59,9 +55,6 @@ def make_kernel(url: str, **kwargs) -> "ObjectStoreNativeKernel":
 
         # S3:
         kernel = make_kernel("s3://my-pond/prod", region="us-east-1")
-
-        # In-memory (for tests):
-        kernel = make_kernel("memory://")
 
         # Then use PondStorage as usual:
         from pond_storage import PondStorage
@@ -97,15 +90,10 @@ def make_kernel(url: str, **kwargs) -> "ObjectStoreNativeKernel":
         )
         store = S3ObjectStore(client, bucket=bucket, prefix=prefix)
 
-    elif scheme == "memory":
-        # In-memory
-        from object_store_native_kernel import InMemoryObjectStore
-        store = InMemoryObjectStore()
-
     else:
         raise ValueError(
             f"Unsupported storage URL scheme '{scheme}'. "
-            f"Use 'file://', 's3://', or 'memory://'."
+            f"Use 'file://' or 's3://'."
         )
 
     return ObjectStoreNativeKernel(store)

@@ -211,34 +211,6 @@ class InMemoryObjectStore:
             self._paths[path] = hash_val
             self.stats["puts"] += 1
 
-    def compare_and_set_path(self, path: str, expected_hash: Optional[str],
-                              new_hash: str) -> bool:
-        """Atomic compare-and-set for a path.
-
-        If the path currently points to expected_hash (or doesn't exist
-        if expected_hash is None), set it to new_hash and return True.
-        Otherwise return False (another writer won the race).
-
-        On S3, this maps to a conditional PUT with If-Match/If-None-Match
-        headers. On the in-memory store, it's protected by the lock.
-
-        This is the foundation for optimistic concurrency: multiple
-        writers can attempt to update HEAD simultaneously; the loser
-        retries by re-reading and re-applying.
-        """
-        if self._latency_ms > 0:
-            time.sleep(self._latency_ms / 1000.0)
-            self.stats["latency_ms_total"] += self._latency_ms
-
-        with self._lock:
-            current = self._paths.get(path)
-            if current == expected_hash:
-                self._paths[path] = new_hash
-                self.stats["puts"] += 1
-                return True
-            self.stats["gets"] += 1
-            return False
-
     def get_path(self, path: str) -> Optional[str]:
         """Resolve a well-known path to its current content hash."""
         if self._latency_ms > 0:
@@ -439,34 +411,13 @@ class ObjectStoreNativeKernel:
         return sorted(root_ref.keys())
 
     # ------------------------------------------------------------------
-    # Concurrency: per-path compare-and-set (CAS)
+    # Dedicated paths (per-collection refs, bypassing root ref blob)
     #
-    # These methods bypass the root ref blob and use dedicated paths
-    # per collection. This enables:
-    #   1. Optimistic concurrency — multiple writers can attempt to
-    #      update HEAD simultaneously; losers retry.
-    #   2. No global serialization point — each collection's HEAD is
-    #      an independent CAS target.
-    #   3. Cache-independent correctness — a new connection reads the
-    #      current HEAD via a single path GET, no cache needed.
+    # These methods use dedicated paths per collection. HEAD refs,
+    # manifest refs, shard index refs — all use put_path/get_path
+    # (last-writer-wins). Concurrency is handled by CRDT shards, NOT
+    # by CAS. There is no compare_and_set — one concurrency model.
     # ------------------------------------------------------------------
-
-    def cas_path(self, path: str, expected_hash: Optional[str],
-                  new_hash: str) -> bool:
-        """Atomic compare-and-set for a dedicated path.
-
-        If path currently points to expected_hash (or doesn't exist if
-        expected_hash is None), set it to new_hash and return True.
-        Otherwise return False.
-
-        Use this for HEAD refs: collections/{name}/HEAD → commit_hash.
-        Multiple writers can race to update HEAD; the CAS ensures only
-        one wins, the others retry.
-
-        On S3 this maps to a conditional PUT (If-Match/If-None-Match).
-        """
-        self.stats["ref_writes"] += 1
-        return self.store.compare_and_set_path(path, expected_hash, new_hash)
 
     def get_path(self, path: str) -> Optional[str]:
         """Read a dedicated path (1 GET, no root ref needed).

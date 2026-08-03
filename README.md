@@ -124,9 +124,6 @@ kernel = make_kernel("file:///var/lib/pond")
 # OR — S3 (boto3, credentials from env):
 kernel = make_kernel("s3://my-pond/prod", region="us-east-1")
 
-# OR — in-memory (for tests):
-kernel = make_kernel("memory://")
-
 storage = PondStorage(kernel)
 
 # Write any workload — same API regardless of backend

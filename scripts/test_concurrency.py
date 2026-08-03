@@ -1,7 +1,7 @@
 """Concurrency tests — verifies multi-writer/multi-engine scenarios.
 
 Tests:
-1. Multiple concurrent writers (append_concurrent with CAS)
+1. Multiple concurrent writers (CRDT shards — every writer wins)
 2. No data loss under contention
 3. New connection reads latest state (cache-independent)
 4. Concurrent reads while writes happen
@@ -40,7 +40,7 @@ def test_concurrent_writers_no_data_loss():
             local_storage = PondStorage(kernel)
             for i in range(n_appends):
                 rows = [{"id": writer_id * 1000 + i + 1, "event": f"w{writer_id}_{i}"}]
-                local_storage.append_concurrent("events", rows, key_col="id", row_group_size=10)
+                local_storage.append_shard("events", rows, key_col="id", row_group_size=10)
             results.append(writer_id)
         except Exception as e:
             errors.append((writer_id, str(e)))
@@ -76,11 +76,11 @@ def test_new_connection_reads_latest():
     # Writer 1 creates and appends
     s1 = PondStorage(kernel)
     s1.write("data", [{"id": 1, "v": "a"}], key_col="id", row_group_size=10)
-    s1.append_concurrent("data", [{"id": 2, "v": "b"}], key_col="id", row_group_size=10)
+    s1.append_shard("data", [{"id": 2, "v": "b"}], key_col="id", row_group_size=10)
 
     # Writer 2 (separate instance, no shared cache) appends
     s2 = PondStorage(kernel)
-    s2.append_concurrent("data", [{"id": 3, "v": "c"}], key_col="id", row_group_size=10)
+    s2.append_shard("data", [{"id": 3, "v": "c"}], key_col="id", row_group_size=10)
 
     # New connection reads — should see all 3 rows
     s3 = PondStorage(kernel)
@@ -108,8 +108,8 @@ def test_concurrent_reads_during_writes():
         i = 1
         while not stop_writes.is_set():
             try:
-                local.append_concurrent("counter", [{"id": i, "n": i}],
-                                          key_col="id", row_group_size=10)
+                local.append_shard("counter", [{"id": i, "n": i}],
+                                      key_col="id", row_group_size=10)
                 i += 1
             except Exception as e:
                 errors.append(("writer", str(e)))
@@ -159,8 +159,8 @@ def test_mixed_workload_streaming_and_lookup():
         local = PondStorage(kernel)
         for i in range(50):
             try:
-                local.append_concurrent("users", [{"id": 1000 + i, "name": f"stream{i}"}],
-                                          key_col="id", row_group_size=10)
+                local.append_shard("users", [{"id": 1000 + i, "name": f"stream{i}"}],
+                                      key_col="id", row_group_size=10)
             except Exception as e:
                 errors.append(("streamer", str(e)))
                 break
@@ -199,25 +199,32 @@ def test_mixed_workload_streaming_and_lookup():
     return True
 
 
-def test_cas_retry_under_contention():
-    """Verify CAS retries correctly under heavy contention."""
+def test_crdt_concurrent_writers():
+    """Verify CRDT shards let every concurrent writer succeed — no losers.
+
+    Unlike CAS (which retries and can lose under extreme contention), CRDT
+    shards require no coordination: each writer appends its own shard and
+    every append succeeds. There are no losers in the CRDT model.
+    """
     kernel, _ = make_object_store_native_kernel()
     storage = PondStorage(kernel)
     storage.write("hot", [{"id": 0, "v": 0}], key_col="id", row_group_size=10)
 
     success_count = [0]
+    errors = []
     lock = threading.Lock()
 
     def writer(wid):
         local = PondStorage(kernel)
         for i in range(10):
             try:
-                local.append_concurrent("hot", [{"id": wid * 100 + i + 1, "v": wid}],
-                                          key_col="id", row_group_size=10, max_retries=10)
+                local.append_shard("hot", [{"id": wid * 100 + i + 1, "v": wid}],
+                                     key_col="id", row_group_size=10)
                 with lock:
                     success_count[0] += 1
             except Exception as e:
-                pass  # some may fail under extreme contention — that's OK
+                with lock:
+                    errors.append((wid, str(e)))
 
     threads = [threading.Thread(target=writer, args=(w,)) for w in range(10)]
     for t in threads:
@@ -225,13 +232,19 @@ def test_cas_retry_under_contention():
     for t in threads:
         t.join()
 
-    # 10 writers × 10 appends = 100 attempts. Most should succeed.
-    assert success_count[0] >= 80, f"Too many failures: {success_count[0]}/100 succeeded"
+    # 10 writers × 10 appends = 100 attempts. ALL must succeed — CRDT has
+    # no losers (every writer wins, no coordination, no retry, no CAS).
+    assert len(errors) == 0, f"CRDT writers failed: {errors[:3]}"
+    assert success_count[0] == 100, \
+        f"Expected all 100 appends to succeed, got {success_count[0]}/100"
 
     final = PondStorage(kernel)
     rows = final.read("hot")
-    print(f"PASS: test_cas_retry_under_contention — "
-          f"{success_count[0]}/100 appends succeeded, {len(rows)} rows final")
+    # 1 init + 100 appends = 101 rows
+    assert len(rows) == 101, f"Expected 101 rows, got {len(rows)}"
+    print(f"PASS: test_crdt_concurrent_writers — "
+          f"{success_count[0]}/100 appends succeeded (CRDT: every writer wins), "
+          f"{len(rows)} rows final")
     return True
 
 
@@ -241,7 +254,7 @@ def main():
         test_new_connection_reads_latest,
         test_concurrent_reads_during_writes,
         test_mixed_workload_streaming_and_lookup,
-        test_cas_retry_under_contention,
+        test_crdt_concurrent_writers,
     ]
     passed = 0
     for test in tests:

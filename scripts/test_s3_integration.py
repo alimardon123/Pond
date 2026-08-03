@@ -8,9 +8,8 @@ Tests:
 2. Branch/merge via S3
 3. ACID transactions via S3
 4. Config stored as a blob (not local FS)
-5. CAS (compare_and_set_path) — optimistic concurrency
-6. list_paths / list_all_blob_hashes (for GC)
-7. Concurrent writers (shards) — no coordination, correct merge
+5. list_paths / list_all_blob_hashes (for GC)
+6. Concurrent writers (shards) — no coordination, correct merge
 
 This test does NOT touch real AWS. It uses moto's mock_s3 decorator to
 provide an in-process S3-compatible API. To run against real S3, set
@@ -183,38 +182,6 @@ def test_config_as_blob():
     return True
 
 
-def test_cas_optimistic_concurrency():
-    """CAS (compare_and_set_path) — optimistic concurrency via S3."""
-    store = _make_store()
-
-    # First writer: create the path (expected=None)
-    ok1 = store.compare_and_set_path("test/head", expected_hash=None,
-                                       new_hash="hash_a")
-    assert ok1, "First CAS (create) should succeed"
-
-    # Second writer: try to create again (should fail)
-    ok2 = store.compare_and_set_path("test/head", expected_hash=None,
-                                       new_hash="hash_b")
-    assert not ok2, "Second CAS (create) should fail — path exists"
-
-    # Update with correct expected hash
-    ok3 = store.compare_and_set_path("test/head", expected_hash="hash_a",
-                                       new_hash="hash_c")
-    assert ok3, "CAS update with correct expected should succeed"
-
-    # Update with wrong expected hash (concurrent writer won)
-    ok4 = store.compare_and_set_path("test/head", expected_hash="hash_a",
-                                       new_hash="hash_d")
-    assert not ok4, "CAS update with stale expected should fail"
-
-    # Verify final value
-    final = store.get_path("test/head")
-    assert final == "hash_c", f"Expected hash_c, got {final}"
-
-    print(f"PASS: test_cas_optimistic_concurrency — CAS works via S3 (If-Match/If-None-Match)")
-    return True
-
-
 def test_list_paths_and_blobs():
     """list_paths / list_all_blob_hashes (for GC) via S3."""
     store = _make_store()
@@ -353,7 +320,6 @@ def main():
         test_branch_merge,
         test_acid_transactions,
         test_config_as_blob,
-        test_cas_optimistic_concurrency,
         test_list_paths_and_blobs,
         test_concurrent_writers,
         test_delete_and_gc,

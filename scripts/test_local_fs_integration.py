@@ -9,11 +9,10 @@ Tests:
 2. Branch/merge via local FS
 3. ACID transactions via local FS
 4. Config stored as a blob (no local FS config file)
-5. CAS (compare_and_set_path) — optimistic concurrency via file locking
-6. list_paths / list_all_blob_hashes (for GC)
-7. Concurrent writers (shards) — no coordination, correct merge
-8. Restart persistence (close kernel, reopen, data survives)
-9. base_dir detection
+5. list_paths / list_all_blob_hashes (for GC)
+6. Concurrent writers (shards) — no coordination, correct merge
+7. Restart persistence (close kernel, reopen, data survives)
+8. base_dir detection
 """
 import os, sys, json, threading, tempfile, shutil
 
@@ -165,35 +164,6 @@ def test_config_as_blob():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_cas_optimistic_concurrency():
-    """CAS (compare_and_set_path) — optimistic concurrency via file locking."""
-    store, tmpdir = _make_store()
-    try:
-        ok1 = store.compare_and_set_path("test/head", expected_hash=None,
-                                           new_hash="hash_a")
-        assert ok1, "First CAS (create) should succeed"
-
-        ok2 = store.compare_and_set_path("test/head", expected_hash=None,
-                                           new_hash="hash_b")
-        assert not ok2, "Second CAS (create) should fail — path exists"
-
-        ok3 = store.compare_and_set_path("test/head", expected_hash="hash_a",
-                                           new_hash="hash_c")
-        assert ok3, "CAS update with correct expected should succeed"
-
-        ok4 = store.compare_and_set_path("test/head", expected_hash="hash_a",
-                                           new_hash="hash_d")
-        assert not ok4, "CAS update with stale expected should fail"
-
-        final = store.get_path("test/head")
-        assert final == "hash_c", f"Expected hash_c, got {final}"
-
-        print(f"PASS: test_cas_optimistic_concurrency — CAS works via file locking")
-        return True
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
 def test_list_paths_and_blobs():
     """list_paths / list_all_blob_hashes (for GC) via local FS."""
     store, tmpdir = _make_store()
@@ -334,7 +304,6 @@ def main():
         test_branch_merge,
         test_acid_transactions,
         test_config_as_blob,
-        test_cas_optimistic_concurrency,
         test_list_paths_and_blobs,
         test_concurrent_writers,
         test_restart_persistence,

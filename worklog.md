@@ -4197,3 +4197,48 @@ Stage Summary:
 - The directory layout mirrors S3's key structure, so migrating between local and S3 is a straight file copy (aws s3 sync). No format conversion.
 - Config is stored as a blob (no .pond/config file) on ALL backends — local FS, S3, and in-memory.
 - PondMinimal (SQLite) is kept for backward compat but should not be used for new code.
+
+---
+Task ID: round-31-remove-cas-fix-layout-remove-inmemory
+Agent: main
+Task: Address four issues: (1) Remove CAS entirely — we decided CRDT shards only, (2) Fix directory layout mismatch between LocalFS and S3, (3) Remove InMemoryObjectStore from make_kernel() — local FS is the dev/test backend, (4) Add parity benchmark proving both backends work identically.
+
+Work Log:
+- Removed CAS entirely from the codebase:
+  * Removed compare_and_set_path from InMemoryObjectStore, LocalFSObjectStore, S3ObjectStore
+  * Removed cas_path from ObjectStoreNativeKernel
+  * Removed _write_commit_cas from UnifiedStorage
+  * Removed append_concurrent from UnifiedStorage and PondStorage
+  * Migrated test_concurrency.py: 5 call sites changed from append_concurrent → append_shard; test_cas_retry_under_contention → test_crdt_concurrent_writers (strengthened assertion: ALL 100 must succeed, not ≥80/100)
+  * Migrated benchmark_comprehensive.py: removed CAS benchmark block
+  * Removed test_cas_optimistic_concurrency from test_s3_integration.py and test_local_fs_integration.py
+  * Zero CAS references remain in non-archive code
+- Fixed directory layout mismatch between LocalFS and S3:
+  * LocalFS blob path: was {blobs_dir}/{hash[:2]}/{hash}.bin → now {blobs_dir}/{hash} (matches S3)
+  * LocalFS path body: was raw text → now JSON {"hash": "..."} (matches S3)
+  * list_all_blob_hashes: updated to flat directory (no sharding, no .bin)
+  * Now `aws s3 sync` works as a straight copy — no format conversion needed
+- Removed InMemoryObjectStore from make_kernel():
+  * make_kernel() now only supports file:// and s3:// (removed memory://)
+  * Local FS is the dev/test backend — pure files, no SQLite
+  * Architecture laws migrated from InMemoryObjectStore to LocalFSObjectStore (real disk persistence, catches layout bugs, validates restart)
+  * InMemoryObjectStore kept as internal class for benchmarks that simulate S3 latency (not exposed in make_kernel)
+- Added parity benchmark (scripts/benchmark_parity.py):
+  * Runs the same 9-workload suite on both LocalFS and S3 (moto mock)
+  * Reports wall-clock time, GET count, PUT count for each workload
+  * Verifies GET/PUT counts are IDENTICAL on both backends (proves same code path)
+  * Workloads: write 1000 rows, cold/warm point lookup, full scan, pruned read, append shard, compact shards, branch+merge, ACID transaction
+  * Result: ALL GET COUNTS MATCH — parity confirmed
+
+Test Results:
+  - 24/24 scripts/test_*.py suites pass
+  - 18/18 architecture laws pass on LocalFS (real disk persistence)
+  - 8/8 S3 integration tests pass (moto mock)
+  - 9/9 local FS integration tests pass
+  - Parity benchmark: ALL GET counts identical on LocalFS and S3
+
+Stage Summary:
+- ONE concurrency model: CRDT shards. No CAS anywhere. The README's "no CAS, no retry, no coordination" claim is now factual.
+- ONE layout: {blobs_dir}/{hash} and {paths_dir}/{path} with JSON body. Local FS and S3 are identical — `aws s3 sync` is a straight copy.
+- TWO backends: file:// (local FS, dev/test) and s3:// (S3, production). No in-memory backend in make_kernel(). Same kernel, same SDK, same lenses, same everything.
+- Parity proven: GET/PUT counts are identical on both backends (same ObjectStoreNativeKernel code path). Only wall-clock latency differs.

@@ -358,35 +358,6 @@ class PondStorage:
         # The commit blob stores the manifest hash directly.
         return commit_hash
 
-    def append_concurrent(self, collection: str, rows,
-                           key_col: Optional[str] = None,
-                           row_group_size: int = 10_000,
-                           encoding_hints: Optional[dict[str, str]] = None,
-                           message: str = "",
-                           max_retries: int = 5) -> str:
-        """Concurrent-safe append — for multi-user/multi-engine scenarios.
-
-        Uses optimistic concurrency (CAS on HEAD ref):
-        - Multiple writers can append simultaneously
-        - Losers re-read HEAD and retry (up to max_retries)
-        - No in-memory cache dependency — a new connection works seamlessly
-
-        Use this when:
-          - Multiple processes/engines write to the same collection
-          - Streaming writers + OLTP engines access the same storage
-          - You want correctness without cache tuning
-
-        Use append() instead when:
-          - Single-writer scenario (same process)
-          - You want O(1) warm writes via in-memory caching
-        """
-        if self._unified is None:
-            raise RuntimeError("UnifiedStorage not available")
-        return self._unified.append_concurrent(
-            collection, rows, key_col=key_col,
-            row_group_size=row_group_size,
-            encoding_hints=encoding_hints,
-            message=message, max_retries=max_retries)
 
     def append_shard(self, collection: str, rows,
                       key_col: Optional[str] = None,

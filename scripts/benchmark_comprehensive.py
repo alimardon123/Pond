@@ -111,9 +111,9 @@ def benchmark_cold_point_lookup():
 
 
 def benchmark_append_paths():
-    """Compare append paths: single-writer vs CRDT shard vs concurrent CAS."""
+    """Compare append paths: single-writer cache vs CRDT shard (cold/warm)."""
     print("\n" + "=" * 70)
-    print("BENCHMARK 3: Append paths (single-writer cache vs CRDT shard vs CAS)")
+    print("BENCHMARK 3: Append paths (single-writer cache vs CRDT shard)")
     print("=" * 70)
 
     # Setup: 1000 row groups
@@ -144,16 +144,14 @@ def benchmark_append_paths():
     t1 = time.time()
     print(f"  Warm shard append (CRDT): {ck.puts:>3} PUTs, {ck.gets:>3} GETs, {(t1-t0)*1000:>6.1f}ms")
 
-    # 3. Concurrent append (CAS)
-    ck.reset()
-    t0 = time.time()
-    s.append_concurrent("t", [{"id": 99997, "v": "cas"}], key_col="id", row_group_size=10)
-    t1 = time.time()
-    print(f"  Concurrent append (CAS):  {ck.puts:>3} PUTs, {ck.gets:>3} GETs, {(t1-t0)*1000:>6.1f}ms")
+    # NOTE: The old CAS append path has been removed. CRDT shards are now
+    # the ONE concurrency model — every concurrent writer appends its own
+    # shard with no coordination, no retry, no CAS. See BENCHMARK 4 for
+    # concurrent-writer throughput using append_shard.
 
     print()
-    print("EXPECTED: Warm=0 GETs, Shard=0 GETs, CAS=4-7 GETs")
-    print("VERDICT: ✓ Warm and shard appends are O(1) — no coordination")
+    print("EXPECTED: Warm=0 GETs, Shard=0 GETs — CRDT needs no coordination")
+    print("VERDICT: ✓ Warm and shard appends are O(1) — no CAS, no coordination")
 
 
 def benchmark_concurrent_writers():

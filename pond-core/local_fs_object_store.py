@@ -92,10 +92,11 @@ class LocalFSObjectStore:
     def _blob_path(self, hash_val: str) -> str:
         """The on-disk path for a content-addressed blob.
 
-        Uses a 2-char sharded directory (same as git) to avoid having
-        millions of files in one directory.
+        Layout matches S3ObjectStore exactly: {blobs_dir}/{hash} (no
+        sharding, no .bin suffix). This makes `aws s3 sync` a straight
+        copy — no format conversion needed.
         """
-        return os.path.join(self._blobs_dir, hash_val[:2], hash_val + ".bin")
+        return os.path.join(self._blobs_dir, hash_val)
 
     def _path_file(self, path: str) -> str:
         """The on-disk file for a named path (ref).
@@ -176,13 +177,12 @@ class LocalFSObjectStore:
         hashes = []
         if not os.path.isdir(self._blobs_dir):
             return hashes
-        for shard in os.listdir(self._blobs_dir):
-            shard_dir = os.path.join(self._blobs_dir, shard)
-            if not os.path.isdir(shard_dir):
-                continue
-            for f in os.listdir(shard_dir):
-                if f.endswith(".bin"):
-                    hashes.append(f[:-4])  # strip ".bin"
+        for f in os.listdir(self._blobs_dir):
+            # Blobs are stored as {blobs_dir}/{hash} (flat, no sharding,
+            # no suffix — matches S3 layout exactly)
+            full = os.path.join(self._blobs_dir, f)
+            if os.path.isfile(full):
+                hashes.append(f)
         return hashes
 
     # ------------------------------------------------------------------
@@ -192,65 +192,19 @@ class LocalFSObjectStore:
     def put_path(self, path: str, hash_val: str) -> None:
         """Bind a well-known path to a content hash.
 
-        The path file contains just the hash as text (64 hex chars).
-        Last-writer-wins: no CAS check. Use compare_and_set_path for
-        optimistic concurrency.
+        The path file contains JSON {"hash": "..."} — same format as
+        S3ObjectStore. This makes `aws s3 sync` a straight copy.
+        Last-writer-wins (no CAS).
         """
         file = self._path_file(path)
         os.makedirs(os.path.dirname(file), exist_ok=True)
-        # Write to a UNIQUE temp file then rename (atomic).
-        # Use os.getpid + a counter to avoid collisions between concurrent
-        # writers racing on the same path.
         tmp = f"{file}.tmp.{os.getpid()}.{threading.get_ident()}.{self._tmp_counter}"
         self._tmp_counter += 1
         with open(tmp, "w") as f:
-            f.write(hash_val)
+            json.dump({"hash": hash_val}, f)
         os.rename(tmp, file)
         with self._lock:
             self.stats["puts"] += 1
-
-    def compare_and_set_path(self, path: str,
-                               expected_hash: Optional[str],
-                               new_hash: str) -> bool:
-        """Atomic compare-and-set for a path.
-
-        If the path currently points to expected_hash (or doesn't exist
-        if expected_hash is None), set it to new_hash and return True.
-        Otherwise return False.
-
-        Uses OS-level file locking (fcntl on POSIX) for atomicity.
-        """
-        file = self._path_file(path)
-        os.makedirs(os.path.dirname(file), exist_ok=True)
-
-        with self._get_path_lock(file):
-            current = None
-            if os.path.exists(file):
-                with open(file, "r") as f:
-                    current = f.read().strip()
-
-            if expected_hash is None:
-                # Only succeed if the path doesn't exist
-                if current is not None:
-                    with self._lock:
-                        self.stats["gets"] += 1
-                    return False
-            else:
-                # Only succeed if current matches expected
-                if current != expected_hash:
-                    with self._lock:
-                        self.stats["gets"] += 1
-                    return False
-
-            # Write the new hash (atomic via unique temp + rename)
-            tmp = f"{file}.tmp.{os.getpid()}.{threading.get_ident()}.{self._tmp_counter}"
-            self._tmp_counter += 1
-            with open(tmp, "w") as f:
-                f.write(new_hash)
-            os.rename(tmp, file)
-            with self._lock:
-                self.stats["puts"] += 1
-            return True
 
     def get_path(self, path: str) -> Optional[str]:
         """Resolve a well-known path to its current content hash."""
@@ -258,10 +212,10 @@ class LocalFSObjectStore:
         if not os.path.exists(file):
             return None
         with open(file, "r") as f:
-            h = f.read().strip()
+            data = json.load(f)
         with self._lock:
             self.stats["gets"] += 1
-        return h
+        return data.get("hash")
 
     def list_paths(self, prefix: str = "") -> list[str]:
         """List all paths with the given prefix."""
