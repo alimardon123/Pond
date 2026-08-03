@@ -75,18 +75,32 @@ def make_kernel(url: str, **kwargs) -> "ObjectStoreNativeKernel":
         # S3
         from s3_object_store import S3ObjectStore
         import boto3
+        from botocore.config import Config
         bucket = parsed.netloc
         prefix = parsed.path.lstrip("/")
         region = kwargs.get("region") or os.environ.get("AWS_REGION", "us-east-1")
         endpoint_url = kwargs.get("endpoint_url")
         aws_access_key_id = kwargs.get("aws_access_key_id")
         aws_secret_access_key = kwargs.get("aws_secret_access_key")
+        # Production retry/timeout config (overrides boto3 defaults)
+        max_retries = kwargs.get("max_retries", 10)
+        connect_timeout = kwargs.get("connect_timeout", 5.0)
+        read_timeout = kwargs.get("read_timeout", 30.0)
+        max_pool_connections = kwargs.get("max_pool_connections", 50)
+        config = Config(
+            max_retry_attempts=max_retries,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_pool_connections=max_pool_connections,
+            retries={"max_attempts": max_retries, "mode": "adaptive"},
+        )
         client = boto3.client(
             "s3",
             region_name=region,
             endpoint_url=endpoint_url,
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
+            config=config,
         )
         store = S3ObjectStore(client, bucket=bucket, prefix=prefix)
 

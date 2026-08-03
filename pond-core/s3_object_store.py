@@ -252,7 +252,11 @@ def make_s3_kernel(bucket: str, prefix: str = "",
                     region: Optional[str] = None,
                     endpoint_url: Optional[str] = None,
                     aws_access_key_id: Optional[str] = None,
-                    aws_secret_access_key: Optional[str] = None) -> "ObjectStoreNativeKernel":
+                    aws_secret_access_key: Optional[str] = None,
+                    max_retries: int = 10,
+                    connect_timeout: float = 5.0,
+                    read_timeout: float = 30.0,
+                    max_pool_connections: int = 50) -> "ObjectStoreNativeKernel":
     """Convenience constructor: create an ObjectStoreNativeKernel backed by real S3.
 
     Args:
@@ -262,6 +266,11 @@ def make_s3_kernel(bucket: str, prefix: str = "",
         endpoint_url: custom endpoint (for MinIO, LocalStack, R2, etc.)
         aws_access_key_id: credentials (or None to use boto3 defaults)
         aws_secret_access_key: credentials (or None to use boto3 defaults)
+        max_retries: max retry attempts for transient failures (default 10)
+        connect_timeout: TCP connect timeout in seconds (default 5.0)
+        read_timeout: S3 read timeout in seconds (default 30.0)
+        max_pool_connections: connection pool size (default 50 — Pond's
+            parallel fetch uses up to 16 threads, 50 gives headroom)
 
     Returns:
         An ObjectStoreNativeKernel instance backed by S3ObjectStore.
@@ -271,12 +280,22 @@ def make_s3_kernel(bucket: str, prefix: str = "",
         storage = PondStorage(kernel)
     """
     import boto3
+    from botocore.config import Config
+
+    config = Config(
+        max_retry_attempts=max_retries,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        max_pool_connections=max_pool_connections,
+        retries={"max_attempts": max_retries, "mode": "adaptive"},
+    )
     client = boto3.client(
         "s3",
         region_name=region,
         endpoint_url=endpoint_url,
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
+        config=config,
     )
     store = S3ObjectStore(client, bucket=bucket, prefix=prefix)
 
