@@ -88,7 +88,6 @@ def make_kernel(url: str, **kwargs) -> "ObjectStoreNativeKernel":
         read_timeout = kwargs.get("read_timeout", 30.0)
         max_pool_connections = kwargs.get("max_pool_connections", 50)
         config = Config(
-            max_retry_attempts=max_retries,
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             max_pool_connections=max_pool_connections,

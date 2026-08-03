@@ -283,7 +283,6 @@ def make_s3_kernel(bucket: str, prefix: str = "",
     from botocore.config import Config
 
     config = Config(
-        max_retry_attempts=max_retries,
         connect_timeout=connect_timeout,
         read_timeout=read_timeout,
         max_pool_connections=max_pool_connections,
