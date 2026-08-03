@@ -114,7 +114,8 @@ class GarbageCollector:
 
     def vacuum(self, collections: Optional[list] = None,
                preserve_days: int = 0,
-               dry_run: bool = False) -> dict:
+               dry_run: bool = False,
+               tentative_ttl_seconds: int = 3600) -> dict:
         """Delete unreachable blobs, optionally preserving recent commits.
 
         Args:
@@ -137,6 +138,15 @@ class GarbageCollector:
 
             dry_run: if True, report what would be deleted without deleting.
 
+            tentative_ttl_seconds: preserve tentative shards (from
+                in-flight ACID transactions) younger than this many
+                seconds. A long-running transaction (e.g. 30 min between
+                begin_tx and commit_tx) has no commit marker until
+                commit_tx runs — without this TTL, a concurrent vacuum
+                would delete its tentative shards. Default 3600 (1 hour).
+                The shard's age is parsed from the UUIDv7 tx_id. Set to
+                0 to disable (old behavior — delete immediately).
+
         Returns:
             {
                 "deleted": int,
@@ -151,6 +161,19 @@ class GarbageCollector:
         live_set = self._build_live_set(collections, preserve_days)
         all_blobs = set(self._list_all_blob_hashes())
         dead_hashes = all_blobs - live_set
+
+        # Bug 7 fix: preserve young tentative shards from in-flight
+        # transactions. Tentative shards (refs containing "/shards/tx_")
+        # whose tx commit marker doesn't exist are excluded from the live
+        # set (so gc() correctly reports them as dead). But vacuum must
+        # NOT delete them if the transaction might still be running —
+        # only delete if the shard is older than tentative_ttl_seconds.
+        # The shard's age is parsed from the UUIDv7 tx_id (time-ordered).
+        if tentative_ttl_seconds > 0:
+            young_tentative = self._young_tentative_blob_hashes(
+                collections, tentative_ttl_seconds)
+            if young_tentative:
+                dead_hashes -= young_tentative
 
         # Count preserved (blobs that would be dead without preserve_days)
         preserved = 0
@@ -301,6 +324,73 @@ class GarbageCollector:
 
         # Leaf node (data blob, stats tree node, etc.)
         return
+
+    def _young_tentative_blob_hashes(self, collections: Optional[list],
+                                      ttl_seconds: int) -> Set[str]:
+        """Return blob hashes referenced by young tentative shards.
+
+        A tentative shard is one whose ref path contains "/shards/tx_"
+        (written by append_shard with tx_id set). It is "young" if the
+        UUIDv7 tx_id encodes a timestamp newer than ttl_seconds ago.
+
+        Such shards belong to in-flight ACID transactions that haven't
+        committed yet (no transactions/{tx_id} marker). They are
+        excluded from the live set by _build_live_set (so gc() reports
+        them as dead), but vacuum must NOT delete them — the transaction
+        may still commit. Only shards older than ttl_seconds are eligible
+        for deletion (likely aborted transactions).
+
+        Returns the set of blob hashes reachable from young tentative
+        shards (the shard manifest + its data blobs).
+        """
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "..", ".."))
+            from uuid7 import uuidv7_timestamp
+        except ImportError:
+            return set()  # can't parse tx_id timestamps — don't preserve
+
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - (ttl_seconds * 1000)
+
+        names = self.kernel.list_names()
+        # Filter by collections if specified (same logic as _build_live_set)
+        if collections:
+            filtered = []
+            for n in names:
+                for coll in collections:
+                    if n.startswith(f"collections/{coll}/"):
+                        filtered.append(n)
+                        break
+            names = filtered
+
+        preserved: Set[str] = set()
+        for name in names:
+            if "/shards/tx_" not in name:
+                continue
+            shard_part = name.split("/shards/tx_")[-1]
+            tx_id = shard_part.split("_", 1)[0] if "_" in shard_part else ""
+            if not tx_id:
+                continue
+            # If the commit marker exists, the tx is committed — already
+            # in the live set (not dead, no need to preserve here).
+            tx_ref = f"transactions/{tx_id}"
+            if self.kernel.resolve(tx_ref) is not None:
+                continue
+            # Marker doesn't exist — parse the UUIDv7 timestamp from tx_id
+            try:
+                tx_ts_ms = uuidv7_timestamp(tx_id)
+            except (ValueError, TypeError):
+                continue  # can't parse — don't preserve (conservative)
+            if tx_ts_ms < cutoff_ms:
+                continue  # old — eligible for deletion
+            # Young — preserve. Walk its reachable blobs (shard manifest
+            # + data blobs) so vacuum doesn't delete them.
+            h = self.kernel.resolve(name)
+            if h is not None and h not in preserved:
+                self._walk_reachable(h, preserved, 0)
+
+        return preserved
 
     def _list_all_blob_hashes(self) -> list[str]:
         """List all blob hashes in the store."""

@@ -691,7 +691,8 @@ class PondStorage:
 
     def vacuum(self, collections: Optional[list] = None,
                preserve_days: int = 0,
-               dry_run: bool = False) -> dict:
+               dry_run: bool = False,
+               tentative_ttl_seconds: int = 3600) -> dict:
         """Delete unreachable blobs — reclaim storage space.
 
         Delta/Iceberg-style vacuum with preservation:
@@ -709,6 +710,12 @@ class PondStorage:
                 Content-addressed blobs shared between preserved and
                 non-preserved commits are NEVER deleted (they're live).
             dry_run: if True, report what would be deleted without deleting.
+            tentative_ttl_seconds: preserve tentative shards from in-flight
+                ACID transactions younger than this many seconds. Default
+                3600 (1 hour). A long-running transaction has no commit
+                marker until commit_tx runs — without this TTL, a concurrent
+                vacuum would delete its tentative shards. Set to 0 to
+                disable (delete immediately, old behavior).
 
         Returns:
             {"deleted": int, "preserved": int, "freed_bytes": int, ...}
@@ -731,7 +738,8 @@ class PondStorage:
                                               "extensions", "maintenance"))
             from vacuum import GarbageCollector
             gc = GarbageCollector(self.kernel)
-            return gc.vacuum(collections, preserve_days, dry_run)
+            return gc.vacuum(collections, preserve_days, dry_run,
+                             tentative_ttl_seconds)
         except ImportError:
             return {"deleted": 0, "preserved": 0, "freed_bytes": -1,
                     "dry_run": dry_run, "collections": collections,

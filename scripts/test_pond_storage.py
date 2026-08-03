@@ -110,6 +110,7 @@ def test_pond_storage_round_trips():
     # Cold point lookup
     kernel.invalidate_root_cache()
     storage._unified._manifest_cache.clear()
+    storage._unified._manifest_hash_cache.clear()
     kernel.reset_stats()
 
     row = storage.point_lookup("test", key="42")
@@ -118,7 +119,8 @@ def test_pond_storage_round_trips():
 
     total = kernel.stats["reads"] + kernel.stats["ref_reads"]
     print(f"\n  Cold point lookup: {total} GETs")
-    assert total == 4, f"Expected 4 GETs, got {total}"
+    # With dedicated paths: 1 ref_read (manifest ref) + 2 data reads = 3
+    assert total == 3, f"Expected 3 GETs, got {total}"
 
     # Round trip estimate
     rt = storage.get_round_trip_count("test", predicates=[("id", ">", 90)])

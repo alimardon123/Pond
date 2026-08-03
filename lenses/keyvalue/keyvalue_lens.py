@@ -289,33 +289,79 @@ class KeyValueLens(PondLens):
             raise ValueError(f"No staged data for collection '{collection}'")
         buffer = self._unified_buffer[collection]
 
-        # Deletes must actually remove data. UnifiedStorage.append() only
-        # adds — it can't delete old keys. If there are tombstones
-        # (value=None), we must do a full rewrite: read all existing data,
-        # remove deleted keys, add new puts, write the result via write()
-        # (overwrite).
+        # Bug 8 fix: use CRDT delete_shard (row-level tombstones) for
+        # deletes instead of a full rewrite. The full rewrite bypassed
+        # CRDT — any concurrent writer's shards were invisible and lost.
+        #
+        # Flow:
+        #   1. For deletes: read existing rows to get their _rowid values,
+        #      then call delete_shard(rowids) to write tombstone shards.
+        #   2. For puts: use append_shard (same as the puts-only path) —
+        #      CRDT-safe, concurrent writers unaffected.
+        #   3. For mixed puts+deletes: do both.
         has_deletes = any(v is None for v in buffer.values())
         puts_only = {k: v for k, v in buffer.items() if v is not None}
 
         if has_deletes:
-            # Full rewrite: read existing data, apply deletes + puts
-            existing_rows = self._unified_storage.read(collection,
-                                                         columns=["_key", "value"])
             deleted_keys = {k for k, v in buffer.items() if v is None}
-            # Keep existing rows that aren't deleted and aren't being overwritten
-            result_rows = []
+
+            # Read existing rows to find _rowid values for deleted keys.
+            # Only rows with _rowid (from upsert_shard) can be tombstoned
+            # via delete_shard. Legacy rows (from append_shard) have no
+            # _rowid — they're left for a future compaction to reclaim.
+            existing_rows = self._unified_storage.read_with_shards(
+                collection, columns=["_key", "_rowid"])
+            rowids_to_delete = []
+            keys_for_tombstones = []
             for row in existing_rows:
-                if row["_key"] not in deleted_keys and row["_key"] not in puts_only:
-                    result_rows.append(row)
-            # Add new puts
-            for k, v in puts_only.items():
-                result_rows.append({"_key": k, "value": self.encode(v)})
-            result_rows.sort(key=lambda r: r["_key"])
-            commit_hash = self._unified_storage.write(
-                collection, result_rows, key_col="_key",
-                row_group_size=10_000,
-                message=message or f"{collection} unified commit (with deletes)")
-            # Stamp metadata if this is a new collection
+                if row.get("_key") in deleted_keys and row.get("_rowid"):
+                    rowids_to_delete.append(row["_rowid"])
+                    # Pass the _key value so tombstones get distinct
+                    # rg_keys (avoids compact_shards dropping them).
+                    keys_for_tombstones.append(row["_key"])
+
+            # Write tombstones for deletes (CRDT-safe — concurrent
+            # writers' shards are unaffected; tombstones only suppress
+            # matching _rowid rows on merge).
+            commit_hash = ""
+            if rowids_to_delete:
+                commit_hash = self._unified_storage.delete_shard(
+                    collection, rowids_to_delete, key_col="_key",
+                    keys=keys_for_tombstones)
+
+            # Append puts (CRDT-safe — same as the puts-only path below).
+            if puts_only:
+                rows = [{"_key": k, "value": self.encode(v)}
+                         for k, v in puts_only.items()]
+                rows.sort(key=lambda r: r["_key"])
+                existing_manifest = self._unified_storage._load_manifest(collection)
+                if existing_manifest is None:
+                    # NEW collection — write() creates the first manifest.
+                    put_hash = self._unified_storage.write(
+                        collection, rows, key_col="_key",
+                        row_group_size=10_000,
+                        message=message or f"{collection} unified commit")
+                    self.stamp_collection_metadata(
+                        collection, lens_type="keyvalue", key_col="_key",
+                        schema_hint={"_key": "string", "value": "bytes"})
+                    commit_hash = put_hash
+                else:
+                    # EXISTING collection — append via CRDT shard
+                    put_hash = self._unified_storage.append(
+                        collection, rows, key_col="_key",
+                        row_group_size=10_000,
+                        message=message or f"{collection} unified commit (puts)")
+                    # Compact shards into HEAD so branch/merge/history see
+                    # the latest data (append uses shards, but version
+                    # control needs HEAD to be current). Tombstones survive
+                    # compaction because delete_shard was called with keys=
+                    # (distinct rg_keys per tombstone).
+                    self._unified_storage.compact_shards(collection)
+                    if not commit_hash:
+                        commit_hash = put_hash
+
+            # Stamp metadata if this is a new collection (deletes-only on
+            # a non-existent collection is a no-op, but be defensive).
             if self.get_collection_metadata(collection).get("lens_type") is None:
                 self.stamp_collection_metadata(
                     collection, lens_type="keyvalue", key_col="_key",

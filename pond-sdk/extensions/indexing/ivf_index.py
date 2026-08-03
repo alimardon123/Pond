@@ -359,6 +359,26 @@ class IVFIndex:
 
         Returns:
             List of {id, distance, vector, metadata} dicts, sorted by distance.
+
+        TODO / KNOWN LIMITATION (Bug 10):
+            The current implementation reads ALL vectors via
+            storage.read(collection) then filters by target_ids in
+            Python (step 2 + step 4 below). This means n_probe has NO
+            effect on I/O — every search reads the entire collection.
+            At PB scale (10M+ vectors) this defeats the purpose of IVF.
+
+            The fix is to store per-cluster blob references in the index
+            (cluster_id → list of blob_hashes / rg_keys), so search can
+            fetch ONLY the n_probe probed clusters' blobs (true I/O
+            reduction). The index format already stores cluster_ids
+            (vector IDs per cluster) — it just needs to also store the
+            blob_hash / rg_key for each cluster's data, so search can do
+            a targeted fetch instead of a full collection scan.
+
+            Until that optimization lands, n_probe only reduces the
+            NUMBER OF DISTANCE COMPUTATIONS (Python-side), not the
+            number of S3 GETs. The IVF index is still correct (returns
+            the right top-k), just not as fast as it could be.
         """
         index = self.load(collection)
         if index is None:

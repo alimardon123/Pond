@@ -382,6 +382,13 @@ class StreamingLens(PondLens):
                 segment_size: int = 1_000_000) -> str:
         """Produce (append) data to a specific partition.
 
+        Bug 9 fix: do NOT call checkout() — that mutates the shared HEAD
+        ref, causing two concurrent producers (even to different
+        partitions) to race on HEAD. Instead, set the active branch
+        IN-MEMORY only (via _active_branches dict). append_shard reads
+        _active_branches to determine where to write the shard, so this
+        is sufficient — no storage mutation, no HEAD race.
+
         Args:
             collection: collection name (the topic)
             partition: partition number (0-indexed)
@@ -392,8 +399,13 @@ class StreamingLens(PondLens):
             The shard manifest hash.
         """
         self._require_unified()
-        # Checkout the partition branch, then append_shard
-        self._unified_storage.checkout(collection, f"p{partition}")
+        us = self._unified_storage
+        branch_name = f"p{partition}"
+        # Set the active branch IN-MEMORY only (no HEAD mutation).
+        # append_shard uses _get_active_branch(collection) which reads
+        # this dict — the shard is written to the partition's shard path
+        # without touching HEAD.
+        us._active_branches[collection] = us._branch_ref(collection, branch_name)
         return self.append_stream(collection, data, segment_size)
 
     def produce_round_robin(self, collection: str, data: bytes,

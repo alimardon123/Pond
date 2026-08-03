@@ -296,14 +296,15 @@ class ObjectStoreNativeKernel:
         """
         self.store = object_store
         self._root_pointer_path = root_pointer_path
-        # Cache of the root ref blob — the SDK can cache this, the kernel
-        # does NOT. For honest benchmarking, call invalidate_root_cache()
-        # before each measurement.
+        # Path cache: name → hash. Avoids redundant GETs for resolve().
+        # Each entry is a single ref (HEAD, manifest, shard ref, etc.).
+        # Invalidated by invalidate_path_cache(name) or invalidate_path_cache().
+        self._path_cache: dict[str, Optional[str]] = {}
+        # Legacy root_ref cache — kept for backward compat with old code
+        # that calls _load_root_ref / invalidate_root_cache. No longer used
+        # by reference()/resolve()/list_names() (which use dedicated paths).
         self._root_ref_cache: Optional[dict[str, str]] = None
         self._root_ref_hash: Optional[str] = None
-        # Track ALL root ref hashes (current + historical) so storage_stats
-        # can exclude them from the data blob count. Each reference() call
-        # creates a new root ref blob; these are metadata, not data.
         self._root_ref_hashes: set[str] = set()
 
         self.stats = {
@@ -353,62 +354,59 @@ class ObjectStoreNativeKernel:
     # ------------------------------------------------------------------
 
     def reference(self, name: str, h: str) -> None:
-        """Bind a name to a hash. Updates the root ref blob.
+        """Bind a name to a hash. 1 PUT, no read, no shared mutable state.
 
-        Flow:
-          1. Read the current root ref blob (1 GET — cached if possible)
-          2. Mutate: root[name] = h
-          3. Write a new root ref blob (1 PUT)
-          4. Update the root pointer to point to it (1 PUT to well-known path)
+        Uses dedicated paths (put_path) — each ref is an independent key.
+        No root_ref blob, no read-modify-write, no contention between
+        unrelated refs. Concurrent writers to different names never
+        interfere. This is the foundation of the no-CAS concurrency model.
 
-        Total: 1 GET + 2 PUTs per reference update.
+        Total: 1 PUT per reference update (was 2 PUTs + 1 GET with root_ref).
         """
-        # Verify the blob exists (defensive — same as PondMinimal)
+        # Verify the blob exists (defensive — has_blob is a free HEAD)
         if not self.store.has_blob(h):
             raise ValueError(f"Hash {h} does not refer to an existing blob")
-
-        # Read the current root ref blob
-        root_ref = self._load_root_ref()
-
-        # Mutate
-        root_ref[name] = h
-
-        # Write the new root ref blob
-        new_root_bytes = json.dumps(root_ref, sort_keys=True).encode()
-        new_root_hash = self.store.put_blob(new_root_bytes)
+        # Write to a dedicated path — 1 PUT, no read, no shared state
+        self.store.put_path(name, h)
         self.stats["ref_writes"] += 1
-
-        # Update the root pointer
-        self.store.put_path(self._root_pointer_path, new_root_hash)
-        self.stats["ref_writes"] += 1
-
-        # Update the cache
-        self._root_ref_cache = root_ref
-        self._root_ref_hash = new_root_hash
-        self._root_ref_hashes.add(new_root_hash)
         self.stats["references"] += 1
+        # Update the path cache so subsequent resolve() calls see the new value
+        self._path_cache[name] = h
 
     def resolve(self, name: str) -> Optional[str]:
-        """Resolve a name to its current hash.
+        """Resolve a name to its current hash. 1 GET (cached after first read).
 
-        Flow:
-          1. Read the root pointer (1 GET — well-known path)
-          2. Read the root ref blob (1 GET — content-addressed)
-          3. Look up name in the dict (in-memory, free)
+        Reads from the dedicated path store. The result is cached in
+        _path_cache for O(0) warm reads. Call invalidate_path_cache(name)
+        to force a re-read.
 
-        Total: 2 GETs per cold resolve. Subsequent resolves in the same
-        kernel instance reuse the cached root ref blob (0 GETs).
-
-        For HONEST cold benchmarking, call invalidate_root_cache() before
-        each measurement.
+        Total: 1 GET cold, 0 GETs warm (cached).
         """
-        root_ref = self._load_root_ref()
-        return root_ref.get(name)
+        # Check cache first (warm path — 0 GETs)
+        if name in self._path_cache:
+            return self._path_cache[name]
+        # Cold path — 1 GET from the dedicated path store
+        h = self.store.get_path(name)
+        self.stats["ref_reads"] += 1
+        self._path_cache[name] = h
+        return h
+
+    def invalidate_path_cache(self, name: Optional[str] = None) -> None:
+        """Invalidate the path cache for a specific name, or all names."""
+        if name is None:
+            self._path_cache.clear()
+        else:
+            self._path_cache.pop(name, None)
 
     def list_names(self) -> list[str]:
-        """List all bound names."""
-        root_ref = self._load_root_ref()
-        return sorted(root_ref.keys())
+        """List all bound names. Uses native prefix listing (O(matching)).
+
+        On S3 this maps to list-objects-v2 with no prefix. On local FS
+        it's a directory walk. Does NOT load a root_ref blob.
+        """
+        names = self.store.list_paths("")
+        self.stats["ref_reads"] += 1
+        return sorted(names)
 
     # ------------------------------------------------------------------
     # Dedicated paths (per-collection refs, bypassing root ref blob)
@@ -422,10 +420,17 @@ class ObjectStoreNativeKernel:
     def get_path(self, path: str) -> Optional[str]:
         """Read a dedicated path (1 GET, no root ref needed).
 
-        Use this to read HEAD refs directly without going through the
-        root ref blob — enables cache-independent reads.
+        Uses the path cache (same as resolve). Counts as a ref_read on
+        cache miss.
         """
-        return self.store.get_path(path)
+        # Check cache first (warm path — 0 GETs)
+        if path in self._path_cache:
+            return self._path_cache[path]
+        # Cold path — 1 GET from the store
+        h = self.store.get_path(path)
+        self.stats["ref_reads"] += 1
+        self._path_cache[path] = h
+        return h
 
     def list_paths_with_prefix(self, prefix: str) -> list[str]:
         """List all paths with a given prefix — O(matching) not O(total).
@@ -443,6 +448,9 @@ class ObjectStoreNativeKernel:
         that are only written by the HEAD owner).
         """
         self.store.put_path(path, hash_val)
+        self.stats["ref_writes"] += 1
+        # Update the path cache so subsequent resolve() calls see the new value
+        self._path_cache[path] = hash_val
 
     # ------------------------------------------------------------------
     # MAINTENANCE operations (NOT kernel primitives)
@@ -500,6 +508,8 @@ class ObjectStoreNativeKernel:
         """
         self._root_ref_cache = None
         self._root_ref_hash = None
+        # Also clear the path cache (the new caching mechanism)
+        self._path_cache.clear()
 
     # ------------------------------------------------------------------
     # Stats + helpers

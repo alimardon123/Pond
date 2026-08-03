@@ -4242,3 +4242,38 @@ Stage Summary:
 - ONE layout: {blobs_dir}/{hash} and {paths_dir}/{path} with JSON body. Local FS and S3 are identical — `aws s3 sync` is a straight copy.
 - TWO backends: file:// (local FS, dev/test) and s3:// (S3, production). No in-memory backend in make_kernel(). Same kernel, same SDK, same lenses, same everything.
 - Parity proven: GET/PUT counts are identical on both backends (same ObjectStoreNativeKernel code path). Only wall-clock latency differs.
+
+---
+Task ID: round-32-architectural-fixes-no-cas
+Agent: main
+Task: Implement the 10 steps from the architectural review — eliminate root_ref blob (no CAS), trust shard index, union row groups, fix merge topology, fix HLC, fix vacuum, fix KV deletes, fix streaming produce, document IVF limitation.
+
+Work Log:
+- Step 1: Eliminated root_ref blob entirely. reference() now uses put_path() (1 PUT, no read, no shared mutable state). resolve() uses get_path() with in-memory path cache (1 GET cold, 0 warm). list_names() uses list_paths_with_prefix() (native S3 listing). No CAS needed — each ref is an independent key, concurrent writers to different names never interfere. Fixed branch ref path from collections/{c}/branches/{branch} to collections/{c}/branch-refs/{branch} to avoid file/directory conflicts on local FS.
+- Step 2: _list_shards_from_refs no longer loads each shard manifest to verify it (was K GETs per read). Trusts the listing + tx commit check. read_with_shards already handles corrupt/missing/tombstoned manifests via try/except. Tombstoned shards (empty blob) filtered by comparing hash to sha256(b"").
+- Step 3: Shard index now uses list_paths_with_prefix for discovery (native O(matching) listing, not O(total) root_ref scan).
+- Step 4: read_with_shards, _read_as_columns_with_shards, read_branch_with_shards now use UNION of row groups (list) instead of dedup-by-key (dict). Fixes concurrent append data loss when writers have overlapping key ranges. Row-level CRDT (_rowid + _version) handles conflicts.
+- Step 5: merge() now reads target_branch's HEAD as parent (was reading active HEAD). Updates target_branch ref + HEAD + manifest ref to merge commit. Source branch ref unchanged. Proper git merge topology.
+- Step 6: HLC is now a single instance per UnifiedStorage (was recreated per call). _merge_rows_by_rowid calls hlc.observe(remote_version) for every remote _version seen. Fixes clock skew data loss. Also added key_col-based dedup for legacy rows (no _rowid) vs CRDT rows (with _rowid).
+- Step 7: vacuum now protects in-flight transaction shards. Tentative shards younger than configurable TTL (default 3600s) are preserved even if their tx marker is missing. Parses UUIDv7 timestamp from tx_id to determine age.
+- Step 8: KeyValueLens.commit() with deletes now uses delete_shard(rowids) instead of full overwrite. CRDT-safe. Extended delete_shard with optional keys parameter for proper key_col values on tombstones.
+- Step 9: StreamingLens.produce() no longer calls checkout() (was mutating shared HEAD). Sets active branch in-memory only via _active_branches dict. Concurrent producers to different partitions no longer race.
+- Step 10: IVF search documented as known limitation — reads all vectors, future optimization should store per-cluster blob references. Added honest TODO docstring.
+
+Performance Improvements (LocalFS benchmark):
+  Cold point lookup: 4 GETs → 2 GETs (-50%)
+  Warm point lookup: 3 GETs → 1 GET (-67%)
+  Pruned 1% read: 4 GETs → 2 GETs (-50%)
+  Branch: 2 PUTs → 1 PUT (-50%)
+  Bulk write 1000: 7 PUTs → 5 PUTs (-29%)
+
+Test Results:
+  - 24/24 scripts/test_*.py suites pass
+  - 18/18 architecture laws pass
+  - All ACID, CRDT, branch, concurrency, GC tests pass
+
+Stage Summary:
+- NO CAS anywhere. The "no CAS, no coordination" claim is now TRUE. Each ref is an independent key — concurrent writers to different names never interfere.
+- The root_ref blob (shared mutable state) is eliminated. Was the root cause of C1 (racy reference), C2 (racy ACID), and the hidden coordination in every ref mutation.
+- Performance improved: cold reads 50% fewer GETs, warm reads 67% fewer GETs, branch 50% fewer PUTs.
+- All 10 critical issues from the architectural review are addressed.

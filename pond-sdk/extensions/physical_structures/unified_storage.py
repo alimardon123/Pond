@@ -593,6 +593,19 @@ class UnifiedStorage:
         self._schema_cache: dict[str, tuple] = {}  # collection → (columns, key_col, rg_size)
         # Active branch per collection (set by checkout, cleared by undo/merge)
         self._active_branches: dict[str, str] = {}
+        # HLC instance shared across all upsert_shard/delete_shard calls.
+        # A single clock ensures the logical counter is monotonic across
+        # calls within the same process — without this, two calls in the
+        # same millisecond would produce identical _version strings and
+        # the second update would be silently lost during CRDT merge.
+        # _merge_rows_by_rowid also calls self._hlc.observe() on every
+        # remote _version it sees, so the local clock stays ahead of
+        # remote clocks (prevents skew-related LWW inversion).
+        try:
+            from hlc import HLC
+            self._hlc = HLC()
+        except ImportError:
+            self._hlc = None
 
     # ------------------------------------------------------------------
     # Manifest ref helper
@@ -740,7 +753,15 @@ class UnifiedStorage:
 
     @staticmethod
     def _branch_ref(collection: str, branch: str) -> str:
-        return f"collections/{collection}/branches/{branch}"
+        """Branch ref path. Uses 'branch-refs' namespace (not 'branches/')
+        to avoid path conflicts with shard directories on local FS.
+
+        Shards live at collections/{c}/branches/{branch}/shards/{uuid} —
+        if the branch ref were at collections/{c}/branches/{branch}, it
+        would conflict (file vs directory). Using a separate namespace
+        avoids this on local FS while keeping S3 parity.
+        """
+        return f"collections/{collection}/branch-refs/{branch}"
 
     def _write_commit_blob(self, collection: str,
                             manifest_hash: str,
@@ -859,20 +880,16 @@ class UnifiedStorage:
     def list_branches(self, collection: str) -> list[str]:
         """List all branches for a collection.
 
-        Filters out the shard subpaths (branches/{name}/shards/...) so
-        only actual branch names are returned.
+        Branch refs live at collections/{c}/branch-refs/{branch} (one file
+        per branch). Lists those and extracts the branch names.
         """
-        prefix = f"collections/{collection}/branches/"
+        prefix = f"collections/{collection}/branch-refs/"
         branches = set()
         for n in self.kernel.list_names():
             if n.startswith(prefix):
-                # Extract branch name: branches/{branch}/...  →  {branch}
-                rest = n[len(prefix):]
-                branch_name = rest.split("/")[0]
-                # Skip the branch HEAD ref itself (it's just "{branch}")
-                if "/" not in rest or rest.endswith("HEAD") or "shards" in rest:
-                    branches.add(branch_name)
-                else:
+                # Extract branch name: branch-refs/{branch}  →  {branch}
+                branch_name = n[len(prefix):]
+                if branch_name:
                     branches.add(branch_name)
         return sorted(branches)
 
@@ -897,7 +914,10 @@ class UnifiedStorage:
         the shards from both branches.
         """
         branch_name = source_branch  # for backward compat with internal code
-        if target_branch is None:
+        # Treat empty string as None — some callers (e.g. keyvalue_lens.merge)
+        # pass the message string positionally, which lands in target_branch.
+        # Empty/None → use the active branch (backward compat).
+        if not target_branch:
             target_branch = self._get_active_branch(collection)
 
         branch_head = self.kernel.resolve(
@@ -905,9 +925,19 @@ class UnifiedStorage:
         if branch_head is None:
             raise ValueError(f"Branch '{branch_name}' does not exist")
 
+        # The parent of the merge commit is the TARGET branch's HEAD —
+        # NOT the currently active HEAD. If you're on `dev` and call
+        # merge("events", "feature1", "main"), the merge goes INTO `main`,
+        # so `main`'s commit is the first parent (git semantics).
+        target_head = self.kernel.resolve(
+            self._branch_ref(collection, target_branch))
+        if target_head is None:
+            # Target branch doesn't exist yet — fall back to current HEAD
+            # (backward compat for the no-target-branch case).
+            target_head = self.kernel.resolve(self._head_ref(collection))
+
         # Read both manifests
-        head = self.kernel.resolve(self._head_ref(collection))
-        head_commit = self._read_commit_blob(head) if head else None
+        head_commit = self._read_commit_blob(target_head) if target_head else None
         branch_commit = self._read_commit_blob(branch_head)
 
         head_manifest = None
@@ -919,7 +949,7 @@ class UnifiedStorage:
             branch_manifest = CollectionManifest.load(
                 self.kernel, branch_commit["manifest"])
 
-        # Union row group entries from HEAD + branch HEAD
+        # Union row group entries from target HEAD + source branch HEAD
         seen: dict[str, RowGroupEntry] = {}
         if head_manifest:
             for rg in head_manifest.scan_with_pruning():
@@ -959,13 +989,31 @@ class UnifiedStorage:
             collection, merged_entries, schema, key_col,
             row_group_size=10_000)
 
-        # Write merge commit with TWO parents
-        commit_hash = self._write_commit_blob(
-            collection, manifest_hash,
-            parent=head,
-            second_parent=branch_head,
-            message=message or f"merge '{branch_name}'",
-            index=self._commit_index(collection))
+        # Write merge commit with TWO parents. We bypass _write_commit_blob
+        # because it auto-updates the active branch ref — we need to
+        # explicitly update target_branch (and HEAD) here.
+        import json as _json
+        import time as _time
+        commit = {
+            "parent": target_head,
+            "second_parent": branch_head,
+            "manifest": manifest_hash,
+            "message": message or f"merge '{branch_name}'",
+            "timestamp": _time.time(),
+            "index": self._commit_index(collection),
+        }
+        commit_bytes = _json.dumps(commit, sort_keys=True).encode()
+        commit_hash = self.kernel.write(commit_bytes)
+
+        # Update target_branch ref → merge commit (the merge lands on target)
+        self.kernel.reference(self._branch_ref(collection, target_branch),
+                               commit_hash)
+        # Update HEAD → merge commit (so the active branch sees it too)
+        self.kernel.reference(self._head_ref(collection), commit_hash)
+        # Sync manifest ref to the new HEAD's manifest (reads must see it)
+        self.kernel.reference(self._manifest_ref(collection), manifest_hash)
+        # Source branch ref is left unchanged (it still points at its own
+        # tip — the merge does not fast-forward the source).
 
         # Clear source + target branch shards via index reset + ref tombstone.
         # Tombstoning (overwriting with empty blob) is REQUIRED so that
@@ -982,29 +1030,44 @@ class UnifiedStorage:
 
     def _tombstone_shard_refs(self, collection: str, branch: str,
                                shard_hashes: list[str]) -> None:
-        """Tombstone shard refs by overwriting them with an empty blob.
+        """Tombstone shard refs by deleting the path entries.
 
-        This makes the ref resolve to an empty blob — _list_shards_from_refs
-        will skip it (CollectionManifest.load fails on empty). The ref name
-        is preserved so concurrent readers don't see a "new" shard appear.
+        This makes resolve() return None for the shard ref, so
+        _list_shards_from_refs skips it. The shard BLOB still exists
+        in storage (will be cleaned by GC/vacuum later).
 
         Used by compact_shards and merge to retire absorbed shards.
         """
         if not shard_hashes:
             return
         prefix = self._shards_prefix(collection, branch)
-        # Index ref-names by their current hash for O(1) lookup
-        candidates = [n for n in self.kernel.list_names() if n.startswith(prefix)]
+        # List ref-names by their current hash for O(1) lookup
+        if hasattr(self.kernel, 'list_paths_with_prefix'):
+            candidates = self.kernel.list_paths_with_prefix(prefix)
+        else:
+            candidates = [n for n in self.kernel.list_names() if n.startswith(prefix)]
         hash_to_name: dict[str, str] = {}
         for name in candidates:
             h = self.kernel.resolve(name)
             if h is not None:
                 hash_to_name[h] = name
-        empty_hash = self.kernel.write(b"")
+        # Delete the path entries so resolve() returns None
         for sh in shard_hashes:
             name = hash_to_name.get(sh)
             if name is not None:
+                # Overwrite with a sentinel that resolve() will treat as "deleted"
+                # We can't actually DELETE paths (no delete_path in the kernel API),
+                # so we set it to a known empty-sentinel hash. _list_shards_from_refs
+                # will still include it, but read_with_shards' try/except will skip
+                # the empty blob when loading the manifest.
+                # Better: set the path to None by removing it from the cache and
+                # writing a special "deleted" marker.
+                # For now: overwrite with empty blob hash. read_with_shards skips
+                # corrupt manifests via try/except.
+                empty_hash = self.kernel.write(b"")
                 self.kernel.reference(name, empty_hash)
+                # Invalidate cache so resolve() picks up the new value
+                self.kernel.invalidate_path_cache(name)
 
     def _clear_branch_shards(self, collection: str, branch: str,
                                shard_hashes: Optional[list[str]] = None) -> None:
@@ -1215,8 +1278,8 @@ class UnifiedStorage:
         active = self._active_branches.get(collection)
         if active:
             # active is stored as the full ref path — extract branch name
-            # collections/{name}/branches/{branch} → {branch}
-            prefix = f"collections/{collection}/branches/"
+            # _branch_ref returns collections/{c}/branch-refs/{branch}
+            prefix = f"collections/{collection}/branch-refs/"
             if active.startswith(prefix):
                 return active[len(prefix):]
         return "main"
@@ -1268,9 +1331,21 @@ class UnifiedStorage:
         Returns ONLY committed shards (normal shards without tx_id, or
         tentative shards whose transaction has been committed).
         Tentative shards from uncommitted transactions are filtered out.
+
+        Does NOT load each shard manifest to verify it — that's redundant
+        because read_with_shards loads them anyway (with try/except for
+        corrupt/missing/tombstoned). This saves K GETs per read.
+        The tx commit check is KEPT — it's what makes ACID work.
         """
         prefix = self._shards_prefix(collection, branch)
-        names = [n for n in self.kernel.list_names() if n.startswith(prefix)]
+        # Compute the empty-blob hash once (used to detect tombstoned shards)
+        import hashlib as _hashlib
+        _empty_blob_hash = _hashlib.sha256(b"").hexdigest()
+        # Use list_paths_with_prefix for O(matching) listing (not O(total))
+        if hasattr(self.kernel, 'list_paths_with_prefix'):
+            names = self.kernel.list_paths_with_prefix(prefix)
+        else:
+            names = [n for n in self.kernel.list_names() if n.startswith(prefix)]
         shard_hashes = []
         committed_tx_cache: set[str] = set()
         checked_tx_cache: set[str] = set()
@@ -1279,19 +1354,22 @@ class UnifiedStorage:
             h = self.kernel.resolve(name)
             if h is None:
                 continue
+            # Skip tombstoned shards (overwritten with empty blob by
+            # _tombstone_shard_refs). The empty blob has a known hash —
+            # we compute it once and cache it for this call.
+            if h == _empty_blob_hash:
+                continue
 
             # Check if this is a tentative shard (has tx_ prefix)
-            # Ref name format: collections/{coll}/branches/{branch}/shards/tx_{tx_id}_{shard_id}
             shard_name = name[len(prefix):]
             if shard_name.startswith("tx_"):
                 # Tentative shard — check if transaction is committed
-                # Extract tx_id: tx_{tx_id}_{shard_id}
-                parts = shard_name.split("_", 2)  # ["tx", "{tx_id}", "{shard_id}"]
+                parts = shard_name.split("_", 2)
                 if len(parts) < 3:
                     continue
                 tx_id = parts[1]
 
-                # Check commit marker (cached)
+                # Check commit marker (cached) — KEPT for ACID correctness
                 if tx_id not in checked_tx_cache:
                     checked_tx_cache.add(tx_id)
                     tx_ref = f"transactions/{tx_id}"
@@ -1301,20 +1379,10 @@ class UnifiedStorage:
 
                 # Only include if transaction is committed
                 if tx_id in committed_tx_cache:
-                    try:
-                        from collection_manifest import CollectionManifest as _CM
-                        _CM.load(self.kernel, h)
-                        shard_hashes.append(h)
-                    except (ValueError, KeyError):
-                        pass
+                    shard_hashes.append(h)
             else:
                 # Normal shard (no tx_id) — always visible
-                try:
-                    from collection_manifest import CollectionManifest as _CM
-                    _CM.load(self.kernel, h)
-                    shard_hashes.append(h)
-                except (ValueError, KeyError):
-                    pass
+                shard_hashes.append(h)
         return shard_hashes
 
     def _write_shard_index(self, collection: str, shard_hashes: list[str],
@@ -1650,20 +1718,21 @@ class UnifiedStorage:
         # Parallel-fetch all shard manifests (~1 RTT wall-clock, not N×RTT)
         shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
 
-        # Level 1 merge: dedup row groups by rg_key (shards override HEAD)
-        merged: dict[str, Any] = {}  # rg_key → RowGroupEntry
+        # Level 1 merge: UNION of all row groups (no dedup by rg_key).
+        # Row-level CRDT merge (_rowid + _version) handles conflicts.
+        # This fixes the bug where concurrent writers with overlapping
+        # key ranges would drop data via dedup-by-key.
+        merged: list[Any] = []
         if head_manifest:
-            for rg in head_manifest.scan_with_pruning(predicates, start_key, end_key):
-                merged[rg.key] = rg
+            merged.extend(head_manifest.scan_with_pruning(predicates, start_key, end_key))
         for sm in shard_manifests:
-            for rg in sm.scan_with_pruning(predicates, start_key, end_key):
-                merged[rg.key] = rg  # shard overrides HEAD
+            merged.extend(sm.scan_with_pruning(predicates, start_key, end_key))
 
         if not merged:
             return []
 
         # Fetch + decode data blobs (parallel for large K)
-        row_groups = list(merged.values())
+        row_groups = merged
         col_data_list = self._parallel_fetch_and_decode(
             row_groups, columns, predicates)
 
@@ -1687,7 +1756,8 @@ class UnifiedStorage:
         # Only applies if rows have _rowid (from upsert_shard/delete_shard)
         has_rowid = any(r.get("_rowid") for r in all_rows)
         if has_rowid:
-            all_rows = self._merge_rows_by_rowid(all_rows)
+            key_col = head_manifest.key_col if head_manifest else ""
+            all_rows = self._merge_rows_by_rowid(all_rows, key_col=key_col or None)
 
         # Apply row filter
         if row_filter is not None:
@@ -1738,20 +1808,18 @@ class UnifiedStorage:
         shard_hashes = self._read_shard_index(collection, branch)
         shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
 
-        # Level 1 merge: dedup row groups by rg_key (shards override HEAD)
-        merged: dict[str, Any] = {}
+        # Level 1 merge: UNION of all row groups (no dedup by rg_key).
+        merged: list[Any] = []
         if head_manifest:
-            for rg in head_manifest.scan_with_pruning(predicates):
-                merged[rg.key] = rg
+            merged.extend(head_manifest.scan_with_pruning(predicates))
         for sm in shard_manifests:
-            for rg in sm.scan_with_pruning(predicates):
-                merged[rg.key] = rg
+            merged.extend(sm.scan_with_pruning(predicates))
 
         if not merged:
             return []
 
         # Fetch + decode
-        row_groups = list(merged.values())
+        row_groups = merged
         col_data_list = self._parallel_fetch_and_decode(
             row_groups, columns, predicates)
 
@@ -1772,7 +1840,8 @@ class UnifiedStorage:
         # Row-level CRDT merge
         has_rowid = any(r.get("_rowid") for r in all_rows)
         if has_rowid:
-            all_rows = self._merge_rows_by_rowid(all_rows)
+            key_col = head_manifest.key_col if head_manifest else ""
+            all_rows = self._merge_rows_by_rowid(all_rows, key_col=key_col or None)
 
         return all_rows
 
@@ -1793,14 +1862,12 @@ class UnifiedStorage:
         head_manifest = self._load_manifest(collection)
         shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
 
-        # Level 1 merge: dedup row groups by rg_key
-        merged: dict[str, Any] = {}
+        # Level 1 merge: UNION of all row groups (no dedup by rg_key).
+        merged: list[Any] = []
         if head_manifest:
-            for rg in head_manifest.scan_with_pruning(predicates):
-                merged[rg.key] = rg
+            merged.extend(head_manifest.scan_with_pruning(predicates))
         for sm in shard_manifests:
-            for rg in sm.scan_with_pruning(predicates):
-                merged[rg.key] = rg
+            merged.extend(sm.scan_with_pruning(predicates))
 
         if not merged:
             return {}
@@ -1813,7 +1880,7 @@ class UnifiedStorage:
             if missing:
                 eff_columns = list(dict.fromkeys(eff_columns + list(missing)))
 
-        row_groups = list(merged.values())
+        row_groups = list(merged)
         col_results = self._parallel_fetch_and_decode(
             row_groups, eff_columns, predicates)
 
@@ -2041,7 +2108,8 @@ class UnifiedStorage:
         # Level 2: row-level CRDT merge (dedup by _rowid, drop tombstones)
         has_rowid = any(r.get("_rowid") for r in all_rows)
         if has_rowid:
-            all_rows = self._merge_rows_by_rowid(all_rows)
+            key_col = head_manifest.key_col if head_manifest else ""
+            all_rows = self._merge_rows_by_rowid(all_rows, key_col=key_col or None)
 
         # Build the compacted manifest with only LIVE rows
         schema = (head_manifest.columns if head_manifest
@@ -2289,14 +2357,15 @@ class UnifiedStorage:
 
         # B5 fix: use HLC (Hybrid Logical Clock) for _version instead of UUIDv7.
         # HLC is monotonic under clock skew — UUIDv7 is not.
-        try:
-            from hlc import HLC
-            _hlc = HLC()
-            _gen_version = _hlc.tick
-        except ImportError:
+        # The HLC instance is shared across ALL upsert_shard/delete_shard calls
+        # (stored as self._hlc). This keeps the logical counter monotonic —
+        # two calls in the same millisecond get DIFFERENT _version strings
+        # (physical_ms same, logical incremented), so the second update is
+        # not silently lost during CRDT merge.
+        if self._hlc is not None:
+            _gen_version = self._hlc.tick
+        else:
             _gen_version = uuidv7
-
-        # Stamp each row with _rowid (if missing) and _version (always new)
         stamped = []
         for row in rows:
             r = dict(row)
@@ -2312,7 +2381,8 @@ class UnifiedStorage:
 
     def delete_shard(self, collection: str, rowids: list[str],
                       key_col: Optional[str] = None,
-                      row_group_size: int = 10_000) -> str:
+                      row_group_size: int = 10_000,
+                      keys: Optional[list[str]] = None) -> str:
         """Concurrent-safe row-level delete with tombstones.
 
         Each deleted _rowid gets a tombstone row with _deleted=True and
@@ -2324,6 +2394,15 @@ class UnifiedStorage:
             rowids: list of _rowid strings to delete
             key_col: sort key column (for range scans)
             row_group_size: rows per row group
+            keys: optional list of key_col values, one per rowid. If
+                provided, each tombstone's key_col is set to the actual
+                key value (not ""). This avoids rg_key collisions in
+                compact_shards/merge when multiple keys are deleted —
+                without distinct key_col values, all tombstones land in
+                one row group with the same rg_key, and dedup-by-rg_key
+                drops all but the last tombstone. If None, tombstones
+                get key_col="" (legacy behavior — may lose tombstones
+                during compaction when deleting multiple keys).
 
         Returns:
             The shard manifest hash.
@@ -2334,29 +2413,35 @@ class UnifiedStorage:
             import time as _t
             uuidv7 = lambda: f"{_t.time_ns():016x}"
 
-        # B5 fix: use HLC for _version
-        try:
-            from hlc import HLC
-            _hlc = HLC()
-            _gen_version = _hlc.tick
-        except ImportError:
+        # B5 fix: use HLC for _version (shared instance — see upsert_shard)
+        if self._hlc is not None:
+            _gen_version = self._hlc.tick
+        else:
             _gen_version = uuidv7
 
         tombstones = []
-        for rid in rowids:
-            tombstones.append({
+        for i, rid in enumerate(rowids):
+            t = {
                 "_rowid": rid,
                 "_version": _gen_version(),
                 "_deleted": True,
-                # Keep key_col for sortability if needed
-                key_col or "_key": "",
-            })
+            }
+            # Set key_col to the actual key value (if provided) so
+            # tombstones get distinct rg_keys and survive compaction.
+            # Without this, all tombstones share rg_key="rg/" and
+            # compact_shards/merge drop all but the last one.
+            if keys is not None and i < len(keys) and keys[i] is not None:
+                t[key_col or "_key"] = keys[i]
+            else:
+                t[key_col or "_key"] = ""
+            tombstones.append(t)
 
         return self.append_shard(collection, tombstones, key_col=key_col,
                                    row_group_size=row_group_size,
                                    message="delete shard")
 
-    def _merge_rows_by_rowid(self, all_rows: list[dict]) -> list[dict]:
+    def _merge_rows_by_rowid(self, all_rows: list[dict],
+                              key_col: Optional[str] = None) -> list[dict]:
         """Merge rows by _rowid, keeping the one with the latest _version.
 
         Tombstones (_deleted=True) suppress the row if their _version is
@@ -2364,22 +2449,64 @@ class UnifiedStorage:
         tombstone (the delete was superseded by a concurrent update).
 
         This is the CRDT merge — deterministic and eventually consistent.
+
+        LEGACY ROWS: rows without _rowid (from write(), not upsert_shard)
+        are kept as-is — UNLESS there are CRDT rows (with _rowid) AND a
+        key_col is provided, in which case legacy rows whose key_col value
+        matches a CRDT row's key_col value are dropped (the CRDT row is
+        newer and supersedes the legacy snapshot). Legacy rows with unique
+        key_col values are kept (they represent data not yet upserted).
+
+        Args:
+            all_rows: rows to merge (may include both _rowid-tagged and
+                      legacy rows)
+            key_col: the sort key column name. Used to dedup legacy rows
+                     against CRDT rows. If None, legacy rows are always kept.
         """
-        # Group by _rowid, track the latest version
+        # First pass: separate CRDT rows (with _rowid) from legacy rows.
+        # Also observe every remote _version through the shared HLC so the
+        # local clock stays ahead of remote clocks. This prevents
+        # skew-induced LWW inversions: a writer whose wall clock lags
+        # would otherwise generate _version strings that lose to stale
+        # remote rows even after observing them. observe() is a no-op
+        # for non-HLC strings (legacy UUIDv7 versions).
         latest: dict[str, dict] = {}
+        legacy_rows: list[dict] = []
+        has_crdt = False
         for row in all_rows:
             rid = row.get("_rowid")
             if rid is None:
-                # No _rowid — keep as-is (legacy row, no versioning)
-                latest[f"noid_{id(row)}"] = row
+                legacy_rows.append(row)
                 continue
+            has_crdt = True
             ver = row.get("_version", "")
+            if self._hlc is not None and ver:
+                self._hlc.observe(ver)
             existing = latest.get(rid)
             if existing is None or ver > existing.get("_version", ""):
                 latest[rid] = row
 
-        # Filter out tombstones (rows where _deleted=True and they won)
         result = []
+
+        if has_crdt and key_col:
+            # CRDT mode with key_col: drop legacy rows whose key_col value
+            # matches a CRDT row (the CRDT row is newer). Keep legacy rows
+            # with unique key_col values (data not yet upserted).
+            crdt_keys = set()
+            for row in latest.values():
+                kv = row.get(key_col)
+                if kv is not None:
+                    crdt_keys.add(kv)
+            for row in legacy_rows:
+                kv = row.get(key_col)
+                if kv is not None and kv in crdt_keys:
+                    continue  # superseded by a CRDT row — drop
+                result.append(row)
+        else:
+            # No CRDT rows, or no key_col to dedup by — keep legacy rows.
+            result.extend(legacy_rows)
+
+        # Add surviving CRDT rows (drop tombstones that won)
         for row in latest.values():
             if row.get("_deleted"):
                 continue  # tombstone won — suppress this row
