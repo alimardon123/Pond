@@ -215,58 +215,6 @@ class PondConfig:
         with open(path) as f:
             return cls.from_dict(json.load(f))
 
-    @classmethod
-    def load_for_kernel(cls, base_dir: str) -> "PondConfig":
-        """Load config for a kernel with the given base_dir.
-
-        Looks for .pond/config in the base_dir. Returns defaults if not found.
-        """
-        return cls.load(os.path.join(base_dir, ".pond", "config"))
-
-    @classmethod
-    def load_for_collection(cls, base_dir: str,
-                              collection: str) -> "PondConfig":
-        """Load config for a specific collection.
-
-        Per-collection overrides live at:
-          .pond/config/collections/{collection}.json
-
-        Falls back to the global .pond/config, then defaults.
-
-        Args:
-            base_dir: kernel base_dir
-            collection: collection name
-
-        Returns:
-            PondConfig — per-collection override merged over global config.
-        """
-        # Start with global config
-        config = cls.load_for_kernel(base_dir)
-
-        # Override with per-collection config if it exists
-        coll_path = os.path.join(base_dir, ".pond", "config",
-                                  "collections", f"{collection}.json")
-        if os.path.exists(coll_path):
-            with open(coll_path) as f:
-                coll_override = cls.from_dict(json.load(f))
-            # Merge: per-collection values override global
-            if coll_override._pruning_enabled != cls.DEFAULTS["pruning_enabled"]:
-                config._pruning_enabled = coll_override._pruning_enabled
-            if coll_override._pruning_force != cls.DEFAULTS["pruning_force"]:
-                config._pruning_force = coll_override._pruning_force
-            if coll_override._encoding_auto_select != cls.DEFAULTS["encoding_auto_select"]:
-                config._encoding_auto_select = coll_override._encoding_auto_select
-            if coll_override._encoding_default != cls.DEFAULTS["encoding_default"]:
-                config._encoding_default = coll_override._encoding_default
-            if coll_override._chunk_size != cls.DEFAULTS["chunk_size"]:
-                config._chunk_size = coll_override._chunk_size
-            if coll_override._row_group_size != cls.DEFAULTS["row_group_size"]:
-                config._row_group_size = coll_override._row_group_size
-            if coll_override._bitpack_max_bitwidth != cls.DEFAULTS["bitpack_max_bitwidth"]:
-                config._bitpack_max_bitwidth = coll_override._bitpack_max_bitwidth
-
-        return config
-
     def should_prune(self, is_object_store: bool = False) -> bool:
         """Decide whether to enable pruning based on config + storage type.
 
@@ -285,6 +233,112 @@ class PondConfig:
             return False
         # "auto" — enable on object stores, disable on local disk
         return is_object_store
+
+    # ------------------------------------------------------------------
+    # Object-store-aware config storage
+    #
+    # When the kernel is object-store-backed (S3, etc.), config lives as
+    # a blob at the well-known path "_pond/config" (global) and
+    # "_pond/config/collections/{name}" (per-collection). This avoids
+    # any local-FS dependency — config is just another blob.
+    # ------------------------------------------------------------------
+
+    _CONFIG_PATH = "_pond/config"
+    _COLLECTION_CONFIG_PREFIX = "_pond/config/collections/"
+
+    def save_to_kernel(self, kernel) -> None:
+        """Save config to the kernel's object store (no local FS).
+
+        Writes the config as a JSON blob and binds it to the well-known
+        path "_pond/config". Works with any kernel (PondMinimal or
+        ObjectStoreNativeKernel).
+        """
+        data = json.dumps(self.to_dict(), sort_keys=True).encode()
+        h = kernel.write(data)
+        kernel.reference(self._CONFIG_PATH, h)
+
+    @classmethod
+    def load_from_kernel(cls, kernel) -> "PondConfig":
+        """Load config from the kernel's object store.
+
+        Returns defaults if the config path doesn't exist.
+        """
+        try:
+            h = kernel.resolve(cls._CONFIG_PATH)
+            if h is None:
+                return cls()  # defaults
+            data = kernel.read_blob(h)
+            return cls.from_dict(json.loads(data))
+        except (KeyError, ValueError, json.JSONDecodeError):
+            return cls()  # defaults on any error
+
+    @classmethod
+    def load_for_kernel(cls, base_dir) -> "PondConfig":
+        """Load config for a kernel.
+
+        If base_dir is a kernel object (has resolve/read_blob methods),
+        load from the object store. Otherwise, treat base_dir as a local
+        path (backward compat with PondMinimal).
+        """
+        # Object-store-backed kernel: load from blobs
+        if hasattr(base_dir, 'resolve') and hasattr(base_dir, 'read_blob'):
+            return cls.load_from_kernel(base_dir)
+        # Local-disk path (PondMinimal backward compat)
+        return cls.load(os.path.join(str(base_dir), ".pond", "config"))
+
+    @classmethod
+    def load_for_collection(cls, base_dir, collection: str) -> "PondConfig":
+        """Load config for a specific collection.
+
+        Per-collection overrides live at:
+          - Object store: "_pond/config/collections/{collection}"
+          - Local disk: .pond/config/collections/{collection}.json
+
+        Falls back to the global config, then defaults.
+        """
+        # Object-store-backed kernel
+        if hasattr(base_dir, 'resolve') and hasattr(base_dir, 'read_blob'):
+            config = cls.load_from_kernel(base_dir)
+            coll_path = f"{cls._COLLECTION_CONFIG_PREFIX}{collection}"
+            try:
+                h = base_dir.resolve(coll_path)
+                if h is not None:
+                    data = base_dir.read_blob(h)
+                    coll_override = cls.from_dict(json.loads(data))
+                    return cls._merge_collection(config, coll_override)
+            except (KeyError, ValueError, json.JSONDecodeError):
+                pass
+            return config
+
+        # Local-disk path (PondMinimal backward compat)
+        config = cls.load_for_kernel(base_dir)
+        coll_path = os.path.join(str(base_dir), ".pond", "config",
+                                  "collections", f"{collection}.json")
+        if os.path.exists(coll_path):
+            with open(coll_path) as f:
+                coll_override = cls.from_dict(json.load(f))
+            return cls._merge_collection(config, coll_override)
+        return config
+
+    @classmethod
+    def _merge_collection(cls, config: "PondConfig",
+                            coll_override: "PondConfig") -> "PondConfig":
+        """Merge per-collection overrides into the global config."""
+        if coll_override._pruning_enabled != cls.DEFAULTS["pruning_enabled"]:
+            config._pruning_enabled = coll_override._pruning_enabled
+        if coll_override._pruning_force != cls.DEFAULTS["pruning_force"]:
+            config._pruning_force = coll_override._pruning_force
+        if coll_override._encoding_auto_select != cls.DEFAULTS["encoding_auto_select"]:
+            config._encoding_auto_select = coll_override._encoding_auto_select
+        if coll_override._encoding_default != cls.DEFAULTS["encoding_default"]:
+            config._encoding_default = coll_override._encoding_default
+        if coll_override._chunk_size != cls.DEFAULTS["chunk_size"]:
+            config._chunk_size = coll_override._chunk_size
+        if coll_override._row_group_size != cls.DEFAULTS["row_group_size"]:
+            config._row_group_size = coll_override._row_group_size
+        if coll_override._bitpack_max_bitwidth != cls.DEFAULTS["bitpack_max_bitwidth"]:
+            config._bitpack_max_bitwidth = coll_override._bitpack_max_bitwidth
+        return config
 
     def get_encoding_hints(self, columns: list[str]) -> dict[str, str]:
         """Get encoding hints for a set of columns.

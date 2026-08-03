@@ -36,8 +36,53 @@ sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 
 from kernel import PondMinimal
+
+# Production path: ObjectStoreNativeKernel + InMemoryObjectStore.
+# This is the SAME code path as S3ObjectStore — the only difference is the
+# store implementation. Tests that run against this kernel validate the
+# actual production architecture (no SQLite, no local disk).
+from object_store_native_kernel import (
+    ObjectStoreNativeKernel, InMemoryObjectStore,
+)
 sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))
 from keyvalue_lens import KeyValueLens
+
+
+# Module-level registry of stores by bench path.
+# This simulates "disk persistence" for the object-store kernel: when a law
+# calls PondMinimal(bench) → kernel.close() → PondMinimal(bench), the second
+# call reopens the SAME store (just like reopening a SQLite file).
+_STORE_REGISTRY: dict[str, InMemoryObjectStore] = {}
+
+
+class ObjectStoreKernelFactory:
+    """Drop-in replacement for PondMinimal that uses ObjectStoreNativeKernel.
+
+    Same constructor signature: PondMinimal(bench) → ObjectStoreKernelFactory(bench).
+    Same restart semantics: a second call with the same bench path reuses the
+    same store (simulating disk persistence).
+
+    This lets the architecture laws run against the production code path
+    (object-store-native) without rewriting every law's setup/teardown.
+    """
+
+    def __new__(cls, bench: str):
+        if bench not in _STORE_REGISTRY:
+            _STORE_REGISTRY[bench] = InMemoryObjectStore()
+        return ObjectStoreNativeKernel(_STORE_REGISTRY[bench])
+
+    @staticmethod
+    def reset(bench: str = None):
+        """Drop a store from the registry (for cleanup)."""
+        if bench is None:
+            _STORE_REGISTRY.clear()
+        else:
+            _STORE_REGISTRY.pop(bench, None)
+
+
+# Override PondMinimal so existing laws use the production kernel.
+# PondMinimal is still available via `from kernel import PondMinimal` if needed.
+PondMinimal = ObjectStoreKernelFactory
 
 
 # These architecture laws use the UNIFIED manifest-based architecture.

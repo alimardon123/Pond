@@ -329,6 +329,10 @@ class ObjectStoreNativeKernel:
         # before each measurement.
         self._root_ref_cache: Optional[dict[str, str]] = None
         self._root_ref_hash: Optional[str] = None
+        # Track ALL root ref hashes (current + historical) so storage_stats
+        # can exclude them from the data blob count. Each reference() call
+        # creates a new root ref blob; these are metadata, not data.
+        self._root_ref_hashes: set[str] = set()
 
         self.stats = {
             "writes": 0,
@@ -409,6 +413,7 @@ class ObjectStoreNativeKernel:
         # Update the cache
         self._root_ref_cache = root_ref
         self._root_ref_hash = new_root_hash
+        self._root_ref_hashes.add(new_root_hash)
         self.stats["references"] += 1
 
     def resolve(self, name: str) -> Optional[str]:
@@ -530,6 +535,7 @@ class ObjectStoreNativeKernel:
         root_ref = json.loads(root_bytes)
         self._root_ref_cache = root_ref
         self._root_ref_hash = root_hash
+        self._root_ref_hashes.add(root_hash)
         return root_ref
 
     def invalidate_root_cache(self) -> None:
@@ -559,8 +565,58 @@ class ObjectStoreNativeKernel:
 
     @property
     def base_dir(self) -> str:
-        """Compat with CollectionMetadata's _detect_object_store check."""
+        """Compat with CollectionMetadata's _detect_object_store check.
+
+        Returns a string identifying the storage backend. For S3-backed
+        stores, this is "s3://{bucket}/{prefix}". For in-memory, it's
+        "object-store://in-memory". This is used by PondConfig to detect
+        whether to use object-store-mode (config stored as blobs) or
+        local-disk-mode (config stored at .pond/config).
+        """
+        # If the store has a bucket/prefix (S3ObjectStore), return the S3 URL
+        if hasattr(self.store, '_bucket'):
+            bucket = self.store._bucket
+            prefix = getattr(self.store, '_prefix', '')
+            if prefix:
+                return f"s3://{bucket}/{prefix}"
+            return f"s3://{bucket}"
         return "object-store://in-memory"
+
+    def close(self) -> None:
+        """No-op for API compat with PondMinimal.
+
+        ObjectStoreNativeKernel holds no resources that need closing —
+        all state lives in the store object, which is managed externally.
+        """
+        pass
+
+    def storage_stats(self) -> dict:
+        """Storage statistics (compat with PondMinimal.storage_stats).
+
+        Counts DATA blobs (content-addressed via put_blob), not root ref
+        blobs (which are metadata created on every reference() update).
+        This matches PondMinimal's semantics where reference updates go
+        to SQLite (not counted as blobs).
+        """
+        all_blobs = set(self.store.list_all_blob_hashes())
+        # Exclude all root ref blobs (current + historical). Each reference()
+        # call creates a new root ref blob; these are metadata, not data.
+        # The set of root ref hashes is tracked in _root_ref_hashes.
+        root_ref_hashes = getattr(self, '_root_ref_hashes', set())
+        if not root_ref_hashes and self._root_ref_hash is not None:
+            root_ref_hashes = {self._root_ref_hash}
+        data_blob_hashes = all_blobs - root_ref_hashes
+        data_bytes = 0
+        if hasattr(self.store, '_blobs'):
+            for h in data_blob_hashes:
+                if h in self.store._blobs:
+                    data_bytes += len(self.store._blobs[h])
+        return {
+            **self.stats,
+            "data_bytes": data_bytes,
+            "blob_count": len(data_blob_hashes),
+            "name_count": len(self.list_names()),
+        }
 
     def print_stats(self, label: str = "") -> None:
         """Print honest I/O stats — no caching hidden."""
@@ -572,7 +628,7 @@ class ObjectStoreNativeKernel:
         print(f"    Ref PUTs:          {self.stats['ref_writes']:,}  (new root ref + root pointer)")
         print(f"    Total GETs:        {self.stats['reads'] + self.stats['ref_reads']:,}")
         print(f"    Total PUTs:        {self.stats['writes'] + self.stats['ref_writes']:,}")
-        if self.store._latency_ms > 0:
+        if hasattr(self.store, '_latency_ms') and self.store._latency_ms > 0:
             total_rtts = self.stats['reads'] + self.stats['ref_reads']
             total_latency = total_rtts * self.store._latency_ms
             print(f"    Simulated RTT:     {total_latency:.0f}ms "

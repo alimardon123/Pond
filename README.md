@@ -104,11 +104,23 @@ Kernel (FROZEN — 3 primitives)
 
 ## Quick Start
 
-```python
-from pond_core.kernel import PondMinimal
-from pond_sdk.pond_storage import PondStorage
+### Production: S3-backed (no SQLite, no local disk)
 
-storage = PondStorage(PondMinimal("/path/to/.pond"))
+```python
+import sys, os
+sys.path.insert(0, "pond-core")
+sys.path.insert(0, "pond-sdk")
+sys.path.insert(0, "pond-sdk/extensions/physical_structures")
+
+from s3_object_store import S3ObjectStore
+from object_store_native_kernel import ObjectStoreNativeKernel
+from pond_storage import PondStorage
+import boto3
+
+client = boto3.client("s3", region_name="us-east-1")
+store = S3ObjectStore(client, bucket="my-pond", prefix="prod")
+kernel = ObjectStoreNativeKernel(store)
+storage = PondStorage(kernel)
 
 # Write any workload — same API
 storage.write("users", [{"id": 1, "name": "alice"}], key_col="id")
@@ -121,7 +133,7 @@ row = storage.point_lookup("users", key="1")
 storage.branch("users", "dev")
 storage.checkout("users", "dev")
 storage.append("users", [{"id": 2, "name": "bob"}], key_col="id")
-storage.merge("users", "dev", "main")
+storage.merge("users", "dev")
 
 # Concurrent multi-writer — CRDT, no CAS
 storage.append_shard("events", [{"id": 1, "event": "click"}], key_col="id")
@@ -131,6 +143,36 @@ rows = storage.read_with_shards("events")
 storage.vacuum(preserve_days=7)
 storage.optimize()
 ```
+
+### Local development: in-memory (for tests/benchmarks)
+
+```python
+sys.path.insert(0, "pond-core")
+sys.path.insert(0, "pond-sdk")
+sys.path.insert(0, "pond-sdk/extensions/physical_structures")
+
+from object_store_native_kernel import make_object_store_native_kernel
+from pond_storage import PondStorage
+
+kernel, _ = make_object_store_native_kernel()  # in-memory mock
+storage = PondStorage(kernel)
+# ... same API as above
+```
+
+### Legacy: local disk + SQLite (PondMinimal — for backward compat)
+
+```python
+sys.path.insert(0, "pond-core")
+sys.path.insert(0, "pond-sdk")
+from kernel import PondMinimal
+from pond_storage import PondStorage
+
+storage = PondStorage(PondMinimal("/path/to/.pond"))
+# ... same API as above
+```
+
+> **Note**: `PondMinimal` uses SQLite + local filesystem. For production
+> object-store deployments, use `S3ObjectStore` + `ObjectStoreNativeKernel`.
 
 ---
 
