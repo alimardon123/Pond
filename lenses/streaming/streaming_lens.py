@@ -302,22 +302,30 @@ class StreamingLens(PondLens):
 
         Each row is one segment — sum n_rows from all row groups in the
         HEAD manifest + every shard manifest.
+
+        Handles BOTH inline (PND2) and manifest (PMAN) shards via
+        UnifiedStorage._load_shard_manifest (which checks the blob's
+        magic bytes and builds a pseudo-manifest for inline shards).
         """
         self._require_unified()
+        us = self._unified_storage
         # Count rows (segments) across HEAD + all shards
-        manifest = self._unified_storage._load_manifest(collection)
+        manifest = us._load_manifest(collection)
         if manifest is None:
             return 0
         total = sum(rg.n_rows for rg in manifest.scan_with_pruning())
-        # Also count shards
-        shard_hashes = self._unified_storage._read_shard_index(collection)
-        for sh in shard_hashes:
-            try:
-                from collection_manifest import CollectionManifest
-                sm = CollectionManifest.load(self.kernel, sh)
+        # Also count shards — use _parallel_fetch_shard_manifests which
+        # handles BOTH inline PND2 shards (single row group, no PMAN) and
+        # traditional PMAN manifest shards. The schema/key_col from HEAD
+        # are needed to build pseudo-manifests for inline shards.
+        shard_hashes = us._read_shard_index(collection)
+        if shard_hashes:
+            shard_manifests = us._parallel_fetch_shard_manifests(
+                shard_hashes,
+                schema_columns=manifest.columns,
+                key_col=manifest.key_col)
+            for sm in shard_manifests:
                 total += sum(rg.n_rows for rg in sm.scan_with_pruning())
-            except (ValueError, KeyError):
-                pass
         return total
 
     # ==================================================================

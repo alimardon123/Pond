@@ -484,21 +484,26 @@ class PND2:
         return result
 
     @staticmethod
-    def peek_stats(data: bytes) -> Optional[dict[str, tuple[Any, Any, int]]]:
-        """Peek at the stats in a PND2 blob header without decoding payloads.
+    def peek_header(data: bytes) -> Optional[tuple[int, list[tuple[str, int, int]], dict[str, tuple[Any, Any, int]]]]:
+        """Peek at a PND2 blob's header — schema + stats, NO payload decode.
 
-        Useful for third-level pruning: fetch the blob, peek at stats,
-        decide whether to decode. Returns None if not a PND2 blob or
-        no stats.
+        This is the INLINE-SHARD reader: when a shard ref points directly
+        to a PND2 blob (single-row-group shard, no PMAN manifest), the
+        reader uses this method to build a pseudo RowGroupEntry from the
+        header stats without decoding the column payloads.
+
+        Returns:
+            Tuple of (n_rows, schema, stats) where:
+              - n_rows: int (rows in this blob)
+              - schema: list of (name, value_type, encoding) tuples
+              - stats: dict[name → (min, max, null_count)]
+            Returns None if not a valid PND2 blob.
         """
         if data[:4] != _PND2_MAGIC:
             return None
         version, flags = struct.unpack("<BB", data[4:6])
         if version != _PND2_VERSION:
             return None
-        if not (flags & _FLAG_HAS_STATS):
-            return None
-
         n_rows, n_columns = struct.unpack("<IH", data[6:12])
         pos = 12
         compression_tag = data[pos]; pos += 1
@@ -526,18 +531,36 @@ class PND2:
             vtype, enc = struct.unpack("<BB", inner[ipos:ipos+2]); ipos += 2
             schema.append((name, vtype, enc))
 
-        # Parse stats
+        # Parse stats (skip if absent — return empty tuple per column)
         stats: dict[str, tuple[Any, Any, int]] = {}
-        for name, vtype, enc in schema:
-            has_min = inner[ipos]; ipos += 1
-            if has_min:
-                mn, ipos = _decode_pnd2_value(vtype, inner, ipos)
-                mx, ipos = _decode_pnd2_value(vtype, inner, ipos)
-            else:
-                mn = mx = None
-            null_count = struct.unpack("<I", inner[ipos:ipos+4])[0]; ipos += 4
-            stats[name] = (mn, mx, null_count)
+        if flags & _FLAG_HAS_STATS:
+            for name, vtype, enc in schema:
+                has_min = inner[ipos]; ipos += 1
+                if has_min:
+                    mn, ipos = _decode_pnd2_value(vtype, inner, ipos)
+                    mx, ipos = _decode_pnd2_value(vtype, inner, ipos)
+                else:
+                    mn = mx = None
+                null_count = struct.unpack("<I", inner[ipos:ipos+4])[0]; ipos += 4
+                stats[name] = (mn, mx, null_count)
+        else:
+            for name, _vt, _enc in schema:
+                stats[name] = (None, None, 0)
 
+        return n_rows, schema, stats
+
+    @staticmethod
+    def peek_stats(data: bytes) -> Optional[dict[str, tuple[Any, Any, int]]]:
+        """Peek at the stats in a PND2 blob header without decoding payloads.
+
+        Useful for third-level pruning: fetch the blob, peek at stats,
+        decide whether to decode. Returns None if not a PND2 blob or
+        no stats.
+        """
+        header = PND2.peek_header(data)
+        if header is None:
+            return None
+        _n_rows, _schema, stats = header
         return stats
 
 
@@ -960,12 +983,19 @@ class UnifiedStorage:
 
         # Also merge shards from BOTH branches (target branch
         # and the source branch being merged)
+        # schema/key_col from the manifests enable inline-shard pseudo-manifests
+        merge_schema = (head_manifest or branch_manifest).columns if \
+            (head_manifest or branch_manifest) else None
+        merge_key_col = (head_manifest or branch_manifest).key_col if \
+            (head_manifest or branch_manifest) else ""
         for shard_manifest in self._parallel_fetch_shard_manifests(
-                self._read_shard_index(collection, target_branch)):
+                self._read_shard_index(collection, target_branch),
+                schema_columns=merge_schema, key_col=merge_key_col):
             for rg in shard_manifest.scan_with_pruning():
                 seen[rg.key] = rg
         for shard_manifest in self._parallel_fetch_shard_manifests(
-                self._read_shard_index(collection, branch_name)):
+                self._read_shard_index(collection, branch_name),
+                schema_columns=merge_schema, key_col=merge_key_col):
             for rg in shard_manifest.scan_with_pruning():
                 seen[rg.key] = rg
 
@@ -1352,12 +1382,153 @@ class UnifiedStorage:
                 shard_hashes.append(h)
         return shard_hashes
 
-    def _parallel_fetch_shard_manifests(self, shard_hashes: list[str]) -> list:
+    def _build_pseudo_manifest_from_pnd2(self, blob_hash: str,
+                                           blob_bytes: bytes,
+                                           schema_columns=None,
+                                           key_col: str = "") -> Optional[CollectionManifest]:
+        """Build a pseudo CollectionManifest from a direct PND2 data blob.
+
+        Used for INLINE SHARDS: when append_shard() writes a single row
+        group, it skips the PMAN shard manifest and points the shard ref
+        directly at the PND2 blob. The reader calls this method to build
+        a manifest-like object with one RowGroupEntry, populated from
+        the PND2 blob's header (schema + stats — NO payload decode).
+
+        Args:
+            blob_hash: the PND2 blob's content hash
+            blob_bytes: the PND2 blob bytes
+            schema_columns: optional schema from the HEAD manifest (used
+                for the pseudo-manifest's schema if provided; otherwise
+                the PND2 blob's own schema is used)
+            key_col: the sort key column name (from HEAD manifest). Used
+                to derive the rg_key from the key column's max stat.
+
+        Returns:
+            A CollectionManifest with one RowGroupEntry, or None if the
+            blob is not a valid PND2 blob.
+        """
+        header = PND2.peek_header(blob_bytes)
+        if header is None:
+            return None
+        n_rows, pnd2_schema, stats = header
+        # pnd2_schema: list[(name, value_type, encoding)]
+        # stats: dict[name, (min, max, null_count)]
+
+        # Derive the rg_key from the key column's max stat
+        rg_key = "rg/"
+        if key_col:
+            key_stats = stats.get(key_col)
+            if key_stats is not None and key_stats[1] is not None:
+                try:
+                    rg_key = _format_rg_key(key_stats[1])
+                except Exception:
+                    rg_key = "rg/"
+        elif n_rows > 0:
+            # No key_col — use row index as the max pk (matches append_shard's
+            # behavior when key_col is None: key_array = list(range(n_rows)))
+            rg_key = _format_rg_key(n_rows - 1)
+
+        # Build the RowGroupEntry with per-column stats from the PND2 header
+        rg = RowGroupEntry(
+            key=rg_key,
+            blob_hash=blob_hash,
+            n_rows=n_rows,
+            storage_mode=STORAGE_WHOLE_BLOB,
+        )
+        for name, vtype, _enc in pnd2_schema:
+            mn, mx, null_count = stats.get(name, (None, None, 0))
+            rg.columns.append(ColumnStatsEntry(
+                name=name, value_type=vtype, min=mn, max=mx,
+                null_count=null_count, chunks=[],
+            ))
+
+        # Build the pseudo-manifest. Use the PND2 blob's actual schema
+        # (it reflects what's really in the blob — including CRDT columns
+        # like _rowid, _version, _deleted that the HEAD manifest's schema
+        # might not have if the collection was created via write()).
+        final_schema = schema_columns
+        if not final_schema:
+            final_schema = [(name, vtype) for name, vtype, _ in pnd2_schema]
+        else:
+            # Merge: ensure CRDT columns from the PND2 schema are present
+            # in the pseudo-manifest's schema (so _manifests_have_rowid
+            # detects them and triggers row-level compaction when needed).
+            existing = {name for name, _ in final_schema}
+            for name, vtype, _ in pnd2_schema:
+                if name not in existing:
+                    final_schema.append((name, vtype))
+
+        manifest = CollectionManifest(self.kernel)
+        manifest.set_schema(
+            columns=final_schema,
+            key_col=key_col or "",
+            row_group_size=max(n_rows, 1),
+            chunk_size=0,
+        )
+        manifest.add_row_group(rg)
+        return manifest
+
+    def _load_shard_manifest(self, shard_hash: str,
+                              schema_columns=None,
+                              key_col: str = "") -> Optional[CollectionManifest]:
+        """Load a shard as a CollectionManifest, handling BOTH formats.
+
+        Shard refs can point to one of two blob types:
+          - b'PMAN' magic: a multi-row-group shard manifest (the classic
+            format). Loaded via CollectionManifest.decode().
+          - b'PND2' magic: an INLINE shard — a direct data blob for a
+            single row group (the new optimized format). Built into a
+            pseudo-manifest via _build_pseudo_manifest_from_pnd2().
+          - empty/missing: a tombstoned shard (skip).
+
+        Args:
+            shard_hash: the blob hash the shard ref points to
+            schema_columns: optional HEAD schema (for pseudo-manifest)
+            key_col: optional HEAD key_col (for pseudo-manifest rg_key)
+
+        Returns:
+            A CollectionManifest, or None for tombstoned/corrupt shards.
+        """
+        if not shard_hash:
+            return None
+        try:
+            blob_bytes = self.kernel.read_blob(shard_hash)
+        except (ValueError, KeyError):
+            return None
+        if not blob_bytes:
+            return None  # tombstoned (empty blob)
+
+        magic = blob_bytes[:4]
+        if magic == b'PND2':
+            # Inline shard — build pseudo-manifest from PND2 header
+            return self._build_pseudo_manifest_from_pnd2(
+                shard_hash, blob_bytes, schema_columns, key_col)
+        elif magic == b'PMAN':
+            # Manifest shard — decode as CollectionManifest
+            try:
+                return CollectionManifest.decode(self.kernel, blob_bytes)
+            except (ValueError, KeyError):
+                return None
+        else:
+            return None  # unknown format
+
+    def _parallel_fetch_shard_manifests(self, shard_hashes: list[str],
+                                          schema_columns=None,
+                                          key_col: str = "") -> list:
         """Fetch all shard manifests in parallel (~1 RTT wall-clock).
 
         Without this, fetching N shard manifests takes N × RTT sequentially.
         With this, N manifests are fetched concurrently — wall-clock is
         ~1 RTT regardless of N (bounded by thread pool size).
+
+        Handles BOTH inline (PND2) and manifest (PMAN) shards via
+        _load_shard_manifest(). The schema_columns and key_col args are
+        used to build pseudo-manifests for inline shards.
+
+        Args:
+            shard_hashes: list of shard blob hashes
+            schema_columns: optional HEAD schema (for inline shards)
+            key_col: optional HEAD key_col (for inline shards)
         """
         if not shard_hashes:
             return []
@@ -1365,20 +1536,18 @@ class UnifiedStorage:
             # Sequential for small N (thread pool overhead > benefit)
             results = []
             for sh in shard_hashes:
-                try:
-                    results.append(CollectionManifest.load(self.kernel, sh))
-                except (ValueError, KeyError):
-                    pass
+                m = self._load_shard_manifest(
+                    sh, schema_columns, key_col)
+                if m is not None:
+                    results.append(m)
             return results
 
         # Parallel for N > 2
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         def fetch_one(sh):
-            try:
-                return CollectionManifest.load(self.kernel, sh)
-            except (ValueError, KeyError):
-                return None
+            return self._load_shard_manifest(
+                sh, schema_columns, key_col)
 
         results = []
         with ThreadPoolExecutor(max_workers=min(32, len(shard_hashes))) as pool:
@@ -1511,33 +1680,47 @@ class UnifiedStorage:
 
         manifest_entries.sort(key=lambda e: e["rg_key"])
 
-        # Build the shard manifest WITHOUT updating the HEAD manifest ref.
-        # The shard is a SEPARATE manifest — it must NOT touch HEAD.
-        # We call CollectionManifest directly instead of _build_manifest_with_return
-        # because _build_manifest_with_return updates the manifest ref.
-        shard_manifest = CollectionManifest(self.kernel)
-        shard_manifest.set_schema(
-            columns=schema_columns,
-            key_col=key_col or "",
-            row_group_size=row_group_size,
-            chunk_size=0,
-        )
-        for entry in manifest_entries:
-            rg = RowGroupEntry(
-                key=entry["rg_key"],
-                blob_hash=entry["blob_hash"],
-                n_rows=entry["n_rows"],
-                storage_mode=STORAGE_WHOLE_BLOB,
+        # INLINE SHARD OPTIMIZATION (single row group):
+        # The PND2 blob is self-describing (header has schema + stats), so
+        # for N==1 we skip the PMAN shard manifest entirely and point the
+        # shard ref DIRECTLY at the PND2 data blob. This saves 1 PUT on
+        # the write path and 1 GET on the read path (no separate manifest
+        # load — the data blob IS the manifest).
+        #
+        # The reader detects this by checking the blob's magic bytes:
+        #   b'PND2' → inline shard → build pseudo RowGroupEntry from header
+        #   b'PMAN' → manifest shard → load via CollectionManifest.decode
+        #
+        # For N>1, we still build a PMAN shard manifest (needed to group
+        # multiple row group entries into one discoverable unit).
+        if len(manifest_entries) == 1:
+            # Inline shard: ref points directly at the PND2 data blob
+            shard_hash = manifest_entries[0]["blob_hash"]
+        else:
+            # Multi-row-group shard: build a PMAN manifest as before
+            shard_manifest = CollectionManifest(self.kernel)
+            shard_manifest.set_schema(
+                columns=schema_columns,
+                key_col=key_col or "",
+                row_group_size=row_group_size,
+                chunk_size=0,
             )
-            for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
-                rg.columns.append(ColumnStatsEntry(
-                    name=col_name, value_type=vtype, min=mn, max=mx,
-                    null_count=null_count, chunks=[],
-                ))
-            shard_manifest.add_row_group(rg)
+            for entry in manifest_entries:
+                rg = RowGroupEntry(
+                    key=entry["rg_key"],
+                    blob_hash=entry["blob_hash"],
+                    n_rows=entry["n_rows"],
+                    storage_mode=STORAGE_WHOLE_BLOB,
+                )
+                for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
+                    rg.columns.append(ColumnStatsEntry(
+                        name=col_name, value_type=vtype, min=mn, max=mx,
+                        null_count=null_count, chunks=[],
+                    ))
+                shard_manifest.add_row_group(rg)
 
-        # Write the shard manifest blob (does NOT update any ref)
-        shard_hash = shard_manifest.commit()
+            # Write the shard manifest blob (does NOT update any ref)
+            shard_hash = shard_manifest.commit()
 
         # Write the shard ref to a unique path (UUIDv7 — time-ordered, unique)
         # This is the KEY: each writer writes to its own path. No conflict.
@@ -1616,7 +1799,12 @@ class UnifiedStorage:
         shard_hashes = self._read_shard_index(collection)
 
         # Parallel-fetch all shard manifests (~1 RTT wall-clock, not N×RTT)
-        shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
+        # Pass HEAD schema + key_col so inline PND2 shards can be built into
+        # pseudo-manifests with the correct rg_key.
+        shard_manifests = self._parallel_fetch_shard_manifests(
+            shard_hashes,
+            schema_columns=(head_manifest.columns if head_manifest else None),
+            key_col=(head_manifest.key_col if head_manifest else ""))
 
         # Level 1 merge: UNION of all row groups (no dedup by rg_key).
         # Row-level CRDT merge (_rowid + _version) handles conflicts.
@@ -1706,7 +1894,10 @@ class UnifiedStorage:
 
         # Read the branch's shards
         shard_hashes = self._read_shard_index(collection, branch)
-        shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
+        shard_manifests = self._parallel_fetch_shard_manifests(
+            shard_hashes,
+            schema_columns=(head_manifest.columns if head_manifest else None),
+            key_col=(head_manifest.key_col if head_manifest else ""))
 
         # Level 1 merge: UNION of all row groups (no dedup by rg_key).
         merged: list[Any] = []
@@ -1760,7 +1951,10 @@ class UnifiedStorage:
             shard_hashes = self._read_shard_index(collection)
 
         head_manifest = self._load_manifest(collection)
-        shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
+        shard_manifests = self._parallel_fetch_shard_manifests(
+            shard_hashes,
+            schema_columns=(head_manifest.columns if head_manifest else None),
+            key_col=(head_manifest.key_col if head_manifest else ""))
 
         # Level 1 merge: UNION of all row groups (no dedup by rg_key).
         merged: list[Any] = []
@@ -1811,7 +2005,8 @@ class UnifiedStorage:
                                 result[col_name].append(val)
         return result
 
-    def compact_shards(self, collection: str) -> Optional[str]:
+    def compact_shards(self, collection: str,
+                        target_row_group_size: int = 100_000) -> Optional[str]:
         """Merge all shards into HEAD, then clear the shards.
 
         This is the ONLY place that needs coordination, and it's idempotent:
@@ -1825,9 +2020,14 @@ class UnifiedStorage:
             without reading any data blobs. O(shard_count) GETs, ZERO data I/O.
             Data blobs are immutable and content-addressed — the new manifest
             simply references them directly from HEAD + shards.
+            (target_row_group_size is a no-op here — manifest-level compaction
+            re-references existing row groups without rewriting them.)
           - Row-level (fallback): when shards have _rowid columns (upserts/
-            deletes), decode all rows, apply CRDT merge by _rowid, re-encode.
-            O(total_rows) data I/O — same as before.
+            deletes), decode all rows, apply CRDT merge by _rowid, re-encode
+            into new row groups of `target_row_group_size` rows each.
+            O(total_rows) data I/O — same as before, but the resulting row
+            groups can be larger (default 100K rows) to reduce read
+            amplification on the next scan.
 
         The fast path makes compaction viable at PB scale: merging 16 shards
         each with 10K row groups costs 16 GETs (shard manifests) + 1 PUT
@@ -1837,6 +2037,14 @@ class UnifiedStorage:
           - HEAD points to a new flat manifest containing all row groups
           - All shards are cleared (their refs are tombstoned)
           - Reads are fast again (1 manifest, no shard list)
+
+        Args:
+            collection: collection name
+            target_row_group_size: row group size for row-level compaction
+                re-encoding (default 100_000). Larger row groups reduce
+                read amplification (fewer blobs per scan) at the cost of
+                coarser pruning. Manifest-level compaction ignores this
+                parameter (it doesn't re-encode).
         """
         head_manifest = self._load_manifest(collection)
         # Read the live shards via ref-listing (the only source of truth
@@ -1846,6 +2054,11 @@ class UnifiedStorage:
         if not shard_hashes:
             return None  # nothing to compact
 
+        # Schema + key_col from HEAD, used to build pseudo-manifests for
+        # inline (PND2) shards that have no PMAN manifest.
+        head_schema = head_manifest.columns if head_manifest else None
+        head_key_col = head_manifest.key_col if head_manifest else ""
+
         # Level 1: merge row group entries (dedup by rg_key, shards override HEAD)
         merged: dict[str, Any] = {}
         if head_manifest:
@@ -1853,13 +2066,12 @@ class UnifiedStorage:
                 merged[rg.key] = rg
         shard_manifests = []
         for sh in shard_hashes:
-            try:
-                sm = CollectionManifest.load(self.kernel, sh)
+            sm = self._load_shard_manifest(
+                sh, head_schema, head_key_col)
+            if sm is not None:
                 shard_manifests.append(sm)
                 for rg in sm.scan_with_pruning():
                     merged[rg.key] = rg
-            except (ValueError, KeyError):
-                pass
 
         if not merged:
             return None
@@ -1870,10 +2082,12 @@ class UnifiedStorage:
 
         if needs_row_merge:
             return self._compact_shards_row_level(
-                collection, head_manifest, shard_hashes, merged)
+                collection, head_manifest, shard_hashes, merged,
+                target_row_group_size=target_row_group_size)
         else:
             return self._compact_shards_manifest_level(
-                collection, head_manifest, shard_hashes, merged)
+                collection, head_manifest, shard_hashes, merged,
+                target_row_group_size=target_row_group_size)
 
     def _manifests_have_rowid(self, head_manifest, shard_manifests) -> bool:
         """Check if any manifest has _rowid column (indicating row-level CRDT).
@@ -1901,13 +2115,21 @@ class UnifiedStorage:
         return False
 
     def _compact_shards_manifest_level(self, collection, head_manifest,
-                                         shard_hashes, merged) -> Optional[str]:
+                                         shard_hashes, merged,
+                                         target_row_group_size: int = 100_000
+                                         ) -> Optional[str]:
         """Fast-path compaction: merge manifest entries only, NO data I/O.
 
         Data blobs are immutable and content-addressed. The new manifest
         simply references the same blob_hash values from HEAD + shards.
         This makes compaction O(shard_count) GETs + O(1) manifest PUT,
         regardless of total data volume — viable at PB scale.
+
+        Note: target_row_group_size is NOT used here — manifest-level
+        compaction re-references existing row groups without rewriting them.
+        To merge small row groups into larger ones, row-level compaction
+        is required (which decodes and re-encodes). The parameter is
+        accepted for API symmetry with _compact_shards_row_level.
         """
         schema = (head_manifest.columns if head_manifest else [("value", 4)])
         key_col = (head_manifest.key_col if head_manifest else "")
@@ -1966,22 +2188,31 @@ class UnifiedStorage:
         # Auto-vacuum: delete the tombstoned shard blobs + old shard manifests.
         # Without this, compaction tombstones refs but leaves dead blobs,
         # so object count goes UP instead of down.
+        # IMPORTANT: pass new_manifest so we DON'T delete data blobs that
+        # are now referenced by the new manifest (inline shards' PND2 blobs
+        # are data — they must survive manifest-level compaction).
         try:
-            self._auto_vacuum_after_compact(collection, shard_hashes)
+            self._auto_vacuum_after_compact(
+                collection, shard_hashes, new_manifest=new_manifest)
         except Exception:
             pass  # best-effort — vacuum failure shouldn't break compaction
 
         return commit_hash
 
     def _compact_shards_row_level(self, collection, head_manifest,
-                                    shard_hashes, merged) -> Optional[str]:
+                                    shard_hashes, merged,
+                                    target_row_group_size: int = 100_000
+                                    ) -> Optional[str]:
         """Fallback compaction: decode all rows, apply row-level CRDT merge.
 
         Used when shards have _rowid columns (upserts/deletes). This path
         reads ALL data blobs, merges by _rowid (latest _version wins),
-        drops tombstones, and re-encodes into new row groups.
+        drops tombstones, and re-encodes into new row groups of
+        `target_row_group_size` rows each (default 100K — larger than
+        typical write-time row groups, reducing read amplification).
 
-        O(total_rows) data I/O — same as the pre-optimization behavior.
+        O(total_rows) data I/O — same as the pre-optimization behavior,
+        but the resulting row groups are larger (better for subsequent reads).
         """
         # Fetch + decode ALL rows from merged row groups
         row_groups = list(merged.values())
@@ -2010,7 +2241,12 @@ class UnifiedStorage:
         schema = (head_manifest.columns if head_manifest
                    else [("value", 4)])
         key_col = (head_manifest.key_col if head_manifest else "")
-        rg_size = (head_manifest.row_group_size if head_manifest else 10_000)
+        # Use the adaptive target_row_group_size for re-encoding (defaults
+        # to 100K — larger than typical write-time row groups, reducing
+        # read amplification on subsequent scans). Fall back to the HEAD
+        # manifest's row_group_size only if the caller passed 0.
+        rg_size = target_row_group_size if target_row_group_size > 0 else \
+            (head_manifest.row_group_size if head_manifest else 10_000)
 
         # BATCH rows into proper row groups (not 1 row per blob)
         if all_rows:
@@ -2087,14 +2323,24 @@ class UnifiedStorage:
             commit_index, is_delta=False)
 
         # Auto-vacuum: delete the tombstoned shard blobs + old shard manifests.
+        # Pass new_manifest to protect blobs referenced by the new manifest.
+        # This is CRITICAL for inline shards: the shard hash IS the PND2 data
+        # blob hash. If row-level compaction re-encodes the SAME data (same
+        # rows → same content → same hash), the new manifest references the
+        # SAME blob as the old shard. Without protection, vacuum would delete
+        # the new manifest's blob — corrupting HEAD.
         try:
-            self._auto_vacuum_after_compact(collection, shard_hashes)
+            self._auto_vacuum_after_compact(
+                collection, shard_hashes, new_manifest=new_manifest)
         except Exception:
             pass
 
         return commit_hash
 
-    def _auto_vacuum_after_compact(self, collection: str, shard_hashes: list[str]) -> None:
+    def _auto_vacuum_after_compact(self, collection: str,
+                                     shard_hashes: list[str],
+                                     new_manifest: Optional[CollectionManifest] = None
+                                     ) -> None:
         """Delete dead blobs after compaction (best-effort).
 
         After compaction, the old shard manifests + their data blobs are
@@ -2103,19 +2349,47 @@ class UnifiedStorage:
 
         Uses the kernel's delete_blob (maintenance operation, not a kernel
         primitive) to reclaim space.
+
+        Args:
+            collection: collection name (unused, kept for API symmetry)
+            shard_hashes: the OLD shard hashes (PMAN manifest hashes for
+                multi-row-group shards, or PND2 data blob hashes for
+                inline single-row-group shards).
+            new_manifest: the NEW compacted manifest. If provided, its
+                row group blob hashes are PROTECTED from deletion (they
+                are now part of HEAD). This is critical for manifest-level
+                compaction of inline shards: the shard hash IS the data
+                blob hash, and that blob is now referenced by the new
+                manifest — deleting it would corrupt HEAD. If None, all
+                shard hashes are deleted (used by row-level compaction
+                where all data is re-encoded into new blobs).
         """
         import hashlib as _hashlib
         empty_hash = _hashlib.sha256(b"").hexdigest()
 
-        # The shard_hashes are the OLD shard manifest hashes. Their data
-        # blobs are now part of the new compacted manifest, so the old
-        # shard manifest blobs themselves are dead.
+        # Build a set of blob hashes referenced by the new manifest.
+        # These must NOT be deleted — they are now part of HEAD.
+        protected_hashes: set[str] = set()
+        if new_manifest is not None:
+            for rg in new_manifest.row_groups:
+                protected_hashes.add(rg.blob_hash)
+
+        # The shard_hashes are the OLD shard hashes. For PMAN manifest
+        # shards, the hash is the manifest blob (its data blobs are
+        # separate and not in shard_hashes, so they're safe). For inline
+        # PND2 shards, the hash IS the data blob — it must be protected
+        # if the new manifest references it.
         for sh in shard_hashes:
-            if sh and sh != empty_hash:
-                try:
-                    self.kernel.store.delete_blob(sh)
-                except Exception:
-                    pass  # best-effort
+            if not sh or sh == empty_hash:
+                continue
+            if sh in protected_hashes:
+                # This blob is now referenced by the new manifest —
+                # deleting it would corrupt HEAD. Skip.
+                continue
+            try:
+                self.kernel.store.delete_blob(sh)
+            except Exception:
+                pass  # best-effort
 
     # ------------------------------------------------------------------
     # ACID TRANSACTIONS — commit markers on top of CRDT shards
@@ -3328,8 +3602,15 @@ class UnifiedStorage:
 
         target = _format_rg_key(key)
 
+        # Load HEAD manifest for schema/key_col (needed for inline shards)
+        head_manifest = self._load_manifest(collection)
+        head_schema = head_manifest.columns if head_manifest else None
+        head_key_col = head_manifest.key_col if head_manifest else ""
+
         # Search shards in parallel for the row group containing this key
-        shard_manifests = self._parallel_fetch_shard_manifests(shard_hashes)
+        shard_manifests = self._parallel_fetch_shard_manifests(
+            shard_hashes,
+            schema_columns=head_schema, key_col=head_key_col)
 
         # Find a candidate row group from any shard
         candidate_blob_hash = None
@@ -3345,7 +3626,7 @@ class UnifiedStorage:
 
         # If not found in shards, try HEAD manifest
         if candidate_blob_hash is None:
-            head_manifest = self._load_manifest(collection)
+            # head_manifest was loaded above for schema/key_col — reuse it
             if head_manifest is None:
                 return None
             rg = head_manifest.find_row_group(target)

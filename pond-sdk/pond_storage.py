@@ -455,16 +455,25 @@ class PondStorage:
             collection, predicates=predicates, columns=columns,
             row_filter=row_filter, start_key=start_key, end_key=end_key)
 
-    def compact_shards(self, collection: str) -> Optional[str]:
+    def compact_shards(self, collection: str,
+                        target_row_group_size: int = 100_000) -> Optional[str]:
         """Merge all shards into HEAD, then clear the shards.
 
         Idempotent — multiple compactors produce the same result.
         Should be called periodically (e.g., after every N shards) to
         bound read amplification.
+
+        Args:
+            collection: collection name
+            target_row_group_size: row group size for row-level compaction
+                re-encoding (default 100_000). Larger row groups reduce
+                read amplification. Manifest-level compaction ignores
+                this parameter.
         """
         if self._unified is None:
             raise RuntimeError("UnifiedStorage not available")
-        return self._unified.compact_shards(collection)
+        return self._unified.compact_shards(
+            collection, target_row_group_size=target_row_group_size)
 
     def shard_count(self, collection: str) -> int:
         """Return the number of unmerged shards for a collection."""
