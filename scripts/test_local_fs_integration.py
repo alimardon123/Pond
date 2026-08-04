@@ -172,8 +172,8 @@ def test_list_paths_and_blobs():
         h2 = store.put_blob(b"blob2")
         h3 = store.put_blob(b"blob3")
 
-        store.put_path("collections/users/HEAD", h1)
-        store.put_path("collections/orders/HEAD", h2)
+        store.put_path("collections/users/branch-refs/main", h1)
+        store.put_path("collections/orders/branch-refs/main", h2)
         store.put_path("collections/users/manifest", h3)
 
         all_blobs = set(store.list_all_blob_hashes())
@@ -182,9 +182,9 @@ def test_list_paths_and_blobs():
         assert h3 in all_blobs, f"h3 not in blobs"
 
         users_paths = store.list_paths("collections/users/")
-        assert "collections/users/HEAD" in users_paths
+        assert "collections/users/branch-refs/main" in users_paths
         assert "collections/users/manifest" in users_paths
-        assert "collections/orders/HEAD" not in users_paths
+        assert "collections/orders/branch-refs/main" not in users_paths
 
         print(f"PASS: test_list_paths_and_blobs — list_paths + list_all_blob_hashes via local FS")
         return True

@@ -86,7 +86,8 @@ class CollectionIndexer(CollectionIndexerInterface):
     def _get_commit_index(self, collection: str) -> int:
         """Get the current commit index from the JSON commit blob."""
         try:
-            head = self.kernel.resolve(f"collections/{collection}/HEAD")
+            head = self.kernel.resolve(
+                f"collections/{collection}/branch-refs/main")
             if head is None:
                 return 0
             commit = json.loads(self.kernel.read_blob(head))

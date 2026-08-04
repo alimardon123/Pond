@@ -353,7 +353,12 @@ class LakehouseLens:
         for SQL queries. Cached — re-registration only happens if the
         commit hash changes.
         """
-        head = self.kernel.resolve(f"collections/{table_name}/HEAD")
+        # Resolve the active branch's commit (replaces the old HEAD ref).
+        us = self._storage._unified
+        if us is not None:
+            head = self.kernel.resolve(us._active_commit_ref(table_name))
+        else:
+            head = self.kernel.resolve(f"collections/{table_name}/branch-refs/main")
         cached = self._registered_tables.get(table_name)
         if cached == head:
             return  # already registered at this commit
@@ -415,7 +420,7 @@ class LakehouseLens:
                          data: pa.Table,
                          key_col: Optional[str] = None,
                          row_group_size: int = DEFAULT_ROW_GROUP_SIZE) -> str:
-        """Write data to a branch (NOT HEAD).
+        """Write data to a branch (NOT the active branch).
 
         Uses the proper CRDT branch mechanism: checkout the branch (so
         subsequent writes — including the shard that append() creates —
@@ -424,10 +429,10 @@ class LakehouseLens:
 
         This is the correct model in the CRDT-shard world:
           - Shards are stored under collections/{name}/branches/{branch}/shards/
-          - read_branch reads HEAD + shards for that branch
+          - read_branch reads the branch's commit + shards
           - The branch's manifest advances as commits land on the branch
-          - Main is untouched because main's HEAD and shard space are
-            separate from the branch's.
+          - Main is untouched because main's branch-refs/main and shard
+            space are separate from the branch's.
 
         Args:
             name: collection name
@@ -443,48 +448,39 @@ class LakehouseLens:
         # Remember the originally active branch (if any) so we can restore it.
         original_active = us._active_branches.get(name)
 
-        # If the branch doesn't exist yet, create it from HEAD (git checkout -b).
-        # If it already exists, just checkout (switch to it).
+        # If the branch doesn't exist yet, create it from the active branch's
+        # commit (git checkout -b). If it already exists, just checkout.
         branch_ref = us._branch_ref(name, branch_name)
         if self.kernel.resolve(branch_ref) is None:
-            # Create branch from current HEAD
             us.branch(name, branch_name)
         us.checkout(name, branch_name)
 
-        # Now writes go to the branch's shard space and HEAD.
+        # Now writes go to the branch's shard space and branch-refs/{branch}.
         rows = data.to_pylist()
         commit_hash = self._storage.append(
             name, rows, key_col=key_col,
             row_group_size=row_group_size,
             message=f"branch {branch_name}: insert {data.num_rows} rows")
 
-        # Capture the new HEAD commit (created by append) and bind it to
-        # the branch ref. Without this, the new commit is only reachable
-        # via HEAD — and we're about to move HEAD back to main.
-        new_branch_commit = self.kernel.resolve(us._head_ref(name))
-        if new_branch_commit is not None:
-            self.kernel.reference(us._branch_ref(name, branch_name),
-                                   new_branch_commit)
+        # _write_commit_blob (called by append) already updated
+        # branch-refs/{branch_name} to the new commit. No separate binding
+        # is needed — the active commit ref IS the branch ref now.
 
         # Restore the original active branch (if any).
         if original_active is None:
-            # Was on default (main) — detach and reset to main.
+            # Was on default (main) — detach and re-sync manifest to main.
             us._active_branches.pop(name, None)
-            # Re-sync HEAD + manifest to main's commit.
-            main_head = self.kernel.resolve(us._head_ref(name))
-            if main_head is not None:
-                # The HEAD ref may have been moved by checkout. Restore it
-                # to main's commit (the one before checkout).
-                # Actually, checkout moved HEAD to the branch's commit.
-                # We need to restore HEAD to main's commit.
-                main_commit = self.kernel.resolve(us._branch_ref(name, "main"))
-                if main_commit is not None:
-                    self.kernel.reference(us._head_ref(name), main_commit)
-                    us._sync_manifest_ref_to_head(name)
+            # Re-sync the manifest ref to main's commit (the one before checkout).
+            main_commit = self.kernel.resolve(us._branch_ref(name, "main"))
+            if main_commit is not None:
+                # Sync the manifest ref so reads see main's data again.
+                us._sync_manifest_ref_to_head(name)
+                if hasattr(us.kernel, 'invalidate_path_cache'):
+                    us.kernel.invalidate_path_cache(us._manifest_ref(name))
         else:
             # Restore the originally active branch.
             # Parse the branch name out of the stored ref path.
-            prefix = f"collections/{name}/branches/"
+            prefix = f"collections/{name}/branch-refs/"
             if original_active.startswith(prefix):
                 orig_name = original_active[len(prefix):]
                 try:
@@ -492,6 +488,9 @@ class LakehouseLens:
                 except ValueError:
                     # Branch was deleted in the meantime — fall back to main.
                     us._active_branches.pop(name, None)
+            else:
+                # Unknown format — detach and fall back to main.
+                us._active_branches.pop(name, None)
 
         # Invalidate the storage's manifest cache so subsequent reads
         # see the restored state.

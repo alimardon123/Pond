@@ -192,8 +192,8 @@ def test_list_paths_and_blobs():
     h3 = store.put_blob(b"blob3")
 
     # Write some paths
-    store.put_path("collections/users/HEAD", h1)
-    store.put_path("collections/orders/HEAD", h2)
+    store.put_path("collections/users/branch-refs/main", h1)
+    store.put_path("collections/orders/branch-refs/main", h2)
     store.put_path("collections/users/manifest", h3)
 
     # List all blobs
@@ -204,9 +204,9 @@ def test_list_paths_and_blobs():
 
     # List paths with prefix
     users_paths = store.list_paths("collections/users/")
-    assert "collections/users/HEAD" in users_paths
+    assert "collections/users/branch-refs/main" in users_paths
     assert "collections/users/manifest" in users_paths
-    assert "collections/orders/HEAD" not in users_paths
+    assert "collections/orders/branch-refs/main" not in users_paths
 
     print(f"PASS: test_list_paths_and_blobs — list_paths + list_all_blob_hashes via S3")
     return True

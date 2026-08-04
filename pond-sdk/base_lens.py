@@ -86,7 +86,15 @@ class PondLens:
 
     @staticmethod
     def _head_ref(name: str) -> str:
-        return f"collections/{name}/HEAD"
+        """DEPRECATED: HEAD ref is eliminated.
+
+        Returns the default branch's commit ref (branch-refs/main).
+        With the HEAD ref eliminated, the 'current commit' for a collection
+        is whatever the active branch points at — and the default active
+        branch is 'main'. External callers that need the active branch's
+        commit ref should use UnifiedStorage._active_commit_ref() instead.
+        """
+        return f"collections/{name}/branch-refs/main"
 
     @staticmethod
     def _branch_ref(name: str, branch: str) -> str:
@@ -105,7 +113,8 @@ class PondLens:
 
         Works for any collection regardless of whether its blobs are
         Parquet, KV, or something else, because branching only copies
-        the HEAD ref to a new branch ref. The blobs are not touched.
+        the active branch's commit ref to a new branch ref. The blobs
+        are not touched.
         """
         head = self.kernel.resolve(self._head_ref(name))
         if head is None:
@@ -114,15 +123,19 @@ class PondLens:
         return head
 
     def collection_exists(self, name: str) -> bool:
-        """Check if a collection has a HEAD ref."""
+        """Check if a collection exists (has a manifest ref or branch-refs/main)."""
+        # The manifest ref is the read shortcut — every collection has one.
+        if self.kernel.resolve(f"collections/{name}/manifest") is not None:
+            return True
+        # Fall back to checking the default branch's commit ref.
         return self.kernel.resolve(self._head_ref(name)) is not None
 
     def list_collections(self, namespace: Optional[str] = None) -> list[str]:
         """List ALL collections (any lens, any format).
 
-        Collections are identified by the `collections/{name}/HEAD` ref
-        pattern. This works for any lens because they all share the
-        same namespace convention.
+        Collections are identified by the `collections/{name}/manifest` ref
+        (the read shortcut). This works for any lens because they all share
+        the same namespace convention.
 
         HIERARCHICAL NAMESPACES:
             Collection names can contain `/` for hierarchical organization:
@@ -144,15 +157,13 @@ class PondLens:
         names = self.kernel.list_names()
         collections = set()
         for n in names:
-            # Must start with "collections/" and end with "/HEAD"
-            if not (n.startswith("collections/") and n.endswith("/HEAD")):
+            # Must start with "collections/" and end with "/manifest"
+            if not (n.startswith("collections/") and n.endswith("/manifest")):
                 continue
-            # Extract the collection name between "collections/" and "/HEAD"
-            coll = n[len("collections/"):-len("/HEAD")]
-            # Filter out non-collection HEADs (branches are at
-            # collections/{name}/branches/{branch}, not .../HEAD)
-            # The collection HEAD is the ONLY ref that ends with "/HEAD"
-            # at the collection level. Branch HEADs don't exist as refs.
+            # Extract the collection name between "collections/" and "/manifest"
+            coll = n[len("collections/"):-len("/manifest")]
+            if not coll:
+                continue
             if namespace:
                 # Filter by namespace prefix
                 if not (coll == namespace or coll.startswith(namespace + "/")):

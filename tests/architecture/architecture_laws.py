@@ -120,7 +120,7 @@ class _BaseShim:
         except ImportError:
             return {}
         import json as _json
-        head = self.kernel.resolve(f"collections/{self.collection}/HEAD")
+        head = self.kernel.resolve(f"collections/{self.collection}/branch-refs/main")
         if head is None:
             return {}
         raw = self.kernel.read_blob(head)
@@ -331,7 +331,7 @@ def law_5_history_replay_equals_snapshot():
                                       "physical_structures"))
     from collection_manifest import CollectionManifest
 
-    current = kernel.resolve("collections/inv5/HEAD")
+    current = kernel.resolve("collections/inv5/branch-refs/main")
     while current:
         raw = kernel.read_blob(current)
         try:
@@ -494,7 +494,7 @@ def law_12_merge_true_dag():
     lens.merge("feature")
 
     # Verify the HEAD commit has a second_parent (true merge)
-    head = kernel.resolve("collections/law12/HEAD")
+    head = kernel.resolve("collections/law12/branch-refs/main")
     import json as _json2
     commit = _json2.loads(kernel.read_blob(head))
 
@@ -601,13 +601,13 @@ def law_14_lakehouse_branch_isolation():
         users = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
         lens.create_table("users", users)
 
-        head_before = kernel.resolve("collections/users/HEAD")
+        head_before = kernel.resolve("collections/users/branch-refs/main")
 
         lens.branch("users", "dev")
         dev_data = pa.table({"id": [4], "name": ["d"]})
         lens.commit_to_branch("users", "dev", dev_data)
 
-        head_after = kernel.resolve("collections/users/HEAD")
+        head_after = kernel.resolve("collections/users/branch-refs/main")
         assert head_before == head_after, \
             "LAW 14 VIOLATED: branch commit moved main HEAD"
 
@@ -749,7 +749,7 @@ def law_18_lakehouse_manifest_storage():
         users = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
         lens.create_table("users", users)
 
-        head = kernel.resolve("collections/users/HEAD")
+        head = kernel.resolve("collections/users/branch-refs/main")
         raw = kernel.read_blob(head)
 
         # The commit MUST be JSON (starts with '{').

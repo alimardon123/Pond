@@ -38,12 +38,12 @@ def test_basic_kernel_ops():
 
     # Reference a name → hash
     # With dedicated paths: 1 PUT (put_path only, no root_ref blob).
-    kernel.reference("collections/users/HEAD", h)
+    kernel.reference("collections/users/branch-refs/main", h)
     assert kernel.stats["ref_writes"] == 1  # 1 put_path (no root_ref blob)
 
     # Resolve the name (cached from the reference() call — 0 ref_reads)
     # reference() updates the path cache, so resolve() is a cache hit.
-    resolved = kernel.resolve("collections/users/HEAD")
+    resolved = kernel.resolve("collections/users/branch-refs/main")
     assert resolved == h
     # With dedicated paths: reference() does 0 ref_reads (pure PUT).
     # resolve() is a cache hit → 0 ref_reads. Total = 0.
@@ -52,7 +52,7 @@ def test_basic_kernel_ops():
 
     # Read by name — force a fresh resolve
     kernel.invalidate_root_cache()  # clears path cache
-    read_data = kernel.read("collections/users/HEAD")
+    read_data = kernel.read("collections/users/branch-refs/main")
     assert read_data == data
     # After invalidate: resolve does 1 ref_read (get_path). Total = 0 + 1 = 1.
     assert kernel.stats["ref_reads"] == 1, \

@@ -640,7 +640,25 @@ class UnifiedStorage:
 
     @staticmethod
     def _head_ref(collection: str) -> str:
-        return f"collections/{collection}/HEAD"
+        """DEPRECATED: HEAD ref is eliminated.
+
+        Kept for backward compat with external callers (e.g. lakehouse_lens).
+        Returns the active branch's commit ref (branch-refs/{active_branch}).
+        NOTE: This is a static method and cannot resolve the in-memory active
+        branch — it returns the 'main' branch ref as a fallback. Callers that
+        need the true active commit ref should use _active_commit_ref() instead.
+        """
+        return f"collections/{collection}/branch-refs/main"
+
+    def _active_commit_ref(self, collection: str) -> str:
+        """The ref for the currently active branch's commit (replaces HEAD).
+
+        With the HEAD ref eliminated, the 'current commit' is whatever the
+        active branch points at. The active branch is tracked in-memory via
+        _active_branches[collection] (set by checkout), defaulting to 'main'.
+        """
+        branch = self._get_active_branch(collection)
+        return self._branch_ref(collection, branch)
 
     def _load_manifest(self, collection: str,
                         manifest_hash: Optional[str] = None,
@@ -814,12 +832,13 @@ class UnifiedStorage:
         }
         commit_bytes = _json.dumps(commit, sort_keys=True).encode()
         commit_hash = self.kernel.write(commit_bytes)
-        # Update HEAD via reference (also updates manifest ref for reads)
-        self.kernel.reference(self._head_ref(collection), commit_hash)
-        # Update active branch ref if set (so commits on a branch move the branch)
-        active = self._active_branches.get(collection)
-        if active:
-            self.kernel.reference(active, commit_hash)
+        # Update the active branch's commit ref (replaces the old HEAD ref).
+        # The active branch is tracked in-memory via _active_branches; this
+        # single ref update is the only ref mutation needed on commit.
+        active = self._active_commit_ref(collection)
+        self.kernel.reference(active, commit_hash)
+        # Update the manifest ref (read shortcut) so reads see the new data.
+        self.kernel.reference(self._manifest_ref(collection), manifest_hash)
         return commit_hash
 
     def _read_commit_blob(self, commit_hash: str) -> Optional[dict]:
@@ -837,7 +856,7 @@ class UnifiedStorage:
 
     def _commit_index(self, collection: str) -> int:
         """Get the next commit index for a collection."""
-        head = self.kernel.resolve(self._head_ref(collection))
+        head = self.kernel.resolve(self._active_commit_ref(collection))
         if head is None:
             return 0
         commit = self._read_commit_blob(head)
@@ -847,20 +866,20 @@ class UnifiedStorage:
 
     def branch(self, collection: str, branch_name: str) -> str:
         """Create a branch — O(1) ref copy."""
-        head = self.kernel.resolve(self._head_ref(collection))
+        head = self.kernel.resolve(self._active_commit_ref(collection))
         if head is None:
             raise KeyError(f"Collection '{collection}' not found")
         self.kernel.reference(self._branch_ref(collection, branch_name), head)
         return head
 
     def _sync_manifest_ref_to_head(self, collection: str) -> None:
-        """After undo/checkout/merge, sync the manifest ref to match HEAD's commit.
+        """After undo/checkout/merge, sync the manifest ref to match the active branch's commit.
 
         The manifest ref (collections/{name}/manifest) must point to the
-        manifest blob of the current HEAD commit. Otherwise reads would
-        see stale data from the old manifest.
+        manifest blob of the current active branch's commit. Otherwise reads
+        would see stale data from the old manifest.
         """
-        head = self.kernel.resolve(self._head_ref(collection))
+        head = self.kernel.resolve(self._active_commit_ref(collection))
         if head is None:
             return
         commit = self._read_commit_blob(head)
@@ -870,7 +889,11 @@ class UnifiedStorage:
         self._invalidate_manifest_cache(collection)
 
     def checkout(self, collection: str, branch_name: str) -> None:
-        """Checkout a branch — point HEAD at the branch's commit.
+        """Checkout a branch — set the active branch IN-MEMORY ONLY.
+
+        No storage mutation: the active branch is tracked via
+        _active_branches[collection], not via a HEAD ref. The manifest
+        ref is synced to the branch's commit so reads see the right data.
 
         Sets the active branch so subsequent commits/append/shard writes
         go to this branch (git-like behavior).
@@ -878,9 +901,14 @@ class UnifiedStorage:
         h = self.kernel.resolve(self._branch_ref(collection, branch_name))
         if h is None:
             raise ValueError(f"Branch '{branch_name}' does not exist")
-        self.kernel.reference(self._head_ref(collection), h)
+        # In-memory only: just set the active branch pointer.
         self._active_branches[collection] = self._branch_ref(collection, branch_name)
+        # Sync manifest ref to this branch's commit (so reads see the right data)
         self._sync_manifest_ref_to_head(collection)
+        # Invalidate path cache so resolve() picks up the new manifest ref
+        # (only if the kernel supports it — PondMinimal doesn't).
+        if hasattr(self.kernel, 'invalidate_path_cache'):
+            self.kernel.invalidate_path_cache(self._manifest_ref(collection))
 
     def checkout_new(self, collection: str, branch_name: str) -> str:
         """Create a branch AND checkout — like `git checkout -b`.
@@ -898,7 +926,7 @@ class UnifiedStorage:
         """
         self.branch(collection, branch_name)
         self.checkout(collection, branch_name)
-        return self.kernel.resolve(self._head_ref(collection))
+        return self.kernel.resolve(self._active_commit_ref(collection))
 
     def list_branches(self, collection: str) -> list[str]:
         """List all branches for a collection.
@@ -955,9 +983,9 @@ class UnifiedStorage:
         target_head = self.kernel.resolve(
             self._branch_ref(collection, target_branch))
         if target_head is None:
-            # Target branch doesn't exist yet — fall back to current HEAD
-            # (backward compat for the no-target-branch case).
-            target_head = self.kernel.resolve(self._head_ref(collection))
+            # Target branch doesn't exist yet — fall back to active branch's
+            # commit (backward compat for the no-target-branch case).
+            target_head = self.kernel.resolve(self._active_commit_ref(collection))
 
         # Read both manifests
         head_commit = self._read_commit_blob(target_head) if target_head else None
@@ -1038,9 +1066,11 @@ class UnifiedStorage:
         # Update target_branch ref → merge commit (the merge lands on target)
         self.kernel.reference(self._branch_ref(collection, target_branch),
                                commit_hash)
-        # Update HEAD → merge commit (so the active branch sees it too)
-        self.kernel.reference(self._head_ref(collection), commit_hash)
-        # Sync manifest ref to the new HEAD's manifest (reads must see it)
+        # No separate HEAD update — the active branch ref is the same as
+        # the target_branch ref when target == active. If target != active,
+        # we intentionally do NOT move the active branch (the merge landed
+        # on a different branch).
+        # Sync manifest ref to the new merge commit's manifest (reads must see it)
         self.kernel.reference(self._manifest_ref(collection), manifest_hash)
         # Source branch ref is left unchanged (it still points at its own
         # tip — the merge does not fast-forward the source).
@@ -1125,7 +1155,7 @@ class UnifiedStorage:
 
         Clears the active branch (undo is a detached-HEAD operation).
         """
-        head = self.kernel.resolve(self._head_ref(collection))
+        head = self.kernel.resolve(self._active_commit_ref(collection))
         if head is None:
             raise ValueError("No commits to undo")
         for _ in range(steps):
@@ -1133,7 +1163,7 @@ class UnifiedStorage:
             if commit is None or not commit.get("parent"):
                 break
             head = commit["parent"]
-        self.kernel.reference(self._head_ref(collection), head)
+        self.kernel.reference(self._active_commit_ref(collection), head)
         self._active_branches.pop(collection, None)  # detach from branch
         self._sync_manifest_ref_to_head(collection)
         return head[:12] if head else ""
@@ -1159,7 +1189,7 @@ class UnifiedStorage:
         Raises:
             ValueError: if the commit is not in the collection's history.
         """
-        head = self.kernel.resolve(self._head_ref(collection))
+        head = self.kernel.resolve(self._active_commit_ref(collection))
         if head is None:
             raise ValueError(f"Collection '{collection}' has no commits")
 
@@ -1182,15 +1212,15 @@ class UnifiedStorage:
                 f"Commit {commit_hash[:12]} is not in the history of "
                 f"collection '{collection}'")
 
-        # Revert HEAD to the specified commit
-        self.kernel.reference(self._head_ref(collection), commit_hash)
+        # Revert the active branch's commit to the specified commit
+        self.kernel.reference(self._active_commit_ref(collection), commit_hash)
         self._active_branches.pop(collection, None)  # detach from branch
         self._sync_manifest_ref_to_head(collection)
         return commit_hash[:12]
 
     def history(self, collection: str, limit: int = 100) -> list[dict]:
-        """Walk the commit chain from HEAD backwards."""
-        head = self.kernel.resolve(self._head_ref(collection))
+        """Walk the commit chain from the active branch's commit backwards."""
+        head = self.kernel.resolve(self._active_commit_ref(collection))
         if head is None:
             return []
 
@@ -2164,7 +2194,7 @@ class UnifiedStorage:
         # Write commit
         parent = self._head_cache.get(collection)
         if parent is None:
-            parent = self.kernel.resolve(self._head_ref(collection))
+            parent = self.kernel.resolve(self._active_commit_ref(collection))
         commit_index = self._commit_index_cache.get(collection, 0)
         if commit_index == 0 and parent:
             pc = self._read_commit_blob(parent)
@@ -2295,7 +2325,7 @@ class UnifiedStorage:
         # Write a new commit pointing to the compacted manifest
         parent = self._head_cache.get(collection)
         if parent is None:
-            parent = self.kernel.resolve(self._head_ref(collection))
+            parent = self.kernel.resolve(self._active_commit_ref(collection))
         commit_index = self._commit_index_cache.get(collection, 0)
         if commit_index == 0 and parent:
             pc = self._read_commit_blob(parent)
@@ -2769,7 +2799,7 @@ class UnifiedStorage:
             # O(1) warm write: use cached HEAD + commit_index if available
             parent = self._head_cache.get(collection)
             if parent is None:
-                parent = self.kernel.resolve(self._head_ref(collection))
+                parent = self.kernel.resolve(self._active_commit_ref(collection))
             commit_index = self._commit_index_cache.get(collection, 0)
             if commit_index == 0 and parent:
                 pc = self._read_commit_blob(parent)
@@ -2811,7 +2841,7 @@ class UnifiedStorage:
         # O(1) warm write: use cached HEAD + commit_index if available
         parent = self._head_cache.get(collection)
         if parent is None:
-            parent = self.kernel.resolve(self._head_ref(collection))
+            parent = self.kernel.resolve(self._active_commit_ref(collection))
         commit_index = self._commit_index_cache.get(collection, 0)
         if commit_index == 0 and parent:
             pc = self._read_commit_blob(parent)

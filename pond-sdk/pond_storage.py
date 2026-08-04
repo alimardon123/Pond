@@ -188,9 +188,13 @@ class PondStorage:
 
         With the unified manifest-based architecture, commits are
         created automatically by write()/append(). This method is kept
-        for API compatibility — it's a no-op that returns the current HEAD.
+        for API compatibility — it's a no-op that returns the current
+        active branch's commit hash.
         """
-        head = self.kernel.resolve(f"collections/{name}/HEAD")
+        if self._unified is not None:
+            head = self.kernel.resolve(self._unified._active_commit_ref(name))
+        else:
+            head = self.kernel.resolve(f"collections/{name}/branch-refs/main")
         return head or ""
 
     def branch(self, name: str, branch_name: str) -> str:
@@ -905,7 +909,7 @@ class PondStorage:
         new_manifest.set_schema_version(new_version)
 
         # Write commit
-        parent = self.kernel.resolve(f"collections/{collection}/HEAD")
+        parent = self.kernel.resolve(self._unified._active_commit_ref(collection))
         commit_index = 0
         if parent:
             pc = self._unified._read_commit_blob(parent)
@@ -963,7 +967,7 @@ class PondStorage:
         new_manifest.set_partition_spec(spec)
         new_manifest.set_schema_version(manifest.schema_version)
 
-        parent = self.kernel.resolve(f"collections/{collection}/HEAD")
+        parent = self.kernel.resolve(self._unified._active_commit_ref(collection))
         commit_index = 0
         if parent:
             pc = self._unified._read_commit_blob(parent)
@@ -981,39 +985,39 @@ class PondStorage:
         return commit_hash
 
     def delete_collection(self, collection: str) -> bool:
-        """Delete a collection by tombstoning its HEAD and manifest refs.
+        """Delete a collection by tombstoning its manifest + branch-refs.
 
         Fix (Round 12 Issue #3): previously a no-op that returned True.
         Now uses the RFC-0008 tombstone pattern from maintenance.py to
-        actually rebind HEAD to TOMBSTONE_HASH, making the collection
-        unreadable. Underlying blobs are NOT deleted (content-addressed,
-        may be shared). Use vacuum() for blob cleanup (not yet implemented).
+        actually rebind the manifest ref (and any branch-refs) to
+        TOMBSTONE_HASH, making the collection unreadable. Underlying
+        blobs are NOT deleted (content-addressed, may be shared). Use
+        vacuum() for blob cleanup (not yet implemented).
         """
         deleted = False
-        head_ref = f"collections/{collection}/HEAD"
         manifest_ref = f"collections/{collection}/manifest"
+        # Collect all refs to tombstone: the manifest ref + all branch-refs.
+        # (With HEAD eliminated, branch-refs/{branch} are the commit refs.)
+        refs_to_tombstone = [manifest_ref]
+        branch_prefix = f"collections/{collection}/branch-refs/"
+        for n in self.kernel.list_names():
+            if n.startswith(branch_prefix):
+                refs_to_tombstone.append(n)
 
         try:
             from maintenance import drop_name, TOMBSTONE_HASH
-            # Tombstone HEAD (makes collection_exists return False)
-            if self.kernel.resolve(head_ref) is not None:
-                drop_name(self.kernel, head_ref)
-                deleted = True
-            # Tombstone manifest (makes _load_manifest return None)
-            if self.kernel.resolve(manifest_ref) is not None:
-                drop_name(self.kernel, manifest_ref)
-                deleted = True
+            for ref in refs_to_tombstone:
+                if self.kernel.resolve(ref) is not None:
+                    drop_name(self.kernel, ref)
+                    deleted = True
         except ImportError:
             # maintenance.py not available — manual tombstone
-            # Write a zero-length blob and point HEAD at it
-            if self.kernel.resolve(head_ref) is not None:
-                empty_blob = self.kernel.write(b"")
-                self.kernel.reference(head_ref, empty_blob)
-                deleted = True
-            if self.kernel.resolve(manifest_ref) is not None:
-                empty_blob = self.kernel.write(b"")
-                self.kernel.reference(manifest_ref, empty_blob)
-                deleted = True
+            # Write a zero-length blob and point the ref at it
+            for ref in refs_to_tombstone:
+                if self.kernel.resolve(ref) is not None:
+                    empty_blob = self.kernel.write(b"")
+                    self.kernel.reference(ref, empty_blob)
+                    deleted = True
 
         if self._unified:
             self._unified._invalidate_manifest_cache(collection)
