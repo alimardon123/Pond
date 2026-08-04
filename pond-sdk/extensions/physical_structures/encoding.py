@@ -1061,17 +1061,22 @@ def decode_column(blob_bytes: bytes) -> list:
                     else:
                         return list(struct.unpack_from(f"<{n}d", data))
         elif vt == VALUE_TYPE_STRING:
-            # Check for bitmap
+            # Batch string decode — use pre-compiled struct for speed
+            _U32 = struct.Struct("<I")
             data = payload[1:]
-            # For strings, we can't easily detect the bitmap by size.
-            # Try: if first bytes look like a bitmap (small values),
-            # skip it. For now, try without bitmap first, then with.
-            # Simpler: just try reading values; if count != n_rows, try with bitmap.
+            # Try without bitmap first
+            off = 0
             result = []
-            off = 1
-            while off < len(payload):
-                val, off = _decode_value_binary(payload, off, vt)
-                result.append(val)
+            result_append = result.append  # local ref — faster
+            while off < len(data):
+                if off + 4 > len(data):
+                    break
+                slen = _U32.unpack_from(data, off)[0]
+                off += 4
+                if off + slen > len(data):
+                    break
+                result_append(data[off:off + slen].decode("utf-8"))
+                off += slen
             if len(result) == n_rows:
                 return result
             # Try with bitmap
@@ -1082,16 +1087,18 @@ def decode_column(blob_bytes: bytes) -> list:
                 if bitmap[i // 8] & (1 << (i % 8)):
                     nulls.add(i)
             result = []
-            val_idx = 0
+            result_append = result.append
             for i in range(n_rows):
                 if i in nulls:
-                    result.append(None)
+                    result_append(None)
                 else:
                     if off < len(payload):
-                        val, off = _decode_value_binary(payload, off, vt)
-                        result.append(val)
+                        slen = _U32.unpack_from(payload, off)[0]
+                        off += 4
+                        result_append(payload[off:off + slen].decode("utf-8"))
+                        off += slen
                     else:
-                        result.append(None)
+                        result_append(None)
             return result
         return []
 

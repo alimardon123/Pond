@@ -1415,58 +1415,65 @@ class UnifiedStorage:
 
         Returns ONLY committed shards (normal shards without tx_id, or
         tentative shards whose transaction has been committed).
-        Tentative shards from uncommitted transactions are filtered out.
 
-        Does NOT load each shard manifest to verify it — that's redundant
-        because read_with_shards loads them anyway (with try/except for
-        corrupt/missing/tombstoned). This saves K GETs per read.
-        The tx commit check is KEPT — it's what makes ACID work.
+        Uses list_paths_with_prefix (1 LIST) then resolves each path.
+        For S3/R2, the resolve calls are cached after first access, but
+        the first read of each path is a GET. To minimize latency, we
+        resolve in parallel using a thread pool.
         """
         prefix = self._shards_prefix(collection, branch)
-        # Compute the empty-blob hash once (used to detect tombstoned shards)
-        import hashlib as _hashlib
-        _empty_blob_hash = _hashlib.sha256(b"").hexdigest()
-        # Use list_paths_with_prefix for O(matching) listing (not O(total))
+        # Use list_paths_with_prefix for O(matching) listing
         if hasattr(self.kernel, 'list_paths_with_prefix'):
             names = self.kernel.list_paths_with_prefix(prefix)
         else:
             names = [n for n in self.kernel.list_names() if n.startswith(prefix)]
+
+        if not names:
+            return []
+
+        # Resolve all shard paths IN PARALLEL (avoids sequential GETs)
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = min(16, len(names))
+
+        def resolve_safe(name):
+            return (name, self.kernel.resolve(name))
+
+        name_to_hash: dict[str, Optional[str]] = {}
+        if len(names) <= 2:
+            for name in names:
+                name_to_hash[name] = self.kernel.resolve(name)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [pool.submit(resolve_safe, name) for name in names]
+                for f in futures:
+                    name, h = f.result()
+                    name_to_hash[name] = h
+
         shard_hashes = []
         committed_tx_cache: set[str] = set()
         checked_tx_cache: set[str] = set()
 
         for name in names:
-            h = self.kernel.resolve(name)
+            h = name_to_hash.get(name)
             if h is None:
-                continue
-            # Skip tombstoned shards (overwritten with empty blob by
-            # _tombstone_shard_refs). The empty blob has a known hash —
-            # we compute it once and cache it for this call.
-            if h == _empty_blob_hash:
                 continue
 
             # Check if this is a tentative shard (has tx_ prefix)
             shard_name = name[len(prefix):]
             if shard_name.startswith("tx_"):
-                # Tentative shard — check if transaction is committed
                 parts = shard_name.split("_", 2)
                 if len(parts) < 3:
                     continue
                 tx_id = parts[1]
-
-                # Check commit marker (cached) — KEPT for ACID correctness
                 if tx_id not in checked_tx_cache:
                     checked_tx_cache.add(tx_id)
                     tx_ref = f"transactions/{tx_id}"
                     tx_hash = self.kernel.resolve(tx_ref)
                     if tx_hash is not None:
                         committed_tx_cache.add(tx_id)
-
-                # Only include if transaction is committed
                 if tx_id in committed_tx_cache:
                     shard_hashes.append(h)
             else:
-                # Normal shard (no tx_id) — always visible
                 shard_hashes.append(h)
         return shard_hashes
 
@@ -1880,15 +1887,15 @@ class UnifiedStorage:
           5. Fetch + decode surviving data blobs (K GETs — parallel)
           6. Merge rows: dedup by _rowid, latest _version wins
         """
-        # Read HEAD manifest (the compacted base)
-        head_manifest = self._load_manifest(collection)
-        # Read all shard hashes via the shard index (1 GET) instead of
-        # listing N refs (N+1 GETs). Falls back to listing if no index.
-        shard_hashes = self._read_shard_index(collection)
+        # Read HEAD manifest + list shards IN PARALLEL (overlaps 2 RTTs)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            head_future = pool.submit(self._load_manifest, collection)
+            shard_future = pool.submit(self._read_shard_index, collection)
+            head_manifest = head_future.result()
+            shard_hashes = shard_future.result()
 
-        # Parallel-fetch all shard manifests (~1 RTT wall-clock, not N×RTT)
-        # Pass HEAD schema + key_col so inline PND2 shards can be built into
-        # pseudo-manifests with the correct rg_key.
+        # Parallel-fetch all shard manifests (~1 RTT wall-clock)
         shard_manifests = self._parallel_fetch_shard_manifests(
             shard_hashes,
             schema_columns=(head_manifest.columns if head_manifest else None),
@@ -3505,46 +3512,39 @@ class UnifiedStorage:
             ) -> list[dict[str, list]]:
         """Fetch and decode multiple row groups in parallel.
 
-        Uses a thread pool to fetch blobs concurrently. Each thread:
-          1. Calls kernel.read_blob (1 S3 GET)
-          2. Calls PND2.decode (CPU work)
+        Separates fetch (I/O) from decode (CPU) for maximum parallelism:
+          Phase 1: Fetch ALL blobs in parallel (1 RTT for all K blobs)
+          Phase 2: Decode ALL blobs in parallel (CPU-bound, uses all cores)
 
-        This reduces wall-clock latency from K × RTT to ~1 × RTT for
-        the fetch phase, and parallelizes the decode phase across cores.
-
-        For small K (1-2 row groups), the thread pool overhead exceeds
-        the benefit — we fall back to sequential.
+        This gives ~1 RTT for fetch + ~decode_time for the whole batch,
+        instead of K × (RTT + decode_time) sequential.
         """
+        if not row_groups:
+            return []
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Phase 1: Fetch all blobs in parallel (I/O bound)
+        def fetch_blob(rg):
+            return self.kernel.read_blob(rg.blob_hash)
+
         if len(row_groups) <= 2:
-            # Sequential for small K (thread pool overhead > benefit)
-            results = []
-            for rg in row_groups:
-                blob_bytes = self.kernel.read_blob(rg.blob_hash)
-                col_data = PND2.decode(blob_bytes, columns=columns,
-                                         predicates=predicates)
-                results.append(col_data)
-            return results
+            blob_bytes_list = [fetch_blob(rg) for rg in row_groups]
+        else:
+            max_fetch_workers = min(32, len(row_groups))
+            with ThreadPoolExecutor(max_workers=max_fetch_workers) as pool:
+                blob_bytes_list = list(pool.map(fetch_blob, row_groups))
 
-        # Parallel for large K
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Phase 2: Decode all blobs in parallel (CPU bound)
+        def decode_blob(blob_bytes):
+            return PND2.decode(blob_bytes, columns=columns, predicates=predicates)
 
-        def fetch_and_decode(rg):
-            blob_bytes = self.kernel.read_blob(rg.blob_hash)
-            return PND2.decode(blob_bytes, columns=columns,
-                                 predicates=predicates)
-
-        # Use at most 16 threads (S3 recommends max 50 concurrent per connection)
-        max_workers = min(16, len(row_groups))
-        results = [None] * len(row_groups)  # preserve order
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {
-                executor.submit(fetch_and_decode, rg): i
-                for i, rg in enumerate(row_groups)
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                results[idx] = future.result()
+        if len(blob_bytes_list) <= 2:
+            results = [decode_blob(b) for b in blob_bytes_list]
+        else:
+            max_decode_workers = min(8, len(blob_bytes_list))
+            with ThreadPoolExecutor(max_workers=max_decode_workers) as pool:
+                results = list(pool.map(decode_blob, blob_bytes_list))
 
         return [r for r in results if r is not None]
 
