@@ -89,10 +89,16 @@ class S3ObjectStore:
     # ------------------------------------------------------------------
 
     def _blob_key(self, hash_val: str) -> str:
-        """The S3 key for a content-addressed blob."""
+        """The S3 key for a content-addressed blob.
+
+        Uses 2-char sharding: blobs/{hash[:2]}/{hash}.
+        Matches LocalFSObjectStore exactly. At PB scale, this keeps
+        list_objects_v2 fast (256 shards × ~4K blobs each, parallelizable).
+        """
+        shard = hash_val[:2]
         if self._prefix:
-            return f"{self._prefix}/blobs/{hash_val}"
-        return f"blobs/{hash_val}"
+            return f"{self._prefix}/blobs/{shard}/{hash_val}"
+        return f"blobs/{shard}/{hash_val}"
 
     def _path_key(self, path: str) -> str:
         """The S3 key for a named path (ref)."""
@@ -166,16 +172,27 @@ class S3ObjectStore:
             return False
 
     def list_all_blob_hashes(self) -> list[str]:
-        """List all blob hashes in the store (for GC reachability)."""
-        prefix = self._blobs_prefix()
+        """List all blob hashes in the store (for GC reachability).
+
+        Walks the 2-char shard directories: blobs/{hash[:2]}/{hash}.
+        Each shard is a separate list_objects_v2 call — parallelizable
+        for faster GC at PB scale.
+        """
+        blobs_prefix = self._blobs_prefix()
         hashes = []
         paginator = self._client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                # Key is "{prefix}/blobs/{hash}" — extract the hash
-                key = obj["Key"]
-                if key.startswith(prefix):
-                    hashes.append(key[len(prefix):])
+        # List all shard dirs first (blobs/ab/, blobs/cd/, ...)
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=blobs_prefix, Delimiter="/"):
+            for prefix_entry in page.get("CommonPrefixes", []):
+                shard_prefix = prefix_entry["Prefix"]
+                # List blobs in this shard
+                for shard_page in paginator.paginate(Bucket=self._bucket, Prefix=shard_prefix):
+                    for obj in shard_page.get("Contents", []):
+                        key = obj["Key"]
+                        # Key is "{shard_prefix}{hash}" — extract the hash
+                        hash_val = key[len(shard_prefix):]
+                        if hash_val:
+                            hashes.append(hash_val)
         return hashes
 
     # ------------------------------------------------------------------

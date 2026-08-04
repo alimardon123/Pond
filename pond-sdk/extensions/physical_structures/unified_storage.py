@@ -1071,12 +1071,11 @@ class UnifiedStorage:
 
     def _clear_branch_shards(self, collection: str, branch: str,
                                shard_hashes: Optional[list[str]] = None) -> None:
-        """Clear a branch's shards: tombstone refs + reset index.
+        """Clear a branch's shards: tombstone refs so listing skips them.
 
         Unified retire path used by compact_shards and merge. After this:
-          - Shard index for {branch} is explicitly empty
-          - Old shard refs are tombstoned (empty blob)
-          - In-memory shard index cache is dropped
+          - Old shard refs are tombstoned (overwritten with the empty-blob
+            hash so _list_shards_from_refs skips them).
         Readers using _list_shards_from_refs see zero live shards because
         tombstoned refs fail CollectionManifest.load and are skipped.
 
@@ -1090,9 +1089,6 @@ class UnifiedStorage:
         if shard_hashes is None:
             shard_hashes = self._read_shard_index(collection, branch)
         self._tombstone_shard_refs(collection, branch, shard_hashes)
-        self._write_shard_index(collection, [], branch)
-        if hasattr(self, '_shard_index_mem'):
-            self._shard_index_mem.pop(f"{collection}/{branch}", None)
 
     def undo(self, collection: str, steps: int = 1) -> str:
         """Undo the last N commits — walk parent pointers.
@@ -1284,46 +1280,17 @@ class UnifiedStorage:
                 return active[len(prefix):]
         return "main"
 
-    @staticmethod
-    def _shard_index_ref(collection: str, branch: str = "main") -> str:
-        """The shard index for a specific branch."""
-        return f"collections/{collection}/branches/{branch}/shard_index"
-
     def _read_shard_index(self, collection: str, branch: Optional[str] = None) -> list[str]:
         """Read the shard index → list of shard manifest hashes.
 
-        ALWAYS merges index + listing (G-Set union). The index may be
-        stale under concurrent writers (last-writer-wins), so the listing
-        is the source of truth. The index is an optimization for the
-        common case (no concurrent writers).
+        Now a thin delegator to _list_shards_from_refs. Kept for backward
+        compat with callers (read_with_shards, compact_shards, etc.).
+        Shard discovery is ref-listing only — there is no longer a separate
+        index blob to consult.
         """
         if branch is None:
             branch = self._get_active_branch(collection)
-
-        # Try the index (fast path)
-        indexed = []
-        try:
-            import json as _json
-            idx_hash = self.kernel.resolve(self._shard_index_ref(collection, branch))
-            if idx_hash is not None:
-                data = self.kernel.read_blob(idx_hash)
-                indexed = list(_json.loads(data))
-                # If index is explicitly empty (post-compaction), check
-                # if there are also no shards in the listing before returning []
-                if not indexed:
-                    listed = self._list_shards_from_refs(collection, branch)
-                    if not listed:
-                        return []
-                    # New shards written after compaction — return them
-                    return listed
-        except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
-        # ALWAYS also list (source of truth) — catches concurrent writers
-        listed = self._list_shards_from_refs(collection, branch)
-
-        # Union (G-Set CRDT) — dedup
-        return list(set(listed) | set(indexed))
+        return self._list_shards_from_refs(collection, branch)
 
     def _list_shards_from_refs(self, collection: str, branch: str) -> list[str]:
         """List shard hashes by scanning refs (source of truth).
@@ -1384,38 +1351,6 @@ class UnifiedStorage:
                 # Normal shard (no tx_id) — always visible
                 shard_hashes.append(h)
         return shard_hashes
-
-    def _write_shard_index(self, collection: str, shard_hashes: list[str],
-                            branch: Optional[str] = None) -> None:
-        """Write the shard index (1 PUT). Last-writer-wins is safe because
-        the index is a G-Set."""
-        if branch is None:
-            branch = self._get_active_branch(collection)
-        import json as _json
-        data = _json.dumps(sorted(set(shard_hashes))).encode()
-        idx_hash = self.kernel.write(data)
-        self.kernel.reference(self._shard_index_ref(collection, branch), idx_hash)
-
-    def _append_to_shard_index(self, collection: str, shard_hash: str,
-                                branch: Optional[str] = None) -> None:
-        """Append one shard to the index — O(1) with in-memory tracking.
-
-        Tracks all shards written by this UnifiedStorage instance in memory.
-        On flush, writes the full list. Last-writer-wins is safe (G-Set CRDT).
-        Readers merge with listing anyway, so a stale index is harmless.
-        """
-        if branch is None:
-            branch = self._get_active_branch(collection)
-        key = f"{collection}/{branch}"
-        if not hasattr(self, '_shard_index_mem'):
-            self._shard_index_mem: dict[str, list[str]] = {}
-        if key not in self._shard_index_mem:
-            # Initialize from storage (one-time read)
-            self._shard_index_mem[key] = self._read_shard_index(collection, branch)
-        if shard_hash not in self._shard_index_mem[key]:
-            self._shard_index_mem[key].append(shard_hash)
-        # Flush to storage (1 PUT)
-        self._write_shard_index(collection, self._shard_index_mem[key], branch)
 
     def _parallel_fetch_shard_manifests(self, shard_hashes: list[str]) -> list:
         """Fetch all shard manifests in parallel (~1 RTT wall-clock).
@@ -1626,15 +1561,9 @@ class UnifiedStorage:
             shard_ref = f"{self._shards_prefix(collection, branch)}{shard_id}"
         self.kernel.reference(shard_ref, shard_hash)
 
-        # Update the shard index (1 PUT) — ONLY for non-transactional shards.
-        # Tentative shards (tx_id set) are NOT added to the index — they're
-        # only visible after commit_tx, at which point they're in the refs
-        # and _list_shards_from_refs will find them via the commit marker check.
-        if not tx_id:
-            try:
-                self._append_to_shard_index(collection, shard_hash)
-            except Exception:
-                pass  # index update is best-effort — listing is the fallback
+        # The shard ref is the discovery mechanism — _list_shards_from_refs
+        # scans refs (with the tx commit-marker check for tentative shards),
+        # so there is no separate index to update here.
 
         # Invalidate manifest cache (so next read picks up the new shard)
         # but PRESERVE the schema cache (schema doesn't change on append)
@@ -1648,40 +1577,11 @@ class UnifiedStorage:
     def list_shards(self, collection: str, branch: Optional[str] = None) -> list[str]:
         """List all shard manifest hashes for a collection's branch.
 
-        Uses the shard index as the authoritative source. Falls back to
-        listing if the index is missing or empty (legacy collections).
-        After compact_shards, the index is reset to empty — old shard
-        refs remain in storage but are not listed (they'll be GC'd).
+        Delegates to _read_shard_index, which scans the live shard refs
+        (tombstoned refs from compaction are skipped by
+        _list_shards_from_refs).
         """
-        if branch is None:
-            branch = self._get_active_branch(collection)
-
-        # Check the shard index first (authoritative after compaction)
-        try:
-            import json as _json
-            idx_hash = self.kernel.resolve(self._shard_index_ref(collection, branch))
-            if idx_hash is not None:
-                data = self.kernel.read_blob(idx_hash)
-                indexed = list(_json.loads(data))
-                if indexed:
-                    result = []
-                    for h in indexed:
-                        try:
-                            from collection_manifest import CollectionManifest as _CM
-                            _CM.load(self.kernel, h)
-                            result.append(h)
-                        except (ValueError, KeyError):
-                            pass
-                    # Also check refs for concurrent writes not in index
-                    listed = self._list_shards_from_refs(collection, branch)
-                    return list(set(result) | set(listed))
-                # Index is empty — check refs for new post-compaction shards
-                return self._list_shards_from_refs(collection, branch)
-        except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
-        # No index — fall back to listing
-        return self._list_shards_from_refs(collection, branch)
+        return self._read_shard_index(collection, branch)
 
     def read_with_shards(self, collection: str,
                           predicates: Optional[list[tuple[str, str, Any]]] = None,
@@ -1939,23 +1839,10 @@ class UnifiedStorage:
           - Reads are fast again (1 manifest, no shard list)
         """
         head_manifest = self._load_manifest(collection)
-        # Read the shard index directly (no listing merge — compaction
-        # doesn't need to catch concurrent writers, it just compacts
-        # the known shards). This avoids N verification reads from
-        # _list_shards_from_refs.
+        # Read the live shards via ref-listing (the only source of truth
+        # now that the separate shard index has been removed).
         branch = self._get_active_branch(collection)
-        shard_hashes = []
-        try:
-            import json as _json
-            idx_hash = self.kernel.resolve(self._shard_index_ref(collection, branch))
-            if idx_hash is not None:
-                data = self.kernel.read_blob(idx_hash)
-                shard_hashes = list(_json.loads(data))
-        except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-        # Fall back to full listing if index is empty/stale
-        if not shard_hashes:
-            shard_hashes = self.list_shards(collection)
+        shard_hashes = self._read_shard_index(collection, branch)
         if not shard_hashes:
             return None  # nothing to compact
 
@@ -2076,6 +1963,14 @@ class UnifiedStorage:
             collection, new_manifest, manifest_hash, commit_hash,
             commit_index, is_delta=False)
 
+        # Auto-vacuum: delete the tombstoned shard blobs + old shard manifests.
+        # Without this, compaction tombstones refs but leaves dead blobs,
+        # so object count goes UP instead of down.
+        try:
+            self._auto_vacuum_after_compact(collection, shard_hashes)
+        except Exception:
+            pass  # best-effort — vacuum failure shouldn't break compaction
+
         return commit_hash
 
     def _compact_shards_row_level(self, collection, head_manifest,
@@ -2191,7 +2086,36 @@ class UnifiedStorage:
             collection, new_manifest, manifest_hash, commit_hash,
             commit_index, is_delta=False)
 
+        # Auto-vacuum: delete the tombstoned shard blobs + old shard manifests.
+        try:
+            self._auto_vacuum_after_compact(collection, shard_hashes)
+        except Exception:
+            pass
+
         return commit_hash
+
+    def _auto_vacuum_after_compact(self, collection: str, shard_hashes: list[str]) -> None:
+        """Delete dead blobs after compaction (best-effort).
+
+        After compaction, the old shard manifests + their data blobs are
+        unreachable (tombstoned refs point to empty blobs). This method
+        deletes those dead blobs so object count actually decreases.
+
+        Uses the kernel's delete_blob (maintenance operation, not a kernel
+        primitive) to reclaim space.
+        """
+        import hashlib as _hashlib
+        empty_hash = _hashlib.sha256(b"").hexdigest()
+
+        # The shard_hashes are the OLD shard manifest hashes. Their data
+        # blobs are now part of the new compacted manifest, so the old
+        # shard manifest blobs themselves are dead.
+        for sh in shard_hashes:
+            if sh and sh != empty_hash:
+                try:
+                    self.kernel.store.delete_blob(sh)
+                except Exception:
+                    pass  # best-effort
 
     # ------------------------------------------------------------------
     # ACID TRANSACTIONS — commit markers on top of CRDT shards
@@ -2275,30 +2199,10 @@ class UnifiedStorage:
     def shard_count(self, collection: str) -> int:
         """Return the number of unmerged shards for a collection.
 
-        Checks the shard index first (authoritative after compaction).
-        If the index is explicitly empty (post-compaction), returns 0
-        even if old shard refs still exist (they're GC candidates).
+        Delegates to _read_shard_index, which scans the live shard refs
+        (post-compaction tombstones are skipped by _list_shards_from_refs).
         """
-        branch = self._get_active_branch(collection)
-        try:
-            import json as _json
-            idx_hash = self.kernel.resolve(self._shard_index_ref(collection, branch))
-            if idx_hash is not None:
-                data = self.kernel.read_blob(idx_hash)
-                indexed = list(_json.loads(data))
-                if not indexed:
-                    # Index is explicitly empty (post-compaction)
-                    # Check if there are NEW shards (post-compaction writes)
-                    new_shards = self._list_shards_from_refs(collection, branch)
-                    # Filter out old shards that are in the old index
-                    # (they're unreachable but still in refs)
-                    # For correctness, count only shards that are NOT
-                    # reachable from HEAD (i.e., new unmerged shards)
-                    return len(new_shards) if new_shards else 0
-                return len(indexed)
-        except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-        return len(self.list_shards(collection))
+        return len(self._read_shard_index(collection))
 
     # ------------------------------------------------------------------
     # ROW-LEVEL CRDT — upsert + delete with version vectors

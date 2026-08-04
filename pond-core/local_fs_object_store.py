@@ -92,11 +92,12 @@ class LocalFSObjectStore:
     def _blob_path(self, hash_val: str) -> str:
         """The on-disk path for a content-addressed blob.
 
-        Layout matches S3ObjectStore exactly: {blobs_dir}/{hash} (no
-        sharding, no .bin suffix). This makes `aws s3 sync` a straight
-        copy — no format conversion needed.
+        Uses 2-char sharding: {blobs_dir}/{hash[:2]}/{hash}.
+        This matches S3ObjectStore exactly and keeps both backends
+        performant at PB scale (256 subdirectories instead of one
+        flat dir with millions of files).
         """
-        return os.path.join(self._blobs_dir, hash_val)
+        return os.path.join(self._blobs_dir, hash_val[:2], hash_val)
 
     def _path_file(self, path: str) -> str:
         """The on-disk file for a named path (ref).
@@ -173,15 +174,19 @@ class LocalFSObjectStore:
         return False
 
     def list_all_blob_hashes(self) -> list[str]:
-        """List all blob hashes in the store (for GC reachability)."""
+        """List all blob hashes in the store (for GC reachability).
+
+        Walks the 2-char shard directories: {blobs_dir}/{hash[:2]}/{hash}.
+        Each shard dir is small (~4K blobs at 1M total) so listing is fast.
+        """
         hashes = []
         if not os.path.isdir(self._blobs_dir):
             return hashes
-        for f in os.listdir(self._blobs_dir):
-            # Blobs are stored as {blobs_dir}/{hash} (flat, no sharding,
-            # no suffix — matches S3 layout exactly)
-            full = os.path.join(self._blobs_dir, f)
-            if os.path.isfile(full):
+        for shard in os.listdir(self._blobs_dir):
+            shard_dir = os.path.join(self._blobs_dir, shard)
+            if not os.path.isdir(shard_dir):
+                continue
+            for f in os.listdir(shard_dir):
                 hashes.append(f)
         return hashes
 
