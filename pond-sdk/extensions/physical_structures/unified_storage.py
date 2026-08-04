@@ -3160,7 +3160,7 @@ class UnifiedStorage:
 
         # Auto-compact when shard count exceeds threshold
         # (bounds read amplification — readers see at most N shards)
-        AUTO_COMPACT_THRESHOLD = 16
+        AUTO_COMPACT_THRESHOLD = 4
         if self.shard_count(collection) >= AUTO_COMPACT_THRESHOLD:
             try:
                 self.compact_shards(collection)
@@ -4124,10 +4124,16 @@ class UnifiedStorage:
             if missing:
                 eff_columns = list(dict.fromkeys(eff_columns + list(missing)))
 
-        for rg in manifest.scan_with_pruning(predicates):
-            col_data = self._fetch_and_cache(rg.blob_hash,
-                                              columns=eff_columns,
-                                              predicates=predicates)
+        # Fetch ALL blobs in parallel first, then yield columnar batches
+        # This is critical for object stores — sequential fetch is K × RTT
+        row_groups = list(manifest.scan_with_pruning(predicates))
+        if not row_groups:
+            return
+
+        col_results = self._parallel_fetch_and_decode(
+            row_groups, eff_columns, predicates)
+
+        for col_data in col_results:
             if col_data:
                 yield col_data
 
