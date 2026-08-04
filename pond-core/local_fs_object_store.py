@@ -222,6 +222,20 @@ class LocalFSObjectStore:
             self.stats["gets"] += 1
         return data.get("hash")
 
+    def delete_path(self, path: str) -> bool:
+        """Delete a named path. Returns True if deleted, False if not found."""
+        file = self._path_file(path)
+        if os.path.exists(file):
+            os.remove(file)
+            with self._lock:
+                self._path_cache_pop(path)
+            return True
+        return False
+
+    def _path_cache_pop(self, path: str):
+        """No-op for LocalFS (no in-memory path cache at store level)."""
+        pass
+
     def list_paths(self, prefix: str = "") -> list[str]:
         """List all paths with the given prefix."""
         prefix_dir = self._paths_prefix_dir(prefix)

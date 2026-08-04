@@ -223,6 +223,14 @@ class InMemoryObjectStore:
             self.stats["gets"] += 1
         return self._paths[path]
 
+    def delete_path(self, path: str) -> bool:
+        """Delete a named path. Returns True if deleted."""
+        with self._lock:
+            if path in self._paths:
+                del self._paths[path]
+                return True
+            return False
+
     def list_paths(self, prefix: str = "") -> list[str]:
         """List all paths with the given prefix (like S3 list-objects-v2)."""
         if self._latency_ms > 0:
@@ -463,6 +471,15 @@ class ObjectStoreNativeKernel:
     def delete_blob(self, hash_val: str) -> bool:
         """Delete a blob by hash. MAINTENANCE operation (not a primitive)."""
         return self.store.delete_blob(hash_val)
+
+    def delete_path(self, path: str) -> bool:
+        """Delete a named path (ref). MAINTENANCE operation.
+        Used by tombstoning to remove shard refs without leaving empty blobs.
+        """
+        result = self.store.delete_path(path)
+        if result:
+            self._path_cache.pop(path, None)
+        return result
 
     def list_all_blob_hashes(self) -> list[str]:
         """List all blob hashes in the store. Used by GC reachability analysis."""

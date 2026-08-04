@@ -1145,12 +1145,13 @@ class UnifiedStorage:
 
     def _tombstone_shard_refs(self, collection: str, branch: str,
                                shard_hashes: list[str]) -> None:
-        """Tombstone shard refs by deleting the path entries.
+        """Tombstone shard refs by deleting the path entries entirely.
 
         This makes resolve() return None for the shard ref, so
-        _list_shards_from_refs skips it. The shard BLOB still exists
-        in storage (will be cleaned by GC/vacuum later).
+        _list_shards_from_refs skips it. The shard BLOB is cleaned by
+        _auto_vacuum_after_compact.
 
+        Uses delete_path (maintenance operation) — no empty blob created.
         Used by compact_shards and merge to retire absorbed shards.
         """
         if not shard_hashes:
@@ -1170,18 +1171,12 @@ class UnifiedStorage:
         for sh in shard_hashes:
             name = hash_to_name.get(sh)
             if name is not None:
-                # Overwrite with a sentinel that resolve() will treat as "deleted"
-                # We can't actually DELETE paths (no delete_path in the kernel API),
-                # so we set it to a known empty-sentinel hash. _list_shards_from_refs
-                # will still include it, but read_with_shards' try/except will skip
-                # the empty blob when loading the manifest.
-                # Better: set the path to None by removing it from the cache and
-                # writing a special "deleted" marker.
-                # For now: overwrite with empty blob hash. read_with_shards skips
-                # corrupt manifests via try/except.
-                empty_hash = self.kernel.write(b"")
-                self.kernel.reference(name, empty_hash)
-                # Invalidate cache so resolve() picks up the new value
+                if hasattr(self.kernel, 'delete_path'):
+                    self.kernel.delete_path(name)
+                else:
+                    # Fallback for old kernels without delete_path
+                    empty_hash = self.kernel.write(b"")
+                    self.kernel.reference(name, empty_hash)
                 self.kernel.invalidate_path_cache(name)
 
     def _clear_branch_shards(self, collection: str, branch: str,

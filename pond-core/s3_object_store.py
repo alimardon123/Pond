@@ -229,6 +229,15 @@ class S3ObjectStore:
         except self._client.exceptions.ClientError:
             return None
 
+    def delete_path(self, path: str) -> bool:
+        """Delete a named path. Returns True if deleted."""
+        key = self._path_key(path)
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=key)
+            return True
+        except self._client.exceptions.ClientError:
+            return False
+
     def list_paths(self, prefix: str = "") -> list[str]:
         """List all paths with the given prefix (like S3 list-objects-v2)."""
         full_prefix = self._paths_prefix() + prefix
