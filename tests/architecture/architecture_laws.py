@@ -120,7 +120,7 @@ class _BaseShim:
         except ImportError:
             return {}
         import json as _json
-        head = self.kernel.resolve(f"collections/{self.collection}/branches/main/commit")
+        head = self.kernel.resolve(f"collections/{self.collection}/_branches/main/commit")
         if head is None:
             return {}
         raw = self.kernel.read_blob(head)
@@ -287,10 +287,10 @@ def law_4_derived_rebuild_produces_identical_hashes():
         rows = [{"id": i, "val": i * 10} for i in range(100)]
         storage.write("inv4", rows, key_col="id", row_group_size=10,
                        message="first write")
-        hash1 = kernel.resolve("collections/inv4/branches/main/manifest")
+        hash1 = kernel.resolve("collections/inv4/_branches/main/manifest")
         storage.write("inv4", rows, key_col="id", row_group_size=10,
                        message="rebuild")
-        hash2 = kernel.resolve("collections/inv4/branches/main/manifest")
+        hash2 = kernel.resolve("collections/inv4/_branches/main/manifest")
         assert hash1 is not None, "LAW 4: first write produced no manifest"
         assert hash2 is not None, "LAW 4: rebuild produced no manifest"
         assert hash1 == hash2,             f"LAW 4 VIOLATED: rebuild produced different manifest: {hash1[:12]} vs {hash2[:12]}"
@@ -331,7 +331,7 @@ def law_5_history_replay_equals_snapshot():
                                       "physical_structures"))
     from collection_manifest import CollectionManifest
 
-    current = kernel.resolve("collections/inv5/branches/main/commit")
+    current = kernel.resolve("collections/inv5/_branches/main/commit")
     while current:
         raw = kernel.read_blob(current)
         try:
@@ -494,7 +494,7 @@ def law_12_merge_true_dag():
     lens.merge("feature")
 
     # Verify the HEAD commit has a second_parent (true merge)
-    head = kernel.resolve("collections/law12/branches/main/commit")
+    head = kernel.resolve("collections/law12/_branches/main/commit")
     import json as _json2
     commit = _json2.loads(kernel.read_blob(head))
 
@@ -601,13 +601,13 @@ def law_14_lakehouse_branch_isolation():
         users = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
         lens.create_table("users", users)
 
-        head_before = kernel.resolve("collections/users/branches/main/commit")
+        head_before = kernel.resolve("collections/users/_branches/main/commit")
 
         lens.branch("users", "dev")
         dev_data = pa.table({"id": [4], "name": ["d"]})
         lens.commit_to_branch("users", "dev", dev_data)
 
-        head_after = kernel.resolve("collections/users/branches/main/commit")
+        head_after = kernel.resolve("collections/users/_branches/main/commit")
         assert head_before == head_after, \
             "LAW 14 VIOLATED: branch commit moved main HEAD"
 
@@ -749,7 +749,7 @@ def law_18_lakehouse_manifest_storage():
         users = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
         lens.create_table("users", users)
 
-        head = kernel.resolve("collections/users/branches/main/commit")
+        head = kernel.resolve("collections/users/_branches/main/commit")
         raw = kernel.read_blob(head)
 
         # The commit MUST be JSON (starts with '{').

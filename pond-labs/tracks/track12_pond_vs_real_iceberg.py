@@ -214,7 +214,7 @@ class PondContender:
         """Branch, commit to branch, merge back."""
         t0 = time.perf_counter()
         main_h = self.kernel.resolve("data/HEAD")
-        self.kernel.reference("data/branches/dev", main_h)
+        self.kernel.reference("data/_branches/dev", main_h)
 
         # Commit to branch
         table = self._get_table()
@@ -231,7 +231,7 @@ class PondContender:
         branch_tree_h = self.kernel.write(branch_tree)
         branch_commit = bytes.fromhex(branch_tree_h) + b'\x01' + bytes.fromhex(main_h)
         branch_commit_h = self.kernel.write(branch_commit)
-        self.kernel.reference("data/branches/dev", branch_commit_h)
+        self.kernel.reference("data/_branches/dev", branch_commit_h)
 
         # Merge: union
         main_batches = self._read_tree(main_h)

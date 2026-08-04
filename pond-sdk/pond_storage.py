@@ -194,7 +194,7 @@ class PondStorage:
         if self._unified is not None:
             head = self.kernel.resolve(self._unified._active_commit_ref(name))
         else:
-            head = self.kernel.resolve(f"collections/{name}/branches/main/commit")
+            head = self.kernel.resolve(f"collections/{name}/_branches/main/commit")
         return head or ""
 
     def branch(self, name: str, branch_name: str) -> str:
@@ -1003,11 +1003,11 @@ class PondStorage:
         if self.kernel.resolve(definition_ref) is not None:
             refs_to_tombstone.append(definition_ref)
         # Tombstone every branch's commit ref under branches/{branch}/commit.
-        branch_prefix = f"collections/{collection}/branches/"
+        branch_prefix = f"collections/{collection}/_branches/"
         for n in self.kernel.list_names():
             if not n.startswith(branch_prefix):
                 continue
-            # Match collections/{c}/branches/{branch}/commit exactly — skip
+            # Match collections/{c}/_branches/{branch}/commit exactly — skip
             # /manifest and /shards/ subpaths (their parent commit ref going
             # away is enough to make the branch unreachable).
             rest = n[len(branch_prefix):]
@@ -1017,7 +1017,7 @@ class PondStorage:
         # If no definition ref existed (legacy collection), still tombstone
         # the default branch's commit ref so collection_exists returns False.
         if not refs_to_tombstone:
-            main_commit_ref = f"collections/{collection}/branches/main/commit"
+            main_commit_ref = f"collections/{collection}/_branches/main/commit"
             if self.kernel.resolve(main_commit_ref) is not None:
                 refs_to_tombstone.append(main_commit_ref)
 

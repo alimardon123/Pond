@@ -138,7 +138,7 @@ def benchmark_pb_scale():
     manifest = storage._load_manifest("pb")
     print(f"\n  {n_groups:,} row groups:")
     print(f"    Stats tree: {'yes' if manifest.stats_tree_root else 'no'}")
-    print(f"    Manifest size: {len(kernel.read_blob(kernel.resolve('collections/pb/branches/main/manifest')))} bytes")
+    print(f"    Manifest size: {len(kernel.read_blob(kernel.resolve('collections/pb/_branches/main/manifest')))} bytes")
 
     # Cold point lookup
     kernel.invalidate_root_cache()

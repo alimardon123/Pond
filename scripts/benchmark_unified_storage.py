@@ -88,7 +88,7 @@ def benchmark_unified_vs_old():
     lens.range_write("old_rw", table, key_col="id", row_group_size=100)
     old_rw_time = time.perf_counter() - t0
     old_rw_writes = kernel.stats.get("writes", 0)
-    old_rw_manifest = kernel.resolve("collections/old_rw/branches/main/manifest") is not None
+    old_rw_manifest = kernel.resolve("collections/old_rw/_branches/main/manifest") is not None
     print(f"{'range_write (old)':<35} {old_rw_time*1000:<12.1f} {old_rw_writes:<10} "
           f"{'yes' if old_rw_manifest else 'no':<10}")
 
@@ -98,7 +98,7 @@ def benchmark_unified_vs_old():
     lens.range_write_encoded("old_enc", table, key_col="id", row_group_size=100)
     old_enc_time = time.perf_counter() - t0
     old_enc_writes = kernel.stats.get("writes", 0)
-    old_enc_manifest = kernel.resolve("collections/old_enc/branches/main/manifest") is not None
+    old_enc_manifest = kernel.resolve("collections/old_enc/_branches/main/manifest") is not None
     print(f"{'range_write_encoded (old)':<35} {old_enc_time*1000:<12.1f} {old_enc_writes:<10} "
           f"{'yes' if old_enc_manifest else 'no':<10}")
 
@@ -108,7 +108,7 @@ def benchmark_unified_vs_old():
     storage.write("unified", rows, key_col="id", row_group_size=100)
     new_time = time.perf_counter() - t0
     new_writes = kernel.stats.get("writes", 0)
-    new_manifest = kernel.resolve("collections/unified/branches/main/manifest") is not None
+    new_manifest = kernel.resolve("collections/unified/_branches/main/manifest") is not None
     print(f"{'unified.write (NEW)':<35} {new_time*1000:<12.1f} {new_writes:<10} "
           f"{'yes' if new_manifest else 'no':<10}")
 

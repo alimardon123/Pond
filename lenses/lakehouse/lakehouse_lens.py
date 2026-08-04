@@ -218,7 +218,7 @@ class LakehouseLens:
         if us is not None:
             manifest_hash = self.kernel.resolve(us._manifest_ref(name))
         else:
-            manifest_hash = self.kernel.resolve(f"collections/{name}/branches/main/manifest")
+            manifest_hash = self.kernel.resolve(f"collections/{name}/_branches/main/manifest")
         if manifest_hash is not None:
             self.kernel.reference(
                 f"collections/{name}/commits/{commit_hash}__manifest",
@@ -364,7 +364,7 @@ class LakehouseLens:
         if us is not None:
             head = self.kernel.resolve(us._active_commit_ref(table_name))
         else:
-            head = self.kernel.resolve(f"collections/{table_name}/branches/main/commit")
+            head = self.kernel.resolve(f"collections/{table_name}/_branches/main/commit")
         cached = self._registered_tables.get(table_name)
         if cached == head:
             return  # already registered at this commit
@@ -434,7 +434,7 @@ class LakehouseLens:
         the original active branch.
 
         This is the correct model in the CRDT-shard world:
-          - Shards are stored under collections/{name}/branches/{branch}/shards/
+          - Shards are stored under collections/{name}/_branches/{branch}/shards/
           - read_branch reads the branch's commit + shards
           - The branch's manifest advances as commits land on the branch
           - Main is untouched because main's branches/main/commit and shard
@@ -483,8 +483,8 @@ class LakehouseLens:
         else:
             # Restore the originally active branch.
             # Parse the branch name out of the stored ref path
-            # (collections/{c}/branches/{branch}/commit → {branch}).
-            prefix = f"collections/{name}/branches/"
+            # (collections/{c}/_branches/{branch}/commit → {branch}).
+            prefix = f"collections/{name}/_branches/"
             if original_active.startswith(prefix):
                 rest = original_active[len(prefix):]
                 # Strip the trailing /commit suffix.

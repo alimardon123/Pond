@@ -189,7 +189,7 @@ def case_study_1_clinical_data_lake():
         check(main_count == 4, f"Main HEAD: {main_count} rows (trial data not visible)")
 
         # Branch has the trial data
-        branch_head = kernel.resolve("collections/patients/branches/trial_protocol")
+        branch_head = kernel.resolve("collections/patients/_branches/trial_protocol")
         commit = json.loads(kernel.read(branch_head))
         parquet = kernel.read(commit["parquet"])
         reader = pa.BufferReader(parquet)

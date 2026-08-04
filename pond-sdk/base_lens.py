@@ -16,9 +16,9 @@ This is NOT a format-aware base class. Per the design goals:
 What this base provides:
   - Shared ref namespace:
       collections/{name}/definition                   → schema hash (collection-level)
-      collections/{name}/branches/{branch}/commit     → commit hash
-      collections/{name}/branches/{branch}/manifest   → manifest hash
-      collections/{name}/branches/{branch}/shards/{uuid} → shard refs
+      collections/{name}/_branches/{branch}/commit     → commit hash
+      collections/{name}/_branches/{branch}/manifest   → manifest hash
+      collections/{name}/_branches/{branch}/shards/{uuid} → shard refs
   - Generic ref-level operations that work on ANY collection's refs,
     regardless of what is inside the blobs:
       - branch(name, branch_name)        — O(1) ref copy
@@ -95,11 +95,11 @@ class PondLens:
         branch is 'main'. External callers that need the active branch's
         commit ref should use UnifiedStorage._active_commit_ref() instead.
         """
-        return f"collections/{name}/branches/main/commit"
+        return f"collections/{name}/_branches/main/commit"
 
     @staticmethod
     def _branch_ref(name: str, branch: str) -> str:
-        return f"collections/{name}/branches/{branch}/commit"
+        return f"collections/{name}/_branches/{branch}/commit"
 
     @staticmethod
     def _definition_ref(name: str) -> str:
@@ -169,12 +169,12 @@ class PondLens:
                     continue
                 collections.add(coll)
                 continue
-            # Fallback: collections/{name}/branches/main/commit (legacy paths
+            # Fallback: collections/{name}/_branches/main/commit (legacy paths
             # where no definition was stamped). Strip the known suffix to
             # recover the collection name (which may contain '/' for
             # hierarchical namespaces like "dev/events").
-            if n.startswith("collections/") and n.endswith("/branches/main/commit"):
-                coll = n[len("collections/"):-len("/branches/main/commit")]
+            if n.startswith("collections/") and n.endswith("/_branches/main/commit"):
+                coll = n[len("collections/"):-len("/_branches/main/commit")]
                 if not coll:
                     continue
                 if namespace and not (coll == namespace or coll.startswith(namespace + "/")):

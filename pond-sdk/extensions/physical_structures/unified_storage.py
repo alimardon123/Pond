@@ -642,7 +642,7 @@ class UnifiedStorage:
         branch is resolved via _get_active_branch (defaults to 'main').
         """
         branch = self._get_active_branch(collection)
-        return f"collections/{collection}/branches/{branch}/manifest"
+        return f"collections/{collection}/_branches/{branch}/manifest"
 
     def _manifest_ref_for_branch(self, collection: str, branch: str) -> str:
         """The manifest ref path for a SPECIFIC branch (not the active one).
@@ -650,7 +650,7 @@ class UnifiedStorage:
         Used by checkout (to invalidate the old branch's cache) and merge
         (to write the merge result to the target branch's manifest ref).
         """
-        return f"collections/{collection}/branches/{branch}/manifest"
+        return f"collections/{collection}/_branches/{branch}/manifest"
 
     @staticmethod
     def _head_ref(collection: str) -> str:
@@ -662,7 +662,7 @@ class UnifiedStorage:
         branch — it returns the 'main' branch ref as a fallback. Callers that
         need the true active commit ref should use _active_commit_ref() instead.
         """
-        return f"collections/{collection}/branches/main/commit"
+        return f"collections/{collection}/_branches/main/commit"
 
     def _active_commit_ref(self, collection: str) -> str:
         """The ref for the currently active branch's commit (replaces HEAD).
@@ -811,12 +811,12 @@ class UnifiedStorage:
         """Branch commit ref path.
 
         Each branch owns its own commit ref at
-        collections/{c}/branches/{branch}/commit. Shards live alongside
-        at collections/{c}/branches/{branch}/shards/{uuid}, and the
-        manifest at collections/{c}/branches/{branch}/manifest — all
+        collections/{c}/_branches/{branch}/commit. Shards live alongside
+        at collections/{c}/_branches/{branch}/shards/{uuid}, and the
+        manifest at collections/{c}/_branches/{branch}/manifest — all
         under the single branches/ namespace (no separate branch-refs/).
         """
-        return f"collections/{collection}/branches/{branch}/commit"
+        return f"collections/{collection}/_branches/{branch}/commit"
 
     def _write_commit_blob(self, collection: str,
                             manifest_hash: str,
@@ -973,19 +973,19 @@ class UnifiedStorage:
     def list_branches(self, collection: str) -> list[str]:
         """List all branches for a collection.
 
-        Branch state lives at collections/{c}/branches/{branch}/ — a branch
+        Branch state lives at collections/{c}/_branches/{branch}/ — a branch
         is identified by having a `commit` (or `manifest`) file inside its
         directory. We list all refs under branches/ and collect the unique
         branch names (ignoring `shards/` subpaths).
         """
-        prefix = f"collections/{collection}/branches/"
+        prefix = f"collections/{collection}/_branches/"
         branches = set()
         for n in self.kernel.list_names():
             if not n.startswith(prefix):
                 continue
-            # n is like collections/{c}/branches/{branch}/commit
-            # or collections/{c}/branches/{branch}/manifest
-            # or collections/{c}/branches/{branch}/shards/{uuid}
+            # n is like collections/{c}/_branches/{branch}/commit
+            # or collections/{c}/_branches/{branch}/manifest
+            # or collections/{c}/_branches/{branch}/shards/{uuid}
             rest = n[len(prefix):]
             parts = rest.split("/")
             if len(parts) >= 2:
@@ -1344,9 +1344,9 @@ class UnifiedStorage:
     #   - Each shard is an independent immutable blob
     #
     # Architecture:
-    #   collections/{name}/branches/{branch}/commit    → commit blob hash
-    #   collections/{name}/branches/{branch}/manifest  → manifest blob hash
-    #   collections/{name}/branches/{branch}/shards/{uuid} → shard manifest (per writer batch)
+    #   collections/{name}/_branches/{branch}/commit    → commit blob hash
+    #   collections/{name}/_branches/{branch}/manifest  → manifest blob hash
+    #   collections/{name}/_branches/{branch}/shards/{uuid} → shard manifest (per writer batch)
     #
     # Write path (append_shard):
     #   1. Writer generates a UUIDv7 (time-ordered, unique)
@@ -1381,16 +1381,16 @@ class UnifiedStorage:
           - A writer can switch branches mid-work — next shard goes to
             the new branch automatically (just like git checkout).
         """
-        return f"collections/{collection}/branches/{branch}/shards/"
+        return f"collections/{collection}/_branches/{branch}/shards/"
 
     def _get_active_branch(self, collection: str) -> str:
         """Get the active branch for a collection (default: main)."""
         active = self._active_branches.get(collection)
         if active:
             # active is stored as the full ref path — extract branch name.
-            # _branch_ref returns collections/{c}/branches/{branch}/commit,
+            # _branch_ref returns collections/{c}/_branches/{branch}/commit,
             # so we strip the prefix and the trailing /commit.
-            prefix = f"collections/{collection}/branches/"
+            prefix = f"collections/{collection}/_branches/"
             if active.startswith(prefix):
                 rest = active[len(prefix):]  # {branch}/commit
                 # Strip the trailing /commit (rsplit handles branch names

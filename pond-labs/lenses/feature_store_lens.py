@@ -18,7 +18,7 @@ Storage model:
   - Feature data stored as Parquet in Pond blobs (same format as Lakehouse Lens)
   - Feature definitions stored as JSON in Pond blobs
   - Commit chain uses Pond refs (collections/{name}/HEAD)
-  - Branches use Pond refs (collections/{name}/branches/{branch})
+  - Branches use Pond refs (collections/{name}/_branches/{branch})
 
 The key insight: feature data is just tabular data. The Feature Store
 Lens adds *feature-specific semantics* (entity registry, point-in-time

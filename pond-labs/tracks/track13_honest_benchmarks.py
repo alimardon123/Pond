@@ -260,7 +260,7 @@ class HonestPond:
         Honestly labeled: this is a union, not a semantic merge."""
         t0 = time.perf_counter()
         main_h = self.kernel.resolve("data/HEAD")
-        self.kernel.reference("data/branches/dev", main_h)
+        self.kernel.reference("data/_branches/dev", main_h)
         self.kernel_refs += 1
 
         table = self._get_table()

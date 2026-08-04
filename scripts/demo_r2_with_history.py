@@ -64,7 +64,7 @@ print("  Commit 1: writing 5000 users...")
 t0 = time.perf_counter()
 s.write("users", [{"id": i, "name": f"user_{i}", "age": i % 100, "city": ["NYC", "LA", "SF"][i % 3]} for i in range(5000)],
         key_col="id", row_group_size=1000, message="initial 5000 users")
-history["users_v1"] = kernel.resolve("collections/users/branches/main/manifest")
+history["users_v1"] = kernel.resolve("collections/users/_branches/main/manifest")
 print(f"    Done in {time.perf_counter()-t0:.1f}s, manifest: {history['users_v1'][:16]}...")
 
 # Commit 2: append 3000 more users
@@ -72,7 +72,7 @@ print("  Commit 2: appending 3000 users...")
 t0 = time.perf_counter()
 s.append("users", [{"id": 5000+i, "name": f"new_user_{i}", "age": i % 50, "city": ["NYC", "LA", "SF"][i % 3]} for i in range(3000)],
          key_col="id", row_group_size=1000, message="append 3000 users")
-history["users_v2"] = kernel.resolve("collections/users/branches/main/manifest")
+history["users_v2"] = kernel.resolve("collections/users/_branches/main/manifest")
 print(f"    Done in {time.perf_counter()-t0:.1f}s, manifest: {history['users_v2'][:16]}...")
 
 # Commit 3: append 2000 more users
@@ -80,7 +80,7 @@ print("  Commit 3: appending 2000 users...")
 t0 = time.perf_counter()
 s.append("users", [{"id": 8000+i, "name": f"late_user_{i}", "age": i % 30, "city": "CHI"} for i in range(2000)],
          key_col="id", row_group_size=1000, message="append 2000 users")
-history["users_v3"] = kernel.resolve("collections/users/branches/main/manifest")
+history["users_v3"] = kernel.resolve("collections/users/_branches/main/manifest")
 print(f"    Done in {time.perf_counter()-t0:.1f}s, manifest: {history['users_v3'][:16]}...")
 
 # Branch + merge
@@ -107,7 +107,7 @@ print("  Commit 1: writing 8000 orders...")
 t0 = time.perf_counter()
 s.write("orders", [{"id": i, "user_id": i % 10500, "amount": float(i * 9.99), "status": "shipped" if i % 3 == 0 else "pending"} for i in range(8000)],
         key_col="id", row_group_size=1000, message="initial 8000 orders")
-history["orders_v1"] = kernel.resolve("collections/orders/branches/main/manifest")
+history["orders_v1"] = kernel.resolve("collections/orders/_branches/main/manifest")
 print(f"    Done in {time.perf_counter()-t0:.1f}s")
 
 print("  Commit 2: appending 2000 orders...")

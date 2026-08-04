@@ -263,7 +263,7 @@ class PondMiniLakehouse:
     def read_branch(self, name, branch_name):
         # PondLakehouse doesn't expose this directly; use the lens
         return self.lh.lens.read_table(name,
-            commit_hash=self.lh.kernel.resolve(f"tables/{name}/branches/{branch_name}"))
+            commit_hash=self.lh.kernel.resolve(f"tables/{name}/_branches/{branch_name}"))
 
     def merge_branch(self, name, branch_name):
         return self.lh.merge_branch(name, branch_name)

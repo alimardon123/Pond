@@ -16,7 +16,7 @@ object storage.
 COLD READ PATH (no caches):
   1. Read root pointer (1 GET — well-known path, ~80 bytes)
   2. Read root ref blob (1 GET — content-addressed, ~1KB for 50 refs)
-  3. Look up collections/{name}/branches/main/manifest in the root ref (in-memory, free)
+  3. Look up collections/{name}/_branches/main/manifest in the root ref (in-memory, free)
   4. Read manifest blob (1 GET — has all row-group stats + blob hashes)
   5. Evaluate predicates IN MEMORY against manifest stats (free)
   6. For each surviving row group: read 1 data blob (1 GET each)

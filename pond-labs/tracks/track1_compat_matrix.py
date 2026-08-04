@@ -125,7 +125,7 @@ def test_branch_safe(kernel, lh, fs):
 
     # Lakehouse creates a branch
     head_before = kernel.resolve("collections/users/HEAD")
-    kernel.reference("collections/users/branches/dev", head_before)
+    kernel.reference("collections/users/_branches/dev", head_before)
 
     # FeatureStore reads — should see the SAME HEAD (unaffected)
     head_after = kernel.resolve("collections/users/HEAD")

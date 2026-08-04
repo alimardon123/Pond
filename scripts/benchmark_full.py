@@ -289,7 +289,7 @@ def bench_time_travel():
 
         # Write version 1
         s.write("tt", [{"id": i, "v": 1} for i in range(100)], key_col="id", row_group_size=100)
-        v1_manifest = kernel.resolve("collections/tt/branches/main/manifest")
+        v1_manifest = kernel.resolve("collections/tt/_branches/main/manifest")
 
         # Append version 2
         s.append("tt", [{"id": 100 + i, "v": 2} for i in range(100)], key_col="id")

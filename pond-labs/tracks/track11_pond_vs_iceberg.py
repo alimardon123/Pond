@@ -252,11 +252,11 @@ class PackedPond:
 
     def branch(self, name):
         h = self.kernel.resolve("data/HEAD")
-        self.kernel.reference(f"data/branches/{name}", h)
+        self.kernel.reference(f"data/_branches/{name}", h)
 
     def merge(self, name):
         main_h = self.kernel.resolve("data/HEAD")
-        branch_h = self.kernel.resolve(f"data/branches/{name}")
+        branch_h = self.kernel.resolve(f"data/_branches/{name}")
         main_batches = self._read_tree(main_h)
         branch_batches = self._read_tree(branch_h)
         merged = main_batches + branch_batches

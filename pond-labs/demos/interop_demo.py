@@ -149,7 +149,7 @@ def main():
         # (e.g., both use features/{name}/HEAD). Here we demonstrate that
         # the kernel's flat namespace allows cross-Lens branching.
         head_hash = kernel.resolve("collections/user_features/HEAD")
-        kernel.reference("collections/user_features/branches/lh_dev", head_hash)
+        kernel.reference("collections/user_features/_branches/lh_dev", head_hash)
         print(f"  Lakehouse Lens created branch 'lh_dev' on user_features (via kernel)")
 
         # Feature Store Lens reads the branch
@@ -290,7 +290,7 @@ def main():
               f"Cross-Lens: PIT join → SQL analysis: avg={expected:.3f} (got {result[0]:.3f})")
 
         # Step 3: Lakehouse Lens branches for analysis
-        kernel.reference("collections/user_features/branches/analysis",
+        kernel.reference("collections/user_features/_branches/analysis",
                         kernel.resolve("collections/user_features/HEAD"))
 
         # Step 4: Feature Store Lens merges analysis branch back
