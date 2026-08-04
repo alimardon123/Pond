@@ -1919,6 +1919,11 @@ class UnifiedStorage:
 
         # Combine into rows
         all_rows: list[dict] = []
+        # Fill missing columns (added via schema evolution) with None.
+        # Only fill when the caller wants all columns (columns=None).
+        manifest_col_names = set()
+        if head_manifest and columns is None:
+            manifest_col_names = {name for name, _ in head_manifest.columns}
         for col_data in col_data_list:
             if not col_data:
                 continue
@@ -1931,6 +1936,10 @@ class UnifiedStorage:
                         row[c] = vals[i]
                     else:
                         row[c] = None
+                # Fill missing columns (schema evolution) with None
+                for mc in manifest_col_names:
+                    if mc not in row:
+                        row[mc] = None
                 all_rows.append(row)
 
         # Level 2 merge: dedup by _rowid, latest _version wins (CRDT)
@@ -3319,6 +3328,11 @@ class UnifiedStorage:
             surviving, eff_columns, predicates)
 
         all_rows: list[dict] = []
+        # Get the full schema from the manifest — includes columns added
+        # via schema evolution that may not exist in older PND2 blobs.
+        # These columns will be filled with None for old row groups.
+        # Only fill when the caller wants all columns (columns=None).
+        manifest_col_names = {name for name, _ in manifest.columns} if columns is None else set()
         for col_data in col_results:
             # Convert column-oriented data to row-oriented dicts
             row_count = max((len(v) for v in col_data.values()), default=0)
@@ -3326,6 +3340,10 @@ class UnifiedStorage:
             for i in range(row_count):
                 row = {c: col_data[c][i] if i < len(col_data[c]) else None
                         for c in col_names}
+                # Fill missing columns (added via schema evolution) with None
+                for mc in manifest_col_names:
+                    if mc not in row:
+                        row[mc] = None
                 if combined_filter is None or combined_filter(row):
                     # Strip predicate-only columns from the result if the
                     # caller didn't request them
