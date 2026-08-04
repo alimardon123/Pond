@@ -640,6 +640,18 @@ class UnifiedStorage:
         self._blob_cache_order: list[str] = []  # LRU order (oldest first)
         self._max_cache_blobs = 100  # 0 = disabled
 
+        # === SHARD LISTING CACHE ===
+        # Cache the shard hash list per (collection, branch) so warm reads
+        # skip the LIST + resolve calls (~1s on R2 for 10+ shards).
+        # Invalidated on any write (append_shard, compact, merge, checkout).
+        self._shard_list_cache: dict[str, list[str]] = {}  # key: "{collection}/{branch}"
+
+        # === SHARD MANIFEST CACHE ===
+        # Cache the CollectionManifest (or pseudo-manifest) built from each
+        # shard blob. Keyed by shard_hash (content-addressed, immutable).
+        # Saves N GETs on warm reads (one per shard).
+        self._shard_manifest_cache: dict[str, Any] = {}
+
         # === RUST ACCELERATION HOOK ===
         # If a Rust-compiled PND2 decoder is available (via PyO3), use it
         # instead of the Python decoder. The Rust decoder is 10-50x faster
@@ -1016,6 +1028,7 @@ class UnifiedStorage:
         # Invalidate ALL UnifiedStorage-level caches for this collection
         # so the next read sees the new branch's data.
         self._invalidate_manifest_cache(collection)
+        self._invalidate_shard_cache(collection)
 
     def checkout_new(self, collection: str, branch_name: str) -> str:
         """Create a branch AND checkout — like `git checkout -b`.
@@ -1264,6 +1277,9 @@ class UnifiedStorage:
         if shard_hashes is None:
             shard_hashes = self._read_shard_index(collection, branch)
         self._tombstone_shard_refs(collection, branch, shard_hashes)
+        # Invalidate the shard cache — shards are now cleared
+        cache_key = f"{collection}/{branch}"
+        self._shard_list_cache.pop(cache_key, None)
 
     def undo(self, collection: str, steps: int = 1) -> str:
         """Undo the last N commits — walk parent pointers.
@@ -1466,14 +1482,26 @@ class UnifiedStorage:
     def _read_shard_index(self, collection: str, branch: Optional[str] = None) -> list[str]:
         """Read the shard index → list of shard manifest hashes.
 
-        Now a thin delegator to _list_shards_from_refs. Kept for backward
-        compat with callers (read_with_shards, compact_shards, etc.).
-        Shard discovery is ref-listing only — there is no longer a separate
-        index blob to consult.
+        Uses an in-memory cache (_shard_list_cache) so warm reads skip
+        the LIST + resolve calls (~1s on R2 for 10+ shards).
+        Cache is invalidated on any write (append_shard, compact, merge).
         """
         if branch is None:
             branch = self._get_active_branch(collection)
-        return self._list_shards_from_refs(collection, branch)
+        cache_key = f"{collection}/{branch}"
+        if cache_key in self._shard_list_cache:
+            return self._shard_list_cache[cache_key]
+        result = self._list_shards_from_refs(collection, branch)
+        self._shard_list_cache[cache_key] = result
+        return result
+
+    def _invalidate_shard_cache(self, collection: str) -> None:
+        """Invalidate the shard listing cache for a collection.
+        Called after writes (append_shard, compact, merge, checkout).
+        """
+        keys_to_remove = [k for k in self._shard_list_cache if k.startswith(f"{collection}/")]
+        for k in keys_to_remove:
+            del self._shard_list_cache[k]
 
     def _list_shards_from_refs(self, collection: str, branch: str) -> list[str]:
         """List shard hashes by scanning refs (source of truth).
@@ -1633,24 +1661,15 @@ class UnifiedStorage:
                               key_col: str = "") -> Optional[CollectionManifest]:
         """Load a shard as a CollectionManifest, handling BOTH formats.
 
-        Shard refs can point to one of two blob types:
-          - b'PMAN' magic: a multi-row-group shard manifest (the classic
-            format). Loaded via CollectionManifest.decode().
-          - b'PND2' magic: an INLINE shard — a direct data blob for a
-            single row group (the new optimized format). Built into a
-            pseudo-manifest via _build_pseudo_manifest_from_pnd2().
-          - empty/missing: a tombstoned shard (skip).
-
-        Args:
-            shard_hash: the blob hash the shard ref points to
-            schema_columns: optional HEAD schema (for pseudo-manifest)
-            key_col: optional HEAD key_col (for pseudo-manifest rg_key)
-
-        Returns:
-            A CollectionManifest, or None for tombstoned/corrupt shards.
+        Uses _shard_manifest_cache (content-addressed, immutable) so warm
+        reads skip the blob fetch entirely.
         """
         if not shard_hash:
             return None
+        # Check shard manifest cache (content-addressed — no invalidation needed)
+        cache_key = shard_hash
+        if cache_key in self._shard_manifest_cache:
+            return self._shard_manifest_cache[cache_key]
         try:
             blob_bytes = self.kernel.read_blob(shard_hash)
         except (ValueError, KeyError):
@@ -1659,18 +1678,19 @@ class UnifiedStorage:
             return None  # tombstoned (empty blob)
 
         magic = blob_bytes[:4]
+        result = None
         if magic == b'PND2':
-            # Inline shard — build pseudo-manifest from PND2 header
-            return self._build_pseudo_manifest_from_pnd2(
+            result = self._build_pseudo_manifest_from_pnd2(
                 shard_hash, blob_bytes, schema_columns, key_col)
         elif magic == b'PMAN':
-            # Manifest shard — decode as CollectionManifest
             try:
-                return CollectionManifest.decode(self.kernel, blob_bytes)
+                result = CollectionManifest.decode(self.kernel, blob_bytes)
             except (ValueError, KeyError):
-                return None
-        else:
-            return None  # unknown format
+                pass
+        # Cache the result (content-addressed — always consistent)
+        if result is not None:
+            self._shard_manifest_cache[cache_key] = result
+        return result
 
     def _parallel_fetch_shard_manifests(self, shard_hashes: list[str],
                                           schema_columns=None,
@@ -1913,6 +1933,7 @@ class UnifiedStorage:
         self._manifest_cache.pop(collection, None)
         self._manifest_hash_cache.pop(collection, None)
         self._head_cache.pop(collection, None)
+        self._invalidate_shard_cache(collection)
         # Keep _schema_cache — it's valid across appends
 
         return shard_hash
@@ -2624,6 +2645,11 @@ class UnifiedStorage:
         marker_bytes = _json.dumps(marker, sort_keys=True).encode()
         marker_hash = self.kernel.write(marker_bytes)
         self.kernel.reference(self._tx_ref(tx_id), marker_hash)
+        # Invalidate shard list cache — tentative shards are now visible
+        # to readers (the commit marker exists, so _list_shards_from_refs
+        # will include them). The cached list didn't include them.
+        for key in list(self._shard_list_cache.keys()):
+            self._shard_list_cache.pop(key, None)
         return marker_hash
 
     def abort_tx(self, tx_id: str) -> None:
@@ -3156,6 +3182,7 @@ class UnifiedStorage:
         new_hash = new_manifest.commit()
         self.kernel.reference(self._manifest_ref(collection), new_hash)
         self._invalidate_manifest_cache(collection)
+        self._invalidate_shard_cache(collection)
         return new_hash
 
     def _build_manifest_with_return(self, collection: str,

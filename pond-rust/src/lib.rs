@@ -1,11 +1,11 @@
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyBytes};
 use pyo3::Bound;
 
 fn skip_stat_value(vtype: u8, data: &[u8]) -> usize {
     match vtype {
         1 | 2 => 8,
-        3 => { if data.len() >= 4 { 4 + u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize } else { 0 } }
+        3 | 4 => { if data.len() >= 4 { 4 + u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize } else { 0 } }
         _ => 0,
     }
 }
@@ -66,6 +66,42 @@ fn filter_indices_str(vals: &[String], op: &str, target: &str) -> Vec<usize> {
     }
 }
 
+fn decode_string_or_binary(data: &[u8], n_rows: usize) -> Vec<Vec<u8>> {
+    // Try without bitmap first, then with bitmap (same as Python decoder)
+    let bitmap_size = (n_rows + 7) / 8;
+
+    // Try without bitmap
+    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(n_rows);
+    let mut off = 0;
+    while off + 4 <= data.len() {
+        let slen = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
+        off += 4;
+        if off + slen <= data.len() {
+            vals.push(data[off..off+slen].to_vec());
+            off += slen;
+        } else { break; }
+    }
+    if vals.len() == n_rows {
+        return vals;
+    }
+
+    // Try with bitmap
+    if data.len() > bitmap_size {
+        vals.clear();
+        let bm_data = &data[bitmap_size..];
+        off = 0;
+        while off + 4 <= bm_data.len() {
+            let slen = u32::from_le_bytes([bm_data[off], bm_data[off+1], bm_data[off+2], bm_data[off+3]]) as usize;
+            off += 4;
+            if off + slen <= bm_data.len() {
+                vals.push(bm_data[off..off+slen].to_vec());
+                off += slen;
+            } else { break; }
+        }
+    }
+    vals
+}
+
 #[pyfunction]
 #[pyo3(signature = (blob_bytes, columns=None, predicates=None))]
 fn decode(py: Python, blob_bytes: &[u8], columns: Option<Vec<String>>, predicates: Option<Vec<(String, String, PyObject)>>) -> PyResult<PyObject> {
@@ -81,7 +117,7 @@ fn decode(py: Python, blob_bytes: &[u8], columns: Option<Vec<String>>, predicate
     let inner = &blob_bytes[13..];
     let mut pos = 0;
 
-    // Parse schema
+    // Parse schema: per col: 1B name_len + name + 1B vtype + 1B encoding
     let mut schema: Vec<(String, u8, u8)> = Vec::with_capacity(n_columns);
     for _ in 0..n_columns {
         if pos + 1 > inner.len() { break; }
@@ -108,8 +144,8 @@ fn decode(py: Python, blob_bytes: &[u8], columns: Option<Vec<String>>, predicate
         }
     }
 
-    // Record payload positions for each column (we'll decode selectively)
-    let mut payload_positions: Vec<(String, u8, u8, usize, usize)> = Vec::new(); // (name, vtype, enc, start, len)
+    // Record payload positions
+    let mut payload_positions: Vec<(String, u8, u8, usize, usize)> = Vec::new();
     for (col_name, vtype, enc) in &schema {
         if pos + 4 > inner.len() { break; }
         let plen = u32::from_le_bytes([inner[pos], inner[pos+1], inner[pos+2], inner[pos+3]]) as usize;
@@ -119,62 +155,44 @@ fn decode(py: Python, blob_bytes: &[u8], columns: Option<Vec<String>>, predicate
         payload_positions.push((col_name.clone(), *vtype, *enc, pstart, plen));
     }
 
-    // === VORTEX-STYLE PREDICATE PUSHDOWN ===
-    // If predicates are provided, decode the predicate column first,
-    // find surviving indices, then only decode matching rows from other columns.
+    // Vortex-style predicate pushdown
     let mut surviving_indices: Option<Vec<usize>> = None;
     let mut pred_col_name: Option<String> = None;
 
     if let Some(ref preds) = predicates {
         for (col_name, op, val) in preds {
-            // Find this column in the schema
             let pp = payload_positions.iter().find(|(n, _, _, _, _)| n == col_name);
             if let Some((_, vtype, enc, pstart, plen)) = pp {
                 let payload = &inner[*pstart..*pstart + *plen];
                 if payload.is_empty() { continue; }
 
-                // Decode the predicate column
-                let vals = match enc {
-                    0 => { // RAW
-                        let vt = payload[0];
+                let vals: Vec<i64> = match enc {
+                    0 => {
                         let data = &payload[1..];
-                        match vt {
-                            1 => { // INT64
-                                let n = data.len() / 8;
-                                (0..n).map(|i| {
-                                    let o = i * 8;
-                                    i64::from_le_bytes([data[o],data[o+1],data[o+2],data[o+3],data[o+4],data[o+5],data[o+6],data[o+7]])
-                                }).collect::<Vec<i64>>()
-                            }
-                            2 => { // FLOAT64 — need different handling
-                                Vec::new() // skip for now
-                            }
+                        match vtype {
+                            1 => { let n = data.len() / 8; (0..n).map(|i| { let o = i*8; i64::from_le_bytes([data[o],data[o+1],data[o+2],data[o+3],data[o+4],data[o+5],data[o+6],data[o+7]]) }).collect() }
                             _ => Vec::new()
                         }
                     }
-                    3 => unpack_bitpack(payload, n_rows), // BITPACK
+                    3 => unpack_bitpack(payload, n_rows),
                     _ => Vec::new(),
                 };
 
-                // Filter based on predicate
                 if !vals.is_empty() {
-                    // Try to extract the target value as i64
                     let target_i64: Option<i64> = val.extract::<i64>(py).ok();
                     if let Some(target) = target_i64 {
                         surviving_indices = Some(filter_indices_i64(&vals, op, target));
                         pred_col_name = Some(col_name.clone());
-                        break; // Only use first predicate column for filtering
+                        break;
                     }
                 }
             }
         }
     }
 
-    // Decode columns (filtered if we have surviving indices)
     let result = PyDict::new_bound(py);
 
     for (col_name, vtype, enc, pstart, plen) in &payload_positions {
-        // Check if caller wants this column
         if let Some(ref cols) = columns {
             if !cols.contains(col_name) && (pred_col_name.as_ref() != Some(col_name)) {
                 continue;
@@ -184,11 +202,43 @@ fn decode(py: Python, blob_bytes: &[u8], columns: Option<Vec<String>>, predicate
         let payload = &inner[*pstart..*pstart + *plen];
         if payload.is_empty() { continue; }
 
+        // BINARY (vtype=5) uses a DIFFERENT payload format:
+        // n_values(4B) + [length(4B) + bytes]*N  (no value_type byte, no bitmap)
+        if *vtype == 5 {
+            if payload.len() < 4 { result.set_item(col_name, Vec::<Vec<u8>>::new())?; continue; }
+            let n_values = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+            let mut off = 4;
+            let mut all_vals: Vec<Vec<u8>> = Vec::with_capacity(n_values);
+            for _ in 0..n_values {
+                if off + 4 > payload.len() { break; }
+                let blen = u32::from_le_bytes([payload[off], payload[off+1], payload[off+2], payload[off+3]]);
+                off += 4;
+                if blen == 0xFFFFFFFF {
+                    all_vals.push(Vec::new()); // null sentinel
+                } else if blen == 0 {
+                    all_vals.push(Vec::new()); // empty bytes
+                } else {
+                    if off + blen as usize <= payload.len() {
+                        all_vals.push(payload[off..off+blen as usize].to_vec());
+                        off += blen as usize;
+                    } else { break; }
+                }
+            }
+            let filtered = if let Some(ref indices) = surviving_indices {
+                indices.iter().map(|&i| all_vals[i].clone()).collect::<Vec<_>>()
+            } else { all_vals };
+            // Convert Vec<Vec<u8>> to list[bytes] (PyBytes, not list[int])
+            let py_bytes: Vec<PyObject> = filtered.iter().map(|b| {
+                PyBytes::new_bound(py, b).into()
+            }).collect();
+            result.set_item(col_name, py_bytes)?;
+            continue;
+        }
+
         match enc {
             0 => { // RAW
-                let vt = payload[0];
-                let data = &payload[1..];
-                match vt {
+                let data = &payload[1..]; // skip value_type byte
+                match vtype {
                     1 => { // INT64
                         let n = data.len() / 8;
                         let all_vals: Vec<i64> = (0..n).map(|i| {
@@ -196,16 +246,8 @@ fn decode(py: Python, blob_bytes: &[u8], columns: Option<Vec<String>>, predicate
                             i64::from_le_bytes([data[o],data[o+1],data[o+2],data[o+3],data[o+4],data[o+5],data[o+6],data[o+7]])
                         }).collect();
                         let filtered = if let Some(ref indices) = surviving_indices {
-                            if pred_col_name.as_ref() == Some(col_name) {
-                                // This IS the predicate column — return only matching values
-                                indices.iter().map(|&i| all_vals[i]).collect()
-                            } else {
-                                // Different column — filter by surviving indices
-                                indices.iter().map(|&i| all_vals[i]).collect()
-                            }
-                        } else {
-                            all_vals
-                        };
+                            indices.iter().map(|&i| all_vals[i]).collect()
+                        } else { all_vals };
                         result.set_item(col_name, filtered)?;
                     }
                     2 => { // FLOAT64
@@ -219,21 +261,17 @@ fn decode(py: Python, blob_bytes: &[u8], columns: Option<Vec<String>>, predicate
                         } else { all_vals };
                         result.set_item(col_name, filtered)?;
                     }
-                    3 => { // STRING
-                        let mut all_vals: Vec<String> = Vec::with_capacity(n_rows);
-                        let mut off = 0;
-                        while off + 4 <= data.len() {
-                            let slen = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-                            off += 4;
-                            if off + slen <= data.len() {
-                                all_vals.push(String::from_utf8_lossy(&data[off..off+slen]).to_string());
-                                off += slen;
-                            } else { break; }
-                        }
+                    3 | 5 => { // STRING or BINARY
+                        let all_vals = decode_string_or_binary(data, n_rows);
                         let filtered = if let Some(ref indices) = surviving_indices {
                             indices.iter().map(|&i| all_vals[i].clone()).collect()
                         } else { all_vals };
-                        result.set_item(col_name, filtered)?;
+                        if *vtype == 3 {
+                            let strs: Vec<String> = filtered.iter().map(|b| String::from_utf8_lossy(b).to_string()).collect();
+                            result.set_item(col_name, strs)?;
+                        } else {
+                            result.set_item(col_name, filtered)?;
+                        }
                     }
                     _ => { result.set_item(col_name, Vec::<i64>::new())?; }
                 }
