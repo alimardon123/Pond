@@ -1975,35 +1975,130 @@ class UnifiedStorage:
         """
         # Read HEAD manifest + list shards IN PARALLEL (overlaps 2 RTTs)
         from concurrent.futures import ThreadPoolExecutor
+
+        # === PIPELINED READ: overlap all I/O phases ===
+        # Phase 1: HEAD manifest + shard listing (parallel, 2 threads)
+        # Phase 2: HEAD data blobs + shard manifests (parallel, all at once)
+        # Phase 3: shard data blobs (parallel, fetched while Phase 2 decodes)
+        #
+        # This eliminates the 3 sequential RTT phases (976ms) by overlapping
+        # HEAD data blob fetch with shard manifest fetch. The key insight:
+        # HEAD row groups are known after Phase 1, so we can start fetching
+        # them immediately while shard manifests are still loading.
+
+        # Phase 1: HEAD manifest + shard listing (parallel)
         with ThreadPoolExecutor(max_workers=2) as pool:
             head_future = pool.submit(self._load_manifest, collection)
             shard_future = pool.submit(self._read_shard_index, collection)
             head_manifest = head_future.result()
             shard_hashes = shard_future.result()
 
-        # Parallel-fetch all shard manifests (~1 RTT wall-clock)
-        shard_manifests = self._parallel_fetch_shard_manifests(
-            shard_hashes,
-            schema_columns=(head_manifest.columns if head_manifest else None),
-            key_col=(head_manifest.key_col if head_manifest else ""))
-
-        # Level 1 merge: UNION of all row groups (no dedup by rg_key).
-        # Row-level CRDT merge (_rowid + _version) handles conflicts.
-        # This fixes the bug where concurrent writers with overlapping
-        # key ranges would drop data via dedup-by-key.
-        merged: list[Any] = []
+        # Phase 2: Start fetching HEAD data blobs + shard manifests IN PARALLEL
+        # HEAD row groups are known now — start fetching them immediately.
+        head_row_groups = []
         if head_manifest:
-            merged.extend(head_manifest.scan_with_pruning(predicates, start_key, end_key))
+            head_row_groups = list(head_manifest.scan_with_pruning(predicates, start_key, end_key))
+
+        # Submit HEAD blob fetches + shard manifest fetches all at once
+        phase2_pool = ThreadPoolExecutor(max_workers=32)
+
+        # Submit HEAD data blob fetches
+        head_blob_futures = {}
+        for rg in head_row_groups:
+            if self._max_cache_blobs > 0 and rg.blob_hash in self._blob_cache:
+                head_blob_futures[rg.blob_hash] = None  # cache hit
+            else:
+                head_blob_futures[rg.blob_hash] = phase2_pool.submit(
+                    self.kernel.read_blob, rg.blob_hash)
+
+        # Submit shard manifest fetches
+        shard_manifest_futures = []
+        for sh in shard_hashes:
+            if sh in self._shard_manifest_cache:
+                shard_manifest_futures.append(None)  # cache hit
+            else:
+                shard_manifest_futures.append(phase2_pool.submit(
+                    self._load_shard_manifest, sh,
+                    head_manifest.columns if head_manifest else None,
+                    head_manifest.key_col if head_manifest else ""))
+
+        # Collect shard manifests (some may already be done)
+        shard_manifests = []
+        for i, future in enumerate(shard_manifest_futures):
+            if future is None:
+                shard_manifests.append(self._shard_manifest_cache.get(shard_hashes[i]))
+            else:
+                sm = future.result()
+                shard_manifests.append(sm)
+
+        # Phase 3: Submit shard data blob fetches (while HEAD blobs finish)
+        shard_row_groups = []
         for sm in shard_manifests:
-            merged.extend(sm.scan_with_pruning(predicates, start_key, end_key))
+            if sm:
+                shard_row_groups.extend(sm.scan_with_pruning(predicates, start_key, end_key))
 
-        if not merged:
-            return []
+        shard_blob_futures = {}
+        for rg in shard_row_groups:
+            if self._max_cache_blobs > 0 and rg.blob_hash in self._blob_cache:
+                shard_blob_futures[rg.blob_hash] = None  # cache hit
+            else:
+                shard_blob_futures[rg.blob_hash] = phase2_pool.submit(
+                    self.kernel.read_blob, rg.blob_hash)
 
-        # Fetch + decode data blobs (parallel for large K)
-        row_groups = merged
-        col_data_list = self._parallel_fetch_and_decode(
-            row_groups, columns, predicates)
+        # Now collect HEAD blob bytes + decode them (while shard blobs fetch)
+        all_row_groups = head_row_groups + shard_row_groups
+        all_blob_futures = []
+        for rg in all_row_groups:
+            h = rg.blob_hash
+            if h in head_blob_futures and head_blob_futures[h] is not None:
+                all_blob_futures.append(head_blob_futures[h])
+            elif h in shard_blob_futures and shard_blob_futures[h] is not None:
+                all_blob_futures.append(shard_blob_futures[h])
+            else:
+                all_blob_futures.append(None)  # cache hit
+
+        # Wait for all blobs, then decode in parallel
+        blob_bytes_list = []
+        for future in all_blob_futures:
+            if future is not None:
+                blob_bytes_list.append(future.result())
+            else:
+                blob_bytes_list.append(None)
+
+        phase2_pool.shutdown(wait=True)
+
+        # Decode all blobs (parallel, 8 threads for CPU)
+        # Use cache for cache hits, decode for misses
+        col_data_list: list[Optional[dict]] = [None] * len(all_row_groups)
+        decode_pool = ThreadPoolExecutor(max_workers=8)
+        decode_futures = []
+        for i, rg in enumerate(all_row_groups):
+            blob_bytes = blob_bytes_list[i]
+            if blob_bytes is None:
+                # Cache hit
+                if self._max_cache_blobs > 0 and rg.blob_hash in self._blob_cache:
+                    self._blob_cache_order.remove(rg.blob_hash)
+                    self._blob_cache_order.append(rg.blob_hash)
+                    col_data_list[i] = self._blob_cache[rg.blob_hash]
+                else:
+                    col_data_list[i] = {}
+            else:
+                decode_futures.append((i, decode_pool.submit(
+                    self._decode_blob, blob_bytes, columns=columns, predicates=predicates)))
+
+        for i, future in decode_futures:
+            col_data = future.result()
+            col_data_list[i] = col_data
+            # Cache the result
+            if self._max_cache_blobs > 0:
+                rg_hash = all_row_groups[i].blob_hash
+                self._blob_cache[rg_hash] = col_data
+                self._blob_cache_order.append(rg_hash)
+                while len(self._blob_cache_order) > self._max_cache_blobs:
+                    old_hash = self._blob_cache_order.pop(0)
+                    self._blob_cache.pop(old_hash, None)
+
+        decode_pool.shutdown(wait=True)
 
         # Combine into rows
         all_rows: list[dict] = []
