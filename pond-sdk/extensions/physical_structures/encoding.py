@@ -272,21 +272,37 @@ def encode_raw(values: list) -> tuple[bytes, dict]:
         bitmap_bytes = bytes(bitmap)
     else:
         bitmap_bytes = b""
+    # NOTE: `any(v is None for v in values)` is O(n) — we could skip it
+    # if we know the data has no nulls (e.g., from a typed source). For now
+    # this is the simplest correct approach.
 
     if vt in (VALUE_TYPE_INT64, VALUE_TYPE_FLOAT64):
-        # Contiguous fixed-size array — SIMD-ready
-        fmt = "<q" if vt == VALUE_TYPE_INT64 else "<d"
-        payload = struct.pack("<B", vt) + bitmap_bytes
-        # Pack all values (nulls get 0 — bitmap is authoritative)
-        packed = [v if v is not None else 0 for v in values]
-        if packed:
-            payload += struct.pack(f"<{len(packed)}{fmt[1:]}", *packed)
+        # Vectorized encoding with numpy — 10-50x faster than struct.pack
+        try:
+            import numpy as np
+            dtype = np.int64 if vt == VALUE_TYPE_INT64 else np.float64
+            # np.fromiter is fastest for Python lists (avoids intermediate list)
+            # Replace None with 0 (bitmap is authoritative for nulls)
+            arr = np.fromiter((v if v is not None else 0 for v in values), dtype=dtype)
+            payload = struct.pack("<B", vt) + bitmap_bytes + arr.tobytes()
+        except ImportError:
+            # Fallback: struct.pack (slower but no numpy dependency)
+            fmt = "<q" if vt == VALUE_TYPE_INT64 else "<d"
+            payload = struct.pack("<B", vt) + bitmap_bytes
+            packed = [v if v is not None else 0 for v in values]
+            if packed:
+                payload += struct.pack(f"<{len(packed)}{fmt[1:]}", *packed)
     elif vt == VALUE_TYPE_STRING:
+        # Batch string encoding — much faster than per-value _encode_value_binary
         payload = struct.pack("<B", vt) + bitmap_bytes
+        # Build all strings + lengths in one pass
+        parts = [payload]
         for v in values:
             if v is not None:
-                payload += _encode_value_binary(v, vt)
-            # nulls produce no bytes — the bitmap marks them
+                b = str(v).encode("utf-8")
+                parts.append(struct.pack("<I", len(b)))
+                parts.append(b)
+        payload = b"".join(parts)
     else:
         payload = struct.pack("<B", VALUE_TYPE_NULL)
 
