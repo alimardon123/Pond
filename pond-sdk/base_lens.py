@@ -15,9 +15,10 @@ This is NOT a format-aware base class. Per the design goals:
 
 What this base provides:
   - Shared ref namespace:
-      collections/{name}/HEAD
-      collections/{name}/branches/{branch}
-      collections/{name}/definition
+      collections/{name}/definition                   → schema hash (collection-level)
+      collections/{name}/branches/{branch}/commit     → commit hash
+      collections/{name}/branches/{branch}/manifest   → manifest hash
+      collections/{name}/branches/{branch}/shards/{uuid} → shard refs
   - Generic ref-level operations that work on ANY collection's refs,
     regardless of what is inside the blobs:
       - branch(name, branch_name)        — O(1) ref copy
@@ -88,17 +89,17 @@ class PondLens:
     def _head_ref(name: str) -> str:
         """DEPRECATED: HEAD ref is eliminated.
 
-        Returns the default branch's commit ref (branch-refs/main).
+        Returns the default branch's commit ref (branches/main/commit).
         With the HEAD ref eliminated, the 'current commit' for a collection
         is whatever the active branch points at — and the default active
         branch is 'main'. External callers that need the active branch's
         commit ref should use UnifiedStorage._active_commit_ref() instead.
         """
-        return f"collections/{name}/branch-refs/main"
+        return f"collections/{name}/branches/main/commit"
 
     @staticmethod
     def _branch_ref(name: str, branch: str) -> str:
-        return f"collections/{name}/branches/{branch}"
+        return f"collections/{name}/branches/{branch}/commit"
 
     @staticmethod
     def _definition_ref(name: str) -> str:
@@ -123,19 +124,21 @@ class PondLens:
         return head
 
     def collection_exists(self, name: str) -> bool:
-        """Check if a collection exists (has a manifest ref or branch-refs/main)."""
-        # The manifest ref is the read shortcut — every collection has one.
-        if self.kernel.resolve(f"collections/{name}/manifest") is not None:
+        """Check if a collection exists (has a definition or a main branch commit)."""
+        # The definition ref is stamped by every lens via
+        # stamp_collection_metadata() — it's the canonical "this collection
+        # exists" marker. Fall back to the default branch's commit ref for
+        # collections created by old code paths that don't stamp a definition.
+        if self.kernel.resolve(self._definition_ref(name)) is not None:
             return True
-        # Fall back to checking the default branch's commit ref.
         return self.kernel.resolve(self._head_ref(name)) is not None
 
     def list_collections(self, namespace: Optional[str] = None) -> list[str]:
         """List ALL collections (any lens, any format).
 
-        Collections are identified by the `collections/{name}/manifest` ref
-        (the read shortcut). This works for any lens because they all share
-        the same namespace convention.
+        Collections are identified by the `collections/{name}/definition` ref
+        (stamped by every lens via stamp_collection_metadata()). This works
+        for any lens because they all share the same namespace convention.
 
         HIERARCHICAL NAMESPACES:
             Collection names can contain `/` for hierarchical organization:
@@ -157,18 +160,26 @@ class PondLens:
         names = self.kernel.list_names()
         collections = set()
         for n in names:
-            # Must start with "collections/" and end with "/manifest"
-            if not (n.startswith("collections/") and n.endswith("/manifest")):
-                continue
-            # Extract the collection name between "collections/" and "/manifest"
-            coll = n[len("collections/"):-len("/manifest")]
-            if not coll:
-                continue
-            if namespace:
-                # Filter by namespace prefix
-                if not (coll == namespace or coll.startswith(namespace + "/")):
+            # Primary marker: collections/{name}/definition (stamped by all lenses)
+            if n.startswith("collections/") and n.endswith("/definition"):
+                coll = n[len("collections/"):-len("/definition")]
+                if not coll:
                     continue
-            collections.add(coll)
+                if namespace and not (coll == namespace or coll.startswith(namespace + "/")):
+                    continue
+                collections.add(coll)
+                continue
+            # Fallback: collections/{name}/branches/main/commit (legacy paths
+            # where no definition was stamped). Strip the known suffix to
+            # recover the collection name (which may contain '/' for
+            # hierarchical namespaces like "dev/events").
+            if n.startswith("collections/") and n.endswith("/branches/main/commit"):
+                coll = n[len("collections/"):-len("/branches/main/commit")]
+                if not coll:
+                    continue
+                if namespace and not (coll == namespace or coll.startswith(namespace + "/")):
+                    continue
+                collections.add(coll)
         return sorted(collections)
 
     def list_namespaces(self, parent: Optional[str] = None) -> list[str]:

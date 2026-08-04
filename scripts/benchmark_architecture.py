@@ -254,10 +254,10 @@ try:
     s = PondStorage(kernel)
 
     s.write("bench", [{"id": i, "v": 1} for i in range(1000)], key_col="id", row_group_size=100, message="v1")
-    v1_manifest = kernel.resolve("collections/bench/manifest")
+    v1_manifest = kernel.resolve("collections/bench/branches/main/manifest")
 
     s.append("bench", [{"id": 1000+i, "v": 2} for i in range(1000)], key_col="id", row_group_size=100, message="v2")
-    v2_manifest = kernel.resolve("collections/bench/manifest")
+    v2_manifest = kernel.resolve("collections/bench/branches/main/manifest")
 
     s.branch("bench", "dev")
     s.checkout("bench", "dev")

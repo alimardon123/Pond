@@ -212,7 +212,13 @@ class LakehouseLens:
 
     def _save_commit_manifest(self, name: str, commit_hash: str) -> None:
         """Save the current manifest hash keyed by commit hash for time-travel."""
-        manifest_hash = self.kernel.resolve(f"collections/{name}/manifest")
+        # Read the active branch's manifest ref (per-branch — was collection-level
+        # collections/{name}/manifest before the branches/ refactor).
+        us = self._storage._unified
+        if us is not None:
+            manifest_hash = self.kernel.resolve(us._manifest_ref(name))
+        else:
+            manifest_hash = self.kernel.resolve(f"collections/{name}/branches/main/manifest")
         if manifest_hash is not None:
             self.kernel.reference(
                 f"collections/{name}/commits/{commit_hash}__manifest",
@@ -358,7 +364,7 @@ class LakehouseLens:
         if us is not None:
             head = self.kernel.resolve(us._active_commit_ref(table_name))
         else:
-            head = self.kernel.resolve(f"collections/{table_name}/branch-refs/main")
+            head = self.kernel.resolve(f"collections/{table_name}/branches/main/commit")
         cached = self._registered_tables.get(table_name)
         if cached == head:
             return  # already registered at this commit
@@ -431,7 +437,7 @@ class LakehouseLens:
           - Shards are stored under collections/{name}/branches/{branch}/shards/
           - read_branch reads the branch's commit + shards
           - The branch's manifest advances as commits land on the branch
-          - Main is untouched because main's branch-refs/main and shard
+          - Main is untouched because main's branches/main/commit and shard
             space are separate from the branch's.
 
         Args:
@@ -455,7 +461,7 @@ class LakehouseLens:
             us.branch(name, branch_name)
         us.checkout(name, branch_name)
 
-        # Now writes go to the branch's shard space and branch-refs/{branch}.
+        # Now writes go to the branch's shard space and branches/{branch}/commit.
         rows = data.to_pylist()
         commit_hash = self._storage.append(
             name, rows, key_col=key_col,
@@ -463,26 +469,26 @@ class LakehouseLens:
             message=f"branch {branch_name}: insert {data.num_rows} rows")
 
         # _write_commit_blob (called by append) already updated
-        # branch-refs/{branch_name} to the new commit. No separate binding
+        # branches/{branch_name}/commit to the new commit. No separate binding
         # is needed — the active commit ref IS the branch ref now.
 
         # Restore the original active branch (if any).
         if original_active is None:
-            # Was on default (main) — detach and re-sync manifest to main.
+            # Was on default (main) — detach. Each branch has its own manifest
+            # ref, so simply popping the active branch is enough — reads will
+            # automatically use main's manifest ref (no sync needed).
             us._active_branches.pop(name, None)
-            # Re-sync the manifest ref to main's commit (the one before checkout).
-            main_commit = self.kernel.resolve(us._branch_ref(name, "main"))
-            if main_commit is not None:
-                # Sync the manifest ref so reads see main's data again.
-                us._sync_manifest_ref_to_head(name)
-                if hasattr(us.kernel, 'invalidate_path_cache'):
-                    us.kernel.invalidate_path_cache(us._manifest_ref(name))
+            if hasattr(us.kernel, 'invalidate_path_cache'):
+                us.kernel.invalidate_path_cache(us._manifest_ref_for_branch(name, "main"))
         else:
             # Restore the originally active branch.
-            # Parse the branch name out of the stored ref path.
-            prefix = f"collections/{name}/branch-refs/"
+            # Parse the branch name out of the stored ref path
+            # (collections/{c}/branches/{branch}/commit → {branch}).
+            prefix = f"collections/{name}/branches/"
             if original_active.startswith(prefix):
-                orig_name = original_active[len(prefix):]
+                rest = original_active[len(prefix):]
+                # Strip the trailing /commit suffix.
+                orig_name = rest.rsplit("/commit", 1)[0] if rest.endswith("/commit") else rest
                 try:
                     us.checkout(name, orig_name)
                 except ValueError:

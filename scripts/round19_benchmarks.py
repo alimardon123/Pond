@@ -260,7 +260,7 @@ def bench_4_append_performance(counting: CountingKernel, storage: PondStorage):
 
     # Manifest size
     manifest = storage._unified._load_manifest("big")
-    manifest_hash = inner.resolve(f"collections/big/manifest")
+    manifest_hash = inner.resolve(f"collections/big/branches/main/manifest")
     manifest_bytes = inner.read_blob(manifest_hash)
     print(f"Manifest size: {len(manifest_bytes)} bytes ({len(manifest.row_groups)} row groups inline)")
 

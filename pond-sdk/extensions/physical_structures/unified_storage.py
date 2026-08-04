@@ -634,21 +634,35 @@ class UnifiedStorage:
     # Manifest ref helper
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _manifest_ref(collection: str) -> str:
-        return f"collections/{collection}/manifest"
+    def _manifest_ref(self, collection: str) -> str:
+        """The manifest ref path for the ACTIVE branch.
+
+        Each branch owns its own manifest ref so checkout is pure
+        in-memory pointer swap (no ref mutation, no race). The active
+        branch is resolved via _get_active_branch (defaults to 'main').
+        """
+        branch = self._get_active_branch(collection)
+        return f"collections/{collection}/branches/{branch}/manifest"
+
+    def _manifest_ref_for_branch(self, collection: str, branch: str) -> str:
+        """The manifest ref path for a SPECIFIC branch (not the active one).
+
+        Used by checkout (to invalidate the old branch's cache) and merge
+        (to write the merge result to the target branch's manifest ref).
+        """
+        return f"collections/{collection}/branches/{branch}/manifest"
 
     @staticmethod
     def _head_ref(collection: str) -> str:
         """DEPRECATED: HEAD ref is eliminated.
 
         Kept for backward compat with external callers (e.g. lakehouse_lens).
-        Returns the active branch's commit ref (branch-refs/{active_branch}).
+        Returns the default branch's commit ref (branches/main/commit).
         NOTE: This is a static method and cannot resolve the in-memory active
         branch — it returns the 'main' branch ref as a fallback. Callers that
         need the true active commit ref should use _active_commit_ref() instead.
         """
-        return f"collections/{collection}/branch-refs/main"
+        return f"collections/{collection}/branches/main/commit"
 
     def _active_commit_ref(self, collection: str) -> str:
         """The ref for the currently active branch's commit (replaces HEAD).
@@ -794,15 +808,15 @@ class UnifiedStorage:
 
     @staticmethod
     def _branch_ref(collection: str, branch: str) -> str:
-        """Branch ref path. Uses 'branch-refs' namespace (not 'branches/')
-        to avoid path conflicts with shard directories on local FS.
+        """Branch commit ref path.
 
-        Shards live at collections/{c}/branches/{branch}/shards/{uuid} —
-        if the branch ref were at collections/{c}/branches/{branch}, it
-        would conflict (file vs directory). Using a separate namespace
-        avoids this on local FS while keeping S3 parity.
+        Each branch owns its own commit ref at
+        collections/{c}/branches/{branch}/commit. Shards live alongside
+        at collections/{c}/branches/{branch}/shards/{uuid}, and the
+        manifest at collections/{c}/branches/{branch}/manifest — all
+        under the single branches/ namespace (no separate branch-refs/).
         """
-        return f"collections/{collection}/branch-refs/{branch}"
+        return f"collections/{collection}/branches/{branch}/commit"
 
     def _write_commit_blob(self, collection: str,
                             manifest_hash: str,
@@ -837,7 +851,9 @@ class UnifiedStorage:
         # single ref update is the only ref mutation needed on commit.
         active = self._active_commit_ref(collection)
         self.kernel.reference(active, commit_hash)
-        # Update the manifest ref (read shortcut) so reads see the new data.
+        # Update the active branch's manifest ref (per-branch manifest).
+        # Each branch has its own manifest ref so checkout is a pure
+        # in-memory pointer swap — no sync needed.
         self.kernel.reference(self._manifest_ref(collection), manifest_hash)
         return commit_hash
 
@@ -865,19 +881,38 @@ class UnifiedStorage:
         return commit.get("index", 0) + 1
 
     def branch(self, collection: str, branch_name: str) -> str:
-        """Create a branch — O(1) ref copy."""
+        """Create a branch — O(1) ref copy.
+
+        Copies BOTH the commit ref AND the manifest ref from the active
+        branch to the new branch. Each branch owns its own manifest ref
+        (per-branch manifests), so a new branch needs its own manifest
+        ref pointing at the source branch's current manifest — otherwise
+        reads on the new branch see no HEAD manifest (only shards).
+        """
         head = self.kernel.resolve(self._active_commit_ref(collection))
         if head is None:
             raise KeyError(f"Collection '{collection}' not found")
         self.kernel.reference(self._branch_ref(collection, branch_name), head)
+        # Also copy the manifest ref so the new branch has a starting manifest.
+        source_branch = self._get_active_branch(collection)
+        source_manifest = self.kernel.resolve(
+            self._manifest_ref_for_branch(collection, source_branch))
+        if source_manifest is not None:
+            self.kernel.reference(
+                self._manifest_ref_for_branch(collection, branch_name),
+                source_manifest)
         return head
 
-    def _sync_manifest_ref_to_head(self, collection: str) -> None:
-        """After undo/checkout/merge, sync the manifest ref to match the active branch's commit.
+    def _sync_branch_manifest_to_head(self, collection: str) -> None:
+        """Sync the active branch's manifest ref to match its commit's manifest.
 
-        The manifest ref (collections/{name}/manifest) must point to the
-        manifest blob of the current active branch's commit. Otherwise reads
-        would see stale data from the old manifest.
+        Used by undo/revert — they rebind the active branch's commit ref
+        to an older commit, so the manifest ref must be rebound to that
+        commit's manifest hash (otherwise reads see the pre-undo manifest).
+
+        NOT needed by checkout — each branch has its own manifest ref, so
+        switching the active branch is enough (the new branch's manifest
+        ref already points at the right manifest).
         """
         head = self.kernel.resolve(self._active_commit_ref(collection))
         if head is None:
@@ -891,9 +926,9 @@ class UnifiedStorage:
     def checkout(self, collection: str, branch_name: str) -> None:
         """Checkout a branch — set the active branch IN-MEMORY ONLY.
 
-        No storage mutation: the active branch is tracked via
-        _active_branches[collection], not via a HEAD ref. The manifest
-        ref is synced to the branch's commit so reads see the right data.
+        No storage mutation: each branch owns its own commit ref AND its
+        own manifest ref, so switching the active branch is a pure pointer
+        swap. Reads automatically pick up the new branch's manifest ref.
 
         Sets the active branch so subsequent commits/append/shard writes
         go to this branch (git-like behavior).
@@ -901,14 +936,21 @@ class UnifiedStorage:
         h = self.kernel.resolve(self._branch_ref(collection, branch_name))
         if h is None:
             raise ValueError(f"Branch '{branch_name}' does not exist")
-        # In-memory only: just set the active branch pointer.
+        # Invalidate the OLD branch's manifest ref cache (so a future
+        # checkout back to it re-reads fresh data).
+        old_branch = self._get_active_branch(collection)
+        if hasattr(self.kernel, 'invalidate_path_cache'):
+            self.kernel.invalidate_path_cache(
+                self._manifest_ref_for_branch(collection, old_branch))
+        # Switch the active branch IN-MEMORY ONLY.
         self._active_branches[collection] = self._branch_ref(collection, branch_name)
-        # Sync manifest ref to this branch's commit (so reads see the right data)
-        self._sync_manifest_ref_to_head(collection)
-        # Invalidate path cache so resolve() picks up the new manifest ref
-        # (only if the kernel supports it — PondMinimal doesn't).
+        # Invalidate the NEW branch's manifest ref cache so the next read
+        # re-reads from storage (rather than seeing a stale cached value).
         if hasattr(self.kernel, 'invalidate_path_cache'):
             self.kernel.invalidate_path_cache(self._manifest_ref(collection))
+        # Invalidate ALL UnifiedStorage-level caches for this collection
+        # so the next read sees the new branch's data.
+        self._invalidate_manifest_cache(collection)
 
     def checkout_new(self, collection: str, branch_name: str) -> str:
         """Create a branch AND checkout — like `git checkout -b`.
@@ -931,16 +973,24 @@ class UnifiedStorage:
     def list_branches(self, collection: str) -> list[str]:
         """List all branches for a collection.
 
-        Branch refs live at collections/{c}/branch-refs/{branch} (one file
-        per branch). Lists those and extracts the branch names.
+        Branch state lives at collections/{c}/branches/{branch}/ — a branch
+        is identified by having a `commit` (or `manifest`) file inside its
+        directory. We list all refs under branches/ and collect the unique
+        branch names (ignoring `shards/` subpaths).
         """
-        prefix = f"collections/{collection}/branch-refs/"
+        prefix = f"collections/{collection}/branches/"
         branches = set()
         for n in self.kernel.list_names():
-            if n.startswith(prefix):
-                # Extract branch name: branch-refs/{branch}  →  {branch}
-                branch_name = n[len(prefix):]
-                if branch_name:
+            if not n.startswith(prefix):
+                continue
+            # n is like collections/{c}/branches/{branch}/commit
+            # or collections/{c}/branches/{branch}/manifest
+            # or collections/{c}/branches/{branch}/shards/{uuid}
+            rest = n[len(prefix):]
+            parts = rest.split("/")
+            if len(parts) >= 2:
+                branch_name = parts[0]
+                if parts[1] in ("commit", "manifest"):
                     branches.add(branch_name)
         return sorted(branches)
 
@@ -1070,8 +1120,13 @@ class UnifiedStorage:
         # the target_branch ref when target == active. If target != active,
         # we intentionally do NOT move the active branch (the merge landed
         # on a different branch).
-        # Sync manifest ref to the new merge commit's manifest (reads must see it)
-        self.kernel.reference(self._manifest_ref(collection), manifest_hash)
+        # Update the TARGET branch's manifest ref (per-branch manifests).
+        # NB: use _manifest_ref_for_branch (specific branch), NOT
+        # _manifest_ref (active branch) — if target != active, writing to
+        # the active branch's manifest ref would corrupt the wrong branch.
+        self.kernel.reference(
+            self._manifest_ref_for_branch(collection, target_branch),
+            manifest_hash)
         # Source branch ref is left unchanged (it still points at its own
         # tip — the merge does not fast-forward the source).
 
@@ -1165,7 +1220,9 @@ class UnifiedStorage:
             head = commit["parent"]
         self.kernel.reference(self._active_commit_ref(collection), head)
         self._active_branches.pop(collection, None)  # detach from branch
-        self._sync_manifest_ref_to_head(collection)
+        # Rebind the active branch's manifest ref to the new HEAD's manifest
+        # (undo rewinds the commit ref; the manifest ref must follow).
+        self._sync_branch_manifest_to_head(collection)
         return head[:12] if head else ""
 
     def revert(self, collection: str, commit_hash: str) -> str:
@@ -1215,7 +1272,8 @@ class UnifiedStorage:
         # Revert the active branch's commit to the specified commit
         self.kernel.reference(self._active_commit_ref(collection), commit_hash)
         self._active_branches.pop(collection, None)  # detach from branch
-        self._sync_manifest_ref_to_head(collection)
+        # Rebind the active branch's manifest ref to the reverted commit's manifest
+        self._sync_branch_manifest_to_head(collection)
         return commit_hash[:12]
 
     def history(self, collection: str, limit: int = 100) -> list[dict]:
@@ -1291,8 +1349,9 @@ class UnifiedStorage:
     #   - Each shard is an independent immutable blob
     #
     # Architecture:
-    #   collections/{name}/HEAD → compacted manifest (merged state)
-    #   collections/{name}/shards/{uuid} → shard manifest (one per writer batch)
+    #   collections/{name}/branches/{branch}/commit    → commit blob hash
+    #   collections/{name}/branches/{branch}/manifest  → manifest blob hash
+    #   collections/{name}/branches/{branch}/shards/{uuid} → shard manifest (per writer batch)
     #
     # Write path (append_shard):
     #   1. Writer generates a UUIDv7 (time-ordered, unique)
@@ -1333,11 +1392,15 @@ class UnifiedStorage:
         """Get the active branch for a collection (default: main)."""
         active = self._active_branches.get(collection)
         if active:
-            # active is stored as the full ref path — extract branch name
-            # _branch_ref returns collections/{c}/branch-refs/{branch}
-            prefix = f"collections/{collection}/branch-refs/"
+            # active is stored as the full ref path — extract branch name.
+            # _branch_ref returns collections/{c}/branches/{branch}/commit,
+            # so we strip the prefix and the trailing /commit.
+            prefix = f"collections/{collection}/branches/"
             if active.startswith(prefix):
-                return active[len(prefix):]
+                rest = active[len(prefix):]  # {branch}/commit
+                # Strip the trailing /commit (rsplit handles branch names
+                # that contain 'commit' as a substring — only the suffix matches).
+                return rest.rsplit("/commit", 1)[0]
         return "main"
 
     def _read_shard_index(self, collection: str, branch: Optional[str] = None) -> list[str]:

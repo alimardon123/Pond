@@ -118,7 +118,7 @@ def benchmark_write_and_read():
         write_reads = count_reads(kernel)
 
         # Verify manifest was built
-        manifest_hash = kernel.resolve(f"collections/{collection}/manifest")
+        manifest_hash = kernel.resolve(f"collections/{collection}/branches/main/manifest")
         has_manifest = manifest_hash is not None
         print(f"  Write: {write_time*1000:.1f}ms, {write_reads} reads, "
               f"manifest={'yes' if has_manifest else 'NO'}")
@@ -313,7 +313,7 @@ def benchmark_manifest_size():
         lens.range_write(collection, table, key_col="id",
                           row_group_size=100)
 
-        manifest_hash = kernel.resolve(f"collections/{collection}/manifest")
+        manifest_hash = kernel.resolve(f"collections/{collection}/branches/main/manifest")
         if manifest_hash:
             blob_path = kernel._blob_path(manifest_hash)
             size = os.path.getsize(blob_path)

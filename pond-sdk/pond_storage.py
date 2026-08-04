@@ -194,7 +194,7 @@ class PondStorage:
         if self._unified is not None:
             head = self.kernel.resolve(self._unified._active_commit_ref(name))
         else:
-            head = self.kernel.resolve(f"collections/{name}/branch-refs/main")
+            head = self.kernel.resolve(f"collections/{name}/branches/main/commit")
         return head or ""
 
     def branch(self, name: str, branch_name: str) -> str:
@@ -985,24 +985,41 @@ class PondStorage:
         return commit_hash
 
     def delete_collection(self, collection: str) -> bool:
-        """Delete a collection by tombstoning its manifest + branch-refs.
+        """Delete a collection by tombstoning its definition + branch commit refs.
 
         Fix (Round 12 Issue #3): previously a no-op that returned True.
         Now uses the RFC-0008 tombstone pattern from maintenance.py to
-        actually rebind the manifest ref (and any branch-refs) to
-        TOMBSTONE_HASH, making the collection unreadable. Underlying
-        blobs are NOT deleted (content-addressed, may be shared). Use
-        vacuum() for blob cleanup (not yet implemented).
+        actually rebind the definition ref (collection-level marker) and
+        each branch's commit ref to TOMBSTONE_HASH, making the collection
+        unreadable. Underlying blobs are NOT deleted (content-addressed,
+        may be shared). Use vacuum() for blob cleanup (not yet implemented).
         """
         deleted = False
-        manifest_ref = f"collections/{collection}/manifest"
-        # Collect all refs to tombstone: the manifest ref + all branch-refs.
-        # (With HEAD eliminated, branch-refs/{branch} are the commit refs.)
-        refs_to_tombstone = [manifest_ref]
-        branch_prefix = f"collections/{collection}/branch-refs/"
+        # Collect all refs to tombstone: the definition ref (collection-level
+        # marker) + each branch's commit ref (so list_branches / checkout
+        # see the collection as gone).
+        refs_to_tombstone: list[str] = []
+        definition_ref = f"collections/{collection}/definition"
+        if self.kernel.resolve(definition_ref) is not None:
+            refs_to_tombstone.append(definition_ref)
+        # Tombstone every branch's commit ref under branches/{branch}/commit.
+        branch_prefix = f"collections/{collection}/branches/"
         for n in self.kernel.list_names():
-            if n.startswith(branch_prefix):
+            if not n.startswith(branch_prefix):
+                continue
+            # Match collections/{c}/branches/{branch}/commit exactly — skip
+            # /manifest and /shards/ subpaths (their parent commit ref going
+            # away is enough to make the branch unreachable).
+            rest = n[len(branch_prefix):]
+            parts = rest.split("/")
+            if len(parts) == 2 and parts[1] == "commit":
                 refs_to_tombstone.append(n)
+        # If no definition ref existed (legacy collection), still tombstone
+        # the default branch's commit ref so collection_exists returns False.
+        if not refs_to_tombstone:
+            main_commit_ref = f"collections/{collection}/branches/main/commit"
+            if self.kernel.resolve(main_commit_ref) is not None:
+                refs_to_tombstone.append(main_commit_ref)
 
         try:
             from maintenance import drop_name, TOMBSTONE_HASH

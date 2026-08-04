@@ -74,7 +74,7 @@ def test_pb_scale_manifest_uses_stats_tree():
     # With lazy build, the manifest blob has ALL row groups inline (no stats tree
     # was persisted). This is the P10 tradeoff: writes are fast, first read
     # pays the build cost. The manifest blob is large but still readable.
-    manifest_hash = kernel.resolve("collections/pb_test/manifest")
+    manifest_hash = kernel.resolve("collections/pb_test/branches/main/manifest")
     manifest_blob = kernel.read_blob(manifest_hash)
     print(f"  manifest blob size: {len(manifest_blob):,} bytes")
 
