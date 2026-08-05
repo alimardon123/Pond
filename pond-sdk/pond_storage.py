@@ -511,6 +511,19 @@ class PondStorage:
         if self._unified is not None:
             self._unified.invalidate_all_caches(collection)
 
+    def wait_for_background_tasks(self, timeout: float = 30.0) -> None:
+        """Wait for all background tombstone/vacuum threads to complete.
+
+        Async tombstoning (in merge + compact) runs in daemon threads.
+        This method blocks until all of them finish (or timeout).
+
+        Call this when you need to ensure all shard refs are cleaned up
+        before checking shard_count() or doing another operation that
+        depends on the tombstoning being complete.
+        """
+        if self._unified is not None:
+            self._unified.wait_for_background_tasks(timeout=timeout)
+
     def upsert_shard(self, collection: str, rows: list[dict],
                       key_col: Optional[str] = None,
                       row_group_size: int = 10_000) -> str:

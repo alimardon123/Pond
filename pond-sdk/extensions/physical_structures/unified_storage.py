@@ -875,6 +875,22 @@ class UnifiedStorage:
         self._delta_chain_depth_cache.pop(collection, None)
         self._schema_cache.pop(collection, None)
 
+    def wait_for_background_tasks(self, timeout: float = 30.0) -> None:
+        """Wait for all background tombstone/vacuum threads to complete.
+
+        Async tombstoning (in merge + compact) runs in daemon threads.
+        This method blocks until all of them finish (or timeout).
+
+        Call this in tests or when you need to ensure all shard refs are
+        cleaned up before checking shard_count() or doing another operation
+        that depends on the tombstoning being complete.
+        """
+        threads = getattr(self, '_bg_threads', [])
+        for t in threads:
+            t.join(timeout=timeout)
+        # Clear the list (threads are done)
+        self._bg_threads = []
+
     def invalidate_all_caches(self, collection: Optional[str] = None) -> None:
         """Invalidate ALL process-local caches for strong consistency.
 
@@ -1226,33 +1242,37 @@ class UnifiedStorage:
         if not target_branch:
             target_branch = self._get_active_branch(collection)
 
-        branch_head = self.kernel.resolve(
-            self._branch_ref(collection, branch_name))
-        if branch_head is None:
-            raise ValueError(f"Branch '{branch_name}' does not exist")
-
         # The parent of the merge commit is the TARGET branch's HEAD —
         # NOT the currently active HEAD. If you're on `dev` and call
         # merge("events", "feature1", "main"), the merge goes INTO `main`,
         # so `main`'s commit is the first parent (git semantics).
-        target_head = self.kernel.resolve(
-            self._branch_ref(collection, target_branch))
+        #
+        # Resolve ALL 4 refs IN PARALLEL: 2 branch commit refs + 2 manifest refs.
+        # Was 4 sequential RTTs, now 1 RTT wall-clock.
+        from concurrent.futures import ThreadPoolExecutor
+
+        target_commit_ref = self._branch_ref(collection, target_branch)
+        branch_commit_ref = self._branch_ref(collection, branch_name)
+        target_manifest_ref = self._manifest_ref_for_branch(collection, target_branch)
+        branch_manifest_ref = self._manifest_ref_for_branch(collection, branch_name)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            f_target_commit = pool.submit(self.kernel.resolve, target_commit_ref)
+            f_branch_commit = pool.submit(self.kernel.resolve, branch_commit_ref)
+            f_target_manifest = pool.submit(self.kernel.resolve, target_manifest_ref)
+            f_branch_manifest = pool.submit(self.kernel.resolve, branch_manifest_ref)
+            target_head = f_target_commit.result()
+            branch_head = f_branch_commit.result()
+            target_manifest_hash = f_target_manifest.result()
+            branch_manifest_hash = f_branch_manifest.result()
+
+        if branch_head is None:
+            raise ValueError(f"Branch '{branch_name}' does not exist")
+
         if target_head is None:
             # Target branch doesn't exist yet — fall back to active branch's
             # commit (backward compat for the no-target-branch case).
             target_head = self.kernel.resolve(self._active_commit_ref(collection))
-
-        # Read both commit blobs AND both manifests IN PARALLEL.
-        # We can read manifests directly via the per-branch manifest ref
-        # (skips the commit-blob → manifest_hash indirection). This collapses
-        # 4 sequential RTTs (2 commits + 2 manifests) into 1 RTT wall-clock.
-        from concurrent.futures import ThreadPoolExecutor
-
-        # Resolve both manifest refs (likely cached — 0 RTTs warm)
-        target_manifest_hash = self.kernel.resolve(
-            self._manifest_ref_for_branch(collection, target_branch))
-        branch_manifest_hash = self.kernel.resolve(
-            self._manifest_ref_for_branch(collection, branch_name))
 
         # Batch ALL 4 reads in parallel: 2 commit blobs + 2 manifests
         # (manifests read directly via manifest_ref, not via commit blob)
@@ -1350,13 +1370,19 @@ class UnifiedStorage:
         # so all 3 PUTs are independent.
         import json as _json
         import time as _time
+        # Compute commit index from the target commit blob we already read
+        # (was a separate _commit_index() call that did 2 more GETs).
+        commit_index = 0
+        if head_commit:
+            commit_index = head_commit.get("index", 0) + 1
+
         commit = {
             "parent": target_head,
             "second_parent": branch_head,
             "manifest": manifest_hash,
             "message": message or f"merge '{branch_name}'",
             "timestamp": _time.time(),
-            "index": self._commit_index(collection),
+            "index": commit_index,
         }
         commit_bytes = _json.dumps(commit, sort_keys=True).encode()
 
@@ -1406,23 +1432,50 @@ class UnifiedStorage:
         # Old shard refs that still point to valid manifests would otherwise
         # be reported as "live" by shard_count and re-merged on next read.
         #
-        # OPTIMIZATION: clear both branches in PARALLEL and pass BOTH the
-        # shard_hashes AND the ref_names. This skips the redundant
-        # list_paths+resolve calls in _tombstone_shard_refs (saves ~4 RTTs).
-        from concurrent.futures import ThreadPoolExecutor
+        # ASYNC TOMBSTONING: The tombstone deletes are fire-and-forget.
+        # They run in a BACKGROUND thread — merge() returns immediately
+        # after the commit + ref PUTs. The shard refs will be deleted
+        # shortly after (within seconds). Readers are NOT affected because
+        # the merged manifest already contains all the row groups — the
+        # shards are redundant data. Even if a reader sees the old shards
+        # AND the new merged manifest, it gets the correct result (the
+        # shards' row groups are a subset of the merged manifest's).
+        #
+        # The only risk: if another process lists shards BEFORE the
+        # tombstone completes, it will see the old shards + the new merged
+        # manifest. This is SAFE because the merge is a UNION — duplicate
+        # row groups (same rg_key) are deduped by the CRDT merge. The
+        # reader just does a bit more work (reads the same row group twice
+        # from different blobs — same content, same hash, deduped).
         target_ref_names = [n for (n, _h) in target_shard_refs]
         branch_ref_names = [n for (n, _h) in branch_shard_refs]
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f1 = pool.submit(self._clear_branch_shards, collection, branch_name,
-                              shard_hashes=branch_shard_hashes,
-                              shard_ref_names=branch_ref_names)
-            f2 = pool.submit(self._clear_branch_shards, collection, target_branch,
-                              shard_hashes=target_shard_hashes,
-                              shard_ref_names=target_ref_names)
-            f1.result()
-            f2.result()
+
+        # Fire-and-forget background tombstoning
+        import threading
+        def _async_tombstone():
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    f1 = pool.submit(self._clear_branch_shards, collection, branch_name,
+                                      shard_hashes=branch_shard_hashes,
+                                      shard_ref_names=branch_ref_names)
+                    f2 = pool.submit(self._clear_branch_shards, collection, target_branch,
+                                      shard_hashes=target_shard_hashes,
+                                      shard_ref_names=target_ref_names)
+                    f1.result()
+                    f2.result()
+            except Exception:
+                pass  # best-effort — tombstone failure doesn't break correctness
+
+        t = threading.Thread(target=_async_tombstone, daemon=True)
+        t.start()
+        self._bg_threads = getattr(self, '_bg_threads', [])
+        self._bg_threads.append(t)
 
         self._active_branches.pop(collection, None)  # merge detaches from branch
+        # Invalidate the shard list cache so the next read doesn't return
+        # the old (pre-merge) shard list. The merged manifest is now HEAD.
+        self._invalidate_shard_cache(collection)
         self._invalidate_manifest_cache(collection)
         return commit_hash
 
@@ -2880,26 +2933,50 @@ class UnifiedStorage:
             self.kernel.reference(active, commit_hash)
             self.kernel.reference(manifest_ref, manifest_hash)
 
-        # Clear shards
+        # ASYNC TOMBSTONING + VACUUM: The shard ref deletes + blob deletes
+        # are fire-and-forget. They run in a BACKGROUND thread — compact()
+        # returns immediately after the commit + ref PUTs.
+        #
+        # This is SAFE because:
+        #   1. The new manifest is already HEAD (commit + refs written).
+        #   2. Readers use the new manifest — they don't need the old shards.
+        #   3. If a reader sees old shards + new manifest, the CRDT union
+        #      dedupes by rg_key (same row group, same blob_hash — no harm).
+        #   4. The tombstone deletes will complete shortly (within seconds).
+        #   5. Vacuum (blob deletes) is purely space reclamation — doesn't
+        #      affect correctness.
         branch = self._get_active_branch(collection)
-        self._clear_branch_shards(collection, branch, shard_hashes=shard_hashes)
+
+        # Capture the data needed by the background thread
+        _shard_hashes = list(shard_hashes)
+        _new_manifest = new_manifest
+        _collection = collection
+        _branch = branch
+
+        import threading
+        def _async_tombstone_and_vacuum():
+            try:
+                self._clear_branch_shards(_collection, _branch,
+                                           shard_hashes=_shard_hashes)
+            except Exception:
+                pass
+            try:
+                self._auto_vacuum_after_compact(
+                    _collection, _shard_hashes, new_manifest=_new_manifest)
+            except Exception:
+                pass  # best-effort
+
+        t = threading.Thread(target=_async_tombstone_and_vacuum, daemon=True)
+        t.start()
+        self._bg_threads = getattr(self, '_bg_threads', [])
+        self._bg_threads.append(t)
 
         # Update caches
         self._update_caches_after_write(
             collection, new_manifest, manifest_hash, commit_hash,
             commit_index, is_delta=False)
-
-        # Auto-vacuum: delete the tombstoned shard blobs + old shard manifests.
-        # Without this, compaction tombstones refs but leaves dead blobs,
-        # so object count goes UP instead of down.
-        # IMPORTANT: pass new_manifest so we DON'T delete data blobs that
-        # are now referenced by the new manifest (inline shards' PND2 blobs
-        # are data — they must survive manifest-level compaction).
-        try:
-            self._auto_vacuum_after_compact(
-                collection, shard_hashes, new_manifest=new_manifest)
-        except Exception:
-            pass  # best-effort — vacuum failure shouldn't break compaction
+        # Invalidate shard list cache — shards are being cleared in background
+        self._invalidate_shard_cache(collection)
 
         return commit_hash
 
@@ -3011,33 +3088,40 @@ class UnifiedStorage:
             message=f"compact {len(shard_hashes)} shards ({len(all_rows)} live rows)",
             index=commit_index)
 
-        # Clear shards: tombstone the absorbed shard refs and reset the index.
-        # The tombstone path overwrites each ref with an empty blob so that
-        # _list_shards_from_refs (which scans refs as source of truth) skips
-        # them. Only the shards that were in the index at compaction time
-        # are tombstoned — a concurrent writer that added a new shard after
-        # we read the index will still be visible (and will be picked up by
-        # the next compaction).
+        # ASYNC TOMBSTONING + VACUUM (same as manifest-level compaction):
+        # Fire-and-forget background thread. compact() returns immediately
+        # after the commit + ref PUTs. See _compact_shards_manifest_level
+        # for the safety analysis.
         branch = self._get_active_branch(collection)
-        self._clear_branch_shards(collection, branch, shard_hashes=shard_hashes)
+
+        _shard_hashes = list(shard_hashes)
+        _new_manifest = new_manifest
+        _collection = collection
+        _branch = branch
+
+        import threading
+        def _async_tombstone_and_vacuum():
+            try:
+                self._clear_branch_shards(_collection, _branch,
+                                           shard_hashes=_shard_hashes)
+            except Exception:
+                pass
+            try:
+                self._auto_vacuum_after_compact(
+                    _collection, _shard_hashes, new_manifest=_new_manifest)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_async_tombstone_and_vacuum, daemon=True)
+        t.start()
+        self._bg_threads = getattr(self, '_bg_threads', [])
+        self._bg_threads.append(t)
 
         # Update caches
         self._update_caches_after_write(
             collection, new_manifest, manifest_hash, commit_hash,
             commit_index, is_delta=False)
-
-        # Auto-vacuum: delete the tombstoned shard blobs + old shard manifests.
-        # Pass new_manifest to protect blobs referenced by the new manifest.
-        # This is CRITICAL for inline shards: the shard hash IS the PND2 data
-        # blob hash. If row-level compaction re-encodes the SAME data (same
-        # rows → same content → same hash), the new manifest references the
-        # SAME blob as the old shard. Without protection, vacuum would delete
-        # the new manifest's blob — corrupting HEAD.
-        try:
-            self._auto_vacuum_after_compact(
-                collection, shard_hashes, new_manifest=new_manifest)
-        except Exception:
-            pass
+        self._invalidate_shard_cache(collection)
 
         return commit_hash
 

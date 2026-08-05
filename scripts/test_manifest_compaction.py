@@ -46,6 +46,7 @@ def test_manifest_level_preserves_rows():
 
     # Compact
     s.compact_shards("test")
+    s.wait_for_background_tasks()
 
     # After compaction: still 80 rows, but now all in HEAD (0 shards)
     rows_after = s.read("test")
@@ -84,6 +85,7 @@ def test_manifest_level_zero_data_reads():
 
     # Compact
     s.compact_shards("test")
+    s.wait_for_background_tasks()
 
     # Count data reads (kernel.stats["reads"]) vs ref reads
     data_reads = kernel.stats["reads"]
@@ -134,6 +136,7 @@ def test_row_level_for_upserts():
 
     # Compact (should use row-level fallback because _rowid is present)
     s.compact_shards("test")
+    s.wait_for_background_tasks()
 
     rows_after = s.read("test")
     assert len(rows_after) == 20, f"Expected 20 rows after compaction, got {len(rows_after)}"
@@ -171,6 +174,7 @@ def test_row_level_for_deletes():
 
     # Compact
     s.compact_shards("test")
+    s.wait_for_background_tasks()
 
     rows_after = s.read("test")
     assert len(rows_after) == 18, f"Expected 18 rows after compaction, got {len(rows_after)}"
@@ -189,6 +193,7 @@ def test_idempotent_compaction():
 
     # First compaction
     s.compact_shards("test")
+    s.wait_for_background_tasks()
     rows_1 = sorted(s.read("test"), key=lambda r: r["id"])
     ids_1 = [r["id"] for r in rows_1]
 
@@ -228,6 +233,7 @@ def test_pb_scale_compaction_throughput():
     kernel.reset_stats()
     t0 = time.perf_counter()
     s.compact_shards("test")
+    s.wait_for_background_tasks()
     t1 = time.perf_counter()
 
     data_reads = kernel.stats["reads"]
@@ -269,6 +275,7 @@ def test_mixed_insert_and_upsert():
 
     # Compact — should use row-level fallback because upsert added _rowid
     s.compact_shards("test")
+    s.wait_for_background_tasks()
 
     rows = s.read("test")
     # 20 (original, no _rowid) + 5 (insert-only) + 1 (upsert with _rowid) = 26

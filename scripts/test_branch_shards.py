@@ -122,6 +122,9 @@ def test_merge_branch_with_shards():
 
     # Merge feature1 into main
     s_main.merge("events", "feature1")
+    # Wait for async tombstoning to complete (merge returns immediately,
+    # shard refs are deleted in background)
+    s_main.wait_for_background_tasks()
 
     # main should now have all rows: init + f1 + f2 + m1 = 4 rows
     merged = s_main.read_with_shards("events")
@@ -149,6 +152,8 @@ def test_shards_cleared_after_merge():
     s_main = PondStorage(kernel)
     s_main.checkout("events", "main")
     s_main.merge("events", "feature1")
+    # Wait for async tombstoning to complete
+    s_main.wait_for_background_tasks()
 
     # feature1 shards should be cleared
     s_f1_new = PondStorage(kernel)
