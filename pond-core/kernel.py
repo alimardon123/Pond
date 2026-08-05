@@ -114,6 +114,39 @@ class PondMinimal:
         self.stats["writes"] += 1
         return h
 
+    def write_batch(self, items: list[bytes]) -> list[str]:
+        """Write a batch of blobs in parallel (thread pool).
+
+        Local FS is fast, but parallel writes still help when there are
+        many blobs to write.
+        """
+        if not items:
+            return []
+        if len(items) == 1:
+            return [self.write(items[0])]
+
+        from concurrent.futures import ThreadPoolExecutor
+        results: list[Optional[str]] = [None] * len(items)
+        errors: list[Optional[Exception]] = [None] * len(items)
+
+        def _put_one(idx, data):
+            try:
+                results[idx] = self.write(data)
+            except Exception as e:
+                errors[idx] = e
+
+        workers = min(16, len(items))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_put_one, i, d)
+                        for i, d in enumerate(items)]
+            for f in futures:
+                f.result()
+
+        for e in errors:
+            if e is not None:
+                raise e
+        return results
+
     # ------------------------------------------------------------------
     # Primitive 2: Read
     # ------------------------------------------------------------------
@@ -144,6 +177,35 @@ class PondMinimal:
             raise ValueError(f"Blob {h} not found on disk")
         with open(path, "rb") as f:
             return f.read()
+
+    def read_blob_batch(self, hashes: list[str]) -> list[bytes]:
+        """Fetch a batch of blobs in parallel (thread pool)."""
+        if not hashes:
+            return []
+        if len(hashes) == 1:
+            return [self.read_blob(hashes[0])]
+
+        from concurrent.futures import ThreadPoolExecutor
+        results: list[Optional[bytes]] = [None] * len(hashes)
+        errors: list[Optional[Exception]] = [None] * len(hashes)
+
+        def _get_one(idx, h):
+            try:
+                results[idx] = self.read_blob(h)
+            except Exception as e:
+                errors[idx] = e
+
+        workers = min(16, len(hashes))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_get_one, i, h)
+                        for i, h in enumerate(hashes)]
+            for f in futures:
+                f.result()
+
+        for e in errors:
+            if e is not None:
+                raise e
+        return results
 
     # ------------------------------------------------------------------
     # Primitive 3: Reference

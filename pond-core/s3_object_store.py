@@ -139,6 +139,61 @@ class S3ObjectStore:
             self.stats["bytes_written"] += len(data)
         return h
 
+    def put_blob_batch(self, items: list[bytes],
+                        max_workers: int = 32) -> list[str]:
+        """Write a batch of blobs in PARALLEL — wall-clock ~1 RTT, not N × RTT.
+
+        Args:
+            items: list of byte payloads to write
+            max_workers: max parallel PUTs (default 32 — R2 supports 50+
+                concurrent connections per client)
+
+        Returns:
+            List of content hashes, in the same order as `items`.
+
+        This is the SINGLE most impactful optimization for bulk writes on
+        R2/S3: 10 sequential PUTs × ~300ms = 3000ms becomes ~300ms wall-clock.
+        """
+        if not items:
+            return []
+        if len(items) == 1:
+            return [self.put_blob(items[0])]
+
+        # Pre-compute hashes + S3 keys (CPU work, no I/O)
+        hashes_keys = [(hash_bytes(data), self._blob_key(hash_bytes(data)))
+                        for data in items]
+
+        from concurrent.futures import ThreadPoolExecutor
+        # Order-preserving parallel execution
+        results: list[Optional[str]] = [None] * len(items)
+        errors: list[Optional[Exception]] = [None] * len(items)
+
+        def _put_one(idx, data, key):
+            try:
+                self._client.put_object(Bucket=self._bucket, Key=key, Body=data)
+            except Exception as e:
+                errors[idx] = e
+
+        workers = min(max_workers, len(items))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_put_one, i, items[i], hashes_keys[i][1])
+                for i in range(len(items))
+            ]
+            for f in futures:
+                f.result()
+
+        # Surface the first error if any
+        for e in errors:
+            if e is not None:
+                raise e
+
+        with self._lock:
+            self.stats["puts"] += len(items)
+            self.stats["bytes_written"] += sum(len(d) for d in items)
+
+        return [h for h, _ in hashes_keys]
+
     def get_blob(self, hash_val: str) -> bytes:
         """Read bytes by content hash. 1 GET = 1 S3 round trip."""
         key = self._blob_key(hash_val)
@@ -151,6 +206,54 @@ class S3ObjectStore:
             self.stats["gets"] += 1
             self.stats["bytes_read"] += len(data)
         return data
+
+    def get_blob_batch(self, hash_vals: list[str],
+                        max_workers: int = 32) -> list[bytes]:
+        """Fetch a batch of blobs in PARALLEL — wall-clock ~1 RTT, not N × RTT.
+
+        Args:
+            hash_vals: list of content hashes to fetch
+            max_workers: max parallel GETs (default 32)
+
+        Returns:
+            List of byte payloads, in the same order as `hash_vals`.
+            Raises KeyError if any hash is not found.
+        """
+        if not hash_vals:
+            return []
+        if len(hash_vals) == 1:
+            return [self.get_blob(hash_vals[0])]
+
+        from concurrent.futures import ThreadPoolExecutor
+        results: list[Optional[bytes]] = [None] * len(hash_vals)
+        errors: list[Optional[Exception]] = [None] * len(hash_vals)
+
+        def _get_one(idx, h):
+            try:
+                key = self._blob_key(h)
+                response = self._client.get_object(Bucket=self._bucket, Key=key)
+                results[idx] = response["Body"].read()
+            except Exception as e:
+                errors[idx] = e
+
+        workers = min(max_workers, len(hash_vals))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_get_one, i, h)
+                        for i, h in enumerate(hash_vals)]
+            for f in futures:
+                f.result()
+
+        for e in errors:
+            if e is not None:
+                raise e
+
+        with self._lock:
+            self.stats["gets"] += len(hash_vals)
+            for r in results:
+                if r is not None:
+                    self.stats["bytes_read"] += len(r)
+
+        return results  # type: ignore[return-value]
 
     def has_blob(self, hash_val: str) -> bool:
         """Check if a blob exists (S3 HEAD — cheaper than GET)."""

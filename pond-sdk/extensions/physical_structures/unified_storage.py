@@ -99,7 +99,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "..", "..", "..", "pond-core"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kernel import PondMinimal  # noqa: E402
+from kernel import PondMinimal, hash_bytes  # noqa: E402
 
 # Reuse the existing encoding + compression + manifest + column_source
 from encoding import (  # noqa: E402
@@ -683,21 +683,46 @@ class UnifiedStorage:
 
         On cache hit: returns decoded data immediately (0 I/O, 0 CPU).
         On cache miss: fetches from storage, decodes, caches, returns.
+
+        IMPORTANT: the cache only stores FULL decodes (columns=None) without
+        predicates. If columns or predicates are specified, we check the cache
+        for a full decode; if found, we project/filter at read time. If not
+        found, we decode with the requested projection (no cache).
         """
-        # Check cache first
-        if self._max_cache_blobs > 0 and blob_hash in self._blob_cache:
-            # Move to end of LRU (most recently used)
-            self._blob_cache_order.remove(blob_hash)
-            self._blob_cache_order.append(blob_hash)
-            return self._blob_cache[blob_hash]
+        # If a projection or predicate is requested, try the cache for a
+        # full decode (no projection). If found, project/filter at read time.
+        if self._max_cache_blobs > 0 and (columns is not None or predicates is not None):
+            if blob_hash in self._blob_cache:
+                cached = self._blob_cache[blob_hash]
+                # Move to end of LRU
+                self._blob_cache_order.remove(blob_hash)
+                self._blob_cache_order.append(blob_hash)
+                # Apply projection
+                if columns is not None:
+                    cached = {c: cached[c] for c in columns if c in cached}
+                # Apply predicate filter (re-evaluate on the cached data)
+                if predicates is not None:
+                    # For simplicity, just return the projected data without
+                    # predicate filtering — the caller's _build_predicate_filter
+                    # will handle row-level filtering.
+                    pass
+                return cached
+
+        # Check cache first (for full-decode requests)
+        if self._max_cache_blobs > 0 and columns is None and predicates is None:
+            if blob_hash in self._blob_cache:
+                # Move to end of LRU (most recently used)
+                self._blob_cache_order.remove(blob_hash)
+                self._blob_cache_order.append(blob_hash)
+                return self._blob_cache[blob_hash]
 
         # Cache miss — fetch + decode
         blob_bytes = self.kernel.read_blob(blob_hash)
         col_data = self._decode_blob(blob_bytes, columns=columns,
                                        predicates=predicates)
 
-        # Cache the result (if caching is enabled)
-        if self._max_cache_blobs > 0:
+        # Cache the result (only for full decodes — no projection, no predicates)
+        if self._max_cache_blobs > 0 and columns is None and predicates is None:
             self._blob_cache[blob_hash] = col_data
             self._blob_cache_order.append(blob_hash)
             # LRU eviction
@@ -909,6 +934,18 @@ class UnifiedStorage:
 
         If the collection has an active branch (set by checkout), the
         branch ref is also updated to point to the new commit.
+
+        OPTIMIZATION (object-store kernels only): commit blob PUT +
+        commit ref PUT + manifest ref PUT are 3 sequential RTTs. With
+        local hash computation + parallel batched PUTs, we collapse to
+        1 RTT wall-clock:
+          1. Compute commit_hash locally (SHA-256 of commit_bytes — no I/O)
+          2. Batch-PUT the commit blob + the 2 ref paths in parallel
+             (commit ref → commit_hash, manifest ref → manifest_hash)
+
+        For PondMinimal (local disk, no `store` attribute), falls back
+        to sequential kernel.write() + kernel.reference() — local disk
+        has no RTT to amortize.
         """
         import json as _json
         import time as _time
@@ -922,15 +959,46 @@ class UnifiedStorage:
             "index": index,
         }
         commit_bytes = _json.dumps(commit, sort_keys=True).encode()
+
+        # ObjectStoreNativeKernel path: parallel PUT via the store
+        if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
+            # Compute commit_hash LOCALLY — saves 1 RTT vs kernel.write()
+            commit_hash = hash_bytes(commit_bytes)
+
+            active = self._active_commit_ref(collection)
+            manifest_ref = self._manifest_ref(collection)
+
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _put_blob():
+                self.kernel.store.put_blob(commit_bytes)
+
+            def _put_active_ref():
+                self.kernel.store.put_path(active, commit_hash)
+
+            def _put_manifest_ref():
+                self.kernel.store.put_path(manifest_ref, manifest_hash)
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                f1 = pool.submit(_put_blob)
+                f2 = pool.submit(_put_active_ref)
+                f3 = pool.submit(_put_manifest_ref)
+                f1.result()
+                f2.result()
+                f3.result()
+
+            # Update caches + stats manually (bypassed kernel.write/reference)
+            self.kernel.stats["writes"] += 1
+            self.kernel.stats["ref_writes"] += 2
+            self.kernel.stats["references"] += 2
+            self.kernel._path_cache[active] = commit_hash
+            self.kernel._path_cache[manifest_ref] = manifest_hash
+            return commit_hash
+
+        # PondMinimal fallback path: sequential (local disk, no RTT)
         commit_hash = self.kernel.write(commit_bytes)
-        # Update the active branch's commit ref (replaces the old HEAD ref).
-        # The active branch is tracked in-memory via _active_branches; this
-        # single ref update is the only ref mutation needed on commit.
         active = self._active_commit_ref(collection)
         self.kernel.reference(active, commit_hash)
-        # Update the active branch's manifest ref (per-branch manifest).
-        # Each branch has its own manifest ref so checkout is a pure
-        # in-memory pointer swap — no sync needed.
         self.kernel.reference(self._manifest_ref(collection), manifest_hash)
         return commit_hash
 
@@ -1115,18 +1183,43 @@ class UnifiedStorage:
             # commit (backward compat for the no-target-branch case).
             target_head = self.kernel.resolve(self._active_commit_ref(collection))
 
-        # Read both manifests
-        head_commit = self._read_commit_blob(target_head) if target_head else None
-        branch_commit = self._read_commit_blob(branch_head)
+        # Read both commit blobs AND both manifests IN PARALLEL.
+        # We can read manifests directly via the per-branch manifest ref
+        # (skips the commit-blob → manifest_hash indirection). This collapses
+        # 4 sequential RTTs (2 commits + 2 manifests) into 1 RTT wall-clock.
+        from concurrent.futures import ThreadPoolExecutor
 
-        head_manifest = None
-        if head_commit and head_commit.get("manifest"):
-            head_manifest = CollectionManifest.load(
-                self.kernel, head_commit["manifest"])
-        branch_manifest = None
-        if branch_commit and branch_commit.get("manifest"):
-            branch_manifest = CollectionManifest.load(
-                self.kernel, branch_commit["manifest"])
+        # Resolve both manifest refs (likely cached — 0 RTTs warm)
+        target_manifest_hash = self.kernel.resolve(
+            self._manifest_ref_for_branch(collection, target_branch))
+        branch_manifest_hash = self.kernel.resolve(
+            self._manifest_ref_for_branch(collection, branch_name))
+
+        # Batch ALL 4 reads in parallel: 2 commit blobs + 2 manifests
+        # (manifests read directly via manifest_ref, not via commit blob)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {}
+            if target_head:
+                futures["head_commit"] = pool.submit(self._read_commit_blob, target_head)
+            futures["branch_commit"] = pool.submit(self._read_commit_blob, branch_head)
+            if target_manifest_hash:
+                futures["head_manifest"] = pool.submit(
+                    CollectionManifest.load, self.kernel, target_manifest_hash)
+            if branch_manifest_hash:
+                futures["branch_manifest"] = pool.submit(
+                    CollectionManifest.load, self.kernel, branch_manifest_hash)
+
+            head_commit = futures["head_commit"].result() if "head_commit" in futures else None
+            branch_commit = futures["branch_commit"].result() if "branch_commit" in futures else None
+            head_manifest = futures["head_manifest"].result() if "head_manifest" in futures else None
+            branch_manifest = futures["branch_manifest"].result() if "branch_manifest" in futures else None
+
+        # Fallback: if manifest_ref wasn't set (old collection), use the
+        # commit blob's manifest hash to load the manifest
+        if head_manifest is None and head_commit and head_commit.get("manifest"):
+            head_manifest = CollectionManifest.load(self.kernel, head_commit["manifest"])
+        if branch_manifest is None and branch_commit and branch_commit.get("manifest"):
+            branch_manifest = CollectionManifest.load(self.kernel, branch_commit["manifest"])
 
         # Union row group entries from target HEAD + source branch HEAD
         seen: dict[str, RowGroupEntry] = {}
@@ -1138,20 +1231,33 @@ class UnifiedStorage:
                 seen[rg.key] = rg  # branch wins
 
         # Also merge shards from BOTH branches (target branch
-        # and the source branch being merged)
+        # and the source branch being merged) — fetched in PARALLEL
         # schema/key_col from the manifests enable inline-shard pseudo-manifests
         merge_schema = (head_manifest or branch_manifest).columns if \
             (head_manifest or branch_manifest) else None
         merge_key_col = (head_manifest or branch_manifest).key_col if \
             (head_manifest or branch_manifest) else ""
-        for shard_manifest in self._parallel_fetch_shard_manifests(
-                self._read_shard_index(collection, target_branch),
-                schema_columns=merge_schema, key_col=merge_key_col):
-            for rg in shard_manifest.scan_with_pruning():
-                seen[rg.key] = rg
-        for shard_manifest in self._parallel_fetch_shard_manifests(
-                self._read_shard_index(collection, branch_name),
-                schema_columns=merge_schema, key_col=merge_key_col):
+
+        # Read both shard indexes IN PARALLEL (2 sequential list calls → 1)
+        # Use _list_shard_refs_with_names to get (name, hash) pairs so we
+        # can skip the redundant list_paths+resolve in _clear_branch_shards.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            target_future = pool.submit(
+                self._list_shard_refs_with_names, collection, target_branch)
+            branch_future = pool.submit(
+                self._list_shard_refs_with_names, collection, branch_name)
+            target_shard_refs = target_future.result()  # [(name, hash)]
+            branch_shard_refs = branch_future.result()
+
+        target_shard_hashes = [h for (_n, h) in target_shard_refs]
+        branch_shard_hashes = [h for (_n, h) in branch_shard_refs]
+
+        # Fetch shard manifests from BOTH branches in PARALLEL (combined batch)
+        all_shard_hashes = list(target_shard_hashes) + list(branch_shard_hashes)
+        all_shard_manifests = self._parallel_fetch_shard_manifests(
+            all_shard_hashes,
+            schema_columns=merge_schema, key_col=merge_key_col)
+        for shard_manifest in all_shard_manifests:
             for rg in shard_manifest.scan_with_pruning():
                 seen[rg.key] = rg
 
@@ -1178,6 +1284,11 @@ class UnifiedStorage:
         # Write merge commit with TWO parents. We bypass _write_commit_blob
         # because it auto-updates the active branch ref — we need to
         # explicitly update target_branch (and HEAD) here.
+        #
+        # OPTIMIZATION (object-store kernels): 3 PUTs (commit blob +
+        # target_branch ref + manifest ref) all run in PARALLEL = 1 RTT
+        # wall-clock (was 3 RTTs sequential). Compute commit_hash locally
+        # so all 3 PUTs are independent.
         import json as _json
         import time as _time
         commit = {
@@ -1189,22 +1300,43 @@ class UnifiedStorage:
             "index": self._commit_index(collection),
         }
         commit_bytes = _json.dumps(commit, sort_keys=True).encode()
-        commit_hash = self.kernel.write(commit_bytes)
 
-        # Update target_branch ref → merge commit (the merge lands on target)
-        self.kernel.reference(self._branch_ref(collection, target_branch),
-                               commit_hash)
-        # No separate HEAD update — the active branch ref is the same as
-        # the target_branch ref when target == active. If target != active,
-        # we intentionally do NOT move the active branch (the merge landed
-        # on a different branch).
-        # Update the TARGET branch's manifest ref (per-branch manifests).
-        # NB: use _manifest_ref_for_branch (specific branch), NOT
-        # _manifest_ref (active branch) — if target != active, writing to
-        # the active branch's manifest ref would corrupt the wrong branch.
-        self.kernel.reference(
-            self._manifest_ref_for_branch(collection, target_branch),
-            manifest_hash)
+        target_branch_ref = self._branch_ref(collection, target_branch)
+        target_manifest_ref = self._manifest_ref_for_branch(collection, target_branch)
+
+        # ObjectStoreNativeKernel path: parallel PUT
+        if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
+            commit_hash = hash_bytes(commit_bytes)
+
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _put_commit_blob():
+                self.kernel.store.put_blob(commit_bytes)
+
+            def _put_target_branch_ref():
+                self.kernel.store.put_path(target_branch_ref, commit_hash)
+
+            def _put_target_manifest_ref():
+                self.kernel.store.put_path(target_manifest_ref, manifest_hash)
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                f1 = pool.submit(_put_commit_blob)
+                f2 = pool.submit(_put_target_branch_ref)
+                f3 = pool.submit(_put_target_manifest_ref)
+                f1.result()
+                f2.result()
+                f3.result()
+
+            self.kernel.stats["writes"] += 1
+            self.kernel.stats["ref_writes"] += 2
+            self.kernel.stats["references"] += 2
+            self.kernel._path_cache[target_branch_ref] = commit_hash
+            self.kernel._path_cache[target_manifest_ref] = manifest_hash
+        else:
+            # PondMinimal fallback: sequential
+            commit_hash = self.kernel.write(commit_bytes)
+            self.kernel.reference(target_branch_ref, commit_hash)
+            self.kernel.reference(target_manifest_ref, manifest_hash)
         # Source branch ref is left unchanged (it still points at its own
         # tip — the merge does not fast-forward the source).
 
@@ -1214,15 +1346,30 @@ class UnifiedStorage:
         # to catch concurrent writers — does NOT pick up the absorbed shards.
         # Old shard refs that still point to valid manifests would otherwise
         # be reported as "live" by shard_count and re-merged on next read.
-        self._clear_branch_shards(collection, branch_name)
-        self._clear_branch_shards(collection, target_branch)
+        #
+        # OPTIMIZATION: clear both branches in PARALLEL and pass BOTH the
+        # shard_hashes AND the ref_names. This skips the redundant
+        # list_paths+resolve calls in _tombstone_shard_refs (saves ~4 RTTs).
+        from concurrent.futures import ThreadPoolExecutor
+        target_ref_names = [n for (n, _h) in target_shard_refs]
+        branch_ref_names = [n for (n, _h) in branch_shard_refs]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(self._clear_branch_shards, collection, branch_name,
+                              shard_hashes=branch_shard_hashes,
+                              shard_ref_names=branch_ref_names)
+            f2 = pool.submit(self._clear_branch_shards, collection, target_branch,
+                              shard_hashes=target_shard_hashes,
+                              shard_ref_names=target_ref_names)
+            f1.result()
+            f2.result()
 
         self._active_branches.pop(collection, None)  # merge detaches from branch
         self._invalidate_manifest_cache(collection)
         return commit_hash
 
     def _tombstone_shard_refs(self, collection: str, branch: str,
-                               shard_hashes: list[str]) -> None:
+                               shard_hashes: list[str],
+                               ref_names: Optional[list[str]] = None) -> None:
         """Tombstone shard refs by deleting the path entries entirely.
 
         This makes resolve() return None for the shard ref, so
@@ -1231,34 +1378,80 @@ class UnifiedStorage:
 
         Uses delete_path (maintenance operation) — no empty blob created.
         Used by compact_shards and merge to retire absorbed shards.
+
+        OPTIMIZATION: deletes run in PARALLEL via thread pool (was N × RTT
+        sequential, now 1 RTT wall-clock for the whole batch).
+
+        Args:
+            shard_hashes: the shard blob hashes to tombstone
+            ref_names: if provided, the ref NAMES (paths) to delete directly.
+                When provided, skips the list_paths+resolve calls entirely
+                (saves 2 RTTs per branch — significant for merge).
         """
         if not shard_hashes:
             return
-        prefix = self._shards_prefix(collection, branch)
-        # List ref-names by their current hash for O(1) lookup
-        if hasattr(self.kernel, 'list_paths_with_prefix'):
-            candidates = self.kernel.list_paths_with_prefix(prefix)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        # If ref_names provided, use them directly (skip list_paths + resolve)
+        if ref_names is not None:
+            names_to_delete = ref_names
         else:
-            candidates = [n for n in self.kernel.list_names() if n.startswith(prefix)]
-        hash_to_name: dict[str, str] = {}
-        for name in candidates:
-            h = self.kernel.resolve(name)
-            if h is not None:
-                hash_to_name[h] = name
-        # Delete the path entries so resolve() returns None
-        for sh in shard_hashes:
-            name = hash_to_name.get(sh)
-            if name is not None:
-                if hasattr(self.kernel, 'delete_path'):
+            # Fall back to listing + resolving to find the names
+            prefix = self._shards_prefix(collection, branch)
+            if hasattr(self.kernel, 'list_paths_with_prefix'):
+                candidates = self.kernel.list_paths_with_prefix(prefix)
+            else:
+                candidates = [n for n in self.kernel.list_names() if n.startswith(prefix)]
+
+            hash_to_name: dict[str, str] = {}
+            if len(candidates) <= 2 or not hasattr(self.kernel, 'store'):
+                for name in candidates:
+                    h = self.kernel.resolve(name)
+                    if h is not None:
+                        hash_to_name[h] = name
+            else:
+                def _resolve_one(name):
+                    return (name, self.kernel.resolve(name))
+                with ThreadPoolExecutor(max_workers=min(16, len(candidates))) as pool:
+                    futures = [pool.submit(_resolve_one, n) for n in candidates]
+                    for f in futures:
+                        name, h = f.result()
+                        if h is not None:
+                            hash_to_name[h] = name
+
+            names_to_delete = []
+            for sh in shard_hashes:
+                name = hash_to_name.get(sh)
+                if name is not None:
+                    names_to_delete.append(name)
+
+        if not names_to_delete:
+            return
+
+        # Delete in PARALLEL (was N × RTT sequential)
+        if hasattr(self.kernel, 'delete_path'):
+            if len(names_to_delete) == 1:
+                self.kernel.delete_path(names_to_delete[0])
+                self.kernel.invalidate_path_cache(names_to_delete[0])
+            else:
+                def _delete_one(name):
                     self.kernel.delete_path(name)
-                else:
-                    # Fallback for old kernels without delete_path
-                    empty_hash = self.kernel.write(b"")
-                    self.kernel.reference(name, empty_hash)
+                    self.kernel.invalidate_path_cache(name)
+                with ThreadPoolExecutor(max_workers=min(16, len(names_to_delete))) as pool:
+                    futures = [pool.submit(_delete_one, n) for n in names_to_delete]
+                    for f in futures:
+                        f.result()
+        else:
+            # Fallback for old kernels without delete_path
+            for name in names_to_delete:
+                empty_hash = self.kernel.write(b"")
+                self.kernel.reference(name, empty_hash)
                 self.kernel.invalidate_path_cache(name)
 
     def _clear_branch_shards(self, collection: str, branch: str,
-                               shard_hashes: Optional[list[str]] = None) -> None:
+                               shard_hashes: Optional[list[str]] = None,
+                               shard_ref_names: Optional[list[str]] = None) -> None:
         """Clear a branch's shards: tombstone refs so listing skips them.
 
         Unified retire path used by compact_shards and merge. After this:
@@ -1273,10 +1466,15 @@ class UnifiedStorage:
             shard_hashes: if provided, skip the _read_shard_index call and
                 use these hashes directly. This avoids re-reading shard
                 manifests during compaction (the caller already has them).
+            shard_ref_names: if provided, the ref NAMES (paths) to delete.
+                When BOTH shard_hashes AND shard_ref_names are provided,
+                _tombstone_shard_refs can skip the list_paths+resolve
+                calls entirely (saves 2 RTTs per branch in merge).
         """
         if shard_hashes is None:
             shard_hashes = self._read_shard_index(collection, branch)
-        self._tombstone_shard_refs(collection, branch, shard_hashes)
+        self._tombstone_shard_refs(collection, branch, shard_hashes,
+                                     ref_names=shard_ref_names)
         # Invalidate the shard cache — shards are now cleared
         cache_key = f"{collection}/{branch}"
         self._shard_list_cache.pop(cache_key, None)
@@ -1514,6 +1712,19 @@ class UnifiedStorage:
         the first read of each path is a GET. To minimize latency, we
         resolve in parallel using a thread pool.
         """
+        return [h for (_name, h) in self._list_shard_refs_with_names(collection, branch)]
+
+    def _list_shard_refs_with_names(self, collection: str, branch: str
+                                     ) -> list[tuple[str, str]]:
+        """List shard refs as (name, hash) pairs (source of truth).
+
+        Same as _list_shards_from_refs but ALSO returns the ref names.
+        Used by merge() to skip the redundant list_paths+resolve calls
+        in _tombstone_shard_refs (the names are needed for delete_path).
+        """
+        import hashlib as _hashlib
+        _empty_blob_hash = _hashlib.sha256(b"").hexdigest()
+
         prefix = self._shards_prefix(collection, branch)
         # Use list_paths_with_prefix for O(matching) listing
         if hasattr(self.kernel, 'list_paths_with_prefix'):
@@ -1524,31 +1735,34 @@ class UnifiedStorage:
         if not names:
             return []
 
-        # Resolve all shard paths IN PARALLEL (avoids sequential GETs)
+        # Resolve all names IN PARALLEL for object-store kernels
+        # (was N × RTT sequential, now 1 RTT wall-clock for the batch)
         from concurrent.futures import ThreadPoolExecutor
-        max_workers = min(16, len(names))
 
-        def resolve_safe(name):
-            return (name, self.kernel.resolve(name))
-
-        name_to_hash: dict[str, Optional[str]] = {}
-        if len(names) <= 2:
+        name_hash_pairs: list[tuple[str, str]] = []
+        if len(names) <= 2 or not hasattr(self.kernel, 'store'):
             for name in names:
-                name_to_hash[name] = self.kernel.resolve(name)
+                h = self.kernel.resolve(name)
+                if h is not None:
+                    name_hash_pairs.append((name, h))
         else:
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = [pool.submit(resolve_safe, name) for name in names]
+            def _resolve_one(name):
+                return (name, self.kernel.resolve(name))
+            with ThreadPoolExecutor(max_workers=min(16, len(names))) as pool:
+                futures = [pool.submit(_resolve_one, n) for n in names]
                 for f in futures:
                     name, h = f.result()
-                    name_to_hash[name] = h
+                    if h is not None:
+                        name_hash_pairs.append((name, h))
 
-        shard_hashes = []
+        # Filter: skip tombstoned (empty blob hash) + check tx commit status
         committed_tx_cache: set[str] = set()
         checked_tx_cache: set[str] = set()
+        result: list[tuple[str, str]] = []
 
-        for name in names:
-            h = name_to_hash.get(name)
-            if h is None:
+        for name, h in name_hash_pairs:
+            # Skip tombstoned shards (overwritten with empty blob)
+            if h == _empty_blob_hash:
                 continue
 
             # Check if this is a tentative shard (has tx_ prefix)
@@ -1565,10 +1779,11 @@ class UnifiedStorage:
                     if tx_hash is not None:
                         committed_tx_cache.add(tx_id)
                 if tx_id in committed_tx_cache:
-                    shard_hashes.append(h)
+                    result.append((name, h))
             else:
-                shard_hashes.append(h)
-        return shard_hashes
+                # Normal shard (no tx_id) — always visible
+                result.append((name, h))
+        return result
 
     def _build_pseudo_manifest_from_pnd2(self, blob_hash: str,
                                            blob_bytes: bytes,
@@ -1841,20 +2056,44 @@ class UnifiedStorage:
                 vtype = _detect_value_type_with_binary(sample)
                 schema_columns.append((col_name, vtype))
 
-        # Encode new row groups (concurrent-safe — immutable blobs)
-        manifest_entries: list[dict] = []
-        for start in range(0, n_rows, row_group_size):
+        # ENCODE all row groups in parallel, then BATCH-WRITE all PND2
+        # blobs in parallel (1 RTT wall-clock for the whole batch).
+        # Previously: encode + write each RG sequentially = N × (encode + RTT).
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _encode_one(start_idx):
+            start = start_idx
             end = min(start + row_group_size, n_rows)
             group_source = _slice_source(source, start, end)
             max_pk = key_array[end - 1]
             rg_key = _format_rg_key(max_pk)
             pnd2_bytes, col_stats = PND2.encode(
                 group_source, encoding_hints=encoding_hints)
-            blob_hash = self.kernel.write(pnd2_bytes)
+            return (rg_key, pnd2_bytes, end - start, col_stats)
+
+        starts = list(range(0, n_rows, row_group_size))
+        encoded: list[tuple[str, bytes, int, list]] = [None] * len(starts)  # type: ignore[list-item]
+        if len(starts) == 1:
+            encoded[0] = _encode_one(starts[0])
+        else:
+            with ThreadPoolExecutor(max_workers=min(8, len(starts))) as pool:
+                futures = {pool.submit(_encode_one, s): i
+                            for i, s in enumerate(starts)}
+                for f in futures:
+                    idx = futures[f]
+                    encoded[idx] = f.result()
+
+        # Compute blob hashes LOCALLY (no I/O) so we can batch the
+        # ref PUT with the blob PUTs in one parallel batch.
+        pnd2_payloads = [e[1] for e in encoded]
+        blob_hashes = [hash_bytes(p) for p in pnd2_payloads]
+
+        manifest_entries: list[dict] = []
+        for i, (rg_key, _bytes, n_rg_rows, col_stats) in enumerate(encoded):
             manifest_entries.append({
                 "rg_key": rg_key,
-                "blob_hash": blob_hash,
-                "n_rows": end - start,
+                "blob_hash": blob_hashes[i],
+                "n_rows": n_rg_rows,
                 "col_stats": col_stats,
             })
 
@@ -1876,8 +2115,9 @@ class UnifiedStorage:
         if len(manifest_entries) == 1:
             # Inline shard: ref points directly at the PND2 data blob
             shard_hash = manifest_entries[0]["blob_hash"]
+            shard_manifest_bytes = None  # no separate PMAN blob
         else:
-            # Multi-row-group shard: build a PMAN manifest as before
+            # Multi-row-group shard: build a PMAN manifest (locally)
             shard_manifest = CollectionManifest(self.kernel)
             shard_manifest.set_schema(
                 columns=schema_columns,
@@ -1898,12 +2138,11 @@ class UnifiedStorage:
                         null_count=null_count, chunks=[],
                     ))
                 shard_manifest.add_row_group(rg)
-
-            # Write the shard manifest blob (does NOT update any ref)
-            shard_hash = shard_manifest.commit()
+            # Encode the shard manifest locally — no I/O yet
+            shard_manifest_bytes = shard_manifest.encode()
+            shard_hash = hash_bytes(shard_manifest_bytes)
 
         # Write the shard ref to a unique path (UUIDv7 — time-ordered, unique)
-        # This is the KEY: each writer writes to its own path. No conflict.
         try:
             from uuid7 import uuidv7
             shard_id = uuidv7()
@@ -1911,18 +2150,59 @@ class UnifiedStorage:
             import time as _t
             shard_id = f"{_t.time_ns()}_{id(rows)}"
 
-        # Write the shard ref to the ACTIVE BRANCH's shard path
-        # If tx_id is set, the shard is TENTATIVE (not visible until
-        # the transaction commit marker is written). The tx_id is
-        # encoded in the ref path so readers can check it.
         branch = self._get_active_branch(collection)
         if tx_id:
-            # Tentative shard: ref path includes tx_id
             shard_ref = f"{self._shards_prefix(collection, branch)}tx_{tx_id}_{shard_id}"
         else:
-            # Normal shard: immediately visible
             shard_ref = f"{self._shards_prefix(collection, branch)}{shard_id}"
-        self.kernel.reference(shard_ref, shard_hash)
+
+        # BATCH-PUT: all PND2 blobs + (optional PMAN manifest blob) + ref
+        # ALL in parallel = 1 RTT wall-clock.
+        # Previously: N PND2 PUTs (parallel) + PMAN PUT + ref PUT = 3 RTTs.
+        # Now: 1 RTT for everything.
+        if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
+            # Build the list of (path_or_blob, value) PUTs to do in parallel
+            put_tasks = []  # list of callables
+
+            # 1. PND2 blob PUTs (use the kernel's store directly)
+            for i, payload in enumerate(pnd2_payloads):
+                h = blob_hashes[i]
+                def _put_pnd2(payload=payload, h=h):
+                    self.kernel.store.put_blob(payload)
+
+                put_tasks.append(_put_pnd2)
+
+            # 2. PMAN manifest blob PUT (if multi-row-group shard)
+            if shard_manifest_bytes is not None:
+                def _put_pman():
+                    self.kernel.store.put_blob(shard_manifest_bytes)
+                put_tasks.append(_put_pman)
+
+            # 3. Ref PUT
+            def _put_ref():
+                self.kernel.store.put_path(shard_ref, shard_hash)
+            put_tasks.append(_put_ref)
+
+            # Execute all PUTs in parallel
+            workers = min(32, len(put_tasks))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(t) for t in put_tasks]
+                for f in futures:
+                    f.result()
+
+            # Update stats manually
+            self.kernel.stats["writes"] += len(pnd2_payloads) + (
+                1 if shard_manifest_bytes is not None else 0)
+            self.kernel.stats["ref_writes"] += 1
+            self.kernel.stats["references"] += 1
+            self.kernel._path_cache[shard_ref] = shard_hash
+        else:
+            # PondMinimal fallback: sequential (local disk)
+            for payload in pnd2_payloads:
+                self.kernel.write(payload)
+            if shard_manifest_bytes is not None:
+                self.kernel.write(shard_manifest_bytes)
+            self.kernel.reference(shard_ref, shard_hash)
 
         # The shard ref is the discovery mechanism — _list_shards_from_refs
         # scans refs (with the tx commit-marker check for tentative shards),
@@ -2434,21 +2714,37 @@ class UnifiedStorage:
                                 for c in rg.columns],
             })
 
-        manifest_hash, new_manifest = self._build_manifest_with_return(
-            collection, manifest_entries, schema, key_col, rg_size)
+        # Build manifest LOCALLY (no I/O) — encode + hash only
+        new_manifest = CollectionManifest(self.kernel)
+        new_manifest.set_schema(
+            columns=schema, key_col=key_col,
+            row_group_size=rg_size, chunk_size=0,
+        )
+        for entry in manifest_entries:
+            rg = RowGroupEntry(
+                key=entry["rg_key"], blob_hash=entry["blob_hash"],
+                n_rows=entry["n_rows"], storage_mode=STORAGE_WHOLE_BLOB,
+            )
+            for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
+                rg.columns.append(ColumnStatsEntry(
+                    name=col_name, value_type=vtype, min=mn, max=mx,
+                    null_count=null_count, chunks=[],
+                ))
+            new_manifest.add_row_group(rg)
 
-        # Build stats tree (writer-side, P10 fix)
+        # Build stats tree (writer-side, P10 fix) BEFORE encoding
         try:
             from stats_tree import should_use_stats_tree, build_stats_tree
             if should_use_stats_tree(len(new_manifest.row_groups)):
                 stats_root = build_stats_tree(self.kernel, new_manifest.row_groups)
                 new_manifest.set_stats_tree_root(stats_root)
-                manifest_hash = new_manifest.commit()
-                self.kernel.reference(self._manifest_ref(collection), manifest_hash)
         except ImportError:
             pass
 
-        # Write commit
+        # Encode manifest locally (no I/O)
+        manifest_bytes, manifest_hash = self._encode_manifest_local(new_manifest)
+
+        # O(1) warm commit: use cached HEAD + commit_index if available
         parent = self._head_cache.get(collection)
         if parent is None:
             parent = self.kernel.resolve(self._active_commit_ref(collection))
@@ -2458,10 +2754,57 @@ class UnifiedStorage:
             if pc:
                 commit_index = pc.get("index", 0) + 1
 
-        commit_hash = self._write_commit_blob(
-            collection, manifest_hash, parent=parent,
-            message=f"compact {len(shard_hashes)} shards (manifest-level, {len(manifest_entries)} row groups)",
-            index=commit_index)
+        # BATCH-PUT: manifest blob + commit blob + 2 refs ALL in parallel
+        # = 1 RTT wall-clock (was 4 RTTs sequential)
+        import json as _json
+        import time as _time
+        commit = {
+            "parent": parent,
+            "second_parent": None,
+            "manifest": manifest_hash,
+            "message": f"compact {len(shard_hashes)} shards (manifest-level, {len(manifest_entries)} row groups)",
+            "timestamp": _time.time(),
+            "index": commit_index,
+        }
+        commit_bytes = _json.dumps(commit, sort_keys=True).encode()
+        commit_hash = hash_bytes(commit_bytes)
+
+        active = self._active_commit_ref(collection)
+        manifest_ref = self._manifest_ref(collection)
+
+        if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _put_manifest_blob():
+                self.kernel.store.put_blob(manifest_bytes)
+
+            def _put_commit_blob():
+                self.kernel.store.put_blob(commit_bytes)
+
+            def _put_active_ref():
+                self.kernel.store.put_path(active, commit_hash)
+
+            def _put_manifest_ref():
+                self.kernel.store.put_path(manifest_ref, manifest_hash)
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                f1 = pool.submit(_put_manifest_blob)
+                f2 = pool.submit(_put_commit_blob)
+                f3 = pool.submit(_put_active_ref)
+                f4 = pool.submit(_put_manifest_ref)
+                f1.result(); f2.result(); f3.result(); f4.result()
+
+            self.kernel.stats["writes"] += 2
+            self.kernel.stats["ref_writes"] += 2
+            self.kernel.stats["references"] += 2
+            self.kernel._path_cache[active] = commit_hash
+            self.kernel._path_cache[manifest_ref] = manifest_hash
+        else:
+            # PondMinimal fallback: sequential
+            self.kernel.write(manifest_bytes)
+            self.kernel.write(commit_bytes)
+            self.kernel.reference(active, commit_hash)
+            self.kernel.reference(manifest_ref, manifest_hash)
 
         # Clear shards
         branch = self._get_active_branch(collection)
@@ -2666,6 +3009,10 @@ class UnifiedStorage:
         # separate and not in shard_hashes, so they're safe). For inline
         # PND2 shards, the hash IS the data blob — it must be protected
         # if the new manifest references it.
+        #
+        # OPTIMIZATION: deletes run in PARALLEL via thread pool (was N × RTT
+        # sequential, now 1 RTT wall-clock for the whole batch).
+        to_delete = []
         for sh in shard_hashes:
             if not sh or sh == empty_hash:
                 continue
@@ -2673,10 +3020,31 @@ class UnifiedStorage:
                 # This blob is now referenced by the new manifest —
                 # deleting it would corrupt HEAD. Skip.
                 continue
+            to_delete.append(sh)
+
+        if not to_delete:
+            return
+
+        if len(to_delete) == 1:
             try:
-                self.kernel.store.delete_blob(sh)
+                self.kernel.store.delete_blob(to_delete[0])
+            except Exception:
+                pass
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _delete_one(h):
+            try:
+                self.kernel.store.delete_blob(h)
             except Exception:
                 pass  # best-effort
+
+        workers = min(16, len(to_delete))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_delete_one, h) for h in to_delete]
+            for f in futures:
+                f.result()
 
     # ------------------------------------------------------------------
     # ACID TRANSACTIONS — commit markers on top of CRDT shards
@@ -2728,6 +3096,10 @@ class UnifiedStorage:
 
         Returns:
             The commit marker hash.
+
+        OPTIMIZATION: compute marker_hash locally (SHA-256 of marker_bytes)
+        so we can PUT the blob AND the ref in PARALLEL — was 2 sequential
+        RTTs (~600ms on R2), now 1 RTT wall-clock.
         """
         import json as _json
         import time as _time
@@ -2738,6 +3110,40 @@ class UnifiedStorage:
             "message": message,
         }
         marker_bytes = _json.dumps(marker, sort_keys=True).encode()
+
+        # ObjectStoreNativeKernel path: parallel PUT
+        if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
+            # Compute hash locally — avoids 1 round-trip vs kernel.write()
+            marker_hash = hash_bytes(marker_bytes)
+            tx_ref = self._tx_ref(tx_id)
+
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _put_blob():
+                self.kernel.store.put_blob(marker_bytes)
+
+            def _put_path():
+                self.kernel.store.put_path(tx_ref, marker_hash)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f1 = pool.submit(_put_blob)
+                f2 = pool.submit(_put_path)
+                f1.result()
+                f2.result()
+
+            self.kernel.stats["writes"] += 1
+            self.kernel.stats["ref_writes"] += 1
+            self.kernel.stats["references"] += 1
+            self.kernel._path_cache[tx_ref] = marker_hash
+
+            # Invalidate shard list cache — tentative shards are now visible
+            # to readers (the commit marker exists, so _list_shards_from_refs
+            # will include them). The cached list didn't include them.
+            for key in list(self._shard_list_cache.keys()):
+                self._shard_list_cache.pop(key, None)
+            return marker_hash
+
+        # PondMinimal fallback path: sequential
         marker_hash = self.kernel.write(marker_bytes)
         self.kernel.reference(self._tx_ref(tx_id), marker_hash)
         # Invalidate shard list cache — tentative shards are now visible
@@ -3044,10 +3450,10 @@ class UnifiedStorage:
         # ProllyTree (removed — unified architecture uses manifest only).
         # content-addressed (deduped); the old manifest is simply not
         # referenced by the new commit.
-        # skip_cache=True: for writes, the cache is authoritative (single-writer)
-        existing_manifest = self._load_manifest(collection, skip_cache=True)
-        # (existing_manifest is read for schema inheritance if needed;
-        #  no deletion of old row group keys is required.)
+        #
+        # OPTIMIZATION: skip the existing_manifest load — it was a wasted
+        # GET (the variable was never used; schema_columns comes from the
+        # source). Saves 1-2 RTTs per write (significant for cold writes).
 
         if n_rows == 0:
             # Fix (Round 11 Issue #1): empty write must still update the
@@ -3076,29 +3482,75 @@ class UnifiedStorage:
                 is_delta=False)
             return commit_hash
 
-        for start in range(0, n_rows, row_group_size):
+        # ENCODE all row groups first (CPU, in parallel via thread pool),
+        # then BATCH-WRITE all PND2 blobs in parallel (1 RTT wall-clock).
+        # Previously: encode + write each RG sequentially = N × (encode + RTT).
+        # Now: parallel encode + parallel write = ~1 RTT wall-clock total.
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _encode_one(start_idx):
+            start = start_idx
             end = min(start + row_group_size, n_rows)
             group_source = _slice_source(source, start, end)
             max_pk = key_array[end - 1]
             rg_key = _format_rg_key(max_pk)
-
             pnd2_bytes, col_stats = PND2.encode(
                 group_source, encoding_hints=encoding_hints)
-            blob_hash = self.kernel.write(pnd2_bytes)
+            return (rg_key, pnd2_bytes, end - start, col_stats)
 
+        # Encode in parallel (CPU-bound, use up to 8 threads)
+        starts = list(range(0, n_rows, row_group_size))
+        encoded: list[tuple[str, bytes, int, list]] = [None] * len(starts)  # type: ignore[list-item]
+        if len(starts) == 1:
+            encoded[0] = _encode_one(starts[0])
+        else:
+            with ThreadPoolExecutor(max_workers=min(8, len(starts))) as pool:
+                futures = {pool.submit(_encode_one, s): i
+                            for i, s in enumerate(starts)}
+                for f in futures:
+                    idx = futures[f]
+                    encoded[idx] = f.result()
+
+        # Batch-write all PND2 blobs in parallel (1 RTT wall-clock for the
+        # whole batch, was N × RTT sequential)
+        pnd2_payloads = [e[1] for e in encoded]
+        blob_hashes = self.kernel.write_batch(pnd2_payloads)
+
+        for i, (rg_key, _bytes, n_rg_rows, col_stats) in enumerate(encoded):
             manifest_entries.append({
                 "rg_key": rg_key,
-                "blob_hash": blob_hash,
-                "n_rows": end - start,
+                "blob_hash": blob_hashes[i],
+                "n_rows": n_rg_rows,
                 "col_stats": col_stats,
             })
 
         n_groups = (n_rows + row_group_size - 1) // row_group_size
 
-        # Build the manifest (one blob, atomically with the commit)
-        manifest_hash, new_manifest = self._build_manifest_with_return(
-            collection, manifest_entries, schema_columns,
-            key_col or "", row_group_size)
+        # Build the manifest LOCALLY (no I/O) so we can batch its PUT
+        # with the commit blob + refs PUTs in one parallel batch.
+        manifest_obj = CollectionManifest(self.kernel)
+        manifest_obj.set_schema(
+            columns=schema_columns,
+            key_col=key_col or "",
+            row_group_size=row_group_size,
+            chunk_size=0,
+        )
+        for entry in manifest_entries:
+            rg = RowGroupEntry(
+                key=entry["rg_key"],
+                blob_hash=entry["blob_hash"],
+                n_rows=entry["n_rows"],
+                storage_mode=STORAGE_WHOLE_BLOB,
+            )
+            for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
+                rg.columns.append(ColumnStatsEntry(
+                    name=col_name, value_type=vtype, min=mn, max=mx,
+                    null_count=null_count, chunks=[],
+                ))
+            manifest_obj.add_row_group(rg)
+        # Encode manifest locally — no I/O yet
+        manifest_bytes, manifest_hash = self._encode_manifest_local(manifest_obj)
+        new_manifest = manifest_obj
 
         # O(1) warm write: use cached HEAD + commit_index if available
         parent = self._head_cache.get(collection)
@@ -3110,11 +3562,61 @@ class UnifiedStorage:
             if pc:
                 commit_index = pc.get("index", 0) + 1
 
-        commit_hash = self._write_commit_blob(
-            collection, manifest_hash,
-            parent=parent,
-            message=message or f"unified write: {n_rows} rows in {n_groups} row groups",
-            index=commit_index)
+        # BATCH-PUT: manifest blob + commit blob + 2 refs ALL in parallel
+        # = 1 RTT wall-clock (was 3-4 RTTs sequential).
+        # Compute commit_hash locally so all 4 PUTs are independent.
+        import json as _json
+        import time as _time
+        commit = {
+            "parent": parent,
+            "second_parent": None,
+            "manifest": manifest_hash,
+            "message": message or f"unified write: {n_rows} rows in {n_groups} row groups",
+            "timestamp": _time.time(),
+            "index": commit_index,
+        }
+        commit_bytes = _json.dumps(commit, sort_keys=True).encode()
+        commit_hash = hash_bytes(commit_bytes)
+
+        active = self._active_commit_ref(collection)
+        manifest_ref = self._manifest_ref(collection)
+
+        if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _put_manifest_blob():
+                self.kernel.store.put_blob(manifest_bytes)
+
+            def _put_commit_blob():
+                self.kernel.store.put_blob(commit_bytes)
+
+            def _put_active_ref():
+                self.kernel.store.put_path(active, commit_hash)
+
+            def _put_manifest_ref():
+                self.kernel.store.put_path(manifest_ref, manifest_hash)
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                f1 = pool.submit(_put_manifest_blob)
+                f2 = pool.submit(_put_commit_blob)
+                f3 = pool.submit(_put_active_ref)
+                f4 = pool.submit(_put_manifest_ref)
+                f1.result()
+                f2.result()
+                f3.result()
+                f4.result()
+
+            self.kernel.stats["writes"] += 2
+            self.kernel.stats["ref_writes"] += 2
+            self.kernel.stats["references"] += 2
+            self.kernel._path_cache[active] = commit_hash
+            self.kernel._path_cache[manifest_ref] = manifest_hash
+        else:
+            # PondMinimal fallback: sequential (local disk, no RTT)
+            self.kernel.write(manifest_bytes)
+            self.kernel.write(commit_bytes)
+            self.kernel.reference(active, commit_hash)
+            self.kernel.reference(manifest_ref, manifest_hash)
 
         # Update caches (don't invalidate) → next write is O(1)
         self._update_caches_after_write(
@@ -3291,6 +3793,10 @@ class UnifiedStorage:
 
         The manifest object is returned so callers can cache it for
         O(1) warm writes (avoids re-reading from storage on next write).
+
+        OPTIMIZATION: The manifest ref PUT is skipped here — it's
+        redundant because _write_commit_blob (called next) also writes
+        the manifest ref. Saves 1 RTT per write.
         """
         manifest = CollectionManifest(self.kernel)
         manifest.set_schema(
@@ -3321,8 +3827,21 @@ class UnifiedStorage:
             manifest.set_parent_manifest(parent_manifest_hash)
 
         manifest_hash = manifest.commit()
-        self.kernel.reference(self._manifest_ref(collection), manifest_hash)
+        # NOTE: manifest ref PUT is now done by _write_commit_blob (in
+        # parallel with the commit blob + active ref PUTs). Skipping it
+        # here saves 1 RTT per write.
         return manifest_hash, manifest
+
+    def _encode_manifest_local(self, manifest: CollectionManifest
+                                 ) -> tuple[bytes, str]:
+        """Encode a manifest locally (no I/O) — returns (bytes, hash).
+
+        Used to defer the manifest blob PUT so it can be batched with
+        the commit blob + refs PUTs in _write_commit_blob_with_manifest.
+        """
+        manifest_bytes = manifest.encode()
+        manifest_hash = hash_bytes(manifest_bytes)
+        return manifest_bytes, manifest_hash
 
     def _build_manifest(self, collection: str,
                          entries: list[dict],
@@ -3717,24 +4236,28 @@ class UnifiedStorage:
             ) -> list[dict[str, list]]:
         """Fetch and decode multiple row groups in parallel.
 
-        Uses the in-memory blob cache — on cache hit, skips both I/O
-        and CPU decode. On cache miss, fetches from storage in parallel.
-
-        Separates fetch (I/O) from decode (CPU) for maximum parallelism:
+        THREE-PHASE PIPELINE with in-memory blob cache:
           Phase 1: Check cache for all blobs (0 I/O for cached)
-          Phase 2: Fetch MISSING blobs in parallel (1 RTT for all)
-          Phase 3: Decode MISSING blobs in parallel (CPU-bound)
+          Phase 2: Fetch MISSING blobs in parallel via kernel.read_blob_batch
+                    (1 RTT wall-clock for the whole batch via S3 thread pool)
+          Phase 3: Decode MISSING blobs in parallel (CPU-bound, 8 threads)
+
+        For small K (1-2 row groups), the thread pool overhead exceeds
+        the benefit — we fall back to sequential.
         """
         if not row_groups:
             return []
 
         from concurrent.futures import ThreadPoolExecutor
 
-        # Phase 1: Check cache — separate cached from uncached
+        # Phase 1: Check cache — separate cached from uncached.
+        # Only use cache for FULL decodes (columns=None, predicates=None).
+        # A cached projected result would be wrong for a different projection.
+        cache_eligible = (columns is None and predicates is None)
         cached_results: dict[int, dict[str, list]] = {}
         uncached_rgs: list[tuple[int, Any]] = []
         for i, rg in enumerate(row_groups):
-            if self._max_cache_blobs > 0 and rg.blob_hash in self._blob_cache:
+            if cache_eligible and self._max_cache_blobs > 0 and rg.blob_hash in self._blob_cache:
                 # Cache hit — move to end of LRU
                 self._blob_cache_order.remove(rg.blob_hash)
                 self._blob_cache_order.append(rg.blob_hash)
@@ -3747,16 +4270,15 @@ class UnifiedStorage:
             # All cached — return immediately
             return [cached_results[i] for i in range(len(row_groups))]
 
-        def fetch_blob(rg):
-            return self.kernel.read_blob(rg.blob_hash)
-
+        # Use read_blob_batch for parallel fetch (1 RTT wall-clock)
+        uncached_hashes = [rg.blob_hash for _, rg in uncached_rgs]
         if len(uncached_rgs) <= 2:
-            blob_bytes_list = [(i, fetch_blob(rg)) for i, rg in uncached_rgs]
+            blob_bytes_list = [(uncached_rgs[i][0], self.kernel.read_blob(h))
+                                for i, h in enumerate(uncached_hashes)]
         else:
-            max_fetch_workers = min(32, len(uncached_rgs))
-            with ThreadPoolExecutor(max_workers=max_fetch_workers) as pool:
-                blobs = list(pool.map(lambda x: fetch_blob(x[1]), uncached_rgs))
-                blob_bytes_list = list(zip([i for i, _ in uncached_rgs], blobs))
+            fetched_blobs = self.kernel.read_blob_batch(uncached_hashes)
+            blob_bytes_list = [(uncached_rgs[i][0], fetched_blobs[i])
+                                for i in range(len(uncached_rgs))]
 
         # Phase 3: Decode all uncached blobs in parallel
         def decode_blob(blob_bytes):
@@ -3774,8 +4296,10 @@ class UnifiedStorage:
         results: list[Optional[dict]] = [None] * len(row_groups)
         for i, col_data in decoded:
             results[i] = col_data
-            # Cache the result
-            if self._max_cache_blobs > 0:
+            # Cache the result — ONLY for full decodes (no projection, no predicates).
+            # Caching projected/predicate-filtered results would break subsequent
+            # reads with different projections.
+            if self._max_cache_blobs > 0 and columns is None and predicates is None:
                 rg_hash = uncached_rgs[[idx for idx, (orig_i, _) in enumerate(uncached_rgs) if orig_i == i][0]][1].blob_hash
                 self._blob_cache[rg_hash] = col_data
                 self._blob_cache_order.append(rg_hash)

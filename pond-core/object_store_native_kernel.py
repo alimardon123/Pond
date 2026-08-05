@@ -164,6 +164,70 @@ class InMemoryObjectStore:
             self.stats["bytes_read"] += len(data)
         return data
 
+    def put_blob_batch(self, items: list[bytes],
+                        max_workers: int = 16) -> list[str]:
+        """Write a batch of blobs in PARALLEL.
+
+        For in-memory store with simulated latency, this is the key win:
+        N sequential PUTs × latency_ms = N × latency, but parallel = 1 × latency.
+        """
+        if not items:
+            return []
+        if len(items) == 1:
+            return [self.put_blob(items[0])]
+
+        from concurrent.futures import ThreadPoolExecutor
+        results: list[Optional[str]] = [None] * len(items)
+        errors: list[Optional[Exception]] = [None] * len(items)
+
+        def _put_one(idx, data):
+            try:
+                results[idx] = self.put_blob(data)
+            except Exception as e:
+                errors[idx] = e
+
+        workers = min(max_workers, len(items))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_put_one, i, d)
+                        for i, d in enumerate(items)]
+            for f in futures:
+                f.result()
+
+        for e in errors:
+            if e is not None:
+                raise e
+        return results  # type: ignore[return-value]
+
+    def get_blob_batch(self, hash_vals: list[str],
+                        max_workers: int = 32) -> list[bytes]:
+        """Fetch a batch of blobs in PARALLEL — wall-clock ~1 RTT, not N × RTT."""
+        if not hash_vals:
+            return []
+        if len(hash_vals) == 1:
+            return [self.get_blob(hash_vals[0])]
+
+        from concurrent.futures import ThreadPoolExecutor
+        results: list[Optional[bytes]] = [None] * len(hash_vals)
+        errors: list[Optional[Exception]] = [None] * len(hash_vals)
+
+        def _get_one(idx, h):
+            try:
+                results[idx] = self.get_blob(h)
+            except Exception as e:
+                errors[idx] = e
+
+        workers = min(max_workers, len(hash_vals))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_get_one, i, h)
+                        for i, h in enumerate(hash_vals)]
+            for f in futures:
+                f.result()
+
+        for e in errors:
+            if e is not None:
+                raise e
+        return results  # type: ignore[return-value]
+
     def has_blob(self, hash_val: str) -> bool:
         """Check if a blob exists (no latency — S3 HEAD is cheap)."""
         with self._lock:
@@ -336,6 +400,34 @@ class ObjectStoreNativeKernel:
         self.stats["writes"] += 1
         return h
 
+    def write_batch(self, items: list[bytes]) -> list[str]:
+        """Write a batch of blobs in PARALLEL — wall-clock ~1 RTT, not N × RTT.
+
+        The biggest win on R2/S3: 10 sequential PUTs × ~300ms = 3000ms
+        becomes ~300ms wall-clock. The store's put_blob_batch uses a
+        thread pool with up to 32 parallel PUTs.
+
+        Idempotent: same bytes → same hash → no duplicate write.
+        """
+        if not items:
+            return []
+        hashes = self.store.put_blob_batch(items)
+        self.stats["writes"] += len(items)
+        return hashes
+
+    def read_blob_batch(self, hashes: list[str]) -> list[bytes]:
+        """Fetch a batch of blobs in PARALLEL — wall-clock ~1 RTT, not N × RTT.
+
+        For cold full scans, this turns N sequential GETs into ~1 RTT
+        wall-clock (the irreducible minimum — you can't fetch faster
+        than the network allows, but you can fetch them all at once).
+        """
+        if not hashes:
+            return []
+        results = self.store.get_blob_batch(hashes)
+        self.stats["reads"] += len(hashes)
+        return results
+
     # ------------------------------------------------------------------
     # Primitive 2: Read
     # ------------------------------------------------------------------
@@ -361,7 +453,8 @@ class ObjectStoreNativeKernel:
     # Primitive 3: Reference (name → hash)
     # ------------------------------------------------------------------
 
-    def reference(self, name: str, h: str) -> None:
+    def reference(self, name: str, h: str,
+                   skip_exists_check: bool = True) -> None:
         """Bind a name to a hash. 1 PUT, no read, no shared mutable state.
 
         Uses dedicated paths (put_path) — each ref is an independent key.
@@ -369,17 +462,61 @@ class ObjectStoreNativeKernel:
         unrelated refs. Concurrent writers to different names never
         interfere. This is the foundation of the no-CAS concurrency model.
 
-        Total: 1 PUT per reference update (was 2 PUTs + 1 GET with root_ref).
+        Args:
+            name: the ref name (e.g., "collections/users/HEAD")
+            h: the hash to bind to
+            skip_exists_check: if True (default), skip the has_blob HEAD
+                check. This saves 1 RTT per ref update (significant on
+                R2/S3 — was adding ~300ms to every commit/merge/branch).
+                The check is defensive only — in normal use, the caller
+                has JUST written the blob via write() or write_batch(),
+                so it always exists. Set to False only for paranoid mode.
+
+        Total: 1 PUT per reference update (was 2 PUTs + 1 GET with root_ref,
+        and was 1 PUT + 1 HEAD with the defensive check).
         """
-        # Verify the blob exists (defensive — has_blob is a free HEAD)
-        if not self.store.has_blob(h):
-            raise ValueError(f"Hash {h} does not refer to an existing blob")
+        if not skip_exists_check:
+            if not self.store.has_blob(h):
+                raise ValueError(f"Hash {h} does not refer to an existing blob")
         # Write to a dedicated path — 1 PUT, no read, no shared state
         self.store.put_path(name, h)
         self.stats["ref_writes"] += 1
         self.stats["references"] += 1
         # Update the path cache so subsequent resolve() calls see the new value
         self._path_cache[name] = h
+
+    def reference_batch(self, refs: list[tuple[str, str]]) -> None:
+        """Update multiple refs in PARALLEL via thread pool.
+
+        Each ref update is an independent path PUT (no shared mutable
+        state), so they can be parallelized safely.
+
+        Args:
+            refs: list of (name, hash) tuples to bind
+
+        Wall-clock: ~1 RTT for the whole batch (was N × RTT sequential).
+        """
+        if not refs:
+            return
+        if len(refs) == 1:
+            self.reference(refs[0][0], refs[0][1])
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _ref_one(name_h):
+            name, h = name_h
+            self.store.put_path(name, h)
+            self._path_cache[name] = h
+
+        workers = min(16, len(refs))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_ref_one, r) for r in refs]
+            for f in futures:
+                f.result()
+
+        self.stats["ref_writes"] += len(refs)
+        self.stats["references"] += len(refs)
 
     def resolve(self, name: str) -> Optional[str]:
         """Resolve a name to its current hash. 1 GET (cached after first read).

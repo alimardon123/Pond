@@ -161,6 +161,70 @@ class LocalFSObjectStore:
             self.stats["bytes_read"] += len(data)
         return data
 
+    def put_blob_batch(self, items: list[bytes],
+                        max_workers: int = 16) -> list[str]:
+        """Write a batch of blobs in PARALLEL via thread pool.
+
+        Local FS is fast (no network), but parallel writes still help with
+        SSD contention on large batches.
+        """
+        if not items:
+            return []
+        if len(items) == 1:
+            return [self.put_blob(items[0])]
+
+        from concurrent.futures import ThreadPoolExecutor
+        results: list[Optional[str]] = [None] * len(items)
+        errors: list[Optional[Exception]] = [None] * len(items)
+
+        def _put_one(idx, data):
+            try:
+                results[idx] = self.put_blob(data)
+            except Exception as e:
+                errors[idx] = e
+
+        workers = min(max_workers, len(items))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_put_one, i, d)
+                        for i, d in enumerate(items)]
+            for f in futures:
+                f.result()
+
+        for e in errors:
+            if e is not None:
+                raise e
+        return results  # type: ignore[return-value]
+
+    def get_blob_batch(self, hash_vals: list[str],
+                        max_workers: int = 16) -> list[bytes]:
+        """Fetch a batch of blobs in PARALLEL via thread pool."""
+        if not hash_vals:
+            return []
+        if len(hash_vals) == 1:
+            return [self.get_blob(hash_vals[0])]
+
+        from concurrent.futures import ThreadPoolExecutor
+        results: list[Optional[bytes]] = [None] * len(hash_vals)
+        errors: list[Optional[Exception]] = [None] * len(hash_vals)
+
+        def _get_one(idx, h):
+            try:
+                results[idx] = self.get_blob(h)
+            except Exception as e:
+                errors[idx] = e
+
+        workers = min(max_workers, len(hash_vals))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_get_one, i, h)
+                        for i, h in enumerate(hash_vals)]
+            for f in futures:
+                f.result()
+
+        for e in errors:
+            if e is not None:
+                raise e
+        return results  # type: ignore[return-value]
+
     def has_blob(self, hash_val: str) -> bool:
         """Check if a blob exists."""
         return os.path.exists(self._blob_path(hash_val))
