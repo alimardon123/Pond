@@ -267,6 +267,14 @@ class GarbageCollector:
         If cutoff_time > 0, stop walking commit chains at commits older
         than cutoff_time (preserve_days logic — old history is eligible
         for GC).
+
+        Handles THREE blob formats:
+          - PondPack (PNPK): commit + manifest in one blob. Extracts both,
+            walks the commit's parent/second_parent AND the manifest's
+            row group blob hashes.
+          - Old JSON commit: walks parent, second_parent, manifest.
+          - Old PMAN manifest: walks row group blob hashes.
+          - PND2 data blob / stats tree node: leaf, no children.
         """
         if hash_val in live:
             return
@@ -276,6 +284,35 @@ class GarbageCollector:
             data = self.kernel.read_blob(hash_val)
         except Exception:
             return
+
+        # Check for PondPack format (commit + manifest in ONE blob)
+        if data[:4] == b"PNPK":
+            try:
+                from pond_pack import decode_pack
+                commit, manifest_bytes = decode_pack(data)
+
+                # Walk commit fields (parent, second_parent)
+                # The "manifest" field in the commit points to the pack hash
+                # itself (set by _read_commit_blob), so we skip it to avoid
+                # a redundant self-walk.
+                if cutoff_time > 0:
+                    commit_ts = commit.get("timestamp", 0)
+                    if commit_ts < cutoff_time:
+                        # Old commit — walk manifest (current data must stay live)
+                        # but don't walk ancestors
+                        self._walk_manifest_bytes(manifest_bytes, live)
+                        return
+
+                for field in ("parent", "second_parent"):
+                    child = commit.get(field)
+                    if child and child not in live:
+                        self._walk_reachable(child, live, cutoff_time)
+
+                # Walk the manifest's row group blob hashes
+                self._walk_manifest_bytes(manifest_bytes, live)
+                return
+            except Exception:
+                pass
 
         # Try as JSON commit blob or shard index
         try:
@@ -307,7 +344,7 @@ class GarbageCollector:
         except (json.JSONDecodeError, UnicodeDecodeError):
             pass
 
-        # Try as CollectionManifest (binary format)
+        # Try as CollectionManifest (binary PMAN format)
         try:
             from collection_manifest import CollectionManifest
             manifest = CollectionManifest.load(self.kernel, hash_val)
@@ -324,6 +361,26 @@ class GarbageCollector:
 
         # Leaf node (data blob, stats tree node, etc.)
         return
+
+    def _walk_manifest_bytes(self, manifest_bytes: bytes, live: Set[str]) -> None:
+        """Walk row group blob hashes from manifest bytes (PMAN format).
+
+        Used by _walk_reachable when the manifest is extracted from a
+        PondPack blob. Avoids a redundant read_blob (the bytes are already
+        in memory).
+        """
+        try:
+            from collection_manifest import CollectionManifest
+            manifest = CollectionManifest.decode(self.kernel, manifest_bytes)
+            for rg in manifest.scan_with_pruning():
+                if rg.blob_hash and rg.blob_hash not in live:
+                    live.add(rg.blob_hash)
+            if manifest.parent_manifest_hash and manifest.parent_manifest_hash not in live:
+                self._walk_reachable(manifest.parent_manifest_hash, live, 0)
+            if manifest.stats_tree_root and manifest.stats_tree_root not in live:
+                self._walk_reachable(manifest.stats_tree_root, live, 0)
+        except (ValueError, KeyError, ImportError):
+            pass
 
     def _young_tentative_blob_hashes(self, collections: Optional[list],
                                       ttl_seconds: int) -> Set[str]:

@@ -122,6 +122,7 @@ from collection_manifest import (  # noqa: E402
     STORAGE_WHOLE_BLOB,  # reuse as "unified" storage mode
     build_manifest_from_zone_map,
 )
+from pond_pack import encode_pack, decode_pack, is_pack  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +794,34 @@ class UnifiedStorage:
         branch = self._get_active_branch(collection)
         return self._branch_ref(collection, branch)
 
+    def _load_manifest_from_hash(self, blob_hash: str
+                                  ) -> CollectionManifest:
+        """Load a manifest from a blob hash — handles pack and PMAN formats.
+
+        If the blob is a PondPack (PNPK), extracts the manifest section
+        and decodes it. If it's a standalone PMAN manifest, decodes directly.
+
+        This is the ONE method that bridges the pack format to the manifest
+        decoder. All manifest loading goes through here.
+
+        Args:
+            blob_hash: the hash of the blob (pack or PMAN manifest)
+
+        Returns:
+            A CollectionManifest.
+
+        Raises:
+            ValueError if the blob can't be decoded.
+            KeyError if the blob is not found.
+        """
+        data = self.kernel.read_blob(blob_hash)
+        # Check if it's a PondPack blob (commit + manifest in one)
+        if is_pack(data):
+            _commit, manifest_bytes = decode_pack(data)
+            return CollectionManifest.decode(self.kernel, manifest_bytes)
+        # Old format: standalone PMAN manifest
+        return CollectionManifest.decode(self.kernel, data)
+
     def _load_manifest(self, collection: str,
                         manifest_hash: Optional[str] = None,
                         skip_cache: bool = False
@@ -803,6 +832,13 @@ class UnifiedStorage:
         time-travel reads — no ref mutation, no race condition).
         If manifest_hash is None, resolves the current manifest ref.
 
+        Supports BOTH formats:
+          - PondPack (PNPK): the manifest_ref points to a pack blob that
+            contains commit + manifest. The manifest is extracted from
+            the pack and decoded.
+          - Old format (PMAN): the manifest_ref points to a standalone
+            manifest blob. Decoded directly.
+
         Round 26 caching strategy:
         - skip_cache=False (READS): verify cached hash matches current ref
           (1 GET). Handles multi-writer scenarios correctly.
@@ -812,7 +848,7 @@ class UnifiedStorage:
         # If a specific manifest hash is requested, load it directly
         if manifest_hash is not None:
             try:
-                return CollectionManifest.load(self.kernel, manifest_hash)
+                return self._load_manifest_from_hash(manifest_hash)
             except (ValueError, KeyError):
                 return None
 
@@ -850,7 +886,7 @@ class UnifiedStorage:
             return None
 
         try:
-            manifest = CollectionManifest.load(self.kernel, resolved_hash)
+            manifest = self._load_manifest_from_hash(resolved_hash)
             self._manifest_cache[collection] = manifest
             self._manifest_hash_cache[collection] = resolved_hash
             return manifest
@@ -1000,27 +1036,18 @@ class UnifiedStorage:
                             parent: Optional[str] = None,
                             second_parent: Optional[str] = None,
                             message: str = "",
-                            index: int = 0) -> str:
+                            index: int = 0,
+                            manifest_bytes: Optional[bytes] = None
+                            ) -> str:
         """Write a commit blob and update HEAD.
 
-        The commit blob is a JSON dict linking to the manifest hash.
-        This is the ONE commit format for ALL workloads — no more
-        JSON encoding (replaces the old BinaryProllyTree format).
+        Uses PondPack format: commit JSON + manifest bytes in ONE blob.
+        Both HEAD ref and manifest_ref point to the pack hash.
+        Saves 1 PUT vs the old separate commit + manifest format.
 
-        If the collection has an active branch (set by checkout), the
-        branch ref is also updated to point to the new commit.
-
-        OPTIMIZATION (object-store kernels only): commit blob PUT +
-        commit ref PUT + manifest ref PUT are 3 sequential RTTs. With
-        local hash computation + parallel batched PUTs, we collapse to
-        1 RTT wall-clock:
-          1. Compute commit_hash locally (SHA-256 of commit_bytes — no I/O)
-          2. Batch-PUT the commit blob + the 2 ref paths in parallel
-             (commit ref → commit_hash, manifest ref → manifest_hash)
-
-        For PondMinimal (local disk, no `store` attribute), falls back
-        to sequential kernel.write() + kernel.reference() — local disk
-        has no RTT to amortize.
+        If manifest_bytes is provided, uses PondPack (commit + manifest
+        in one blob). If manifest_bytes is None, falls back to the old
+        format (JSON commit only, manifest written separately).
         """
         import json as _json
         import time as _time
@@ -1033,24 +1060,54 @@ class UnifiedStorage:
             "timestamp": _time.time(),
             "index": index,
         }
+
+        active = self._active_commit_ref(collection)
+        manifest_ref = self._manifest_ref(collection)
+
+        # PondPack path: commit + manifest in ONE blob (saves 1 PUT)
+        if manifest_bytes is not None:
+            pack_bytes = encode_pack(commit, manifest_bytes)
+            pack_hash = hash_bytes(pack_bytes)
+
+            if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
+                from concurrent.futures import ThreadPoolExecutor
+
+                def _put_pack():
+                    self.kernel.store.put_blob(pack_bytes)
+                def _put_active():
+                    self.kernel.store.put_path(active, pack_hash)
+                def _put_manifest():
+                    self.kernel.store.put_path(manifest_ref, pack_hash)
+
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    f1 = pool.submit(_put_pack)
+                    f2 = pool.submit(_put_active)
+                    f3 = pool.submit(_put_manifest)
+                    f1.result(); f2.result(); f3.result()
+
+                self.kernel.stats["writes"] += 1
+                self.kernel.stats["ref_writes"] += 2
+                self.kernel.stats["references"] += 2
+                self.kernel._update_path_cache(active, pack_hash)
+                self.kernel._update_path_cache(manifest_ref, pack_hash)
+            else:
+                self.kernel.write(pack_bytes)
+                self.kernel.reference(active, pack_hash)
+                self.kernel.reference(manifest_ref, pack_hash)
+            return pack_hash
+
+        # Fallback: old format (JSON commit only — manifest written separately)
         commit_bytes = _json.dumps(commit, sort_keys=True).encode()
 
-        # ObjectStoreNativeKernel path: parallel PUT via the store
         if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
-            # Compute commit_hash LOCALLY — saves 1 RTT vs kernel.write()
             commit_hash = hash_bytes(commit_bytes)
-
-            active = self._active_commit_ref(collection)
-            manifest_ref = self._manifest_ref(collection)
 
             from concurrent.futures import ThreadPoolExecutor
 
             def _put_blob():
                 self.kernel.store.put_blob(commit_bytes)
-
             def _put_active_ref():
                 self.kernel.store.put_path(active, commit_hash)
-
             def _put_manifest_ref():
                 self.kernel.store.put_path(manifest_ref, manifest_hash)
 
@@ -1058,11 +1115,8 @@ class UnifiedStorage:
                 f1 = pool.submit(_put_blob)
                 f2 = pool.submit(_put_active_ref)
                 f3 = pool.submit(_put_manifest_ref)
-                f1.result()
-                f2.result()
-                f3.result()
+                f1.result(); f2.result(); f3.result()
 
-            # Update caches + stats manually (bypassed kernel.write/reference)
             self.kernel.stats["writes"] += 1
             self.kernel.stats["ref_writes"] += 2
             self.kernel.stats["references"] += 2
@@ -1070,25 +1124,41 @@ class UnifiedStorage:
             self.kernel._update_path_cache(manifest_ref, manifest_hash)
             return commit_hash
 
-        # PondMinimal fallback path: sequential (local disk, no RTT)
+        # PondMinimal fallback
         commit_hash = self.kernel.write(commit_bytes)
-        active = self._active_commit_ref(collection)
         self.kernel.reference(active, commit_hash)
-        self.kernel.reference(self._manifest_ref(collection), manifest_hash)
+        self.kernel.reference(manifest_ref, manifest_hash)
         return commit_hash
 
     def _read_commit_blob(self, commit_hash: str) -> Optional[dict]:
         """Read and decode a commit blob.
 
-        Returns None for JSON decode errors or missing blobs (expected
+        Supports BOTH formats:
+          - PondPack (PNPK magic): extract commit JSON from the pack.
+            Sets commit["manifest"] = commit_hash (the pack blob IS the
+            manifest blob — the manifest is inside the pack).
+          - Old JSON commit: parse directly (commit["manifest"] points to
+            a separate manifest blob).
+
+        Returns None for decode errors or missing blobs (expected
         for legacy/foreign commits). Re-raises network errors and OOM.
         """
         import json as _json
         try:
             raw = self.kernel.read_blob(commit_hash)
+            # Check if it's a PondPack blob
+            if is_pack(raw):
+                commit, _manifest_bytes = decode_pack(raw)
+                # The manifest is inside this pack blob. Set commit["manifest"]
+                # to the pack hash (commit_hash) so that all code reading
+                # commit["manifest"] gets the correct blob to load the manifest
+                # from. _load_manifest_from_hash handles pack → manifest extraction.
+                commit["manifest"] = commit_hash
+                return commit
+            # Old format: JSON commit
             return _json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError, KeyError, ValueError):
-            return None  # expected: not a JSON commit, or blob missing
+            return None  # expected: not a commit, or blob missing
 
     def _commit_index(self, collection: str) -> int:
         """Get the next commit index for a collection."""
@@ -1283,10 +1353,10 @@ class UnifiedStorage:
             futures["branch_commit"] = pool.submit(self._read_commit_blob, branch_head)
             if target_manifest_hash:
                 futures["head_manifest"] = pool.submit(
-                    CollectionManifest.load, self.kernel, target_manifest_hash)
+                    self._load_manifest_from_hash, target_manifest_hash)
             if branch_manifest_hash:
                 futures["branch_manifest"] = pool.submit(
-                    CollectionManifest.load, self.kernel, branch_manifest_hash)
+                    self._load_manifest_from_hash, branch_manifest_hash)
 
             head_commit = futures["head_commit"].result() if "head_commit" in futures else None
             branch_commit = futures["branch_commit"].result() if "branch_commit" in futures else None
@@ -1294,11 +1364,18 @@ class UnifiedStorage:
             branch_manifest = futures["branch_manifest"].result() if "branch_manifest" in futures else None
 
         # Fallback: if manifest_ref wasn't set (old collection), use the
-        # commit blob's manifest hash to load the manifest
+        # commit blob's manifest hash to load the manifest. Use
+        # _load_manifest_from_hash which handles both pack and PMAN formats.
         if head_manifest is None and head_commit and head_commit.get("manifest"):
-            head_manifest = CollectionManifest.load(self.kernel, head_commit["manifest"])
+            try:
+                head_manifest = self._load_manifest_from_hash(head_commit["manifest"])
+            except (ValueError, KeyError):
+                pass
         if branch_manifest is None and branch_commit and branch_commit.get("manifest"):
-            branch_manifest = CollectionManifest.load(self.kernel, branch_commit["manifest"])
+            try:
+                branch_manifest = self._load_manifest_from_hash(branch_commit["manifest"])
+            except (ValueError, KeyError):
+                pass
 
         # Union row group entries from target HEAD + source branch HEAD
         seen: dict[str, RowGroupEntry] = {}
@@ -1356,22 +1433,15 @@ class UnifiedStorage:
         key_col = (head_manifest or branch_manifest).key_col if \
             (head_manifest or branch_manifest) else ""
 
-        manifest_hash = self._build_manifest(
+        manifest_hash, manifest_bytes = self._build_manifest(
             collection, merged_entries, schema, key_col,
             row_group_size=10_000)
 
-        # Write merge commit with TWO parents. We bypass _write_commit_blob
-        # because it auto-updates the active branch ref — we need to
-        # explicitly update target_branch (and HEAD) here.
-        #
-        # OPTIMIZATION (object-store kernels): 3 PUTs (commit blob +
-        # target_branch ref + manifest ref) all run in PARALLEL = 1 RTT
-        # wall-clock (was 3 RTTs sequential). Compute commit_hash locally
-        # so all 3 PUTs are independent.
+        # Write merge commit with TWO parents using PondPack (commit + manifest
+        # in ONE blob). Both target_branch ref and manifest ref point to the
+        # pack hash. 3 PUTs in parallel = 1 RTT wall-clock.
         import json as _json
         import time as _time
-        # Compute commit index from the target commit blob we already read
-        # (was a separate _commit_index() call that did 2 more GETs).
         commit_index = 0
         if head_commit:
             commit_index = head_commit.get("index", 0) + 1
@@ -1384,44 +1454,37 @@ class UnifiedStorage:
             "timestamp": _time.time(),
             "index": commit_index,
         }
-        commit_bytes = _json.dumps(commit, sort_keys=True).encode()
+        pack_bytes = encode_pack(commit, manifest_bytes)
+        pack_hash = hash_bytes(pack_bytes)
 
         target_branch_ref = self._branch_ref(collection, target_branch)
         target_manifest_ref = self._manifest_ref_for_branch(collection, target_branch)
 
-        # ObjectStoreNativeKernel path: parallel PUT
         if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
-            commit_hash = hash_bytes(commit_bytes)
-
             from concurrent.futures import ThreadPoolExecutor
 
-            def _put_commit_blob():
-                self.kernel.store.put_blob(commit_bytes)
-
-            def _put_target_branch_ref():
-                self.kernel.store.put_path(target_branch_ref, commit_hash)
-
-            def _put_target_manifest_ref():
-                self.kernel.store.put_path(target_manifest_ref, manifest_hash)
+            def _put_pack():
+                self.kernel.store.put_blob(pack_bytes)
+            def _put_branch_ref():
+                self.kernel.store.put_path(target_branch_ref, pack_hash)
+            def _put_manifest_ref():
+                self.kernel.store.put_path(target_manifest_ref, pack_hash)
 
             with ThreadPoolExecutor(max_workers=3) as pool:
-                f1 = pool.submit(_put_commit_blob)
-                f2 = pool.submit(_put_target_branch_ref)
-                f3 = pool.submit(_put_target_manifest_ref)
-                f1.result()
-                f2.result()
-                f3.result()
+                f1 = pool.submit(_put_pack)
+                f2 = pool.submit(_put_branch_ref)
+                f3 = pool.submit(_put_manifest_ref)
+                f1.result(); f2.result(); f3.result()
 
             self.kernel.stats["writes"] += 1
             self.kernel.stats["ref_writes"] += 2
             self.kernel.stats["references"] += 2
-            self.kernel._update_path_cache(target_branch_ref, commit_hash)
-            self.kernel._update_path_cache(target_manifest_ref, manifest_hash)
+            self.kernel._update_path_cache(target_branch_ref, pack_hash)
+            self.kernel._update_path_cache(target_manifest_ref, pack_hash)
         else:
-            # PondMinimal fallback: sequential
-            commit_hash = self.kernel.write(commit_bytes)
-            self.kernel.reference(target_branch_ref, commit_hash)
-            self.kernel.reference(target_manifest_ref, manifest_hash)
+            self.kernel.write(pack_bytes)
+            self.kernel.reference(target_branch_ref, pack_hash)
+            self.kernel.reference(target_manifest_ref, pack_hash)
         # Source branch ref is left unchanged (it still points at its own
         # tip — the merge does not fast-forward the source).
 
@@ -1477,7 +1540,7 @@ class UnifiedStorage:
         # the old (pre-merge) shard list. The merged manifest is now HEAD.
         self._invalidate_shard_cache(collection)
         self._invalidate_manifest_cache(collection)
-        return commit_hash
+        return pack_hash
 
     def _tombstone_shard_refs(self, collection: str, branch: str,
                                shard_hashes: list[str],
@@ -1708,8 +1771,8 @@ class UnifiedStorage:
         if not ma or not mb:
             return {"added": [], "removed": [], "modified": []}
 
-        manifest_a = CollectionManifest.load(self.kernel, ma)
-        manifest_b = CollectionManifest.load(self.kernel, mb)
+        manifest_a = self._load_manifest_from_hash(ma)
+        manifest_b = self._load_manifest_from_hash(mb)
 
         entries_a = {rg.key: rg for rg in manifest_a.scan_with_pruning()}
         entries_b = {rg.key: rg for rg in manifest_b.scan_with_pruning()}
@@ -2580,9 +2643,9 @@ class UnifiedStorage:
             return []
         branch_manifest_hash = branch_commit["manifest"]
 
-        # Load the branch's manifest
+        # Load the branch's manifest (handles both pack and PMAN formats)
         try:
-            head_manifest = CollectionManifest.load(self.kernel, branch_manifest_hash)
+            head_manifest = self._load_manifest_from_hash(branch_manifest_hash)
         except (ValueError, KeyError):
             head_manifest = None
 
@@ -2881,8 +2944,8 @@ class UnifiedStorage:
             if pc:
                 commit_index = pc.get("index", 0) + 1
 
-        # BATCH-PUT: manifest blob + commit blob + 2 refs ALL in parallel
-        # = 1 RTT wall-clock (was 4 RTTs sequential)
+        # BATCH-PUT: pack blob (commit + manifest) + 2 refs in parallel
+        # = 1 RTT wall-clock. PondPack saves 1 PUT vs separate commit + manifest.
         import json as _json
         import time as _time
         commit = {
@@ -2893,8 +2956,8 @@ class UnifiedStorage:
             "timestamp": _time.time(),
             "index": commit_index,
         }
-        commit_bytes = _json.dumps(commit, sort_keys=True).encode()
-        commit_hash = hash_bytes(commit_bytes)
+        pack_bytes = encode_pack(commit, manifest_bytes)
+        pack_hash = hash_bytes(pack_bytes)
 
         active = self._active_commit_ref(collection)
         manifest_ref = self._manifest_ref(collection)
@@ -2902,36 +2965,31 @@ class UnifiedStorage:
         if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
             from concurrent.futures import ThreadPoolExecutor
 
-            def _put_manifest_blob():
-                self.kernel.store.put_blob(manifest_bytes)
-
-            def _put_commit_blob():
-                self.kernel.store.put_blob(commit_bytes)
+            def _put_pack_blob():
+                self.kernel.store.put_blob(pack_bytes)
 
             def _put_active_ref():
-                self.kernel.store.put_path(active, commit_hash)
+                self.kernel.store.put_path(active, pack_hash)
 
             def _put_manifest_ref():
-                self.kernel.store.put_path(manifest_ref, manifest_hash)
+                self.kernel.store.put_path(manifest_ref, pack_hash)
 
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                f1 = pool.submit(_put_manifest_blob)
-                f2 = pool.submit(_put_commit_blob)
-                f3 = pool.submit(_put_active_ref)
-                f4 = pool.submit(_put_manifest_ref)
-                f1.result(); f2.result(); f3.result(); f4.result()
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                f1 = pool.submit(_put_pack_blob)
+                f2 = pool.submit(_put_active_ref)
+                f3 = pool.submit(_put_manifest_ref)
+                f1.result(); f2.result(); f3.result()
 
-            self.kernel.stats["writes"] += 2
+            self.kernel.stats["writes"] += 1
             self.kernel.stats["ref_writes"] += 2
             self.kernel.stats["references"] += 2
-            self.kernel._update_path_cache(active, commit_hash)
-            self.kernel._update_path_cache(manifest_ref, manifest_hash)
+            self.kernel._update_path_cache(active, pack_hash)
+            self.kernel._update_path_cache(manifest_ref, pack_hash)
         else:
             # PondMinimal fallback: sequential
-            self.kernel.write(manifest_bytes)
-            self.kernel.write(commit_bytes)
-            self.kernel.reference(active, commit_hash)
-            self.kernel.reference(manifest_ref, manifest_hash)
+            self.kernel.write(pack_bytes)
+            self.kernel.reference(active, pack_hash)
+            self.kernel.reference(manifest_ref, pack_hash)
 
         # ASYNC TOMBSTONING + VACUUM: The shard ref deletes + blob deletes
         # are fire-and-forget. They run in a BACKGROUND thread — compact()
@@ -2971,14 +3029,14 @@ class UnifiedStorage:
         self._bg_threads = getattr(self, '_bg_threads', [])
         self._bg_threads.append(t)
 
-        # Update caches
+        # Update caches — both commit_hash and manifest_hash are pack_hash
         self._update_caches_after_write(
-            collection, new_manifest, manifest_hash, commit_hash,
+            collection, new_manifest, pack_hash, pack_hash,
             commit_index, is_delta=False)
         # Invalidate shard list cache — shards are being cleared in background
         self._invalidate_shard_cache(collection)
 
-        return commit_hash
+        return pack_hash
 
     def _compact_shards_row_level(self, collection, head_manifest,
                                     shard_hashes, merged,
@@ -3052,24 +3110,22 @@ class UnifiedStorage:
                     "n_rows": end - start,
                     "col_stats": col_stats,
                 })
-            manifest_hash, new_manifest = self._build_manifest_with_return(
+            manifest_hash, new_manifest, manifest_bytes = self._build_manifest_with_return(
                 collection, manifest_entries, schema, key_col, rg_size)
         else:
-            manifest_hash, new_manifest = self._build_manifest_with_return(
+            manifest_hash, new_manifest, manifest_bytes = self._build_manifest_with_return(
                 collection, [], schema, key_col, rg_size)
 
         # P10 fix: Build stats tree during compaction (writer-side).
-        # This is the RIGHT place — compact has write access, and the
-        # result is a flat manifest with all row groups inline (perfect
-        # for stats tree construction). Readers find it pre-built.
+        # Re-encode manifest if stats tree was added (manifest_bytes changes).
         try:
             from stats_tree import should_use_stats_tree, build_stats_tree
             if should_use_stats_tree(len(new_manifest.row_groups)):
                 stats_root = build_stats_tree(self.kernel, new_manifest.row_groups)
                 new_manifest.set_stats_tree_root(stats_root)
-                # Re-commit the manifest with the stats tree root
-                manifest_hash = new_manifest.commit()
-                self.kernel.reference(self._manifest_ref(collection), manifest_hash)
+                # Re-encode locally with the stats tree root
+                manifest_bytes = new_manifest.encode()
+                manifest_hash = hash_bytes(manifest_bytes)
         except ImportError:
             pass
 
@@ -3086,7 +3142,7 @@ class UnifiedStorage:
         commit_hash = self._write_commit_blob(
             collection, manifest_hash, parent=parent,
             message=f"compact {len(shard_hashes)} shards ({len(all_rows)} live rows)",
-            index=commit_index)
+            index=commit_index, manifest_bytes=manifest_bytes)
 
         # ASYNC TOMBSTONING + VACUUM (same as manifest-level compaction):
         # Fire-and-forget background thread. compact() returns immediately
@@ -3619,7 +3675,7 @@ class UnifiedStorage:
             manifest = CollectionManifest(self.kernel)
             manifest.set_schema(columns=schema_columns, key_col=key_col or "",
                                  row_group_size=row_group_size, chunk_size=0)
-            manifest_hash = self._build_manifest(
+            manifest_hash, manifest_bytes = self._build_manifest(
                 collection, [], schema_columns,
                 key_col or "", row_group_size)
             # O(1) warm write: use cached HEAD + commit_index if available
@@ -3634,7 +3690,7 @@ class UnifiedStorage:
             commit_hash = self._write_commit_blob(
                 collection, manifest_hash, parent=parent,
                 message=message or "write: empty table",
-                index=commit_index)
+                index=commit_index, manifest_bytes=manifest_bytes)
             self._update_caches_after_write(
                 collection, manifest, manifest_hash, commit_hash, commit_index,
                 is_delta=False)
@@ -3720,9 +3776,11 @@ class UnifiedStorage:
             if pc:
                 commit_index = pc.get("index", 0) + 1
 
-        # BATCH-PUT: manifest blob + commit blob + 2 refs ALL in parallel
+        # BATCH-PUT: pack blob (commit + manifest in ONE) + 2 refs in parallel
         # = 1 RTT wall-clock (was 3-4 RTTs sequential).
-        # Compute commit_hash locally so all 4 PUTs are independent.
+        # PondPack combines commit JSON + manifest bytes into ONE blob, so
+        # we write 1 blob + 2 refs (both refs point to the pack hash).
+        # This saves 1 PUT vs the old format (separate commit + manifest blobs).
         import json as _json
         import time as _time
         commit = {
@@ -3733,8 +3791,9 @@ class UnifiedStorage:
             "timestamp": _time.time(),
             "index": commit_index,
         }
-        commit_bytes = _json.dumps(commit, sort_keys=True).encode()
-        commit_hash = hash_bytes(commit_bytes)
+        # Build the pack: commit JSON + manifest bytes in ONE blob
+        pack_bytes = encode_pack(commit, manifest_bytes)
+        pack_hash = hash_bytes(pack_bytes)
 
         active = self._active_commit_ref(collection)
         manifest_ref = self._manifest_ref(collection)
@@ -3742,45 +3801,43 @@ class UnifiedStorage:
         if hasattr(self.kernel, 'store') and hasattr(self.kernel.store, 'put_blob'):
             from concurrent.futures import ThreadPoolExecutor
 
-            def _put_manifest_blob():
-                self.kernel.store.put_blob(manifest_bytes)
-
-            def _put_commit_blob():
-                self.kernel.store.put_blob(commit_bytes)
+            def _put_pack_blob():
+                self.kernel.store.put_blob(pack_bytes)
 
             def _put_active_ref():
-                self.kernel.store.put_path(active, commit_hash)
+                self.kernel.store.put_path(active, pack_hash)
 
             def _put_manifest_ref():
-                self.kernel.store.put_path(manifest_ref, manifest_hash)
+                self.kernel.store.put_path(manifest_ref, pack_hash)
 
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                f1 = pool.submit(_put_manifest_blob)
-                f2 = pool.submit(_put_commit_blob)
-                f3 = pool.submit(_put_active_ref)
-                f4 = pool.submit(_put_manifest_ref)
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                f1 = pool.submit(_put_pack_blob)
+                f2 = pool.submit(_put_active_ref)
+                f3 = pool.submit(_put_manifest_ref)
                 f1.result()
                 f2.result()
                 f3.result()
-                f4.result()
 
-            self.kernel.stats["writes"] += 2
+            self.kernel.stats["writes"] += 1  # 1 pack blob (was 2: commit + manifest)
             self.kernel.stats["ref_writes"] += 2
             self.kernel.stats["references"] += 2
-            self.kernel._update_path_cache(active, commit_hash)
-            self.kernel._update_path_cache(manifest_ref, manifest_hash)
+            self.kernel._update_path_cache(active, pack_hash)
+            self.kernel._update_path_cache(manifest_ref, pack_hash)
         else:
             # PondMinimal fallback: sequential (local disk, no RTT)
-            self.kernel.write(manifest_bytes)
-            self.kernel.write(commit_bytes)
-            self.kernel.reference(active, commit_hash)
-            self.kernel.reference(manifest_ref, manifest_hash)
+            self.kernel.write(pack_bytes)
+            self.kernel.reference(active, pack_hash)
+            self.kernel.reference(manifest_ref, pack_hash)
 
         # Update caches (don't invalidate) → next write is O(1)
+        # Both commit_hash and manifest_hash map to pack_hash in storage.
+        # The cache stores manifest_hash → manifest object; the path cache
+        # stores ref → pack_hash. _load_manifest_from_hash handles the
+        # pack → manifest extraction transparently.
         self._update_caches_after_write(
-            collection, new_manifest, manifest_hash, commit_hash, commit_index,
+            collection, new_manifest, pack_hash, pack_hash, commit_index,
             is_delta=False)
-        return commit_hash
+        return pack_hash
 
     def append(self, collection: str, rows,
                key_col: Optional[str] = None,
@@ -3877,8 +3934,8 @@ class UnifiedStorage:
         # stats_tree_root is set, skipping the parent_manifest_hash walk.
         if manifest.stats_tree_root and manifest.parent_manifest_hash:
             try:
-                parent = CollectionManifest.load(
-                    self.kernel, manifest.parent_manifest_hash)
+                parent = self._load_manifest_from_hash(
+                    manifest.parent_manifest_hash)
                 for rg in parent.scan_with_pruning():
                     if rg.key in seen_keys:
                         continue  # newer version already collected
@@ -3984,11 +4041,12 @@ class UnifiedStorage:
         if parent_manifest_hash is not None:
             manifest.set_parent_manifest(parent_manifest_hash)
 
-        manifest_hash = manifest.commit()
-        # NOTE: manifest ref PUT is now done by _write_commit_blob (in
-        # parallel with the commit blob + active ref PUTs). Skipping it
-        # here saves 1 RTT per write.
-        return manifest_hash, manifest
+        # Encode manifest LOCALLY (no I/O) — the caller will include it
+        # in a PondPack blob (commit + manifest in ONE blob).
+        # This replaces manifest.commit() which wrote a separate blob.
+        manifest_bytes = manifest.encode()
+        manifest_hash = hash_bytes(manifest_bytes)
+        return manifest_hash, manifest, manifest_bytes
 
     def _encode_manifest_local(self, manifest: CollectionManifest
                                  ) -> tuple[bytes, str]:
@@ -4006,37 +4064,28 @@ class UnifiedStorage:
                          schema_columns: list[tuple[str, int]],
                          key_col: str,
                          row_group_size: int,
-                         parent_manifest_hash: Optional[str] = None) -> Optional[str]:
+                         parent_manifest_hash: Optional[str] = None
+                         ) -> tuple[Optional[str], Optional[bytes]]:
         """Build the CollectionManifest for the just-written row groups.
 
-        At PB scale (>25K row groups), the manifest delegates to a
-        hierarchical stats tree. The manifest blob itself stays small
-        (schema + sort order + stats_tree_root = ~200 bytes), and the
-        stats tree provides O(log N) reads via content-addressed nodes.
-
-        For delta-appends (parent_manifest_hash set), the manifest stores
-        only the NEW row groups + a pointer to the parent. The reader
-        walks the parent chain. This makes append() O(new_row_groups).
+        Encodes the manifest LOCALLY (no I/O) — returns (hash, bytes).
+        The caller is responsible for writing the manifest, either as a
+        standalone PMAN blob or as part of a PondPack blob (commit + manifest).
         """
         manifest = CollectionManifest(self.kernel)
         manifest.set_schema(
             columns=schema_columns,
             key_col=key_col,
             row_group_size=row_group_size,
-            chunk_size=0,  # unified storage has no per-chunk blobs
+            chunk_size=0,
         )
-
-        # Build RowGroupEntry objects (we need them for both the flat
-        # manifest AND the stats tree)
-        rg_entries: list[RowGroupEntry] = []
         for entry in entries:
             rg = RowGroupEntry(
                 key=entry["rg_key"],
                 blob_hash=entry["blob_hash"],
                 n_rows=entry["n_rows"],
-                storage_mode=STORAGE_WHOLE_BLOB,  # unified mode
+                storage_mode=STORAGE_WHOLE_BLOB,
             )
-            # Build column stats entries from the per-column stats
             for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
                 rg.columns.append(ColumnStatsEntry(
                     name=col_name,
@@ -4044,20 +4093,16 @@ class UnifiedStorage:
                     min=mn,
                     max=mx,
                     null_count=null_count,
-                    chunks=[],  # no per-chunk stats in unified mode
+                    chunks=[],
                 ))
             manifest.add_row_group(rg)
-            rg_entries.append(rg)
 
-        # P10 fix: StatsTree is NOT built eagerly — lazy on first read.
-
-        # Delta-manifest: set parent pointer for O(1) appends at PB scale
         if parent_manifest_hash is not None:
             manifest.set_parent_manifest(parent_manifest_hash)
 
-        manifest_hash = manifest.commit()
-        self.kernel.reference(self._manifest_ref(collection), manifest_hash)
-        return manifest_hash
+        manifest_bytes = manifest.encode()
+        manifest_hash = hash_bytes(manifest_bytes)
+        return manifest_hash, manifest_bytes
 
     # ------------------------------------------------------------------
     # READ — the ONE read path

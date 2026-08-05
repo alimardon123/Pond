@@ -275,7 +275,13 @@ def law_3_lens_does_not_change_stored_bytes():
 
 
 def law_4_derived_rebuild_produces_identical_hashes():
-    """LAW 4: Content-addressed manifests are deterministic."""
+    """LAW 4: Content-addressed manifests are deterministic.
+
+    With PondPack, the manifest_ref points to a pack blob (commit + manifest).
+    The pack hash changes between writes (different commit timestamp), but
+    the MANIFEST INSIDE the pack is deterministic. We verify by extracting
+    the manifest bytes from each pack and comparing their hashes.
+    """
     import shutil
     bench = "/tmp/pond_inv4"
     if os.path.exists(bench): shutil.rmtree(bench)
@@ -287,17 +293,33 @@ def law_4_derived_rebuild_produces_identical_hashes():
         rows = [{"id": i, "val": i * 10} for i in range(100)]
         storage.write("inv4", rows, key_col="id", row_group_size=10,
                        message="first write")
-        hash1 = kernel.resolve("collections/inv4/_branches/main/manifest")
+        pack_hash1 = kernel.resolve("collections/inv4/_branches/main/manifest")
+        # Extract manifest bytes from the pack
+        pack_bytes1 = kernel.read_blob(pack_hash1)
+        if pack_bytes1[:4] == b"PNPK":
+            from pond_pack import decode_pack as _dp
+            _commit1, manifest_bytes1 = _dp(pack_bytes1)
+        else:
+            manifest_bytes1 = pack_bytes1  # old PMAN format
+
         storage.write("inv4", rows, key_col="id", row_group_size=10,
                        message="rebuild")
-        hash2 = kernel.resolve("collections/inv4/_branches/main/manifest")
-        assert hash1 is not None, "LAW 4: first write produced no manifest"
-        assert hash2 is not None, "LAW 4: rebuild produced no manifest"
-        assert hash1 == hash2,             f"LAW 4 VIOLATED: rebuild produced different manifest: {hash1[:12]} vs {hash2[:12]}"
+        pack_hash2 = kernel.resolve("collections/inv4/_branches/main/manifest")
+        pack_bytes2 = kernel.read_blob(pack_hash2)
+        if pack_bytes2[:4] == b"PNPK":
+            _commit2, manifest_bytes2 = _dp(pack_bytes2)
+        else:
+            manifest_bytes2 = pack_bytes2
+
+        assert pack_hash1 is not None, "LAW 4: first write produced no manifest"
+        assert pack_hash2 is not None, "LAW 4: rebuild produced no manifest"
+        # The manifest BYTES should be identical (deterministic)
+        assert manifest_bytes1 == manifest_bytes2, \
+            f"LAW 4 VIOLATED: rebuild produced different manifest bytes"
         kernel.close()
     finally:
         shutil.rmtree(bench, ignore_errors=True)
-    print("PASS: Invariant 4 — rebuild produces identical manifest hash")
+    print("PASS: Invariant 4 — rebuild produces identical manifest bytes")
 
 def law_5_history_replay_equals_snapshot():
     """LAW 5: History replay equals current snapshot.
@@ -495,8 +517,14 @@ def law_12_merge_true_dag():
 
     # Verify the HEAD commit has a second_parent (true merge)
     head = kernel.resolve("collections/law12/_branches/main/commit")
-    import json as _json2
-    commit = _json2.loads(kernel.read_blob(head))
+    # The HEAD blob may be a PondPack (PNPK) or old JSON commit — handle both
+    head_bytes = kernel.read_blob(head)
+    if head_bytes[:4] == b"PNPK":
+        from pond_pack import decode_pack as _dp
+        commit, _manifest_bytes = _dp(head_bytes)
+    else:
+        import json as _json2
+        commit = _json2.loads(head_bytes)
 
     assert commit.get("second_parent") is not None, \
         "LAW 12 VIOLATED: merge commit has no second_parent (not a true DAG)"
@@ -752,18 +780,27 @@ def law_18_lakehouse_manifest_storage():
         head = kernel.resolve("collections/users/_branches/main/commit")
         raw = kernel.read_blob(head)
 
-        # The commit MUST be JSON (starts with '{').
-        assert len(raw) > 0 and raw[0:1] == b'{', \
-            f"LAW 18 VIOLATED: commit is not JSON (first byte: {raw[0] if raw else 'empty'})"
+        # The commit may be PondPack (PNPK) or old JSON format.
+        # Both must contain a commit with a manifest reference.
+        if raw[:4] == b"PNPK":
+            from pond_pack import decode_pack as _dp
+            commit, manifest_bytes = _dp(raw)
+        else:
+            assert len(raw) > 0 and raw[0:1] == b'{', \
+                f"LAW 18 VIOLATED: commit is not JSON or PNPK (first byte: {raw[0] if raw else 'empty'})"
+            commit = _json.loads(raw)
+            manifest_bytes = None
 
-        commit = _json.loads(raw)
         assert commit.get("manifest") is not None, \
             "LAW 18 VIOLATED: commit has no manifest hash"
 
         # Verify the manifest contains row group entries
         sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_structures"))
         from collection_manifest import CollectionManifest
-        manifest = CollectionManifest.load(kernel, commit["manifest"])
+        if manifest_bytes is not None:
+            manifest = CollectionManifest.decode(kernel, manifest_bytes)
+        else:
+            manifest = CollectionManifest.load(kernel, commit["manifest"])
         rg_count = len(list(manifest.scan_with_pruning()))
         assert rg_count >= 1, \
             f"LAW 18 VIOLATED: no row groups in manifest (got {rg_count})"
