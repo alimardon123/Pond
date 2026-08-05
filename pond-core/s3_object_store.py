@@ -91,17 +91,35 @@ class S3ObjectStore:
     def _blob_key(self, hash_val: str) -> str:
         """The S3 key for a content-addressed blob.
 
-        Uses 2-char sharding: blobs/{hash[:2]}/{hash}.
-        Matches LocalFSObjectStore exactly. At PB scale, this keeps
-        list_objects_v2 fast (256 shards × ~4K blobs each, parallelizable).
+        NEW short layout: b/{hash[:2]}/{hash}
+        (was: blobs/{hash[:2]}/{hash})
+        2-char sharding keeps list_objects_v2 fast at PB scale.
         """
+        shard = hash_val[:2]
+        if self._prefix:
+            return f"{self._prefix}/b/{shard}/{hash_val}"
+        return f"b/{shard}/{hash_val}"
+
+    def _old_blob_key(self, hash_val: str) -> str:
+        """OLD blob key format for backward compat."""
         shard = hash_val[:2]
         if self._prefix:
             return f"{self._prefix}/blobs/{shard}/{hash_val}"
         return f"blobs/{shard}/{hash_val}"
 
     def _path_key(self, path: str) -> str:
-        """The S3 key for a named path (ref)."""
+        """The S3 key for a named path (ref).
+
+        NEW short layout: paths are stored directly under the prefix.
+        No "paths/" subdirectory — the path IS the key.
+        (was: {prefix}/paths/{path})
+        """
+        if self._prefix:
+            return f"{self._prefix}/{path}"
+        return path
+
+    def _old_path_key(self, path: str) -> str:
+        """OLD path key format for backward compat."""
         if self._prefix:
             return f"{self._prefix}/paths/{path}"
         return f"paths/{path}"
@@ -109,14 +127,14 @@ class S3ObjectStore:
     def _paths_prefix(self) -> str:
         """The S3 prefix for listing all paths."""
         if self._prefix:
-            return f"{self._prefix}/paths/"
-        return "paths/"
+            return f"{self._prefix}/r/"
+        return "r/"
 
     def _blobs_prefix(self) -> str:
         """The S3 prefix for listing all blobs."""
         if self._prefix:
-            return f"{self._prefix}/blobs/"
-        return "blobs/"
+            return f"{self._prefix}/b/"
+        return "b/"
 
     # ------------------------------------------------------------------
     # Content-addressed blob operations
@@ -195,13 +213,22 @@ class S3ObjectStore:
         return [h for h, _ in hashes_keys]
 
     def get_blob(self, hash_val: str) -> bytes:
-        """Read bytes by content hash. 1 GET = 1 S3 round trip."""
+        """Read bytes by content hash. 1 GET = 1 S3 round trip.
+
+        Tries the NEW short key first, falls back to OLD key for backward compat.
+        """
         key = self._blob_key(hash_val)
         try:
             response = self._client.get_object(Bucket=self._bucket, Key=key)
             data = response["Body"].read()
         except self._client.exceptions.NoSuchKey:
-            raise KeyError(f"Blob {hash_val} not found in S3")
+            # Backward compat: try old key format
+            old_key = self._old_blob_key(hash_val)
+            try:
+                response = self._client.get_object(Bucket=self._bucket, Key=old_key)
+                data = response["Body"].read()
+            except self._client.exceptions.NoSuchKey:
+                raise KeyError(f"Blob {hash_val} not found in S3")
         with self._lock:
             self.stats["gets"] += 1
             self.stats["bytes_read"] += len(data)
@@ -256,47 +283,60 @@ class S3ObjectStore:
         return results  # type: ignore[return-value]
 
     def has_blob(self, hash_val: str) -> bool:
-        """Check if a blob exists (S3 HEAD — cheaper than GET)."""
+        """Check if a blob exists (S3 HEAD — cheaper than GET).
+
+        Checks both NEW and OLD key formats.
+        """
         key = self._blob_key(hash_val)
         try:
             self._client.head_object(Bucket=self._bucket, Key=key)
+            return True
+        except self._client.exceptions.ClientError:
+            pass
+        # Backward compat: try old key
+        old_key = self._old_blob_key(hash_val)
+        try:
+            self._client.head_object(Bucket=self._bucket, Key=old_key)
             return True
         except self._client.exceptions.ClientError:
             return False
 
     def delete_blob(self, hash_val: str) -> bool:
-        """Delete a blob by hash. Used by GC/vacuum."""
-        key = self._blob_key(hash_val)
-        try:
-            self._client.head_object(Bucket=self._bucket, Key=key)
-            self._client.delete_object(Bucket=self._bucket, Key=key)
-            return True
-        except self._client.exceptions.ClientError:
-            return False
+        """Delete a blob by hash. Used by GC/vacuum.
+
+        Deletes from both NEW and OLD key formats.
+        """
+        deleted = False
+        for key_func in [self._blob_key, self._old_blob_key]:
+            key = key_func(hash_val)
+            try:
+                self._client.head_object(Bucket=self._bucket, Key=key)
+                self._client.delete_object(Bucket=self._bucket, Key=key)
+                deleted = True
+            except self._client.exceptions.ClientError:
+                pass
+        return deleted
 
     def list_all_blob_hashes(self) -> list[str]:
         """List all blob hashes in the store (for GC reachability).
 
-        Walks the 2-char shard directories: blobs/{hash[:2]}/{hash}.
-        Each shard is a separate list_objects_v2 call — parallelizable
-        for faster GC at PB scale.
+        Scans both NEW (b/) and OLD (blobs/) locations.
         """
-        blobs_prefix = self._blobs_prefix()
         hashes = []
         paginator = self._client.get_paginator("list_objects_v2")
-        # List all shard dirs first (blobs/ab/, blobs/cd/, ...)
-        for page in paginator.paginate(Bucket=self._bucket, Prefix=blobs_prefix, Delimiter="/"):
-            for prefix_entry in page.get("CommonPrefixes", []):
-                shard_prefix = prefix_entry["Prefix"]
-                # List blobs in this shard
-                for shard_page in paginator.paginate(Bucket=self._bucket, Prefix=shard_prefix):
-                    for obj in shard_page.get("Contents", []):
-                        key = obj["Key"]
-                        # Key is "{shard_prefix}{hash}" — extract the hash
-                        hash_val = key[len(shard_prefix):]
-                        if hash_val:
-                            hashes.append(hash_val)
-        return hashes
+
+        # NEW location: b/{hash[:2]}/{hash}
+        for blobs_prefix in [self._blobs_prefix(), f"{self._prefix}/blobs/" if self._prefix else "blobs/"]:
+            for page in paginator.paginate(Bucket=self._bucket, Prefix=blobs_prefix, Delimiter="/"):
+                for prefix_entry in page.get("CommonPrefixes", []):
+                    shard_prefix = prefix_entry["Prefix"]
+                    for shard_page in paginator.paginate(Bucket=self._bucket, Prefix=shard_prefix):
+                        for obj in shard_page.get("Contents", []):
+                            key = obj["Key"]
+                            hash_val = key[len(shard_prefix):]
+                            if hash_val:
+                                hashes.append(hash_val)
+        return list(set(hashes))
 
     # ------------------------------------------------------------------
     # Named path operations (well-known refs)
@@ -318,7 +358,10 @@ class S3ObjectStore:
             self.stats["puts"] += 1
 
     def get_path(self, path: str) -> Optional[str]:
-        """Resolve a well-known path to its current content hash."""
+        """Resolve a well-known path to its current content hash.
+
+        Tries the NEW short key first, falls back to OLD key for backward compat.
+        """
         key = self._path_key(path)
         try:
             response = self._client.get_object(Bucket=self._bucket, Key=key)
@@ -327,9 +370,19 @@ class S3ObjectStore:
             with self._lock:
                 self.stats["gets"] += 1
             return data.get("hash")
-        except self._client.exceptions.NoSuchKey:
-            return None
-        except self._client.exceptions.ClientError:
+        except (self._client.exceptions.NoSuchKey, self._client.exceptions.ClientError):
+            pass
+
+        # Backward compat: try old key format
+        old_key = self._old_path_key(path)
+        try:
+            response = self._client.get_object(Bucket=self._bucket, Key=old_key)
+            body = response["Body"].read()
+            data = json.loads(body)
+            with self._lock:
+                self.stats["gets"] += 1
+            return data.get("hash")
+        except (self._client.exceptions.NoSuchKey, self._client.exceptions.ClientError):
             return None
 
     def delete_path(self, path: str) -> bool:
@@ -342,17 +395,35 @@ class S3ObjectStore:
             return False
 
     def list_paths(self, prefix: str = "") -> list[str]:
-        """List all paths with the given prefix (like S3 list-objects-v2)."""
-        full_prefix = self._paths_prefix() + prefix
+        """List all paths with the given prefix.
+
+        Scans both NEW ({prefix}/{path}) and OLD ({prefix}/paths/{path}) locations.
+        """
         paths = []
         paginator = self._client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self._bucket, Prefix=full_prefix):
+
+        # NEW location: {prefix}/{path}
+        new_full_prefix = f"{self._prefix}/{prefix}" if self._prefix else prefix
+        new_strip = len(f"{self._prefix}/") if self._prefix else 0
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=new_full_prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if key.startswith(full_prefix):
-                    # Strip the paths/ prefix to return just the path name
-                    paths.append(key[len(self._paths_prefix()):])
-        return sorted(paths)
+                if key.startswith(new_full_prefix):
+                    p = key[new_strip:]
+                    # Skip blob keys
+                    if not p.startswith("b/"):
+                        paths.append(p)
+
+        # OLD location: {prefix}/paths/{path}
+        old_full_prefix = f"{self._prefix}/paths/{prefix}" if self._prefix else f"paths/{prefix}"
+        old_strip = len(f"{self._prefix}/paths/") if self._prefix else len("paths/")
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=old_full_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.startswith(old_full_prefix):
+                    paths.append(key[old_strip:])
+
+        return sorted(set(paths))
 
     # ------------------------------------------------------------------
     # Stats (same interface as InMemoryObjectStore)

@@ -548,17 +548,29 @@ class PondStorage:
 
     def delete_shard(self, collection: str, rowids: list[str],
                       key_col: Optional[str] = None,
-                      row_group_size: int = 10_000) -> str:
+                      row_group_size: int = 10_000,
+                      keys: Optional[list[str]] = None) -> str:
         """Concurrent-safe row-level delete with tombstones.
 
         Each deleted _rowid gets a tombstone with _deleted=True and a new
         _version. On merge, if the tombstone's _version is later than any
         live row's _version, the row is suppressed.
+
+        Args:
+            collection: collection name
+            rowids: list of _rowid strings to delete
+            key_col: sort key column (for range scans)
+            row_group_size: rows per row group
+            keys: optional list of key_col values, one per rowid. If
+                provided, each tombstone's key_col is set to the actual
+                key value. This ensures tombstones match legacy rows
+                during CRDT merge (type-coerced via str()).
         """
         if self._unified is None:
             raise RuntimeError("UnifiedStorage not available")
         return self._unified.delete_shard(collection, rowids, key_col=key_col,
-                                            row_group_size=row_group_size)
+                                            row_group_size=row_group_size,
+                                            keys=keys)
 
     def read(self, collection: str,
              predicates: Optional[list[tuple[str, str, Any]]] = None,

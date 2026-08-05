@@ -163,9 +163,10 @@ def test_row_level_for_deletes():
     rows_with_rowid = [r for r in rows if r.get("_rowid") and r["id"] in (0, 1)]
     assert len(rows_with_rowid) == 2, f"Expected 2 rows with _rowid, got {len(rows_with_rowid)}"
     rowids_to_delete = [r["_rowid"] for r in rows_with_rowid]
+    keys_to_delete = [str(r["id"]) for r in rows_with_rowid]  # pass keys for proper tombstone matching
 
     # Delete rows 0 and 1
-    s.delete_shard("test", rowids_to_delete, key_col="id", row_group_size=10)
+    s.delete_shard("test", rowids_to_delete, key_col="id", row_group_size=10, keys=keys_to_delete)
 
     # Before compaction: 18 live rows (2 deleted via tombstone)
     rows_before = s.read_with_shards("test")
@@ -278,16 +279,17 @@ def test_mixed_insert_and_upsert():
     s.wait_for_background_tasks()
 
     rows = s.read("test")
-    # 20 (original, no _rowid) + 5 (insert-only) + 1 (upsert with _rowid) = 26
-    # The upsert didn't UPDATE id=0 — it created a duplicate with _rowid.
-    # This is the correct CRDT behavior: without _rowid on the original,
-    # there's no way to match them.
-    assert len(rows) == 26, f"Expected 26 rows, got {len(rows)}"
+    # With the CRDT fix: the upsert shard has _rowid + key_col="id"=0.
+    # The _merge_rows_by_rowid now uses str() coercion to match legacy
+    # rows by key_col. So the upserted row (id=0, _rowid=X) suppresses
+    # the legacy row (id=0, no _rowid) because they share the same key.
+    # Result: 20 original - 1 superseded + 5 insert-only + 1 upsert = 25
+    assert len(rows) == 25, f"Expected 25 rows (1 superseded by upsert), got {len(rows)}"
 
-    # Verify the upserted row exists
+    # Verify the upserted row exists (should be the only id=0 row now)
     id_zero_rows = [r for r in rows if r["id"] == 0]
-    assert len(id_zero_rows) == 2, \
-        f"Expected 2 rows with id=0 (original + upsert), got {len(id_zero_rows)}"
+    assert len(id_zero_rows) == 1, \
+        f"Expected 1 row with id=0 (upsert superseded original), got {len(id_zero_rows)}"
     vals = {r["val"] for r in id_zero_rows}
     assert "updated" in vals, f"Upsert value not found: {vals}"
 

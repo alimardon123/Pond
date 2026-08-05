@@ -166,11 +166,12 @@ def test_gc_cleans_uncommitted():
     s.append_shard("users", [{"id": 700, "name": "will_be_aborted"}], key_col="id", tx_id=tx)
     # Don't commit — abort
 
-    # GC should clean up the tentative shard's blob
+    # GC should find the tentative shard's blob as dead
+    # (it's not reachable from any committed ref — tx_id in the ref path
+    # means it's a tentative shard, and no commit marker exists)
     stats = s.gc()
     # The tentative shard blob should be in the dead set
-    # (it's not reachable from any committed ref)
-    assert stats["dead"] > 0, "Expected dead blobs from uncommitted tx"
+    assert stats["dead"] > 0, f"Expected dead blobs from uncommitted tx, got {stats['dead']}"
 
     # Vacuum
     s.vacuum()

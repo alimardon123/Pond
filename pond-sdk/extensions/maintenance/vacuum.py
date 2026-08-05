@@ -231,7 +231,8 @@ class GarbageCollector:
             filtered = []
             for n in names:
                 for coll in collections:
-                    if n.startswith(f"collections/{coll}/"):
+                    # Check both NEW (r/{coll}/) and OLD (collections/{coll}/) formats
+                    if n.startswith(f"r/{coll}/") or n.startswith(f"collections/{coll}/"):
                         filtered.append(n)
                         break
             names = filtered
@@ -241,17 +242,36 @@ class GarbageCollector:
         # are NOT walked (their refs are walked but the tx commit marker
         # doesn't exist, so the reader filters them out — and GC treats
         # them as dead since no commit marker = unreachable).
-        cutoff_time = time.time() - (preserve_days * 86400) if preserve_days > 0 else 0
+        # cutoff_time: commits older than this are eligible for GC.
+        # preserve_days > 0: keep commits from the last N days
+        # preserve_days == 0: keep ALL history (default — time-travel safe)
+        # preserve_days < 0: prune ALL old commits (aggressive — for testing)
+        if preserve_days < 0:
+            cutoff_time = float('inf')  # all commits are "old" → prune all ancestors
+        elif preserve_days > 0:
+            cutoff_time = time.time() - (preserve_days * 86400)
+        else:
+            cutoff_time = 0  # walk all ancestors (preserve history)
         for name in names:
             # Skip tentative shard refs from uncommitted transactions
-            # (shards with tx_ prefix where the tx commit marker doesn't exist)
-            if "/shards/tx_" in name:
-                # Extract tx_id: .../shards/tx_{tx_id}_{shard_id}
-                shard_part = name.split("/shards/tx_")[-1]
+            # Handles both NEW (r/.../s/tx_...) and OLD (.../shards/tx_...) formats
+            if "/s/tx_" in name or "/shards/tx_" in name:
+                # Extract tx_id from the path
+                # NEW: r/{coll}/{branch}/s/tx_{tx_id}_{shard_id}
+                # OLD: collections/{coll}/_branches/{branch}/shards/tx_{tx_id}_{shard_id}
+                if "/s/tx_" in name:
+                    shard_part = name.split("/s/tx_")[-1]
+                else:
+                    shard_part = name.split("/shards/tx_")[-1]
                 tx_id = shard_part.split("_", 1)[0] if "_" in shard_part else ""
                 if tx_id:
-                    tx_ref = f"transactions/{tx_id}"
-                    if self.kernel.resolve(tx_ref) is None:
+                    # Check both NEW (r/tx/{tx_id}) and OLD (transactions/{tx_id}) formats
+                    tx_hash = None
+                    for tx_ref in [f"r/tx/{tx_id}", f"transactions/{tx_id}"]:
+                        tx_hash = self.kernel.resolve(tx_ref)
+                        if tx_hash is not None:
+                            break
+                    if tx_hash is None:
                         continue  # uncommitted — skip (will be cleaned up as dead)
 
             h = self.kernel.resolve(name)

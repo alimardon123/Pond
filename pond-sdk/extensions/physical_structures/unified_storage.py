@@ -773,32 +773,26 @@ class UnifiedStorage:
     def _manifest_ref(self, collection: str) -> str:
         """The manifest ref path for the ACTIVE branch.
 
-        Each branch owns its own manifest ref so checkout is pure
-        in-memory pointer swap (no ref mutation, no race). The active
-        branch is resolved via _get_active_branch (defaults to 'main').
+        Uses the NEW short layout: r/{collection}/{branch}/manifest
+        (was: collections/{collection}/_branches/{branch}/manifest)
+
+        The store layer handles backward compat — old refs under the
+        long path are still readable.
         """
         branch = self._get_active_branch(collection)
-        return f"collections/{collection}/_branches/{branch}/manifest"
+        return f"r/{collection}/{branch}/manifest"
 
     def _manifest_ref_for_branch(self, collection: str, branch: str) -> str:
-        """The manifest ref path for a SPECIFIC branch (not the active one).
-
-        Used by checkout (to invalidate the old branch's cache) and merge
-        (to write the merge result to the target branch's manifest ref).
-        """
-        return f"collections/{collection}/_branches/{branch}/manifest"
+        """The manifest ref path for a SPECIFIC branch (not the active one)."""
+        return f"r/{collection}/{branch}/manifest"
 
     @staticmethod
     def _head_ref(collection: str) -> str:
         """DEPRECATED: HEAD ref is eliminated.
 
-        Kept for backward compat with external callers (e.g. lakehouse_lens).
-        Returns the default branch's commit ref (branches/main/commit).
-        NOTE: This is a static method and cannot resolve the in-memory active
-        branch — it returns the 'main' branch ref as a fallback. Callers that
-        need the true active commit ref should use _active_commit_ref() instead.
+        Returns the default branch's commit ref (main/commit).
         """
-        return f"collections/{collection}/_branches/main/commit"
+        return f"r/{collection}/main/commit"
 
     def _active_commit_ref(self, collection: str) -> str:
         """The ref for the currently active branch's commit (replaces HEAD).
@@ -1039,13 +1033,10 @@ class UnifiedStorage:
     def _branch_ref(collection: str, branch: str) -> str:
         """Branch commit ref path.
 
-        Each branch owns its own commit ref at
-        collections/{c}/_branches/{branch}/commit. Shards live alongside
-        at collections/{c}/_branches/{branch}/shards/{uuid}, and the
-        manifest at collections/{c}/_branches/{branch}/manifest — all
-        under the single branches/ namespace (no separate branch-refs/).
+        NEW short layout: r/{collection}/{branch}/commit
+        (was: collections/{collection}/_branches/{branch}/commit)
         """
-        return f"collections/{collection}/_branches/{branch}/commit"
+        return f"r/{collection}/{branch}/commit"
 
     def _write_commit_blob(self, collection: str,
                             manifest_hash: str,
@@ -1845,27 +1836,22 @@ class UnifiedStorage:
     def _shards_prefix(collection: str, branch: str = "main") -> str:
         """Shards live UNDER branches — each branch has its own shard set.
 
-        This enables concurrent work on different branches:
-          - 2 writers on feature1 → shards under branches/feature1/shards/
-          - 3 writers on main     → shards under branches/main/shards/
-          - A writer can switch branches mid-work — next shard goes to
-            the new branch automatically (just like git checkout).
+        NEW short layout: r/{collection}/{branch}/s/
+        (was: collections/{collection}/_branches/{branch}/shards/)
         """
-        return f"collections/{collection}/_branches/{branch}/shards/"
+        return f"r/{collection}/{branch}/s/"
 
     def _get_active_branch(self, collection: str) -> str:
         """Get the active branch for a collection (default: main)."""
         active = self._active_branches.get(collection)
         if active:
             # active is stored as the full ref path — extract branch name.
-            # _branch_ref returns collections/{c}/_branches/{branch}/commit,
-            # so we strip the prefix and the trailing /commit.
-            prefix = f"collections/{collection}/_branches/"
-            if active.startswith(prefix):
-                rest = active[len(prefix):]  # {branch}/commit
-                # Strip the trailing /commit (rsplit handles branch names
-                # that contain 'commit' as a substring — only the suffix matches).
-                return rest.rsplit("/commit", 1)[0]
+            # NEW format: r/{collection}/{branch}/commit
+            # OLD format: collections/{collection}/_branches/{branch}/commit
+            for prefix in [f"r/{collection}/", f"collections/{collection}/_branches/"]:
+                if active.startswith(prefix):
+                    rest = active[len(prefix):]  # {branch}/commit
+                    return rest.rsplit("/commit", 1)[0]
         return "main"
 
     def _read_shard_index(self, collection: str, branch: Optional[str] = None) -> list[str]:
@@ -1980,7 +1966,7 @@ class UnifiedStorage:
                 tx_id = parts[1]
                 if tx_id not in checked_tx_cache:
                     checked_tx_cache.add(tx_id)
-                    tx_ref = f"transactions/{tx_id}"
+                    tx_ref = self._tx_ref(tx_id)
                     tx_hash = self.kernel.resolve(tx_ref)
                     if tx_hash is not None:
                         committed_tx_cache.add(tx_id)
@@ -3292,8 +3278,12 @@ class UnifiedStorage:
 
     @staticmethod
     def _tx_ref(tx_id: str) -> str:
-        """The commit marker ref path."""
-        return f"transactions/{tx_id}"
+        """The commit marker ref path.
+
+        NEW short layout: r/tx/{tx_id}
+        (was: transactions/{tx_id})
+        """
+        return f"r/tx/{tx_id}"
 
     def begin_tx(self) -> str:
         """Begin a transaction. Returns the tx_id.
@@ -3563,6 +3553,13 @@ class UnifiedStorage:
         newer and supersedes the legacy snapshot). Legacy rows with unique
         key_col values are kept (they represent data not yet upserted).
 
+        TOMBSTONE KEY MATCHING: tombstones carry the key_col value of the
+        row they delete. Legacy rows with the same key_col value are
+        suppressed (the tombstone says "this key is deleted"). The match
+        is type-coerced (str(0) == 0) to handle the case where tombstones
+        store key_col as strings (from delete_shard's keys parameter) but
+        the original data has ints.
+
         Args:
             all_rows: rows to merge (may include both _rowid-tagged and
                       legacy rows)
@@ -3570,12 +3567,6 @@ class UnifiedStorage:
                      against CRDT rows. If None, legacy rows are always kept.
         """
         # First pass: separate CRDT rows (with _rowid) from legacy rows.
-        # Also observe every remote _version through the shared HLC so the
-        # local clock stays ahead of remote clocks. This prevents
-        # skew-induced LWW inversions: a writer whose wall clock lags
-        # would otherwise generate _version strings that lose to stale
-        # remote rows even after observing them. observe() is a no-op
-        # for non-HLC strings (legacy UUIDv7 versions).
         latest: dict[str, dict] = {}
         legacy_rows: list[dict] = []
         has_crdt = False
@@ -3595,18 +3586,18 @@ class UnifiedStorage:
         result = []
 
         if has_crdt and key_col:
-            # CRDT mode with key_col: drop legacy rows whose key_col value
-            # matches a CRDT row (the CRDT row is newer). Keep legacy rows
-            # with unique key_col values (data not yet upserted).
+            # CRDT mode with key_col: build a set of key_col values that
+            # are "claimed" by CRDT rows (either live or tombstoned).
+            # Use str() coercion so that int 0 and str "0" match.
             crdt_keys = set()
             for row in latest.values():
                 kv = row.get(key_col)
                 if kv is not None:
-                    crdt_keys.add(kv)
+                    crdt_keys.add(str(kv))
             for row in legacy_rows:
                 kv = row.get(key_col)
-                if kv is not None and kv in crdt_keys:
-                    continue  # superseded by a CRDT row — drop
+                if kv is not None and str(kv) in crdt_keys:
+                    continue  # superseded by a CRDT row (live or tombstoned) — drop
                 result.append(row)
         else:
             # No CRDT rows, or no key_col to dedup by — keep legacy rows.

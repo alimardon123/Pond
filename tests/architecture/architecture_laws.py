@@ -120,7 +120,7 @@ class _BaseShim:
         except ImportError:
             return {}
         import json as _json
-        head = self.kernel.resolve(f"collections/{self.collection}/_branches/main/commit")
+        head = self.kernel.resolve(f"r/{self.collection}/main/commit")
         if head is None:
             return {}
         raw = self.kernel.read_blob(head)
@@ -293,7 +293,7 @@ def law_4_derived_rebuild_produces_identical_hashes():
         rows = [{"id": i, "val": i * 10} for i in range(100)]
         storage.write("inv4", rows, key_col="id", row_group_size=10,
                        message="first write")
-        pack_hash1 = kernel.resolve("collections/inv4/_branches/main/manifest")
+        pack_hash1 = kernel.resolve("r/inv4/main/manifest")
         # Extract manifest bytes from the pack
         pack_bytes1 = kernel.read_blob(pack_hash1)
         if pack_bytes1[:4] == b"PNPK":
@@ -304,7 +304,7 @@ def law_4_derived_rebuild_produces_identical_hashes():
 
         storage.write("inv4", rows, key_col="id", row_group_size=10,
                        message="rebuild")
-        pack_hash2 = kernel.resolve("collections/inv4/_branches/main/manifest")
+        pack_hash2 = kernel.resolve("r/inv4/main/manifest")
         pack_bytes2 = kernel.read_blob(pack_hash2)
         if pack_bytes2[:4] == b"PNPK":
             _commit2, manifest_bytes2 = _dp(pack_bytes2)
@@ -353,7 +353,7 @@ def law_5_history_replay_equals_snapshot():
                                       "physical_structures"))
     from collection_manifest import CollectionManifest
 
-    current = kernel.resolve("collections/inv5/_branches/main/commit")
+    current = kernel.resolve("r/inv5/main/commit")
     while current:
         raw = kernel.read_blob(current)
         try:
@@ -516,7 +516,7 @@ def law_12_merge_true_dag():
     lens.merge("feature")
 
     # Verify the HEAD commit has a second_parent (true merge)
-    head = kernel.resolve("collections/law12/_branches/main/commit")
+    head = kernel.resolve("r/law12/main/commit")
     # The HEAD blob may be a PondPack (PNPK) or old JSON commit — handle both
     head_bytes = kernel.read_blob(head)
     if head_bytes[:4] == b"PNPK":
@@ -629,13 +629,13 @@ def law_14_lakehouse_branch_isolation():
         users = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
         lens.create_table("users", users)
 
-        head_before = kernel.resolve("collections/users/_branches/main/commit")
+        head_before = kernel.resolve("r/users/main/commit")
 
         lens.branch("users", "dev")
         dev_data = pa.table({"id": [4], "name": ["d"]})
         lens.commit_to_branch("users", "dev", dev_data)
 
-        head_after = kernel.resolve("collections/users/_branches/main/commit")
+        head_after = kernel.resolve("r/users/main/commit")
         assert head_before == head_after, \
             "LAW 14 VIOLATED: branch commit moved main HEAD"
 
@@ -777,7 +777,7 @@ def law_18_lakehouse_manifest_storage():
         users = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
         lens.create_table("users", users)
 
-        head = kernel.resolve("collections/users/_branches/main/commit")
+        head = kernel.resolve("r/users/main/commit")
         raw = kernel.read_blob(head)
 
         # The commit may be PondPack (PNPK) or old JSON format.

@@ -82,7 +82,7 @@ def test_time_travel_no_mutation():
                    key_col="id", row_group_size=10)
 
     # Save the manifest hash for version 1
-    manifest_v1 = kernel.resolve("collections/test/_branches/main/manifest")
+    manifest_v1 = kernel.resolve("r/test/main/manifest")
 
     # Append version 2 (2 more rows) — appends go to shards, HEAD unchanged
     storage.append("test", [{"id": 3, "v": 2}, {"id": 4, "v": 2}],
@@ -90,7 +90,7 @@ def test_time_travel_no_mutation():
 
     # In the CRDT model, HEAD manifest is unchanged by append() — the new
     # rows live in shards. read() merges HEAD + shards to return all 4.
-    manifest_v2 = kernel.resolve("collections/test/_branches/main/manifest")
+    manifest_v2 = kernel.resolve("r/test/main/manifest")
     assert manifest_v1 == manifest_v2, \
         "CRDT model: append() should NOT change HEAD manifest (uses shards)"
 
@@ -105,7 +105,7 @@ def test_time_travel_no_mutation():
     # CRITICAL: verify the manifest ref was NOT mutated by the time-travel read
     # (the old swap-then-restore approach would have left the ref pointing at v1
     # if the restore failed)
-    manifest_after = kernel.resolve("collections/test/_branches/main/manifest")
+    manifest_after = kernel.resolve("r/test/main/manifest")
     assert manifest_after == manifest_v2, \
         "BUG: manifest ref was mutated by time-travel read (race condition!)"
 
@@ -129,7 +129,7 @@ def test_branch_read_no_mutation():
     }), key_col="id")
 
     # Save main manifest
-    main_manifest = kernel.resolve("collections/users/_branches/main/manifest")
+    main_manifest = kernel.resolve("r/users/main/manifest")
 
     # Create branch with additional data
     lens.branch("users", "dev")
@@ -139,7 +139,7 @@ def test_branch_read_no_mutation():
     }), key_col="id")
 
     # CRITICAL: main manifest should be unchanged after branch commit
-    main_after_branch = kernel.resolve("collections/users/_branches/main/manifest")
+    main_after_branch = kernel.resolve("r/users/main/manifest")
     assert main_after_branch == main_manifest, \
         "BUG: branch commit mutated main manifest"
 
@@ -154,7 +154,7 @@ def test_branch_read_no_mutation():
         f"Dev branch should have 4 rows, got {dev_rows.num_rows}"
 
     # CRITICAL: main manifest should STILL be unchanged after branch read
-    main_after_read = kernel.resolve("collections/users/_branches/main/manifest")
+    main_after_read = kernel.resolve("r/users/main/manifest")
     assert main_after_read == main_manifest, \
         "BUG: branch read mutated main manifest (race condition!)"
 

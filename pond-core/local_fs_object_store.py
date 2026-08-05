@@ -55,21 +55,22 @@ class LocalFSObjectStore:
     def __init__(self, base_dir: str):
         """Create a local-FS object store.
 
-        Args:
-            base_dir: the root directory. Blobs go in {base_dir}/blobs/,
-                paths go in {base_dir}/paths/. Created if it doesn't exist.
+        NEW short layout:
+            Blobs: {base_dir}/b/{hash[:2]}/{hash}
+            Refs:  {base_dir}/{ref_path}  (directly under base_dir)
+        OLD layout (backward compat, still readable):
+            Blobs: {base_dir}/blobs/{hash[:2]}/{hash}
+            Refs:  {base_dir}/paths/{ref_path}
         """
         self._base_dir = os.path.abspath(base_dir)
-        self._blobs_dir = os.path.join(self._base_dir, "blobs")
-        self._paths_dir = os.path.join(self._base_dir, "paths")
+        # NEW short blob dir
+        self._blobs_dir = os.path.join(self._base_dir, "b")
+        # OLD blob dir (for backward compat reads)
+        self._old_blobs_dir = os.path.join(self._base_dir, "blobs")
         os.makedirs(self._blobs_dir, exist_ok=True)
-        os.makedirs(self._paths_dir, exist_ok=True)
 
         self._lock = threading.Lock()
-        # Per-hash locks for concurrent blob writes
         self._blob_locks: dict[str, threading.Lock] = {}
-        # Counter for unique temp filenames (avoids collisions between
-        # concurrent writers racing on the same path)
         self._tmp_counter = 0
 
         # Honest stats (same shape as InMemoryObjectStore / S3ObjectStore)
@@ -92,24 +93,29 @@ class LocalFSObjectStore:
     def _blob_path(self, hash_val: str) -> str:
         """The on-disk path for a content-addressed blob.
 
-        Uses 2-char sharding: {blobs_dir}/{hash[:2]}/{hash}.
-        This matches S3ObjectStore exactly and keeps both backends
-        performant at PB scale (256 subdirectories instead of one
-        flat dir with millions of files).
+        NEW: {base_dir}/b/{hash[:2]}/{hash}
         """
         return os.path.join(self._blobs_dir, hash_val[:2], hash_val)
+
+    def _old_blob_path(self, hash_val: str) -> str:
+        """OLD blob path for backward compat reads."""
+        return os.path.join(self._old_blobs_dir, hash_val[:2], hash_val)
 
     def _path_file(self, path: str) -> str:
         """The on-disk file for a named path (ref).
 
-        Paths can contain '/' (e.g., 'collections/users/HEAD'). We map
-        them directly to nested directories.
+        NEW: {base_dir}/{path}  (directly under base_dir)
+        OLD: {base_dir}/paths/{path}
         """
-        return os.path.join(self._paths_dir, path)
+        return os.path.join(self._base_dir, path)
+
+    def _old_path_file(self, path: str) -> str:
+        """OLD path file for backward compat reads."""
+        return os.path.join(self._base_dir, "paths", path)
 
     def _paths_prefix_dir(self, prefix: str = "") -> str:
         """The on-disk directory for listing paths with a prefix."""
-        return os.path.join(self._paths_dir, prefix)
+        return os.path.join(self._base_dir, prefix)
 
     def _blobs_prefix_dir(self) -> str:
         return self._blobs_dir
@@ -153,7 +159,11 @@ class LocalFSObjectStore:
         """Read bytes by content hash."""
         path = self._blob_path(hash_val)
         if not os.path.exists(path):
-            raise KeyError(f"Blob {hash_val} not found on disk")
+            # Backward compat: try old path
+            old_path = self._old_blob_path(hash_val)
+            if not os.path.exists(old_path):
+                raise KeyError(f"Blob {hash_val} not found on disk")
+            path = old_path
         with open(path, "rb") as f:
             data = f.read()
         with self._lock:
@@ -226,33 +236,47 @@ class LocalFSObjectStore:
         return results  # type: ignore[return-value]
 
     def has_blob(self, hash_val: str) -> bool:
-        """Check if a blob exists."""
-        return os.path.exists(self._blob_path(hash_val))
+        """Check if a blob exists (checks both NEW and OLD paths)."""
+        if os.path.exists(self._blob_path(hash_val)):
+            return True
+        return os.path.exists(self._old_blob_path(hash_val))
 
     def delete_blob(self, hash_val: str) -> bool:
-        """Delete a blob by hash. Used by GC/vacuum."""
+        """Delete a blob by hash (from both NEW and OLD paths)."""
+        deleted = False
         path = self._blob_path(hash_val)
         if os.path.exists(path):
             os.remove(path)
-            return True
-        return False
+            deleted = True
+        old_path = self._old_blob_path(hash_val)
+        if os.path.exists(old_path):
+            os.remove(old_path)
+            deleted = True
+        return deleted
 
     def list_all_blob_hashes(self) -> list[str]:
         """List all blob hashes in the store (for GC reachability).
 
-        Walks the 2-char shard directories: {blobs_dir}/{hash[:2]}/{hash}.
-        Each shard dir is small (~4K blobs at 1M total) so listing is fast.
+        Scans both NEW (b/) and OLD (blobs/) directories.
         """
         hashes = []
-        if not os.path.isdir(self._blobs_dir):
-            return hashes
-        for shard in os.listdir(self._blobs_dir):
-            shard_dir = os.path.join(self._blobs_dir, shard)
-            if not os.path.isdir(shard_dir):
-                continue
-            for f in os.listdir(shard_dir):
-                hashes.append(f)
-        return hashes
+        # NEW location
+        if os.path.isdir(self._blobs_dir):
+            for shard in os.listdir(self._blobs_dir):
+                shard_dir = os.path.join(self._blobs_dir, shard)
+                if not os.path.isdir(shard_dir):
+                    continue
+                for f in os.listdir(shard_dir):
+                    hashes.append(f)
+        # OLD location (backward compat)
+        if os.path.isdir(self._old_blobs_dir):
+            for shard in os.listdir(self._old_blobs_dir):
+                shard_dir = os.path.join(self._old_blobs_dir, shard)
+                if not os.path.isdir(shard_dir):
+                    continue
+                for f in os.listdir(shard_dir):
+                    hashes.append(f)
+        return list(set(hashes))
 
     # ------------------------------------------------------------------
     # Named path operations (well-known refs)
@@ -276,10 +300,17 @@ class LocalFSObjectStore:
             self.stats["puts"] += 1
 
     def get_path(self, path: str) -> Optional[str]:
-        """Resolve a well-known path to its current content hash."""
+        """Resolve a well-known path to its current content hash.
+
+        Tries NEW path first, falls back to OLD path for backward compat.
+        """
         file = self._path_file(path)
         if not os.path.exists(file):
-            return None
+            # Backward compat: try old path
+            old_file = self._old_path_file(path)
+            if not os.path.exists(old_file):
+                return None
+            file = old_file
         with open(file, "r") as f:
             data = json.load(f)
         with self._lock:
@@ -288,32 +319,56 @@ class LocalFSObjectStore:
 
     def delete_path(self, path: str) -> bool:
         """Delete a named path. Returns True if deleted, False if not found."""
+        # Delete from both NEW and OLD locations
+        deleted = False
         file = self._path_file(path)
         if os.path.exists(file):
             os.remove(file)
+            deleted = True
+        old_file = self._old_path_file(path)
+        if os.path.exists(old_file):
+            os.remove(old_file)
+            deleted = True
+        if deleted:
             with self._lock:
                 self._path_cache_pop(path)
-            return True
-        return False
+        return deleted
 
     def _path_cache_pop(self, path: str):
         """No-op for LocalFS (no in-memory path cache at store level)."""
         pass
 
     def list_paths(self, prefix: str = "") -> list[str]:
-        """List all paths with the given prefix."""
-        prefix_dir = self._paths_prefix_dir(prefix)
+        """List all paths with the given prefix.
+
+        Scans both NEW ({base_dir}/{prefix}) and OLD ({base_dir}/paths/{prefix})
+        locations, merges results.
+        """
         paths = []
-        if not os.path.isdir(prefix_dir):
-            return paths
-        for root, _dirs, files in os.walk(prefix_dir):
-            for f in files:
-                # Full path relative to _paths_dir
-                full = os.path.join(root, f)
-                rel = os.path.relpath(full, self._paths_dir)
-                # Normalize to forward slashes (S3 uses /)
-                paths.append(rel.replace(os.sep, "/"))
-        return sorted(paths)
+
+        # NEW location
+        new_prefix_dir = self._paths_prefix_dir(prefix)
+        if os.path.isdir(new_prefix_dir):
+            for root, _dirs, files in os.walk(new_prefix_dir):
+                for f in files:
+                    full = os.path.join(root, f)
+                    rel = os.path.relpath(full, self._base_dir)
+                    p = rel.replace(os.sep, "/")
+                    # Skip blob directory
+                    if not p.startswith("b/"):
+                        paths.append(p)
+
+        # OLD location (backward compat)
+        old_prefix_dir = os.path.join(self._base_dir, "paths", prefix)
+        if os.path.isdir(old_prefix_dir):
+            old_paths_dir = os.path.join(self._base_dir, "paths")
+            for root, _dirs, files in os.walk(old_prefix_dir):
+                for f in files:
+                    full = os.path.join(root, f)
+                    rel = os.path.relpath(full, old_paths_dir)
+                    paths.append(rel.replace(os.sep, "/"))
+
+        return sorted(set(paths))
 
     # ------------------------------------------------------------------
     # Per-path locking for CAS
