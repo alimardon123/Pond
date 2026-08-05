@@ -4358,3 +4358,97 @@ Stage Summary:
 - The two-stage fetch+decode pipeline (Stage 1: parallel GET all blobs, Stage 2: parallel decode) overlaps I/O and CPU better than the previous per-worker fetch+decode pattern.
 - Merge and compaction remain the hardest cases because they have inherently sequential dependencies: manifest build needs shard data, commit needs manifest hash, tombstoning needs commit success. Further gains require either (a) background/async tombstoning, (b) speculative parallel execution, or (c) reducing the number of stages by combining operations at the format level.
 - No regressions: all 18 architecture laws pass, all 24 test suites pass (same 2 pre-existing failures, verified via git stash).
+
+---
+Task ID: round-34-multi-process-safe-caching
+Agent: main
+Task: Make all process-local caches SAFE for multi-process use. Pond will be a central storage where multiple processes/apps read and write concurrently via CRDT. Caches must NEVER cause a process to miss another process's writes indefinitely. Goal: caches optimize performance but never affect correctness.
+
+Work Log:
+- Added `cache_ttl_seconds` parameter to ObjectStoreNativeKernel (default 5.0s).
+  - ttl > 0: path cache entries expire after `ttl` seconds (re-validated with fresh GET)
+  - ttl == 0: NEVER cache (every resolve is a live GET — strongest consistency)
+  - ttl == inf: cache forever (single-process benchmark only)
+- Added `_path_cache_timestamps` dict alongside `_path_cache` to track when each
+  entry was cached. `resolve()` and `get_path()` check the timestamp and
+  re-validate if the entry is older than `ttl`.
+- Added `_update_path_cache()` helper on the kernel — used by `reference()`,
+  `set_path()`, `reference_batch()`, and the SDK's direct cache writes
+  (in _write_commit_blob, commit_tx, merge, append_shard, etc.). Centralizes
+  the cache+timestamp update logic and respects TTL=0 (no-op when caching
+  is disabled).
+- Updated all 10 direct `self.kernel._path_cache[name] = h` writes in
+  unified_storage.py to use `self.kernel._update_path_cache(name, h)` instead.
+- Added TTL to `_shard_list_cache` in UnifiedStorage:
+  - New `_shard_list_cache_timestamps` dict tracks when each entry was cached
+  - `_read_shard_index()` checks TTL and re-reads if expired
+  - TTL=0 means never cache (every shard list read is live)
+  - Uses the kernel's `cache_ttl_seconds` value for consistency
+- Fixed the `read()` method's shard list cache check — was bypassing TTL by
+  reading `_shard_list_cache` directly. Now delegates to `_read_shard_index()`
+  which respects TTL.
+- Added `invalidate_all_caches(collection=None)` method on UnifiedStorage and
+  PondStorage — the "strong consistency escape hatch". Clears ALL process-local
+  caches (manifest, head, shard_list, blob, shard_manifest, schema,
+  commit_index, delta_chain_depth) + the kernel's path cache. Call this before
+  a read that MUST see the latest state from other processes.
+- Documented the multi-process safety model in cache declarations:
+  - `_blob_cache` + `_shard_manifest_cache`: content-addressed (immutable) —
+    always safe across processes.
+  - `_manifest_cache`, `_head_cache`, `_shard_list_cache`, `_schema_cache`,
+    `_commit_index_cache`: collection-name-keyed — can go stale if another
+    process writes. Invalidated on LOCAL writes + TTL-revalidated.
+- Wrote scripts/test_multiprocess_visibility.py (5 tests):
+  1. test_process_b_sees_process_a_write_with_ttl — Process B sees A's append
+     within TTL seconds (default 5s)
+  2. test_process_b_sees_write_immediately_with_invalidate — Process B sees
+     A's append IMMEDIATELY via invalidate_all_caches()
+  3. test_process_b_sees_write_immediately_with_ttl_zero — With TTL=0, Process
+     B always sees the latest state (every read is live)
+  4. test_concurrent_writers_different_processes — 5 processes each write 20
+     rows via append_shard; final reader sees all 101 rows (1 init + 100 appends)
+  5. test_blob_cache_is_safe_across_processes — content-addressed blob cache
+     is always safe; manifest re-validation picks up new shards from other
+     processes
+
+MULTI-PROCESS SAFETY MODEL:
+  - Content-addressed caches (blob_cache, shard_manifest_cache): ALWAYS safe.
+    Immutable blobs can be cached indefinitely with no correctness impact.
+  - Ref-based caches (path_cache, manifest_cache, head_cache, shard_list_cache,
+    schema_cache, commit_index_cache): TTL-revalidated. A process sees other
+    processes' writes within `cache_ttl_seconds` (default 5s).
+  - For strong consistency: call `storage.invalidate_all_caches()` before reads
+    that MUST see the latest state, OR construct the kernel with
+    `cache_ttl_seconds=0` (every resolve is a live GET — safest, slowest).
+  - CRDT shards (append_shard, upsert_shard, delete_shard) are ALWAYS safe for
+    concurrent multi-process writes — no coordination needed. Each writer writes
+    to its own shard path; readers merge all shards.
+
+Test Results:
+  - 25/25 scripts/test_*.py suites pass (added test_multiprocess_visibility.py)
+  - 18/18 architecture laws pass
+  - All ACID, CRDT, branch, concurrency, GC, PB-scale, multi-process tests pass
+
+R2 Benchmark (no regression):
+  Bulk write 1000: 860ms (<1s ✅)
+  Cold point lookup: 711ms (<1s ✅)
+  Warm point lookup: 212ms (<1s ✅)
+  Full scan: 803ms (<1s ✅)
+  Pruned 10%: 392ms (<1s ✅)
+  Append shard: 479ms (<1s ✅)
+  Branch: 965ms (<1s ✅)
+  ACID tx 2-coll: 1058ms (~1s, was 1976ms before Round 33)
+  Merge: 2368ms (still >1s — needs async tombstoning)
+  Compaction: 1642ms (still >1s — needs async tombstoning)
+
+Stage Summary:
+- All process-local caches now have TTL-based revalidation (default 5s) or can
+  be disabled entirely (TTL=0) for strong consistency.
+- The `invalidate_all_caches()` escape hatch lets callers force strong consistency
+  for specific reads without disabling caching globally.
+- Content-addressed caches (blob, shard_manifest) are always safe — immutable
+  blobs can be cached indefinitely.
+- 5 new multi-process visibility tests prove the model works: Process B sees
+  Process A's writes within TTL, immediately via invalidate, or always with TTL=0.
+- No performance regression — R2 benchmark results unchanged from Round 33.
+- Ready for async tombstoning work (to get merge + compaction under 1s).

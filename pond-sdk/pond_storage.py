@@ -485,6 +485,32 @@ class PondStorage:
             return 0
         return self._unified.shard_count(collection)
 
+    def invalidate_all_caches(self, collection: Optional[str] = None) -> None:
+        """Invalidate ALL process-local caches for strong consistency.
+
+        Call this before a read that MUST see the latest state from other
+        processes. By default, the SDK's caches are process-local and may
+        return stale data for up to `cache_ttl_seconds` (kernel path cache
+        TTL, default 5s) after another process writes.
+
+        Args:
+            collection: if None, invalidate ALL collections' caches.
+                If a collection name, invalidate only that collection.
+
+        This is the "I want strong consistency" escape hatch. It's expensive
+        (forces re-reads from storage) but correct.
+
+        Example:
+            # Process A writes
+            storage_a.write("users", rows)
+
+            # Process B reads — MUST call this to see A's write immediately
+            storage_b.invalidate_all_caches()
+            rows = storage_b.read("users")
+        """
+        if self._unified is not None:
+            self._unified.invalidate_all_caches(collection)
+
     def upsert_shard(self, collection: str, rows: list[dict],
                       key_col: Optional[str] = None,
                       row_group_size: int = 10_000) -> str:

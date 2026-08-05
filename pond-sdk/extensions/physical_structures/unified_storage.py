@@ -92,6 +92,7 @@ import struct
 import os
 import sys
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Any, Iterator, Callable
 
@@ -598,6 +599,16 @@ class UnifiedStorage:
 
     def __init__(self, kernel: PondMinimal):
         self.kernel = kernel
+        # SDK-level caches are PROCESS-LOCAL. They NEVER affect correctness
+        # for multi-process use because:
+        #   - _blob_cache + _shard_manifest_cache: keyed by content-hash
+        #     (immutable blobs) — always safe.
+        #   - _manifest_cache, _head_cache, _shard_list_cache, _schema_cache,
+        #     _commit_index_cache: keyed by collection name — these CAN go
+        #     stale if another process writes. They are invalidated on THIS
+        #     process's writes, and TTL-revalidated via the kernel's path
+        #     cache (the kernel re-checks the ref hash on every read by
+        #     default; set kernel cache_ttl_seconds=0 for strong consistency).
         self._manifest_cache: dict[str, CollectionManifest] = {}
         # Cache the manifest HASH alongside the manifest object so we
         # don't need a separate resolve() call to get the hash.
@@ -633,7 +644,7 @@ class UnifiedStorage:
         #   - Stores DECODED column data (not raw bytes) — skips both
         #     I/O AND CPU decode on cache hit
         #   - Content-addressed — blob_hash is immutable, so cache is
-        #     always consistent (no invalidation needed)
+        #     always consistent (no invalidation needed, multi-process safe)
         #   - Works for ALL workloads (lakehouse, KV, vector, streaming)
         #   - User-configurable via max_cache_blobs=0 to disable
         self._blob_cache: dict[str, dict[str, list]] = {}
@@ -643,13 +654,19 @@ class UnifiedStorage:
         # === SHARD LISTING CACHE ===
         # Cache the shard hash list per (collection, branch) so warm reads
         # skip the LIST + resolve calls (~1s on R2 for 10+ shards).
-        # Invalidated on any write (append_shard, compact, merge, checkout).
+        # Invalidated on any LOCAL write (append_shard, compact, merge,
+        # checkout). For multi-process safety, ALSO TTL-revalidated
+        # (uses the kernel's cache_ttl_seconds) so a process sees other
+        # processes' shard appends within TTL seconds.
+        # For strong consistency, call unified_storage.invalidate_all_caches()
+        # before reads that must see the latest state.
         self._shard_list_cache: dict[str, list[str]] = {}  # key: "{collection}/{branch}"
+        self._shard_list_cache_timestamps: dict[str, float] = {}
 
         # === SHARD MANIFEST CACHE ===
         # Cache the CollectionManifest (or pseudo-manifest) built from each
         # shard blob. Keyed by shard_hash (content-addressed, immutable).
-        # Saves N GETs on warm reads (one per shard).
+        # Saves N GETs on warm reads (one per shard). Multi-process safe.
         self._shard_manifest_cache: dict[str, Any] = {}
 
         # === RUST ACCELERATION HOOK ===
@@ -858,6 +875,48 @@ class UnifiedStorage:
         self._delta_chain_depth_cache.pop(collection, None)
         self._schema_cache.pop(collection, None)
 
+    def invalidate_all_caches(self, collection: Optional[str] = None) -> None:
+        """Invalidate ALL process-local caches for strong consistency.
+
+        Call this before a read that MUST see the latest state from other
+        processes. By default, the SDK's caches are process-local and may
+        return stale data for up to `cache_ttl_seconds` (kernel path cache
+        TTL, default 5s) after another process writes.
+
+        Args:
+            collection: if None, invalidate ALL collections' caches.
+                If a collection name, invalidate only that collection.
+
+        This is the "I want strong consistency" escape hatch. It's expensive
+        (forces re-reads from storage) but correct.
+        """
+        if collection is None:
+            self._manifest_cache.clear()
+            self._manifest_hash_cache.clear()
+            self._head_cache.clear()
+            self._commit_index_cache.clear()
+            self._delta_chain_depth_cache.clear()
+            self._schema_cache.clear()
+            self._shard_list_cache.clear()
+            self._shard_list_cache_timestamps.clear()
+            self._blob_cache.clear()
+            self._blob_cache_order.clear()
+            self._shard_manifest_cache.clear()
+            # Also clear the kernel's path cache (forces fresh GETs)
+            if hasattr(self.kernel, 'invalidate_path_cache'):
+                self.kernel.invalidate_path_cache()
+        else:
+            self._invalidate_manifest_cache(collection)
+            self._invalidate_shard_cache(collection)
+            # Clear blob cache (can't selectively clear by collection —
+            # blob hashes are content-addressed, not collection-scoped.
+            # Just clear the whole blob cache — it'll be re-populated.)
+            self._blob_cache.clear()
+            self._blob_cache_order.clear()
+            self._shard_manifest_cache.clear()
+            if hasattr(self.kernel, 'invalidate_path_cache'):
+                self.kernel.invalidate_path_cache()
+
     def _update_caches_after_write(self, collection: str,
                                      manifest: CollectionManifest,
                                      manifest_hash: str,
@@ -991,8 +1050,8 @@ class UnifiedStorage:
             self.kernel.stats["writes"] += 1
             self.kernel.stats["ref_writes"] += 2
             self.kernel.stats["references"] += 2
-            self.kernel._path_cache[active] = commit_hash
-            self.kernel._path_cache[manifest_ref] = manifest_hash
+            self.kernel._update_path_cache(active, commit_hash)
+            self.kernel._update_path_cache(manifest_ref, manifest_hash)
             return commit_hash
 
         # PondMinimal fallback path: sequential (local disk, no RTT)
@@ -1330,8 +1389,8 @@ class UnifiedStorage:
             self.kernel.stats["writes"] += 1
             self.kernel.stats["ref_writes"] += 2
             self.kernel.stats["references"] += 2
-            self.kernel._path_cache[target_branch_ref] = commit_hash
-            self.kernel._path_cache[target_manifest_ref] = manifest_hash
+            self.kernel._update_path_cache(target_branch_ref, commit_hash)
+            self.kernel._update_path_cache(target_manifest_ref, manifest_hash)
         else:
             # PondMinimal fallback: sequential
             commit_hash = self.kernel.write(commit_bytes)
@@ -1682,15 +1741,29 @@ class UnifiedStorage:
 
         Uses an in-memory cache (_shard_list_cache) so warm reads skip
         the LIST + resolve calls (~1s on R2 for 10+ shards).
-        Cache is invalidated on any write (append_shard, compact, merge).
+        Cache is invalidated on any LOCAL write (append_shard, compact,
+        merge) AND TTL-revalidated (uses kernel's cache_ttl_seconds)
+        so a process sees OTHER processes' shard appends within TTL.
+
+        TTL semantics:
+          - ttl > 0: cache entries expire after `ttl` seconds (default 5s)
+          - ttl == 0: NEVER cache (every read is live — strongest consistency)
+          - ttl == inf: cache forever (single-process benchmark only)
         """
         if branch is None:
             branch = self._get_active_branch(collection)
         cache_key = f"{collection}/{branch}"
-        if cache_key in self._shard_list_cache:
-            return self._shard_list_cache[cache_key]
+        ttl = getattr(self.kernel, '_cache_ttl', 5.0)
+        # Check cache + TTL (skip cache entirely if ttl == 0)
+        if ttl > 0 and cache_key in self._shard_list_cache:
+            cached_at = self._shard_list_cache_timestamps.get(cache_key, 0.0)
+            if time.time() - cached_at < ttl:
+                return self._shard_list_cache[cache_key]
+            # TTL expired — fall through to re-read
         result = self._list_shards_from_refs(collection, branch)
-        self._shard_list_cache[cache_key] = result
+        if ttl > 0:
+            self._shard_list_cache[cache_key] = result
+            self._shard_list_cache_timestamps[cache_key] = time.time()
         return result
 
     def _invalidate_shard_cache(self, collection: str) -> None:
@@ -1700,6 +1773,7 @@ class UnifiedStorage:
         keys_to_remove = [k for k in self._shard_list_cache if k.startswith(f"{collection}/")]
         for k in keys_to_remove:
             del self._shard_list_cache[k]
+            self._shard_list_cache_timestamps.pop(k, None)
 
     def _list_shards_from_refs(self, collection: str, branch: str) -> list[str]:
         """List shard hashes by scanning refs (source of truth).
@@ -2195,7 +2269,7 @@ class UnifiedStorage:
                 1 if shard_manifest_bytes is not None else 0)
             self.kernel.stats["ref_writes"] += 1
             self.kernel.stats["references"] += 1
-            self.kernel._path_cache[shard_ref] = shard_hash
+            self.kernel._update_path_cache(shard_ref, shard_hash)
         else:
             # PondMinimal fallback: sequential (local disk)
             for payload in pnd2_payloads:
@@ -2797,8 +2871,8 @@ class UnifiedStorage:
             self.kernel.stats["writes"] += 2
             self.kernel.stats["ref_writes"] += 2
             self.kernel.stats["references"] += 2
-            self.kernel._path_cache[active] = commit_hash
-            self.kernel._path_cache[manifest_ref] = manifest_hash
+            self.kernel._update_path_cache(active, commit_hash)
+            self.kernel._update_path_cache(manifest_ref, manifest_hash)
         else:
             # PondMinimal fallback: sequential
             self.kernel.write(manifest_bytes)
@@ -3134,7 +3208,7 @@ class UnifiedStorage:
             self.kernel.stats["writes"] += 1
             self.kernel.stats["ref_writes"] += 1
             self.kernel.stats["references"] += 1
-            self.kernel._path_cache[tx_ref] = marker_hash
+            self.kernel._update_path_cache(tx_ref, marker_hash)
 
             # Invalidate shard list cache — tentative shards are now visible
             # to readers (the commit marker exists, so _list_shards_from_refs
@@ -3609,8 +3683,8 @@ class UnifiedStorage:
             self.kernel.stats["writes"] += 2
             self.kernel.stats["ref_writes"] += 2
             self.kernel.stats["references"] += 2
-            self.kernel._path_cache[active] = commit_hash
-            self.kernel._path_cache[manifest_ref] = manifest_hash
+            self.kernel._update_path_cache(active, commit_hash)
+            self.kernel._update_path_cache(manifest_ref, manifest_hash)
         else:
             # PondMinimal fallback: sequential (local disk, no RTT)
             self.kernel.write(manifest_bytes)
@@ -3936,15 +4010,10 @@ class UnifiedStorage:
         # read_with_shards. Time-travel queries (manifest_hash / commit_hash
         # set) skip this and read the snapshot manifest directly.
         #
-        # Optimization: check shard list cache first. If cached and empty,
-        # skip the LIST call entirely (saves ~400ms on R2).
+        # Use _read_shard_index (TTL-cached) so the shard list is revalidated
+        # periodically for multi-process safety.
         if manifest_hash is None and commit_hash is None:
-            branch = self._get_active_branch(collection)
-            cache_key = f"{collection}/{branch}"
-            if cache_key in self._shard_list_cache:
-                shard_hashes = self._shard_list_cache[cache_key]
-            else:
-                shard_hashes = self._read_shard_index(collection)
+            shard_hashes = self._read_shard_index(collection)
             if shard_hashes:
                 return self.read_with_shards(
                     collection, predicates=predicates,

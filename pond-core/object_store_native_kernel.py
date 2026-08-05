@@ -357,7 +357,8 @@ class ObjectStoreNativeKernel:
     """
 
     def __init__(self, object_store: InMemoryObjectStore,
-                  root_pointer_path: str = _ROOT_POINTER_PATH):
+                  root_pointer_path: str = _ROOT_POINTER_PATH,
+                  cache_ttl_seconds: float = 5.0):
         """Create an object-store-native kernel.
 
         Args:
@@ -365,13 +366,37 @@ class ObjectStoreNativeKernel:
                 with put_blob/get_blob/put_path/get_path)
             root_pointer_path: well-known path for the root pointer
                 (default "_root")
+            cache_ttl_seconds: TTL for the path cache (default 5.0s).
+                After this many seconds, a cached resolve() result is
+                re-validated with a fresh GET. This makes the cache SAFE
+                for multi-process use: a process sees other processes'
+                writes within `cache_ttl_seconds` seconds.
+                Set to 0.0 to disable caching entirely (every resolve is
+                a live GET — safest, slowest).
+                Set to float('inf') for single-process benchmarks (cache
+                forever — fastest, but unsafe for multi-process).
+
+        MULTI-PROCESS SAFETY:
+            The path cache is a PROCESS-LOCAL optimization. It does NOT
+            coordinate with other processes. With the default TTL of 5s,
+            a process will see other processes' ref updates within 5
+            seconds. For strong consistency, set cache_ttl_seconds=0
+            (every resolve is a live GET).
+
+            Content-addressed blobs (data) are ALWAYS safe to cache —
+            they're immutable. Only REFS (HEAD, manifest ref, shard refs)
+            can be mutated by other processes, and those are the ones
+            that need TTL-based revalidation.
         """
         self.store = object_store
         self._root_pointer_path = root_pointer_path
-        # Path cache: name → hash. Avoids redundant GETs for resolve().
-        # Each entry is a single ref (HEAD, manifest, shard ref, etc.).
-        # Invalidated by invalidate_path_cache(name) or invalidate_path_cache().
+        # Path cache: name → (hash, cached_at_timestamp).
+        # TTL-based: entries older than cache_ttl_seconds are re-validated.
+        # This makes the cache safe for multi-process use — within TTL
+        # seconds, a process sees other processes' ref updates.
         self._path_cache: dict[str, Optional[str]] = {}
+        self._path_cache_timestamps: dict[str, float] = {}
+        self._cache_ttl = cache_ttl_seconds
         # Legacy root_ref cache — kept for backward compat with old code
         # that calls _load_root_ref / invalidate_root_cache. No longer used
         # by reference()/resolve()/list_names() (which use dedicated paths).
@@ -483,7 +508,8 @@ class ObjectStoreNativeKernel:
         self.stats["ref_writes"] += 1
         self.stats["references"] += 1
         # Update the path cache so subsequent resolve() calls see the new value
-        self._path_cache[name] = h
+        # (no-op if cache_ttl_seconds == 0)
+        self._update_path_cache(name, h)
 
     def reference_batch(self, refs: list[tuple[str, str]]) -> None:
         """Update multiple refs in PARALLEL via thread pool.
@@ -507,7 +533,7 @@ class ObjectStoreNativeKernel:
         def _ref_one(name_h):
             name, h = name_h
             self.store.put_path(name, h)
-            self._path_cache[name] = h
+            self._update_path_cache(name, h)
 
         workers = min(16, len(refs))
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -519,29 +545,48 @@ class ObjectStoreNativeKernel:
         self.stats["references"] += len(refs)
 
     def resolve(self, name: str) -> Optional[str]:
-        """Resolve a name to its current hash. 1 GET (cached after first read).
+        """Resolve a name to its current hash. 1 GET cold, 0 GETs warm (TTL-cached).
 
         Reads from the dedicated path store. The result is cached in
-        _path_cache for O(0) warm reads. Call invalidate_path_cache(name)
-        to force a re-read.
+        _path_cache with a TTL (default 5s). After the TTL expires, the
+        next resolve() re-validates with a fresh GET. This makes the cache
+        SAFE for multi-process use: a process sees other processes' writes
+        within TTL seconds.
 
-        Total: 1 GET cold, 0 GETs warm (cached).
+        For strong consistency (always see latest), set cache_ttl_seconds=0
+        at construction. Every resolve becomes a live GET.
+
+        Total: 1 GET cold, 0 GETs warm (within TTL), 1 GET after TTL expiry.
         """
-        # Check cache first (warm path — 0 GETs)
-        if name in self._path_cache:
-            return self._path_cache[name]
-        # Cold path — 1 GET from the dedicated path store
+        # Check cache first (warm path — 0 GETs, within TTL)
+        # ttl == 0 means NEVER cache (strongest consistency)
+        if self._cache_ttl > 0 and name in self._path_cache:
+            cached_at = self._path_cache_timestamps.get(name, 0.0)
+            now = time.time()
+            if now - cached_at < self._cache_ttl:
+                return self._path_cache[name]
+            # TTL expired — fall through to re-validate
+        # Cold or expired path — 1 GET from the dedicated path store
         h = self.store.get_path(name)
         self.stats["ref_reads"] += 1
-        self._path_cache[name] = h
+        if self._cache_ttl > 0:
+            self._path_cache[name] = h
+            self._path_cache_timestamps[name] = time.time()
         return h
 
     def invalidate_path_cache(self, name: Optional[str] = None) -> None:
-        """Invalidate the path cache for a specific name, or all names."""
+        """Invalidate the path cache for a specific name, or all names.
+
+        Called by the SDK after a write that changes a ref (so the writer's
+        own cache stays consistent). For multi-process safety, the TTL
+        also auto-invalidates other processes' caches.
+        """
         if name is None:
             self._path_cache.clear()
+            self._path_cache_timestamps.clear()
         else:
             self._path_cache.pop(name, None)
+            self._path_cache_timestamps.pop(name, None)
 
     def list_names(self) -> list[str]:
         """List all bound names. Uses native prefix listing (O(matching)).
@@ -563,18 +608,23 @@ class ObjectStoreNativeKernel:
     # ------------------------------------------------------------------
 
     def get_path(self, path: str) -> Optional[str]:
-        """Read a dedicated path (1 GET, no root ref needed).
+        """Read a dedicated path (1 GET cold, 0 GETs warm within TTL).
 
-        Uses the path cache (same as resolve). Counts as a ref_read on
-        cache miss.
+        Uses the path cache (same as resolve) with TTL-based revalidation.
         """
-        # Check cache first (warm path — 0 GETs)
-        if path in self._path_cache:
-            return self._path_cache[path]
-        # Cold path — 1 GET from the store
+        # Check cache first (warm path — 0 GETs, within TTL)
+        # ttl == 0 means NEVER cache (strongest consistency)
+        if self._cache_ttl > 0 and path in self._path_cache:
+            cached_at = self._path_cache_timestamps.get(path, 0.0)
+            now = time.time()
+            if now - cached_at < self._cache_ttl:
+                return self._path_cache[path]
+        # Cold or expired path — 1 GET from the store
         h = self.store.get_path(path)
         self.stats["ref_reads"] += 1
-        self._path_cache[path] = h
+        if self._cache_ttl > 0:
+            self._path_cache[path] = h
+            self._path_cache_timestamps[path] = time.time()
         return h
 
     def list_paths_with_prefix(self, prefix: str) -> list[str]:
@@ -595,7 +645,21 @@ class ObjectStoreNativeKernel:
         self.store.put_path(path, hash_val)
         self.stats["ref_writes"] += 1
         # Update the path cache so subsequent resolve() calls see the new value
+        self._update_path_cache(path, hash_val)
+
+    def _update_path_cache(self, path: str, hash_val: Optional[str]) -> None:
+        """Update the path cache AND timestamp (used after a ref PUT).
+
+        Call this whenever you've written a ref via store.put_path() directly
+        (bypassing reference() / set_path()). It keeps the cache + timestamps
+        in sync so the TTL logic works correctly.
+
+        If cache_ttl_seconds == 0, this is a no-op (caching disabled).
+        """
+        if self._cache_ttl <= 0:
+            return  # caching disabled
         self._path_cache[path] = hash_val
+        self._path_cache_timestamps[path] = time.time()
 
     # ------------------------------------------------------------------
     # MAINTENANCE operations (NOT kernel primitives)
@@ -616,6 +680,7 @@ class ObjectStoreNativeKernel:
         result = self.store.delete_path(path)
         if result:
             self._path_cache.pop(path, None)
+            self._path_cache_timestamps.pop(path, None)
         return result
 
     def list_all_blob_hashes(self) -> list[str]:
