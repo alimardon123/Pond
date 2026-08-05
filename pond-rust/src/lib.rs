@@ -37,7 +37,8 @@ const FLAG_HAS_STATS: u8 = 0x01;
 const FLAG_COMPRESSED: u8 = 0x02;
 
 const COMPRESSION_NONE: u8 = 0;
-const COMPRESSION_ZSTD: u8 = 1;
+const COMPRESSION_LZ4: u8 = 1;
+const COMPRESSION_ZSTD: u8 = 2;
 
 // Value types
 const VT_INT64: u8 = 1;
@@ -335,40 +336,30 @@ fn decode_raw(py: Python, payload: &[u8], vtype: u8, n_rows: usize) -> PyResult<
             Ok(list.into())
         }
         VT_STRING | VT_BINARY => {
-            // String/Binary: optional bitmap + length-prefixed values
-            // Try without bitmap first
+            // String/Binary RAW format: value_type(1B) + optional null_bitmap + [len(4B) + bytes]*N
+            // The null bitmap is ONLY present if has_nulls=True at encode time.
+            // Since we can't tell from the payload alone, we use a heuristic:
+            //   1. Try parsing WITHOUT a bitmap first (the common case).
+            //   2. If that fails (wrong count or out of bounds), try WITH a bitmap.
+            // This is simpler and more reliable than trying to detect the bitmap
+            // by checking if the first N bytes "look like" a bitmap.
+
             let list = PyList::empty_bound(py);
-            let mut off = 0;
 
-            // Check if there's a bitmap (n_rows bits = (n_rows+7)/8 bytes)
-            let bitmap_size = (n_rows + 7) / 8;
-            let has_bitmap = data.len() >= bitmap_size + 4;
-            let (data_start, has_bitmap) = if has_bitmap {
-                // Try to parse: if first 4 bytes after bitmap look like a valid length, use bitmap
-                let potential_len = u32::from_le_bytes([
-                    data[bitmap_size], data[bitmap_size+1],
-                    data[bitmap_size+2], data[bitmap_size+3]
-                ]) as usize;
-                if bitmap_size + 4 + potential_len <= data.len() {
-                    (bitmap_size, true)
-                } else {
-                    (0, false)
-                }
-            } else {
-                (0, false)
-            };
-
-            let vals_data = &data[data_start..];
-
-            // Parse length-prefixed values
+            // Approach: parse all length-prefixed values from data[1..] (skip value_type byte)
+            let vals_data = data; // 'data' already skipped value_type byte above
             let mut vals: Vec<&[u8]> = Vec::with_capacity(n_rows);
+            let mut off = 0;
             while off + 4 <= vals_data.len() && vals.len() < n_rows {
                 let slen = u32::from_le_bytes([
                     vals_data[off], vals_data[off+1],
                     vals_data[off+2], vals_data[off+3]
                 ]) as usize;
                 off += 4;
-                if off + slen <= vals_data.len() {
+                if slen == 0xFFFFFFFF {
+                    // null sentinel
+                    vals.push(&[]);
+                } else if off + slen <= vals_data.len() {
                     vals.push(&vals_data[off..off+slen]);
                     off += slen;
                 } else {
@@ -376,27 +367,74 @@ fn decode_raw(py: Python, payload: &[u8], vtype: u8, n_rows: usize) -> PyResult<
                 }
             }
 
-            if has_bitmap {
-                // Apply bitmap — only non-null values are in vals
-                let bitmap = &data[..bitmap_size];
-                let mut val_idx = 0;
-                for i in 0..n_rows {
-                    if bitmap[i / 8] & (1 << (i % 8)) != 0 {
-                        if val_idx < vals.len() {
+            // If we got the right number of values, use them directly
+            if vals.len() == n_rows {
+                for v in &vals {
+                    if vtype == VT_STRING {
+                        list.append(String::from_utf8_lossy(v).to_string())?;
+                    } else {
+                        list.append(PyBytes::new_bound(py, v))?;
+                    }
+                }
+            } else if vals.len() < n_rows {
+                // Maybe there's a null bitmap. Try parsing with bitmap.
+                let bitmap_size = (n_rows + 7) / 8;
+                if vals_data.len() > bitmap_size {
+                    let bitmap = &vals_data[..bitmap_size];
+                    let vals_after_bitmap = &vals_data[bitmap_size..];
+
+                    // Re-parse values from after the bitmap
+                    let mut vals2: Vec<&[u8]> = Vec::with_capacity(n_rows);
+                    let mut off2 = 0;
+                    while off2 + 4 <= vals_after_bitmap.len() && vals2.len() < n_rows {
+                        let slen = u32::from_le_bytes([
+                            vals_after_bitmap[off2], vals_after_bitmap[off2+1],
+                            vals_after_bitmap[off2+2], vals_after_bitmap[off2+3]
+                        ]) as usize;
+                        off2 += 4;
+                        if slen == 0xFFFFFFFF {
+                            vals2.push(&[]);
+                        } else if off2 + slen <= vals_after_bitmap.len() {
+                            vals2.push(&vals_after_bitmap[off2..off2+slen]);
+                            off2 += slen;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Apply bitmap: 1=null, 0=valid (Arrow convention)
+                    let mut val_idx = 0;
+                    for i in 0..n_rows {
+                        if bitmap[i / 8] & (1 << (i % 8)) != 0 {
+                            // null
+                            list.append(py.None())?;
+                        } else if val_idx < vals2.len() {
                             if vtype == VT_STRING {
-                                list.append(String::from_utf8_lossy(vals[val_idx]).to_string())?;
+                                list.append(String::from_utf8_lossy(vals2[val_idx]).to_string())?;
                             } else {
-                                list.append(PyBytes::new_bound(py, vals[val_idx]))?;
+                                list.append(PyBytes::new_bound(py, vals2[val_idx]))?;
                             }
                             val_idx += 1;
+                        } else {
+                            list.append(py.None())?;
                         }
-                    } else {
+                    }
+                } else {
+                    // No bitmap possible — return what we got (padded with None)
+                    for v in &vals {
+                        if vtype == VT_STRING {
+                            list.append(String::from_utf8_lossy(v).to_string())?;
+                        } else {
+                            list.append(PyBytes::new_bound(py, v))?;
+                        }
+                    }
+                    while list.len() < n_rows {
                         list.append(py.None())?;
                     }
                 }
             } else {
-                // No bitmap — all values present
-                for v in &vals {
+                // Got MORE values than expected — just return the first n_rows
+                for v in vals.iter().take(n_rows) {
                     if vtype == VT_STRING {
                         list.append(String::from_utf8_lossy(v).to_string())?;
                     } else {
