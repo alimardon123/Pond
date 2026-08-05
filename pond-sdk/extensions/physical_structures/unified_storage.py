@@ -3416,8 +3416,16 @@ class UnifiedStorage:
         # Live read: if there are unmerged shards, include them via
         # read_with_shards. Time-travel queries (manifest_hash / commit_hash
         # set) skip this and read the snapshot manifest directly.
+        #
+        # Optimization: check shard list cache first. If cached and empty,
+        # skip the LIST call entirely (saves ~400ms on R2).
         if manifest_hash is None and commit_hash is None:
-            shard_hashes = self._read_shard_index(collection)
+            branch = self._get_active_branch(collection)
+            cache_key = f"{collection}/{branch}"
+            if cache_key in self._shard_list_cache:
+                shard_hashes = self._shard_list_cache[cache_key]
+            else:
+                shard_hashes = self._read_shard_index(collection)
             if shard_hashes:
                 return self.read_with_shards(
                     collection, predicates=predicates,
