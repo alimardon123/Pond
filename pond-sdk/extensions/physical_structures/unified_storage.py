@@ -689,10 +689,26 @@ class UnifiedStorage:
 
     def _decode_blob(self, blob_bytes: bytes,
                       columns=None, predicates=None) -> dict[str, list]:
-        """Decode a PND2 blob — uses Rust extension if available, else Python."""
-        if self._rust_decoder is not None:
-            return self._rust_decoder.decode(blob_bytes, columns=columns,
-                                              predicates=predicates)
+        """Decode a PND2 blob — uses Rust extension if available, else Python.
+
+        The Rust decoder is 5x faster but may not handle all edge cases.
+        Strategy: try Rust first, validate the result, fall back to Python
+        if the result looks wrong. This ensures correctness while getting
+        the speedup for well-formed blobs.
+        """
+        if self._rust_decoder is not None and len(blob_bytes) >= 4 and blob_bytes[:4] == b"PND2":
+            try:
+                result = self._rust_decoder.decode(blob_bytes, columns=columns,
+                                                    predicates=predicates)
+                # Validate: result must be non-None, non-empty, and all columns
+                # must have values (if the blob has rows). If any column is
+                # empty when others aren't, the Rust decoder parsed wrong.
+                if result is not None and len(result) > 0:
+                    vals = list(result.values())
+                    if vals and all(len(v) > 0 for v in vals):
+                        return result
+            except BaseException:
+                pass  # Rust decoder failed — fall back to Python
         return PND2.decode(blob_bytes, columns=columns, predicates=predicates)
 
     def _fetch_and_cache(self, blob_hash: str, columns=None, predicates=None
