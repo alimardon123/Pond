@@ -724,11 +724,116 @@ fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 // ---------------------------------------------------------------------------
+// PND2 Encoder (write-path acceleration)
+// ---------------------------------------------------------------------------
+
+/// Encode a list of column values into a PND2 blob (RAW encoding only).
+///
+/// Handles INT64, FLOAT64, and STRING columns with RAW encoding.
+/// Returns None for columns that need DICT/RLE/BITPACK (Python handles those).
+#[pyfunction]
+#[pyo3(signature = (columns, n_rows))]
+fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResult<PyObject> {
+    if columns.is_empty() || n_rows == 0 {
+        return Ok(py.None());
+    }
+
+    let mut inner = Vec::new();
+    let mut col_payloads: Vec<Vec<u8>> = Vec::new();
+
+    // Schema section
+    for (name, values_obj) in &columns {
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > 255 {
+            return Ok(py.None());
+        }
+
+        // Try INT64
+        if let Ok(vals) = values_obj.extract::<Vec<i64>>(py) {
+            if vals.len() != n_rows { return Ok(py.None()); }
+            let mut payload = Vec::with_capacity(1 + n_rows * 8);
+            payload.push(VT_INT64);
+            for v in &vals { payload.extend_from_slice(&v.to_le_bytes()); }
+            // Stats
+            let min = vals.iter().min().copied().unwrap_or(0);
+            let max = vals.iter().max().copied().unwrap_or(0);
+            inner.extend_from_slice(&[name_bytes.len() as u8]);
+            inner.extend_from_slice(name_bytes);
+            inner.extend_from_slice(&[VT_INT64, ENC_RAW]);
+            // Will add stats + payload later
+            col_payloads.push(payload);
+            continue;
+        }
+
+        // Try FLOAT64
+        if let Ok(vals) = values_obj.extract::<Vec<f64>>(py) {
+            if vals.len() != n_rows { return Ok(py.None()); }
+            let mut payload = Vec::with_capacity(1 + n_rows * 8);
+            payload.push(VT_FLOAT64);
+            for v in &vals { payload.extend_from_slice(&v.to_le_bytes()); }
+            inner.extend_from_slice(&[name_bytes.len() as u8]);
+            inner.extend_from_slice(name_bytes);
+            inner.extend_from_slice(&[VT_FLOAT64, ENC_RAW]);
+            col_payloads.push(payload);
+            continue;
+        }
+
+        // Try STRING
+        if let Ok(vals) = values_obj.extract::<Vec<String>>(py) {
+            if vals.len() != n_rows { return Ok(py.None()); }
+            let mut payload = Vec::new();
+            payload.push(VT_STRING);
+            for v in &vals {
+                let vb = v.as_bytes();
+                payload.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+                payload.extend_from_slice(vb);
+            }
+            inner.extend_from_slice(&[name_bytes.len() as u8]);
+            inner.extend_from_slice(name_bytes);
+            inner.extend_from_slice(&[VT_STRING, ENC_RAW]);
+            col_payloads.push(payload);
+            continue;
+        }
+
+        // Can't handle — let Python do it
+        return Ok(py.None());
+    }
+
+    // Stats section (we need to re-derive min/max from payloads)
+    // For simplicity, we store has_min=0 for all (Python encoder computes
+    // proper stats; the Rust encoder is a fast path that skips stats).
+    // The reader handles has_min=0 gracefully.
+    for _ in &col_payloads {
+        inner.push(0); // no min/max
+        inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+    }
+
+    // Per-column payloads
+    for payload in &col_payloads {
+        inner.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        inner.extend_from_slice(payload);
+    }
+
+    // Build final PND2 blob (uncompressed)
+    let mut blob = Vec::new();
+    blob.extend_from_slice(PND2_MAGIC);
+    blob.push(PND2_VERSION);
+    blob.push(FLAG_HAS_STATS);
+    blob.extend_from_slice(&(n_rows as u32).to_le_bytes());
+    blob.extend_from_slice(&(col_payloads.len() as u16).to_le_bytes());
+    blob.push(COMPRESSION_NONE);
+    blob.extend_from_slice(&inner);
+
+    Ok(PyBytes::new_bound(py, &blob).into())
+}
+
+// ---------------------------------------------------------------------------
 // Python module definition
 // ---------------------------------------------------------------------------
 
 #[pymodule]
 fn pond_rust(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
+    m.add_function(wrap_pyfunction!(encode, m)?)?;
     Ok(())
 }
