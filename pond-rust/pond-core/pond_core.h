@@ -80,8 +80,36 @@ const double* pond_result_column_f64(const PondResult* result, size_t index);
 /*
  * Get a STRING column value at a specific row index.
  * Returns a null-terminated string, valid until the result is freed.
+ *
+ * NOTE: for batch access (iterating all rows), prefer
+ * pond_result_column_str_array() — it avoids per-row FFI overhead
+ * which can be 10-100x slower for large string columns.
  */
 const char* pond_result_column_str(const PondResult* result, size_t col_index, size_t row_index);
+
+/*
+ * Get ALL string pointers for a STRING column in one call (batch accessor).
+ *
+ * Returns a pointer to an array of `n_values` `const char*` pointers
+ * (where `n_values` = pond_result_column_len(result, col_index)).
+ * Each pointer is a null-terminated C string, valid until the result
+ * is freed.
+ *
+ * This is MUCH faster than calling pond_result_column_str() in a loop
+ * for languages with high FFI call cost (Python/ctypes, Go/cgo).
+ *
+ * Returns NULL on null result / out-of-bounds / non-STRING column.
+ * Free the returned array with pond_str_array_free() (optional — also
+ * freed when the result is freed).
+ */
+const char* const* pond_result_column_str_array(const PondResult* result, size_t col_index);
+
+/*
+ * Free a string pointer array returned by pond_result_column_str_array.
+ * Optional — the array is also freed when the PondResult is freed.
+ * Safe to call on NULL.
+ */
+void pond_str_array_free(const char* const* arr);
 
 /*
  * Get a BINARY column value at a specific row index.

@@ -155,6 +155,40 @@ func ResultColumnStr(r *PondResult, colIdx, rowIdx int) string {
         return C.GoString(cs)
 }
 
+// ResultColumnStrArray wraps pond_result_column_str_array (BATCH accessor).
+//
+// Returns a Go []string containing ALL string values from the column in
+// one call. This is MUCH faster than calling ResultColumnStr in a loop
+// for columns with many rows — the per-row variant has cgo overhead per
+// call, while this variant pays cgo overhead only once per column.
+//
+// The strings are copied into Go-owned memory, so they remain valid after
+// ResultFree.
+func ResultColumnStrArray(r *PondResult, colIdx int) []string {
+        if r == nil {
+                return nil
+        }
+        n := ResultColumnLen(r, colIdx)
+        if n == 0 {
+                return []string{}
+        }
+        arr := C.pond_result_column_str_array(r, C.size_t(colIdx))
+        if arr == nil {
+                return nil
+        }
+        // Walk the C array of char* pointers and copy each into a Go string.
+        out := make([]string, n)
+        for i := 0; i < n; i++ {
+                // arr[i] is a *C.char — dereference via indexing on the pointer array.
+                // Go's cgo allows indexing on C pointer types.
+                ptr := (*[1 << 30](*C.char))(unsafe.Pointer(arr))[i]
+                if ptr != nil {
+                        out[i] = C.GoString(ptr)
+                }
+        }
+        return out
+}
+
 // ResultColumnBin wraps pond_result_column_bin. Returns the value as a
 // Go byte slice (copied — safe to use after ResultFree).
 func ResultColumnBin(r *PondResult, colIdx, rowIdx int) ([]byte, error) {
