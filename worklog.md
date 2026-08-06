@@ -4749,3 +4749,104 @@ Stage Summary:
 - The Rust crate is the canonical format implementation — other languages port from here
 - Design principles upheld: Simple (one file, clear structure), Performant (5.8x),
   Efficient (minimal allocations), Beautiful (clean separation of concerns)
+
+---
+Task ID: rounds-33-48-cumulative-optimization
+Agent: main
+Task: Comprehensive performance optimization across 16 rounds. Summary of all changes and cumulative impact.
+
+CUMULATIVE R2 BENCHMARK (Rounds 33-48):
+
+  | Operation        | Round 33  | Round 48  | Improvement |
+  |------------------|-----------|-----------|-------------|
+  | Bulk write 1K    | 4898ms    | ~950ms    | 5.2x        |
+  | Point lookup cold| 732ms     | ~540ms    | 1.4x        |
+  | Point lookup warm| 181ms     | ~200ms    | same        |
+  | Full scan 10K    | 602ms     | ~640ms    | same (I/O)  |
+  | Pruned 1%        | 377ms     | ~280ms    | 1.3x        |
+  | Append shard     | 613ms     | ~300ms    | 2.0x        |
+  | Branch           | 965ms     | ~800ms    | 1.2x        |
+  | Merge            | 3344ms    | 847ms     | 3.9x        |
+  | ACID tx          | 1976ms    | 830ms     | 2.4x        |
+  | Compaction       | 2878ms    | 1097ms    | 2.6x        |
+
+KEY OPTIMIZATIONS BY ROUND:
+
+  Round 33: Parallel batch I/O (put_blob_batch, get_blob_batch)
+    - Bulk write: 4.9s → 1.0s (parallel PUTs)
+    - ACID tx: 2.0s → 0.9s (parallel blob+ref PUTs)
+
+  Round 34: Multi-process safe caching (TTL + invalidate_all_caches)
+    - Process B sees A's writes within 5s TTL or immediately via invalidate
+
+  Round 35: Async tombstoning for merge + compaction
+    - Merge/compact return immediately, tombstone in background thread
+
+  Round 36: PondPack (commit + manifest in ONE blob)
+    - Merge: 2.4s → 1.4s (halved blob reads)
+    - Write: 1 fewer PUT per commit
+
+  Round 37: Rust PND2 decoder (4-5x faster decode)
+    - Verified correct for all encodings (RAW, BITPACK, DICT, RLE)
+
+  Round 38: Full suite benchmark + Rust decoder fixes
+    - Fixed COMPRESSION_ZSTD constant (was 1, should be 2)
+    - Fixed string RAW double-skip bug
+
+  Round 39: CRDT delete fix + simpler folder structure + GC fixes
+    - Fixed CRDT delete: str() coercion for key matching
+    - Folder: paths/collections/{c}/_branches/ → collections/{c}/_branches/
+    - All 26 test suites pass (was 24/26)
+
+  Round 40: Full-name folder structure with no ambiguity
+    - blobs/, collections/, _branches/, shards/, transactions/
+    - _branches is reserved (can't be a collection name)
+
+  Round 41: append_shard_batch + merge optimization + shared thread pool
+    - append_shard_batch: 20 appends in 1 parallel batch (20x faster)
+    - Merge: skip redundant commit blob reads (PondPack)
+
+  Round 42: _branches rename + Rust PND2 encoder (44x faster)
+    - Underscore prefix marks system directory
+    - Rust encoder: 41.75ms → 0.94ms for 10K rows
+
+  Round 43: Wire Rust encoder into write path
+    - PND2.encode() tries Rust first, falls back to Python
+    - 4.7x faster encode (8.9ms vs 41.75ms for 10K rows)
+
+  Round 44: Rust encoder returns stats for free (8.7x write speedup)
+    - Stats computed during single-pass encode (zero extra cost)
+    - Deep analysis: StatsTree should NOT be built at write time
+    - Current architecture is already optimal for OLTP/streaming
+
+  Round 45: Full suite benchmark + shared pool analysis
+    - Fixed benchmark: row_group_size=100 → 10000 (102 GETs → 3 GETs)
+    - Shared pool: 'with pool:' shuts down — per-call pools are negligible
+
+  Round 46: PondPack v2 — inline data blobs
+    - Single-row-group writes inline the PND2 data into the pack
+    - Cold point lookup: 3 GETs → 2 GETs
+
+  Round 47: Pipelined merge (5 RTTs → 2 RTTs)
+    - Phase 1: resolve 4 refs + list 2 shard dirs in parallel
+    - Phase 2: read 2 packs + N shard blobs in parallel
+    - Merge: 1330ms → 847ms (36% faster)
+
+  Round 48: Pipelined compaction (3 RTTs → 2 RTTs)
+    - Same pipelining pattern as merge
+    - Compaction: 1627ms → 1097ms (33% faster)
+
+ARCHITECTURE CHANGES:
+  - PondPack v2: commit + manifest + optional inline data in ONE blob
+  - Rust core: PND2 encode + decode (8.7x encode, 4x decode)
+  - Folder structure: blobs/, collections/{c}/_branches/{b}/, transactions/
+  - Multi-process safe: TTL caches + invalidate_all_caches()
+  - Async tombstoning: merge/compact return immediately
+  - append_shard_batch: parallel multi-shard writes
+  - Pipelined I/O: merge + compaction batch all reads in 2 RTTs
+  - Inline data: single-row-group writes skip 1 GET on reads
+
+TEST RESULTS:
+  - 26/26 scripts/test_*.py suites pass
+  - 18/18 architecture laws pass
+  - 0 pre-existing failures
