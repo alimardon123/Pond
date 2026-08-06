@@ -1393,19 +1393,23 @@ class UnifiedStorage:
         if not target_branch:
             target_branch = self._get_active_branch(collection)
 
-        # The parent of the merge commit is the TARGET branch's HEAD —
-        # NOT the currently active HEAD. If you're on `dev` and call
-        # merge("events", "feature1", "main"), the merge goes INTO `main`,
-        # so `main`'s commit is the first parent (git semantics).
+        # === PIPELINED MERGE READ PHASE ===
+        # All read I/O happens in ONE parallel batch instead of 5 sequential phases.
         #
-        # OPTIMIZATION: With PondPack, the manifest_ref points to the pack
-        # blob which contains BOTH the commit and the manifest. We only need
-        # to read the 2 packs (via manifest_ref) — NOT the commit blobs separately.
-        # This saves 2 GETs (180ms on R2).
+        # Phase 1 (was 5 RTTs, now 1-2 RTTs):
+        #   - Resolve 4 refs (target commit, branch commit, target manifest, branch manifest)
+        #   - List 2 shard directories (target + branch)
+        #   ALL 6 operations run in parallel.
         #
-        # We also need the commit hashes for the parent pointers. The commit
-        # ref and manifest ref both point to the same pack hash, so
-        # target_head == target_manifest_hash (and same for branch).
+        # Phase 2 (1 RTT):
+        #   - Read 2 pack blobs (via manifest_ref — contains commit + manifest)
+        #   - Resolve N shard refs (in parallel)
+        #   ALL operations run in parallel.
+        #
+        # Phase 3 (1 RTT):
+        #   - Read N shard manifests/blobs (in parallel)
+        #
+        # Total: 3 RTTs (was 5 RTTs). Saves ~180ms on R2.
         from concurrent.futures import ThreadPoolExecutor
 
         target_commit_ref = self._branch_ref(collection, target_branch)
@@ -1413,16 +1417,21 @@ class UnifiedStorage:
         target_manifest_ref = self._manifest_ref_for_branch(collection, target_branch)
         branch_manifest_ref = self._manifest_ref_for_branch(collection, branch_name)
 
-        # Resolve all 4 refs in parallel
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            f_target_commit = pool.submit(self.kernel.resolve, target_commit_ref)
-            f_branch_commit = pool.submit(self.kernel.resolve, branch_commit_ref)
-            f_target_manifest = pool.submit(self.kernel.resolve, target_manifest_ref)
-            f_branch_manifest = pool.submit(self.kernel.resolve, branch_manifest_ref)
-            target_head = f_target_commit.result()
-            branch_head = f_branch_commit.result()
-            target_manifest_hash = f_target_manifest.result()
-            branch_manifest_hash = f_branch_manifest.result()
+        # Phase 1: Resolve all 4 refs + list both shard dirs IN PARALLEL (1 RTT)
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            f_tc = pool.submit(self.kernel.resolve, target_commit_ref)
+            f_bc = pool.submit(self.kernel.resolve, branch_commit_ref)
+            f_tm = pool.submit(self.kernel.resolve, target_manifest_ref)
+            f_bm = pool.submit(self.kernel.resolve, branch_manifest_ref)
+            f_ts = pool.submit(self._list_shard_refs_with_names, collection, target_branch)
+            f_bs = pool.submit(self._list_shard_refs_with_names, collection, branch_name)
+
+            target_head = f_tc.result()
+            branch_head = f_bc.result()
+            target_manifest_hash = f_tm.result()
+            branch_manifest_hash = f_bm.result()
+            target_shard_refs = f_ts.result()
+            branch_shard_refs = f_bs.result()
 
         if branch_head is None:
             raise ValueError(f"Branch '{branch_name}' does not exist")
@@ -1430,67 +1439,108 @@ class UnifiedStorage:
         if target_head is None:
             target_head = self.kernel.resolve(self._active_commit_ref(collection))
 
-        # Read ONLY the 2 packs (via manifest_ref) — skip separate commit blob reads.
-        # The pack contains both the commit metadata and the manifest.
-        # For old collections (no pack), the manifest_ref points to a PMAN blob,
-        # and we fall back to reading the commit blob separately.
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        target_shard_hashes = [h for (_n, h) in target_shard_refs]
+        branch_shard_hashes = [h for (_n, h) in branch_shard_refs]
+        all_shard_hashes = list(target_shard_hashes) + list(branch_shard_hashes)
+
+        # Phase 2: Read 2 pack blobs + all shard blobs IN PARALLEL (1 RTT)
+        with ThreadPoolExecutor(max_workers=min(32, 2 + len(all_shard_hashes))) as pool:
             futures = {}
-            # Read manifests (or packs) via manifest_ref
+
+            # Read packs (commit + manifest in one blob)
             if target_manifest_hash:
-                futures["head_manifest"] = pool.submit(
-                    self._load_manifest_from_hash, target_manifest_hash)
+                futures["head_pack"] = pool.submit(self.kernel.read_blob, target_manifest_hash)
             if branch_manifest_hash:
-                futures["branch_manifest"] = pool.submit(
-                    self._load_manifest_from_hash, branch_manifest_hash)
-            # Also read commit blobs — needed for parent/index and for
-            # old collections where manifest_ref might not be set.
-            # But ONLY if commit hash differs from manifest hash (i.e., old format).
-            # With PondPack, commit hash == manifest hash (same pack), so
-            # reading the pack via manifest_ref already gives us the commit.
+                futures["branch_pack"] = pool.submit(self.kernel.read_blob, branch_manifest_hash)
+
+            # Read old-format commit blobs if needed (commit hash != manifest hash)
             if target_head and target_head != target_manifest_hash:
-                futures["head_commit"] = pool.submit(self._read_commit_blob, target_head)
+                futures["head_commit"] = pool.submit(self.kernel.read_blob, target_head)
             if branch_head and branch_head != target_manifest_hash:
-                futures["branch_commit"] = pool.submit(self._read_commit_blob, branch_head)
+                futures["branch_commit"] = pool.submit(self.kernel.read_blob, branch_head)
 
-            head_commit = futures["head_commit"].result() if "head_commit" in futures else None
-            branch_commit = futures["branch_commit"].result() if "branch_commit" in futures else None
-            head_manifest = futures["head_manifest"].result() if "head_manifest" in futures else None
-            branch_manifest = futures["branch_manifest"].result() if "branch_manifest" in futures else None
+            # Read all shard blobs in the SAME batch
+            for i, sh in enumerate(all_shard_hashes):
+                futures[f"shard_{i}"] = pool.submit(self.kernel.read_blob, sh)
 
-        # With PondPack, the pack blob (read via manifest_ref) contains both
-        # the commit and the manifest. If we didn't read the commit separately
-        # (because commit hash == manifest hash), extract it from the pack.
-        # This avoids an extra GET — the pack bytes are already cached by
-        # _load_manifest_from_hash's kernel.read_blob call.
-        if head_commit is None and target_manifest_hash:
-            try:
-                pack_bytes = self.kernel.read_blob(target_manifest_hash)
+            # Collect results
+            head_manifest = None
+            branch_manifest = None
+            head_commit = None
+            branch_commit = None
+
+            if "head_pack" in futures:
+                pack_bytes = futures["head_pack"].result()
                 if is_pack(pack_bytes):
-                    head_commit, _, _ = decode_pack(pack_bytes)
-            except Exception:
-                pass
-        if branch_commit is None and branch_manifest_hash:
-            try:
-                pack_bytes = self.kernel.read_blob(branch_manifest_hash)
+                    head_commit, manifest_bytes, inline_data = decode_pack(pack_bytes)
+                    if inline_data is not None:
+                        self._inline_data_cache[target_manifest_hash] = inline_data
+                    head_manifest = CollectionManifest.decode(self.kernel, manifest_bytes)
+                else:
+                    head_manifest = CollectionManifest.decode(self.kernel, pack_bytes)
+
+            if "branch_pack" in futures:
+                pack_bytes = futures["branch_pack"].result()
                 if is_pack(pack_bytes):
-                    branch_commit, _, _ = decode_pack(pack_bytes)
-            except Exception:
-                pass
+                    branch_commit, manifest_bytes, inline_data = decode_pack(pack_bytes)
+                    if inline_data is not None:
+                        self._inline_data_cache[branch_manifest_hash] = inline_data
+                    branch_manifest = CollectionManifest.decode(self.kernel, manifest_bytes)
+                else:
+                    branch_manifest = CollectionManifest.decode(self.kernel, pack_bytes)
 
-        # Fallback for old collections
-        if head_manifest is None and head_commit and head_commit.get("manifest"):
-            try:
-                head_manifest = self._load_manifest_from_hash(head_commit["manifest"])
-            except (ValueError, KeyError):
-                pass
-        if branch_manifest is None and branch_commit and branch_commit.get("manifest"):
-            try:
-                branch_manifest = self._load_manifest_from_hash(branch_commit["manifest"])
-            except (ValueError, KeyError):
-                pass
+            # Old-format fallbacks
+            if head_commit is None and "head_commit" in futures:
+                raw = futures["head_commit"].result()
+                if is_pack(raw):
+                    head_commit, _, _ = decode_pack(raw)
+                else:
+                    import json as _json
+                    try:
+                        head_commit = _json.loads(raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
 
-        # Union row group entries from target HEAD + source branch HEAD
+            if branch_commit is None and "branch_commit" in futures:
+                raw = futures["branch_commit"].result()
+                if is_pack(raw):
+                    branch_commit, _, _ = decode_pack(raw)
+                else:
+                    import json as _json
+                    try:
+                        branch_commit = _json.loads(raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+
+            # Old collections: manifest_ref might point to PMAN, commit has manifest hash
+            if head_manifest is None and head_commit and head_commit.get("manifest"):
+                try:
+                    head_manifest = self._load_manifest_from_hash(head_commit["manifest"])
+                except (ValueError, KeyError):
+                    pass
+            if branch_manifest is None and branch_commit and branch_commit.get("manifest"):
+                try:
+                    branch_manifest = self._load_manifest_from_hash(branch_commit["manifest"])
+                except (ValueError, KeyError):
+                    pass
+
+            # Decode shard blobs
+            merge_schema = (head_manifest or branch_manifest).columns if \
+                (head_manifest or branch_manifest) else None
+            merge_key_col = (head_manifest or branch_manifest).key_col if \
+                (head_manifest or branch_manifest) else ""
+
+            all_shard_manifests = []
+            for i in range(len(all_shard_hashes)):
+                key = f"shard_{i}"
+                if key in futures:
+                    shard_bytes = futures[key].result()
+                    sm = self._load_shard_manifest_from_bytes(
+                        all_shard_hashes[i], shard_bytes, merge_schema, merge_key_col)
+                    if sm is not None:
+                        all_shard_manifests.append(sm)
+
+        # Union row group entries from target HEAD + source branch HEAD + all shards
         seen: dict[str, RowGroupEntry] = {}
         if head_manifest:
             for rg in head_manifest.scan_with_pruning():
@@ -1498,34 +1548,6 @@ class UnifiedStorage:
         if branch_manifest:
             for rg in branch_manifest.scan_with_pruning():
                 seen[rg.key] = rg  # branch wins
-
-        # Also merge shards from BOTH branches (target branch
-        # and the source branch being merged) — fetched in PARALLEL
-        # schema/key_col from the manifests enable inline-shard pseudo-manifests
-        merge_schema = (head_manifest or branch_manifest).columns if \
-            (head_manifest or branch_manifest) else None
-        merge_key_col = (head_manifest or branch_manifest).key_col if \
-            (head_manifest or branch_manifest) else ""
-
-        # Read both shard indexes IN PARALLEL (2 sequential list calls → 1)
-        # Use _list_shard_refs_with_names to get (name, hash) pairs so we
-        # can skip the redundant list_paths+resolve in _clear_branch_shards.
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            target_future = pool.submit(
-                self._list_shard_refs_with_names, collection, target_branch)
-            branch_future = pool.submit(
-                self._list_shard_refs_with_names, collection, branch_name)
-            target_shard_refs = target_future.result()  # [(name, hash)]
-            branch_shard_refs = branch_future.result()
-
-        target_shard_hashes = [h for (_n, h) in target_shard_refs]
-        branch_shard_hashes = [h for (_n, h) in branch_shard_refs]
-
-        # Fetch shard manifests from BOTH branches in PARALLEL (combined batch)
-        all_shard_hashes = list(target_shard_hashes) + list(branch_shard_hashes)
-        all_shard_manifests = self._parallel_fetch_shard_manifests(
-            all_shard_hashes,
-            schema_columns=merge_schema, key_col=merge_key_col)
         for shard_manifest in all_shard_manifests:
             for rg in shard_manifest.scan_with_pruning():
                 seen[rg.key] = rg
@@ -2175,6 +2197,29 @@ class UnifiedStorage:
         )
         manifest.add_row_group(rg)
         return manifest
+
+    def _load_shard_manifest_from_bytes(self, shard_hash: str,
+                                          blob_bytes: bytes,
+                                          schema_columns=None,
+                                          key_col: str = "") -> Optional[CollectionManifest]:
+        """Decode a shard blob (already fetched) into a CollectionManifest.
+
+        Handles both PND2 (inline shard) and PMAN (manifest shard) formats.
+        Used by the pipelined merge to avoid re-fetching shard blobs that
+        were already read in the parallel batch.
+        """
+        if not blob_bytes:
+            return None  # tombstoned (empty blob)
+        magic = blob_bytes[:4]
+        if magic == b'PND2':
+            return self._build_pseudo_manifest_from_pnd2(
+                shard_hash, blob_bytes, schema_columns, key_col)
+        elif magic == b'PMAN':
+            try:
+                return CollectionManifest.decode(self.kernel, blob_bytes)
+            except (ValueError, KeyError):
+                return None
+        return None
 
     def _load_shard_manifest(self, shard_hash: str,
                               schema_columns=None,
