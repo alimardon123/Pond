@@ -4,15 +4,17 @@ Creates:
   - 3 collections (users, orders, events)
   - Multiple commits per collection (history for time travel)
   - Branch + merge on users
-  - ACID transaction
+  - Atomic publication across collections
 
 Data is LEFT on R2 under prefix 'pond-demo' for inspection.
 
-To browse via AWS CLI:
-  aws s3 ls s3://pondbucket/pond-demo/ --endpoint-url https://81425c4736b181e41dc82c32050a5207.r2.cloudflarestorage.com
+To browse via AWS CLI (set env vars first):
+  export R2_ENDPOINT=... R2_ACCESS_KEY=... R2_SECRET_KEY=... R2_BUCKET=...
+  aws s3 ls s3://$R2_BUCKET/pond-demo/ --endpoint-url $R2_ENDPOINT
 
 To query from local:
-  python scripts/query_r2_demo.py
+  R2_ENDPOINT=... R2_ACCESS_KEY=... R2_SECRET_KEY=... R2_BUCKET=... \
+      python scripts/query_r2_demo.py
 """
 import os, sys, time, json
 
@@ -21,27 +23,16 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_structures"))
+sys.path.insert(0, HERE)  # for _r2_config
 
 from s3_object_store import S3ObjectStore
 from object_store_native_kernel import ObjectStoreNativeKernel
 from pond_storage import PondStorage
-import boto3
-from botocore.config import Config
+from _r2_config import get_r2_client, get_r2_bucket
 
-# R2 credentials
-R2_ENDPOINT = "https://81425c4736b181e41dc82c32050a5207.r2.cloudflarestorage.com"
-R2_ACCESS_KEY = "4331a4a6283b1d929cda0085d24450e0"
-R2_SECRET_KEY = "286c9be9d520e15fee90145147a43f15001209d192b63ca7a9e2ba53dde31122"
-R2_BUCKET = "pondbucket"
+R2_BUCKET = get_r2_bucket()
 PREFIX = "pond-demo"  # Fixed prefix — data stays for inspection
-
-config = Config(
-    connect_timeout=5.0, read_timeout=60.0, max_pool_connections=50,
-    retries={"max_attempts": 5, "mode": "adaptive"},
-)
-client = boto3.client("s3", endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY, aws_secret_access_key=R2_SECRET_KEY,
-    region_name="auto", config=config)
+client = get_r2_client()
 
 store = S3ObjectStore(client, bucket=R2_BUCKET, prefix=PREFIX)
 kernel = ObjectStoreNativeKernel(store)
@@ -130,8 +121,8 @@ s.append("events", [{"id": 5000+i, "event_type": ["click", "view", "purchase"][i
          key_col="id", row_group_size=1000, message="append 5000 events")
 print(f"    Done in {time.perf_counter()-t0:.1f}s")
 
-# === ACID Transaction ===
-print("\n--- ACID Transaction (2 collections) ---")
+# === Atomic Publication (cross-collection) ===
+print("\n--- Atomic Publication (2 collections) ---")
 t0 = time.perf_counter()
 tx = s.begin_tx()
 s.append_shard("users", [{"id": 99999, "name": "tx_user", "age": 30, "city": "SEA"}], key_col="id", tx_id=tx)

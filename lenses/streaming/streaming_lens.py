@@ -250,13 +250,17 @@ class StreamingLens(PondLens):
 
         if not data:
             return ""
-        # Get the current segment count (offset for new segments)
-        current_count = self.segment_count(collection)
+        # The 'offset' column stores BYTE offsets (not segment indices),
+        # because read_stream() interprets it as a byte offset when
+        # slicing segments. The first new segment starts at the current
+        # total stream size (in bytes), so the new data is concatenated
+        # after the existing data.
+        current_size = self.stream_size(collection)
         rows = []
         for i in range(0, len(data), segment_size):
             segment = data[i:i + segment_size]
             rows.append({
-                "offset": current_count + i // segment_size,
+                "offset": current_size + i,
                 "segment": segment,
             })
         return self._unified_storage.append_shard(

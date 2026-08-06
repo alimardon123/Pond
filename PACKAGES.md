@@ -16,43 +16,56 @@ pond_repo/
 ├── KNOWLEDGE_GRAPH.md           # Navigational map of the repo
 ├── worklog.md                   # Append-only research log
 │
-├── pond-core/                   # Layer 0: Storage Kernel (FROZEN)
-│   └── kernel.py                # 3 primitives: Write, Read, Ref (~199 LOC)
+├── pond-core/                   # Layer 0: Storage Kernel + storage backends (NOT FROZEN)
+│   ├── kernel.py                # PondMinimal — 3 ops + batch I/O helpers (~274 LOC)
+│   ├── object_store_native_kernel.py # ObjectStoreNativeKernel (no SQLite; refs as blobs)
+│   ├── local_fs_object_store.py # LocalFSObjectStore (pure files)
+│   ├── s3_object_store.py       # S3ObjectStore (real boto3)
+│   ├── s3_mock_backend.py       # Latency-injecting S3 mock
+│   └── make_kernel.py           # make_kernel(url) factory — file:// or s3://
 │
 ├── pond-sdk/                    # Layer 1: Storage infrastructure + extensions
 │   ├── base_lens.py             # PondLens — shared namespace base (no format awareness)
-│   ├── prolly_tree.py           # ProllyLensBase + ProllyTree (universal storage backend)
-│   ├── collection_metadata.py   # CollectionMetadata — data-side metadata manager
+│   ├── pond_storage.py          # PondStorage — THE unified SDK class (namespace + commit + data I/O)
+│   ├── pond_config.py           # PondConfig — persistent pruning/encoding settings
 │   ├── row_query.py             # LensQuery — lazy row-level query builder
 │   ├── uuid7.py                 # UUIDv7 time-ordered UUID for _rowid
-│   ├── binary_encoding.py       # Binary Prolly tree encoding
+│   ├── hlc.py                   # HLC — Hybrid Logical Clock for clock-skew-safe LWW CRDT
 │   ├── maintenance.py           # Tombstone helpers (RFC-0008)
-│   ├── collection.py            # Collection metadata (namespace, type, source)
 │   └── extensions/              # Optional modules (data-side, not lens-side)
-│       ├── indexing/            # Collection-level indexing
+│       ├── indexing/            # Collection-level indexing + vector ANN
 │       │   ├── base.py          # CollectionIndexerInterface (abstract)
 │       │   ├── collection_index.py # CollectionIndexer (RECOMMENDED)
-│       │   └── 
+│       │   ├── ivf_index.py     # IVFIndex — IVF ANN (Known Gap: reads ALL vectors)
+│       │   └── hnsw_index.py    # HNSWIndex — HNSW graph ANN
+│       ├── maintenance/         # GC + vacuum
+│       │   └── vacuum.py        # GarbageCollector — collect() + vacuum(...)
 │       ├── semantic/            # Semantic model management
 │       │   ├── base.py          # SemanticModelAdapter (abstract)
 │       │   └── ossie.py         # SemanticMixin + OssieAdapter
-│       └── physical_structures/ # Pruning, zone maps, bloom filters, stats
-│           ├── base.py          # PhysicalStructure (abstract)
-│           ├── bloom_filter.py
-│           ├── statistics.py
-│           ├── zone_map.py
-│           ├── pruning.py       # ZoneMap, PruningPredicate, ColumnPredicate
-│           ├── zone_map_index.py # ZoneMapIndex (ProllyTreeIndex of zone maps)
-│           └── pruning_reader.py # PruningReader (generic pruning reader)
+│       └── physical_structures/ # Universal storage backend + derived structures
+│           ├── __init__.py
+│           ├── unified_storage.py       # UnifiedStorage + PND2 — THE universal backend (5,540 LOC)
+│           ├── collection_manifest.py   # CollectionManifest — one manifest per commit (PMAN)
+│           ├── stats_tree.py            # StatsTreeReader — PB-scale hierarchical stats index
+│           ├── embedded_stats.py        # ColumnStats + value-type constants
+│           ├── compression.py           # zstd / LZ4 transparent compression
+│           ├── encoding.py              # ColumnEncoding — FastLanes-style RLE/Dict/Bitpack/Raw
+│           ├── column_source.py         # ColumnSource — format-agnostic column access protocol
+│           └── pond_pack.py             # PondPack — commit+manifest in one PNPK blob
 │
 ├── lenses/                      # Layer 2: Production Lens implementations
-│   ├── keyvalue/                # KeyValueLens (KV storage over ProllyTreeIndex)
+│   ├── keyvalue/                # KeyValueLens (KV storage over UnifiedStorage)
 │   │   └── keyvalue_lens.py     # extends PondLens directly
-│   ├── lakehouse/               # LakehouseLens (DuckDB + Parquet row groups)
-│   │   └── lakehouse_lens.py    # extends PondLens directly
-│   └── vector/                  # VectorLens (packed binary vector storage)
-│       ├── vector_lens.py       # extends PondLens directly
-│       └── test_vector.py       # Tests
+│   ├── lakehouse/               # LakehouseLens (tabular: CREATE TABLE, INSERT, time travel)
+│   │   └── lakehouse_lens.py    # NO base class — documented exception (see SDK_SPEC.md)
+│   ├── vector/                  # VectorLens (packed binary vector storage + k-NN search)
+│   │   ├── vector_lens.py       # extends PondLens directly
+│   │   └── test_vector.py       # Tests
+│   ├── streaming/               # StreamingLens (chunked segments, range reads)
+│   │   └── streaming_lens.py    # extends PondLens directly
+│   └── oltp/                    # OLTPLens (in-memory memtable + batch flush to CRDT shards)
+│       └── oltp_lens.py         # NO base class — documented exception (see SDK_SPEC.md)
 │
 ├── services/                    # Cross-cutting services (on the kernel only)
 │   ├── transport/               # Transport Layer (compression + encryption)
@@ -105,11 +118,14 @@ pond_repo/
 ## Dependency rules
 
 ```
-pond-core (FROZEN, ~199 LOC)
+pond-core (kernel.py 274 LOC + storage backends; NOT FROZEN —
+           gained write_batch / read_blob_batch in the thread-safety round)
     ↓
-pond-sdk (base_lens, prolly_tree, collection_metadata, extensions/)
+pond-sdk (base_lens, pond_storage, pond_config, hlc, uuid7,
+          maintenance, row_query, extensions/{indexing, maintenance,
+          semantic, physical_structures/unified_storage})
     ↓
-lenses/ (keyvalue, lakehouse, vector — each extends PondLens directly)
+lenses/ (keyvalue, lakehouse, vector, streaming, oltp)
     ↓
 pond-labs/ (experimental code, depends on everything)
 
@@ -122,7 +138,10 @@ pond-rust/pond-python           sdk-go/ (cgo over libpond_core.a)
 ```
 
 **Rules:**
-- No lens depends on another lens. All lenses extend PondLens directly.
+- No lens depends on another lens.
+- KeyValueLens, VectorLens, and StreamingLens extend `PondLens` directly.
+- `LakehouseLens` and `OLTPLens` declare NO base class — documented
+  exceptions, NOT bugs (see `SDK_SPEC.md` and `DESIGN_GOALS.md` Known Gaps).
 - pond-sdk depends only on pond-core.
 - Services depend only on pond-core (not on pond-sdk or lenses).
 - Extensions are data-side (collection-level), not lens-side.

@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk",
                                   "extensions", "physical_structures"))
 
 from kernel import PondMinimal  # noqa: E402
+from base_lens import PondLens  # noqa: E402
 
 # PyArrow for the Parquet/Arrow interchange (REQUIRED — this is a tabular lens)
 try:
@@ -78,7 +79,7 @@ _HAVE_LEGACY = False
 DEFAULT_ROW_GROUP_SIZE = 10_000
 
 
-class LakehouseLens:
+class LakehouseLens(PondLens):
     """Thin tabular lens over PondStorage.
 
     Provides PyArrow Table ↔ PondStorage conversion and DuckDB SQL
@@ -91,6 +92,9 @@ class LakehouseLens:
       - read_columns → storage.read(columns=...) → pa.Table
       - point_lookup → storage.point_lookup()
       - branch/merge → storage.branch()/storage.merge()
+
+    Extends PondLens to inherit branch/list_collections/set_definition/
+    get_definition/history for free (no duplication).
 
     Usage:
         from pond_storage import PondStorage
@@ -109,6 +113,7 @@ class LakehouseLens:
         Args:
             kernel: the PondMinimal or ObjectStoreNativeKernel instance
         """
+        super().__init__(kernel)
         self.kernel = kernel
         # Use PondStorage (the unified SDK — the only path)
         self._storage: Optional[PondStorage] = None

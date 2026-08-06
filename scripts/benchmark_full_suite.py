@@ -10,7 +10,7 @@ Features tested:
   5. Append shard (CRDT writes) — single + concurrent
   6. read_with_shards (merge HEAD + shards)
   7. Branch + merge topology
-  8. ACID transactions (1-coll, 5-coll)
+  8. Atomic publication across collections (1-coll, 5-coll)
   9. Compaction (manifest-level + row-level)
   10. Upsert + delete (row-level CRDT)
   11. Time-travel reads (history, diff)
@@ -18,7 +18,8 @@ Features tested:
   13. Multi-process visibility
 
 Usage:
-  PYTHONPATH=pond-core:pond-sdk:pond-sdk/extensions/physical_structures:pond-rust/target/release \
+  R2_ENDPOINT=... R2_ACCESS_KEY=... R2_SECRET_KEY=... R2_BUCKET=... \
+    PYTHONPATH=pond-core:pond-sdk:pond-sdk/extensions/physical_structures:pond-rust/target/release \
     python scripts/benchmark_full_suite.py
 """
 import os, sys, time, tempfile, threading, json
@@ -29,12 +30,12 @@ sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_structures"))
 sys.path.insert(0, os.path.join(REPO, "pond-rust", "target", "release"))
+sys.path.insert(0, HERE)  # for _r2_config
 
 from s3_object_store import S3ObjectStore
 from object_store_native_kernel import ObjectStoreNativeKernel
 from pond_storage import PondStorage
-import boto3
-from botocore.config import Config
+from _r2_config import get_r2_client, get_r2_bucket, get_r2_prefix
 
 # Check Rust acceleration
 try:
@@ -43,22 +44,9 @@ try:
 except ImportError:
     RUST_ENABLED = False
 
-# R2 credentials
-R2_ENDPOINT = "https://81425c4736b181e41dc82c32050a5207.r2.cloudflarestorage.com"
-R2_ACCESS_KEY = "4331a4a6283b1d929cda0085d24450e0"
-R2_SECRET_KEY = "286c9be9d520e15fee90145147a43f15001209d192b63ca7a9e2ba53dde31122"
-R2_BUCKET = "pondbucket"
-PREFIX = f"suite-{int(time.time())}"
-
-config = Config(
-    connect_timeout=5.0, read_timeout=120.0, max_pool_connections=50,
-    retries={"max_attempts": 5, "mode": "adaptive"},
-)
-_client = boto3.client(
-    "s3", endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY, aws_secret_access_key=R2_SECRET_KEY,
-    region_name="auto", config=config,
-)
+R2_BUCKET = get_r2_bucket()
+PREFIX = get_r2_prefix(default=f"suite-{int(time.time())}")
+_client = get_r2_client()
 
 
 def make_kernel():
@@ -334,10 +322,10 @@ rows = s.read("branch")
 print(f"  After merge:           {len(rows)} rows")
 
 # =============================================================================
-# 6. ACID TRANSACTIONS
+# 6. ATOMIC PUBLICATION (commit markers + CRDT)
 # =============================================================================
 print("\n" + "=" * 80)
-print("  6. ACID TRANSACTIONS — commit markers + CRDT")
+print("  6. ATOMIC PUBLICATION — commit markers + CRDT")
 print("=" * 80)
 
 kernel, store = make_kernel()
@@ -354,7 +342,7 @@ s.commit_tx(tx)
 tx1 = time.perf_counter() - t0
 st = stats(store)
 print(f"  1-collection tx:       {ms(tx1):>8}, {st['puts']} PUTs")
-record("acid_tx_1coll", "1", tx1, st)
+record("atomic_pub_1coll", "1", tx1, st)
 
 # 5-collection tx
 reset(kernel, store)
@@ -369,7 +357,7 @@ s.commit_tx(tx)
 tx5 = time.perf_counter() - t0
 st = stats(store)
 print(f"  5-collection tx:       {ms(tx5):>8}, {st['puts']} PUTs")
-record("acid_tx_5coll", "5", tx5, st)
+record("atomic_pub_5coll", "5", tx5, st)
 
 # Abort (no-op)
 tx = s.begin_tx()

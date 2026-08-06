@@ -84,8 +84,18 @@ class PondMinimal:
 
         os.makedirs(self.objects_dir, exist_ok=True)
 
-        # Root pointer namespace — the ONLY mutable state
-        self.root_db = sqlite3.connect(self.root_store_path, isolation_level=None)
+        # Root pointer namespace — the ONLY mutable state.
+        # check_same_thread=False allows the connection to be used from
+        # worker threads (UnifiedStorage uses a ThreadPoolExecutor for
+        # parallel I/O). We guard all writes with _db_lock to serialize
+        # SQLite mutations (SQLite handles concurrent reads fine via WAL,
+        # but cross-thread writes without a lock raise ProgrammingError).
+        import threading
+        self._db_lock = threading.RLock()
+        self.root_db = sqlite3.connect(
+            self.root_store_path, isolation_level=None,
+            check_same_thread=False,
+        )
         self.root_db.execute("""
             CREATE TABLE IF NOT EXISTS roots (
                 name TEXT PRIMARY KEY,
@@ -116,6 +126,13 @@ class PondMinimal:
 
     def write_batch(self, items: list[bytes]) -> list[str]:
         """Write a batch of blobs in parallel (thread pool).
+
+        This is a SAME-COLLECTION I/O performance primitive — it batches
+        multiple `write()` calls into a thread pool to amortize per-call
+        overhead. It is NOT cross-collection atomicity (A7 law still
+        holds: the kernel provides no way to atomically update multiple
+        refs/names). Each blob is written independently; a crash mid-batch
+        leaves some blobs written and others not.
 
         Local FS is fast, but parallel writes still help when there are
         many blobs to write.
@@ -179,7 +196,11 @@ class PondMinimal:
             return f.read()
 
     def read_blob_batch(self, hashes: list[str]) -> list[bytes]:
-        """Fetch a batch of blobs in parallel (thread pool)."""
+        """Fetch a batch of blobs in parallel (thread pool).
+
+        Same-collection I/O performance primitive (like write_batch).
+        NOT cross-collection atomicity — each blob is read independently.
+        """
         if not hashes:
             return []
         if len(hashes) == 1:
@@ -216,21 +237,24 @@ class PondMinimal:
         The hash must refer to an existing blob (we verify)."""
         if not os.path.exists(self._blob_path(h)):
             raise ValueError(f"Hash {h} does not refer to an existing blob")
-        self.root_db.execute(
-            "INSERT OR REPLACE INTO roots (name, hash, updated_at) VALUES (?, ?, ?)",
-            (name, h, time.time())
-        )
+        with self._db_lock:
+            self.root_db.execute(
+                "INSERT OR REPLACE INTO roots (name, hash, updated_at) VALUES (?, ?, ?)",
+                (name, h, time.time())
+            )
         self.stats["references"] += 1
 
     def resolve(self, name: str) -> Optional[str]:
         """Resolve a name to its current hash. Returns None if unbound."""
-        cur = self.root_db.execute("SELECT hash FROM roots WHERE name = ?", (name,))
-        row = cur.fetchone()
+        with self._db_lock:
+            cur = self.root_db.execute("SELECT hash FROM roots WHERE name = ?", (name,))
+            row = cur.fetchone()
         return row[0] if row else None
 
     def list_names(self) -> list[str]:
-        cur = self.root_db.execute("SELECT name FROM roots ORDER BY name")
-        return [row[0] for row in cur.fetchall()]
+        with self._db_lock:
+            cur = self.root_db.execute("SELECT name FROM roots ORDER BY name")
+            return [row[0] for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Internal helpers

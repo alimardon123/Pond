@@ -53,9 +53,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "..", "..", "pond-sdk", "extensions",
                                   "physical_structures"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "..", "..", "pond-core"))
+
+from base_lens import PondLens  # noqa: E402
 
 
-class OLTPLens:
+class OLTPLens(PondLens):
     """Fast key-value lens with in-memory memtable + batch flush.
 
     Each app process creates its own OLTPLens instance. Writes go to
@@ -63,6 +67,11 @@ class OLTPLens:
     it flushes to object storage as a CRDT shard.
 
     Multiple apps flush independently — CRDT handles conflicts.
+
+    Extends PondLens to inherit branch/list_collections/set_definition/
+    get_definition/history for free. Note: OLTPLens's __init__ takes
+    `storage` (a PondStorage instance) rather than `kernel` directly,
+    because it needs the full storage API for shard appends.
     """
 
     def __init__(self, storage, collection: str,
@@ -70,6 +79,10 @@ class OLTPLens:
                  flush_threshold: int = 1000,
                  flush_interval_s: float = 5.0,
                  value_col: str = "value"):
+        # OLTPLens doesn't take kernel directly — it takes a PondStorage
+        # which wraps a kernel. Extract the kernel for PondLens.__init__.
+        kernel = getattr(storage, "kernel", None) or storage
+        super().__init__(kernel)
         self.storage = storage
         self.collection = collection
         self.key_col = key_col

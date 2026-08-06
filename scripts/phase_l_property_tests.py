@@ -330,17 +330,38 @@ def test_A6_atomic_commit_blob():
 def test_A7_coordinator_out_of_model():
     """A7: Cross-Collection atomicity is NOT provided. Verify by
     attempting a 2-Collection atomic write and confirming the
-    kernel has no API for it."""
+    kernel has no API for it.
+
+    NOTE: the kernel MAY provide same-collection batch I/O (write_batch,
+    read_blob_batch) — these are a performance optimization over calling
+    write/read in a loop, NOT cross-collection atomicity. They do not
+    violate A7. What A7 forbids is an API that atomically updates
+    MULTIPLE refs / MULTIPLE collections in one call (e.g. batch_ref,
+    transaction, commit_tx)."""
     print("\n=== A7: Coordinator out-of-model ===")
     k, d = make_kernel()
     try:
-        # The kernel has no batch_ref() or transactional API.
-        # Confirm by inspecting the API.
+        # The kernel has no cross-collection batch_ref() or transactional
+        # API. Confirm by inspecting the API for cross-ref operations.
+        #
+        # Same-collection batch I/O (write_batch, read_blob_batch) is OK —
+        # it's a performance primitive, not a coordination primitive.
+        # What we forbid is anything that updates MULTIPLE names atomically.
         api = [m for m in dir(k) if not m.startswith("_")]
-        has_batch = any("batch" in m.lower() or "transaction" in m.lower()
-                        or "atomic" in m.lower() for m in api)
-        check(not has_batch,
-              "kernel has no batch/transaction/atomic API")
+        # Forbidden: methods that atomically update multiple refs/names
+        # Allowed: write_batch / read_blob_batch (single-blob I/O batching)
+        forbidden_patterns = ("batch_ref", "transaction", "atomic",
+                              "commit_tx", "begin_tx", "multi_ref",
+                              "atomic_ref", "batch_ref_update")
+        has_forbidden = any(
+            any(p in m.lower() for p in forbidden_patterns)
+            for m in api
+        )
+        check(not has_forbidden,
+              "kernel has no cross-collection atomicity API "
+              "(batch_ref / transaction / commit_tx). "
+              "Same-collection batch I/O (write_batch, read_blob_batch) "
+              "is allowed — it's a performance primitive, not coordination.")
         # Two refs cannot be updated atomically; we must update them
         # one at a time, and a reader between the two updates sees
         # a partial state.

@@ -143,7 +143,10 @@ storage.merge("users", "dev")
 storage.append_shard("events", [{"id": 1, "event": "click"}], key_col="id")
 rows = storage.read_with_shards("events")
 
-# ACID transactions — commit markers on top of CRDT
+# Atomic publication across collections — commit markers on top of CRDT
+# (NOT full ACID — no isolation, no rollback, no conflict detection.
+#  This provides atomic VISIBILITY: once the commit marker exists, all
+#  tentative shards become visible together. See docs/HONEST_COMPETITOR_COMPARISON.md §3.)
 tx = storage.begin_tx()
 storage.append_shard("users", [{"id": 3, "name": "carol"}], key_col="id", tx_id=tx)
 storage.append_shard("orders", [{"id": 3, "amount": 50.0}], key_col="id", tx_id=tx)

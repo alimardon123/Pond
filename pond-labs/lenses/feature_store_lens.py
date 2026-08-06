@@ -205,8 +205,12 @@ class FeatureStoreLens(PondLens):
 
         key_col = defn["entity_columns"][0] if defn["entity_columns"] else None
 
-        # Read existing data (if any) and union with new data
-        if self.collection_exists(collection):
+        # Read existing data (if any) and union with new data.
+        # NOTE: collection_exists() returns True if the collection has a
+        # definition OR a HEAD commit. We need to check HEAD specifically
+        # because a freshly-defined collection has a definition but no data.
+        head_commit = self.kernel.resolve(self._head_ref(collection))
+        if head_commit is not None:
             existing = self.read_features(collection)
             try:
                 combined = pa.concat_tables([existing, data], promote_options="default")

@@ -91,9 +91,29 @@ New code should use `KeyValueLens`. The class lives in
 `lenses/keyvalue/keyvalue_lens.py`.
 
 KeyValueLens is NOT the universal base class — that's `PondLens`
-in `pond-sdk/base_lens.py`. KeyValueLens is a peer of `LakehouseLens`
-and `VectorLens`; all three extend `PondLens` directly. No production
-lens inherits from another lens.
+in `pond-sdk/base_lens.py`. KeyValueLens is a peer of `LakehouseLens`,
+`VectorLens`, `StreamingLens`, and `OLTPLens`.
+
+> **Honesty note (Task 65).** The previous version of this section
+> claimed "all three extend `PondLens` directly." That is **only true
+> for three of the five production lenses**:
+>
+> | Lens | Class declaration | Extends `PondLens`? |
+> |---|---|---|
+> | `KeyValueLens` | `class KeyValueLens(PondLens):` | ✅ Yes |
+> | `VectorLens`   | `class VectorLens(PondLens):`   | ✅ Yes |
+> | `StreamingLens`| `class StreamingLens(PondLens):`| ✅ Yes |
+> | `LakehouseLens`| `class LakehouseLens:`          | ❌ No (documented exception) |
+> | `OLTPLens`     | `class OLTPLens:`               | ❌ No (documented exception) |
+>
+> `LakehouseLens` and `OLTPLens` declare no base class because they
+> do not need the ref-namespace operations `PondLens` provides — they
+> are thin wrappers over `PondStorage` / `UnifiedStorage` that own
+> their own read/write API. This is a **documented exception**, NOT a
+> bug — but it does mean callers cannot assume `(PondLens)`-shaped
+> methods on every production lens. See `DESIGN_GOALS.md` Known Gaps.
+
+No production lens inherits from another lens.
 
 ### 1.4. Constructing a Lens
 
@@ -212,7 +232,7 @@ are used by the SDK:
 | `collections/{name}/HEAD` | HEAD commit reference (shared namespace) | `collections/analytics/orders/HEAD` |
 | `collections/{name}/branches/{branch}` | Branch reference | `collections/analytics/orders/branches/dev` |
 | `collections/{name}/definition` | Optional lens-specific metadata | `collections/analytics/orders/definition` |
-| `collections/{name}/snapshot` | Latest snapshot pointer (ProllyLensBase) | `collections/analytics/orders/snapshot` |
+| `collections/{name}/snapshot` | Latest snapshot pointer (legacy `ProllyLensBase`; production reads use `collections/{name}/HEAD` → PNPK pack → manifest) | `collections/analytics/orders/snapshot` |
 | `{name}__index__{index}` | Index reference (legacy convention) | `analytics/orders__index__by_region` |
 | `__schema/{name}/v{version}` | Schema version (Schema Registry) | `__schema/user_features/v1` |
 | `__stats/{name}` | Statistics (Physical Structure) | `__stats/users` |
@@ -255,11 +275,20 @@ the kernel and decoded via `lens.decode(bytes)`.
 
 ### 3.2. `get()` complexity (Ambiguity C)
 
-- **`KeyValueLens` (the app-facing KV lens):** O(log N) — uses a
-  Prolly tree (ProllyLensBase) for O(log N) point lookup. This is
-  the only KV lens class; `Lens` and `View` are aliases for it.
-- **`ProllyLensBase` (the storage backend):** O(log N) — the
-  underlying Prolly tree implementation used by KeyValueLens.
+- **`KeyValueLens` (the app-facing KV lens):** O(log N) point lookup
+  in the legacy Prolly-tree path; the production path uses
+  `UnifiedStorage.point_lookup` which reads the collection manifest
+  (PMAN / PNPK pack) and fetches a single data blob — O(1) GETs for
+  the warm path, O(2-3) GETs cold. This is the only KV lens class;
+  `Lens` and `View` are aliases for it.
+- **`UnifiedStorage` (the production storage backend):** the actual
+  universal storage backend lives at
+  `pond-sdk/extensions/physical_structures/unified_storage.py`
+  (5,540 LOC). It is NOT `pond-sdk/prolly_tree.py` — that file does
+  NOT exist in the production SDK (it lives in
+  `archive/legacy-sdk/prolly_tree.py` as historical reference).
+  `UnifiedStorage.point_lookup` reads the manifest, finds the row
+  group containing the key, and fetches only that row group.
 
 **Recommendation:** extend `KeyValueLens` for production KV lenses.
 For auto-indexing, extend `IndexedLens` (in `auto_index.py`), which
@@ -370,8 +399,9 @@ analytics/orders__index__by_region
 ```
 
 The index blob is a serialized Prolly tree (binary format, see
-`pond-sdk/binary_encoding.py`). The tree maps `indexed_value →
-blob_hash`.
+`archive/legacy-sdk/binary_encoding.py` for the historical reference
+encoding; production indexes use `UnifiedStorage`'s PND2 column
+encoding). The tree maps `indexed_value → blob_hash`.
 
 ### 4.5. `drop_index` / `unregister_index` (Ambiguity F)
 

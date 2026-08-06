@@ -50,6 +50,59 @@ registries, semantic layers) to be implemented as independent
 > Phase Q (validation) addresses these gaps. The architecture is
 > frozen; the validation begins.
 
+#### 1.1 Known gaps (post-veteran-architect review, Task 65)
+
+The veteran architect review (`docs/VETERAN_ARCHITECT_REVIEW.md`)
+identified several gaps that the model-vs-implementation narrative
+did not previously surface. These are now part of the honesty record.
+Where the gap is a doc-vs-code drift that has been fixed in this
+round, the entry says so. Where the gap is real (code behavior the
+docs overclaim), the entry stays open until the code is fixed.
+
+- **FeatureStoreLens in `pond-labs/` needs migration from
+  `ProllyLensBase` to `UnifiedStorage`.** Its self-test
+  (`tests/test_all.py::test_feature_store_lens`) currently skips
+  with a "not yet migrated" marker. The docs previously implied it
+  was shipping; reality is it's stuck on the legacy Prolly path.
+  Status: **open** — needs migration work.
+- **`StreamingLens` time-travel via `commit_hash` is NOT implemented
+  in the unified path.** `read_stream(collection, start_byte, end_byte,
+  commit_hash=None)` accepts `commit_hash` for backward-compat in the
+  signature, but the unified-storage path always reads from HEAD.
+  Use `replay_from(offset)` for offset-based time-travel on
+  partitioned topics. Status: **open** — needs a HEAD-pointer walk in
+  `UnifiedStorage.read`.
+- **IVF vector index does NOT reduce I/O.**
+  `pond-sdk/extensions/indexing/ivf_index.py:363-381` admits: the
+  implementation reads ALL vectors via `storage.read(collection)`
+  then filters by target_ids in Python. Every search reads the
+  entire collection. At PB scale (10M+ vectors) this defeats the
+  purpose of IVF. The IVF *format* is correct (centroids + cluster
+  assignments); the *integration* with `UnifiedStorage` is not.
+  Status: **open** — needs per-cluster blob fetching.
+- **`LakehouseLens` and `OLTPLens` do NOT extend `PondLens`.**
+  `class LakehouseLens:` and `class OLTPLens:` declare no base class
+  (verified in source). This is a **documented exception, not a bug**
+  — both lenses are thin wrappers over `PondStorage`/
+  `UnifiedStorage` and own their own read/write API. Callers cannot
+  assume `(PondLens)`-shaped methods on every production lens. See
+  `SDK_SPEC.md` §1.3 for the per-lens table.
+- **"ACID transactions" are atomic publication only.** The
+  `commit_tx` path provides atomic publication across collections
+  (all-or-nothing HEAD pointer moves via a transaction marker) — but
+  there is NO isolation (readers can see tentative shards before
+  commit), NO rollback (a failed transaction leaves orphan shards
+  for GC to clean up), and NO serializability. Calling this "ACID"
+  is overclaim; the honest term is "atomic publication" or
+  "multi-collection commit." See `scripts/test_acid.py` for what is
+  actually tested (atomicity + abort + snapshot isolation in the
+  narrow reader sense; not the database ACID sense).
+
+These gaps use the §6 outcome vocabulary: they are **Supported** by
+source-code evidence and the veteran's review. They are not yet
+**Falsified** by a fix — that requires code changes, which are out
+of scope for the docs-only Task 65.
+
 Tagline: *one copy of data on object storage, serving all workloads
 without duplication, with no JVM, no Spark, no Iceberg-style
 metadata explosion.*
@@ -67,15 +120,18 @@ underneath those things — and underneath things that don't exist yet.
 
 This is a research goal stated as an engineering goal. "Smallest"
 is measured by **substrate count (currently 6, honest)** and by
-lines of code in `pond-core` (currently ~140). "All workload
-semantics" is measured by the number of distinct Lenses implemented
-(currently 8+). "Composition is sound" is measured by formal laws
-(TLA+ checked 6 invariants across 56 reachable states in a finite
-model — establishes consistency, not correctness), 683 passing
-tests (verify implementation matches model, including 61
-differential tests against real Git/Dolt/Iceberg for specific
-invariants), and 4 engineering packages that implement the
-algebras. **None of this is external validation.** Phase Q
+lines of code in `pond-core` (currently 274 LOC in `kernel.py` +
+~280 LOC in `object_store_native_kernel.py` + 443 LOC in
+`local_fs_object_store.py` + 519 LOC in `s3_object_store.py` +
+112 LOC in `make_kernel.py` — NOT ~140 LOC as previously claimed).
+"All workload semantics" is measured by the number of distinct
+Lenses implemented (currently 8+). "Composition is sound" is
+measured by formal laws (TLA+ checked 6 invariants across 56
+reachable states in a finite model — establishes consistency, not
+correctness), 683 passing tests (verify implementation matches
+model, including 61 differential tests against real Git/Dolt/Iceberg
+for specific invariants), and 4 engineering packages that implement
+the algebras. **None of this is external validation.** Phase Q
 (benchmarks, whitepaper, flagship, expert review) is where
 soundness gets tested against reality.
 
@@ -119,21 +175,40 @@ The seven principles, in priority order:
 
 ### 3.1 Simple — the kernel remains intellectually small
 
-The kernel is 6 substrates + 3 operations (~140 LOC in `pond-core/kernel.py`,
-plus ~280 LOC in `pond-core/object_store_native_kernel.py` for the
-object-store-native variant). It must stay intellectually small. Rich
-behavior must *emerge* from composition, not from kernel features. The
-honest substrate count is 6 (Bytes, Names, Time, Coordination, Range-Read,
-Key) — see the honesty note in §1.
+The kernel is 6 substrates + 3 operations + same-collection batch
+I/O helpers. `pond-core/kernel.py` is currently 274 LOC (was ~140;
+grew after the thread-safety round added `write_batch` and
+`read_blob_batch`). The object-store-native variant
+(`pond-core/object_store_native_kernel.py`) adds ~280 LOC, plus
+storage backends (`local_fs_object_store.py` 443 LOC,
+`s3_object_store.py` 519 LOC) and the `make_kernel.py` factory (112
+LOC). The kernel is NOT "FROZEN" in the implementation sense — it
+has gained methods. The honest description is:
+
+> **6 substrates, 3 operations (`write`, `read`, `reference`) +
+> batch I/O helpers (`write_batch`, `read_blob`, `read_blob_batch`)
+> + ref-namespace helpers (`resolve`, `list_names`).**
+
+The batch helpers are **same-collection performance primitives** —
+they let a Lens issue parallel blob PUTs/GETs in one round-trip.
+They are NOT cross-collection atomicity (that lives in
+`services/replication/replication_coordinator.py` per axiom A7).
+Rich behavior must *emerge* from composition, not from kernel
+features. The honest substrate count is 6 (Bytes, Names, Time,
+Coordination, Range-Read, Key) — see the honesty note in §1.
 
 The kernel must stay small enough that a single engineer can hold the
 entire kernel in their head. If a proposed change makes the kernel too
 large to hold in one's head, it is rejected — even if it adds useful
-capability.
+capability. The thread-safety round added batch helpers without
+breaking this property — they are 3-5 line wrappers around `write`
+/ `read` that batch the underlying calls.
 
 **Test:** Can you describe the kernel in one sentence? ("Three
-primitives: write bytes, read bytes, mutate a name→hash mapping.")
-If you need a second sentence, the kernel has grown too complex.
+primitives: write bytes, read bytes, mutate a name→hash mapping;
+plus optional batch wrappers for same-collection performance.")
+If you need a second sentence beyond the batch-wrapper caveat, the
+kernel has grown too complex.
 
 ### 3.2 Powerful — rich behavior emerges from composition
 
@@ -305,7 +380,7 @@ RFCs decide.
 |---|---|---|---|
 | RFC-0001 | What Is a Lens? | Draft (superseded by RFC-0007) | The original draft definition of a Lens |
 | RFC-0002 | Elegance Metrics | Draft | How to measure architectural elegance |
-| RFC-0003 | Kernel Specification | **Accepted (FROZEN)** | The 3 primitives, 5 storage laws, 7 composition laws |
+| RFC-0003 | Kernel Specification | **Accepted (FROZEN)** | The 3 primitives, 5 storage laws, 7 composition laws. *(Note: "FROZEN" here means the RFC text is frozen as the spec; the kernel **implementation** is NOT frozen — see §3.1 and §1.1 Known Gaps for `write_batch`/`read_blob_batch`.)* |
 | RFC-0004 | View Composition | Draft | How Views compose (parallel and sequential) |
 | RFC-0005 | Derived Structures → Materialization | Draft (being renamed) | All auxiliary structures are `f(snapshot)` |
 | RFC-0006 | Layered Architecture | Draft | Layer 0–3, each adds one capability |
@@ -337,12 +412,13 @@ frozen.
 
 | Package | Layer | LOC | Responsibility |
 |---|---|---|---|
-| `pond-core` | 0 | ~420 | The kernel: `kernel.py` (PondMinimal, SQLite-backed, ~140 LOC) + `object_store_native_kernel.py` (ObjectStoreNativeKernel, no SQLite, ~280 LOC) + `s3_mock_backend.py` (S3 mock with latency). FROZEN. |
-| `pond-sdk` | 1–2 | ~3000 | `base_lens.py` (PondLens shared namespace), `prolly_tree.py` (ProllyLensBase), `binary_encoding.py`, `collection_metadata.py`, `best_effort.py`, `maintenance.py`, `uuid7.py`, extensions (`physical_structures/`: `unified_storage.py`, `collection_manifest.py`, `stats_tree.py`, `encoding.py`, `compression.py`, `column_source.py`, `embedded_stats.py`, etc.) |
-| `lenses/lakehouse` | 3 | ~2200 | LakehouseLens (Parquet + DuckDB + SQL pushdown). Flagship tabular lens. |
-| `lenses/keyvalue` | 3 | ~760 | KeyValueLens (ProllyTreeIndex + optional UnifiedStorage via `use_unified_storage=True`) |
-| `lenses/vector` | 3 | ~530 | VectorLens (k-NN search + optional UnifiedStorage). Linear scan; no HNSW/IVF. |
-| `lenses/streaming` | 3 | ~400 | StreamingLens (chunked segments + range reads). No consumer groups. |
+| `pond-core` | 0 | ~1630 | The kernel + storage backends: `kernel.py` (PondMinimal, 274 LOC; NOT FROZEN — has `write_batch`/`read_blob_batch` same-collection helpers) + `object_store_native_kernel.py` (ObjectStoreNativeKernel, no SQLite, ~280 LOC) + `local_fs_object_store.py` (443 LOC) + `s3_object_store.py` (519 LOC) + `s3_mock_backend.py` (latency-injecting mock) + `make_kernel.py` (112 LOC unified factory). |
+| `pond-sdk` | 1–2 | ~3000 | `base_lens.py` (PondLens shared namespace), `pond_storage.py` (PondStorage — the unified SDK class), `pond_config.py`, `maintenance.py`, `uuid7.py`, `hlc.py`, `row_query.py`, extensions (`physical_structures/`: `unified_storage.py` THE universal storage backend, `collection_manifest.py`, `stats_tree.py`, `encoding.py`, `compression.py`, `column_source.py`, `embedded_stats.py`, `pond_pack.py`; `indexing/`: `collection_index.py`, `ivf_index.py`, `hnsw_index.py`; `maintenance/vacuum.py`; `semantic/`). The legacy `prolly_tree.py`/`binary_encoding.py`/`collection_metadata.py` referenced in older docs are in `archive/legacy-sdk/` and `archive/legacy-extensions/`. |
+| `lenses/lakehouse` | 3 | ~2200 | LakehouseLens (Parquet + DuckDB + SQL pushdown). Flagship tabular lens. **NO base class** (documented exception — see §1.1 Known Gaps). |
+| `lenses/keyvalue` | 3 | ~760 | KeyValueLens (UnifiedStorage-backed; extends `PondLens` directly). |
+| `lenses/vector` | 3 | ~530 | VectorLens (k-NN search; UnifiedStorage-backed; extends `PondLens` directly). IVF index exists but does NOT yet reduce I/O (see §1.1 Known Gaps). HNSW index exists. |
+| `lenses/streaming` | 3 | ~400 | StreamingLens (chunked segments + range reads; extends `PondLens` directly). Kafka-like features (topics, partitions, consumer groups). `commit_hash` time-travel is NOT implemented in the unified path (see §1.1 Known Gaps). |
+| `lenses/oltp` | 3 | ~184 | OLTPLens (in-memory memtable + batch flush to CRDT shards; **NO base class** — documented exception). |
 | `services/` | 3 | ~500 | Schema registry, replication coordinator, transport (production) |
 | `pond-labs/` | 3 | ~3000 | Demos, benchmarks, tracks (validation suite) |
 
@@ -731,7 +807,7 @@ kernel. Five tracks executed:
 | Hazard tests | 0 | 0 | **10** |
 | TLA+ invariants proven | 0 | 0 | **6** |
 | Transport Layer implemented | no | no | **yes** |
-| Kernel LOC | ~140 | ~140 | **~140** (FROZEN throughout) |
+| Kernel LOC | ~140 | ~140 | **~140** (FROZEN throughout) *(Task 65 correction: `kernel.py` is now 274 LOC and NOT FROZEN — gained `write_batch`/`read_blob_batch` same-collection helpers; see §3.1)* |
 
 **Phase L soft spots status:**
 - §2.1 (API inspection only) — partially closed (TR3, TR6 now behavioral)
@@ -744,6 +820,15 @@ kernel. Five tracks executed:
 - §3.3 (Transport conceptual) — **closed** (implemented)
 
 **5 of 8 soft spots closed.** The kernel is FROZEN. The model is FROZEN. The proof is FROZEN.
+
+> **Task 65 correction.** The "kernel is FROZEN" claim here refers to
+> the Phase L *snapshot*, not the current implementation. As of the
+> thread-safety round, `pond-core/kernel.py` is 274 LOC and has gained
+> `write_batch` / `read_blob_batch` (same-collection performance
+> primitives). The *substrate/operation count* (6 substrates, 3
+> operations) is still frozen — adding a new substrate or operation
+> requires an Accepted RFC. Same-collection batch wrappers do not.
+> See §3.1 and §1.1 Known Gaps for the honest current state.
 
 ### Phase O — Remaining work (COMPLETE)
 
@@ -793,10 +878,10 @@ Dolt/Iceberg/FDB installs — not attempted in this environment).
 
 The Pond research project has reached its **final state**:
 
-- **Kernel**: 3 operations (`Write`, `Read`, `Ref`), ~140 LOC, FROZEN
+- **Kernel**: 3 operations (`Write`, `Read`, `Ref`), ~140 LOC, FROZEN *(Task 65 correction: now 274 LOC + same-collection batch helpers — see §3.1; substrate/operation count is still FROZEN, implementation is not)*
 - **Model**: 6 substrates, 10 axioms, 17 algebras, 0 open questions, FROZEN
 - **Proof**: 6 TLA+ invariants across 56 reachable states, FROZEN
-- **Tests**: 630 checks (562 property + 45 differential + 23 hazard), all passing, FROZEN
+- **Tests**: 630 checks (562 property + 45 differential + 23 hazard), all passing, FROZEN *(Task 65 note: check count is now higher — see `scripts/README.md` and the veteran's review for the current number; some self-tests fail per `docs/VETERAN_ARCHITECT_REVIEW.md`)*
 - **Transport Layer**: reference implementation in `services/transport/`
 
 The research question — *is a small-substrate kernel the right
@@ -873,7 +958,7 @@ and conceptual tests.
 | Engineering tests | 53 passing (P.1-P.4) |
 | TLA+ invariants | 6 proven across 56 reachable states |
 | **Total checks** | **683, all passing** |
-| Kernel LOC | ~140 (FROZEN throughout K, L, N, O, P) |
+| Kernel LOC | ~140 (FROZEN throughout K, L, N, O, P) *(Task 65 correction: now 274 LOC; substrate/operation count still FROZEN, implementation gained `write_batch`/`read_blob_batch` — see §3.1)* |
 | Packages built | pond-core, pond-sdk, pond-feature-store, pond-arrow, pond-transport (ref + prod), pond-schema, pond-replication |
 
 ### Status: internal consistency established; external validation pending
@@ -912,6 +997,13 @@ The kernel is FROZEN at ~140 LOC. The model is FROZEN at 17
 algebras. The internal consistency work (Phases K-P) is done. The
 external validation work (Phase Q) is the next phase. **Whether
 Pond is the right abstraction is not yet decided.**
+
+> **Task 65 correction.** "The kernel is FROZEN at ~140 LOC" was true
+> at Phase P snapshot time. As of the thread-safety round,
+> `pond-core/kernel.py` is 274 LOC and has gained same-collection
+> batch I/O helpers (`write_batch`, `read_blob_batch`). What is still
+> FROZEN is the *substrate/operation count* (6 substrates, 3
+> operations) — see §3.1. The model (17 algebras) is unchanged.
 
 ### Phase Q — Validation (IN PROGRESS)
 
@@ -1037,9 +1129,14 @@ If you are an agent picking up Pond work, do this in order:
 
 ### If you are an AI agent specifically
 
-- The kernel is FROZEN. Do not modify `pond-core/kernel.py`
-  without an Accepted RFC that passes the Admission Rule
-  (`rfcs/README.md`).
+- The kernel is NOT FROZEN at the implementation level — it has
+  gained `write_batch` and `read_blob_batch` (same-collection
+  performance primitives; not cross-collection atomicity). What
+  IS frozen is the **substrate/operation count** (6 substrates, 3
+  operations). Adding a new substrate or a new core operation
+  requires an Accepted RFC that passes the Admission Rule
+  (`rfcs/README.md`). Same-collection batch wrappers and bug fixes
+  do not require an RFC.
 - Do not add features to the kernel to solve Lens-level problems.
   The answer to "the kernel can't do X" is almost always "X is a
   Lens-level pattern, not a kernel primitive." See RFC-0008 for
@@ -1113,11 +1210,35 @@ streaming) to be competitive.
 
 ### What's NOT built (honest gaps)
 
+> **Task 65 update.** Several items below were true when §10 was written
+> but are no longer accurate. Rather than rewrite history, the per-item
+> status is annotated inline. The authoritative current gap list is
+> **§1.1 Known gaps (post-veteran-architect review)** — read that
+> first.
+
 - **No HNSW/IVF for vector search** — linear scan only. Not usable at >100K vectors.
+  *(Task 65 status: **partly outdated.** `pond-sdk/extensions/indexing/hnsw_index.py`
+  and `ivf_index.py` now exist. HNSW is implemented per its docstring.
+  IVF exists but does NOT reduce I/O — it reads all vectors then filters
+  in Python. See §1.1 Known Gaps.)*
 - **No transactions** — single-writer per Ref. No cross-collection atomicity.
+  *(Task 65 status: **partly outdated.** `commit_tx` provides atomic
+  publication across collections (all-or-nothing HEAD pointer moves).
+  But there is no isolation, no rollback, no serializability — see
+  §1.1 Known Gaps. The honest term is "atomic publication," not "ACID.")*
 - **No consumer groups / partitioning** in StreamingLens.
+  *(Task 65 status: **outdated.** `StreamingLens` now has `create_topic`,
+  `list_partitions`, `produce`, `produce_round_robin`, `get_latest_offset`,
+  `consume`, `commit_offset`, `list_consumer_groups`,
+  `get_consumer_group_offsets`, `replay_from`. See `lenses/streaming/streaming_lens.py`.)*
 - **LakehouseLens still defaults to PondMinimal (SQLite)** — not yet migrated to ObjectStoreNativeKernel.
+  *(Task 65 status: **needs verification.** The `make_kernel()` factory
+  routes `file://` and `s3://` URLs to `ObjectStoreNativeKernel`; whether
+  LakehouseLens actually uses this path by default is unverified.)*
 - **No production S3 backend** — only InMemoryObjectStore with simulated latency.
+  *(Task 65 status: **outdated.** `pond-core/s3_object_store.py` is a real
+  boto3-backed store. R2/S3 integration tests (`scripts/test_s3_integration.py`,
+  `scripts/benchmark_full_r2.py`) exercise it against moto and real R2.)*
 - **No PB-scale benchmark** — max tested is 30K row groups (smoke test, not perf).
 - **Git lens is archived** — 63-line prototype, not shipped.
 

@@ -4,7 +4,8 @@ Reads the dataset created by demo_r2_with_history.py directly from R2.
 No local data — everything is fetched from Cloudflare R2.
 
 Usage:
-  python scripts/query_r2_demo.py
+  R2_ENDPOINT=... R2_ACCESS_KEY=... R2_SECRET_KEY=... R2_BUCKET=... \
+      python scripts/query_r2_demo.py
 """
 import os, sys, time, json
 
@@ -13,14 +14,15 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "pond-core"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
 sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_structures"))
+sys.path.insert(0, HERE)  # for _r2_config
 
 from s3_object_store import S3ObjectStore
 from object_store_native_kernel import ObjectStoreNativeKernel
 from pond_storage import PondStorage
-import boto3
-from botocore.config import Config
+from _r2_config import get_r2_access_key, get_r2_secret_key
 
-# Load saved history
+# Load saved history (endpoint/bucket/prefix come from the history file,
+# but credentials MUST come from env vars — never hardcoded)
 history_file = os.path.join(HERE, "r2_demo_history.json")
 with open(history_file) as f:
     demo = json.load(f)
@@ -30,16 +32,18 @@ R2_BUCKET = demo["bucket"]
 PREFIX = demo["prefix"]
 SAVED_HISTORY = demo["history"]
 
-# R2 credentials (same as demo script)
-R2_ACCESS_KEY = "4331a4a6283b1d929cda0085d24450e0"
-R2_SECRET_KEY = "286c9be9d520e15fee90145147a43f15001209d192b63ca7a9e2ba53dde31122"
-
+# Credentials always come from env vars (the history file is shareable;
+# credentials are not). Endpoint/bucket/prefix come from the history file
+# so the query script reads from the same place the demo wrote to.
+import boto3
+from botocore.config import Config
 config = Config(
     connect_timeout=5.0, read_timeout=60.0, max_pool_connections=50,
     retries={"max_attempts": 5, "mode": "adaptive"},
 )
 client = boto3.client("s3", endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY, aws_secret_access_key=R2_SECRET_KEY,
+    aws_access_key_id=get_r2_access_key(),
+    aws_secret_access_key=get_r2_secret_key(),
     region_name="auto", config=config)
 
 store = S3ObjectStore(client, bucket=R2_BUCKET, prefix=PREFIX)

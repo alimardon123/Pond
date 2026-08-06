@@ -107,7 +107,8 @@ class KeyValueLens(PondLens):
     """
 
     def __init__(self, kernel: PondMinimal, name: Optional[str] = None,
-                 use_unified_storage: bool = True):
+                 use_unified_storage: bool = True,
+                 compact_after_commit: bool = True):
         """Create a KeyValueLens.
 
         Args:
@@ -118,6 +119,14 @@ class KeyValueLens(PondLens):
                   There is now only ONE storage path — the unified
                   manifest-based architecture. All lenses use PND2
                   blobs + CollectionManifest + JSON commit blobs.
+            compact_after_commit: if True (default), call compact_shards()
+                  after every commit that uses append(). This keeps HEAD
+                  current so branch/merge/history see the latest data
+                  immediately. Set to False for high-write-throughput
+                  workloads where you accept eventual consistency on
+                  HEAD (read_with_shards still sees all data; only
+                  history()/branch() need a separate compact call).
+                  See VETERAN_ARCHITECT_REVIEW.md §3.7 for the tradeoff.
         """
         super().__init__(kernel)
         self._default_collection = name
@@ -125,6 +134,7 @@ class KeyValueLens(PondLens):
             self.name = name
         # Attached indexer for auto-notify on commit (set via attach_indexer)
         self._attached_indexer = None
+        self._compact_after_commit = compact_after_commit
 
         # Unified storage backend (the ONLY storage path)
         self._unified_storage = None
@@ -356,7 +366,12 @@ class KeyValueLens(PondLens):
                     # control needs HEAD to be current). Tombstones survive
                     # compaction because delete_shard was called with keys=
                     # (distinct rg_keys per tombstone).
-                    self._unified_storage.compact_shards(collection)
+                    #
+                    # NOTE: this is O(N) per commit. For high-write workloads,
+                    # set compact_after_commit=False and compact periodically
+                    # via a background job. See VETERAN_ARCHITECT_REVIEW.md §3.7.
+                    if self._compact_after_commit:
+                        self._unified_storage.compact_shards(collection)
                     if not commit_hash:
                         commit_hash = put_hash
 
@@ -393,7 +408,9 @@ class KeyValueLens(PondLens):
                 # Compact shards into HEAD so branch/merge/history see
                 # the latest data (append uses shards, but version
                 # control needs HEAD to be current).
-                self._unified_storage.compact_shards(collection)
+                # See NOTE above about compact_after_commit flag.
+                if self._compact_after_commit:
+                    self._unified_storage.compact_shards(collection)
         else:
             commit_hash = ""
 

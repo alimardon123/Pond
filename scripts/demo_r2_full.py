@@ -14,7 +14,8 @@ Then tests cross-lens bidirectional access:
 Data is LEFT on R2 under 'pond-full-demo' for inspection.
 
 Usage:
-  python scripts/demo_r2_full.py
+  R2_ENDPOINT=... R2_ACCESS_KEY=... R2_SECRET_KEY=... R2_BUCKET=... \
+      python scripts/demo_r2_full.py
 """
 import os, sys, time, json, tempfile
 
@@ -26,27 +27,17 @@ sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_struct
 sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))
 sys.path.insert(0, os.path.join(REPO, "lenses", "vector"))
 sys.path.insert(0, os.path.join(REPO, "lenses", "streaming"))
+sys.path.insert(0, HERE)  # for _r2_config
 
 from s3_object_store import S3ObjectStore
 from object_store_native_kernel import ObjectStoreNativeKernel
 from pond_storage import PondStorage
-import boto3
-from botocore.config import Config
+from _r2_config import get_r2_client, get_r2_bucket
 import duckdb
 
-# R2 credentials
-R2_ENDPOINT = "https://81425c4736b181e41dc82c32050a5207.r2.cloudflarestorage.com"
-R2_ACCESS_KEY = "4331a4a6283b1d929cda0085d24450e0"
-R2_SECRET_KEY = "286c9be9d520e15fee90145147a43f15001209d192b63ca7a9e2ba53dde31122"
-R2_BUCKET = "pondbucket"
+R2_BUCKET = get_r2_bucket()
 PREFIX = "pond-full-demo"
-
-# Clean up old demo first, then create fresh
-config = Config(connect_timeout=5.0, read_timeout=120.0, max_pool_connections=50,
-                retries={"max_attempts": 5, "mode": "adaptive"})
-client = boto3.client("s3", endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY, aws_secret_access_key=R2_SECRET_KEY,
-    region_name="auto", config=config)
+client = get_r2_client()
 
 # Delete old demo data
 print("=== Cleaning up old demo data ===")
