@@ -152,13 +152,13 @@ for n_rows in [1_000, 10_000, 100_000]:
 # 2. POINT LOOKUP — cold, warm, at scale
 # =============================================================================
 print("\n" + "=" * 80)
-print("  2. POINT LOOKUP — cold, warm (10K rows, 100 row groups)")
+print("  2. POINT LOOKUP — cold, warm (10K rows, 1 row group (default size))")
 print("=" * 80)
 
 kernel, store = make_kernel()
 s = PondStorage(kernel)
 s.write("lookup", [{"id": i, "v": f"v{i}"} for i in range(10_000)],
-        key_col="id", row_group_size=100)
+        key_col="id", row_group_size=10_000)
 
 # Cold lookup
 reset(kernel, store)
@@ -184,14 +184,14 @@ record("point_lookup_warm", "10K", warm, st_warm)
 # 3. FULL SCAN + PRUNED SCANS
 # =============================================================================
 print("\n" + "=" * 80)
-print("  3. FULL SCAN + PRUNED SCANS — 10K rows, 100 row groups")
+print("  3. FULL SCAN + PRUNED SCANS — 10K rows, 1 row group (default size)")
 print("=" * 80)
 
 kernel, store = make_kernel()
 s = PondStorage(kernel)
 s.write("scan", [{"id": i, "v": f"v{i}", "age": i % 100, "region": ["US","EU","ASIA"][i%3]}
                  for i in range(10_000)],
-        key_col="id", row_group_size=100)
+        key_col="id", row_group_size=10_000)
 
 # Full scan
 reset(kernel, store)
@@ -303,7 +303,7 @@ print("=" * 80)
 kernel, store = make_kernel()
 s = PondStorage(kernel)
 s.write("branch", [{"id": i, "v": f"v{i}"} for i in range(1000)],
-        key_col="id", row_group_size=100)
+        key_col="id", row_group_size=10_000)
 
 # Branch
 reset(kernel, store)
@@ -390,7 +390,7 @@ print("=" * 80)
 kernel, store = make_kernel()
 s = PondStorage(kernel)
 s.write("compact", [{"id": i, "v": f"v{i}"} for i in range(1000)],
-        key_col="id", row_group_size=100)
+        key_col="id", row_group_size=10_000)
 
 # Add 5 shards (manifest-level compaction eligible)
 for i in range(5):
@@ -411,7 +411,7 @@ record("compact_manifest", "1K+5shards", compact_t, st)
 kernel2, store2 = make_kernel()
 s2 = PondStorage(kernel2)
 s2.write("compact_row", [{"id": i, "v": f"v{i}"} for i in range(100)],
-          key_col="id", row_group_size=100)
+          key_col="id", row_group_size=10_000)
 
 # Upsert some rows (creates _rowid columns → triggers row-level compaction)
 s2.upsert_shard("compact_row", [{"id": 50, "v": "updated"}], key_col="id")
@@ -436,7 +436,7 @@ print("=" * 80)
 kernel, store = make_kernel()
 s = PondStorage(kernel)
 s.write("crdt_row", [{"id": i, "v": f"v{i}"} for i in range(100)],
-        key_col="id", row_group_size=100)
+        key_col="id", row_group_size=10_000)
 
 # Upsert
 reset(kernel, store)
@@ -482,11 +482,11 @@ print("=" * 80)
 kernel, store = make_kernel()
 s = PondStorage(kernel)
 s.write("history", [{"id": i, "v": f"v1_{i}"} for i in range(100)],
-        key_col="id", row_group_size=100)
+        key_col="id", row_group_size=10_000)
 commit1 = s._unified._head_cache.get("history")
 
 s.write("history", [{"id": i, "v": f"v2_{i}"} for i in range(100)],
-        key_col="id", row_group_size=100)
+        key_col="id", row_group_size=10_000)
 commit2 = s._unified._head_cache.get("history")
 
 # History
@@ -554,7 +554,7 @@ print("=" * 80)
 kernel_a, store_a = make_kernel()
 s_a = PondStorage(kernel_a)
 s_a.write("multi", [{"id": i, "v": f"v{i}"} for i in range(100)],
-          key_col="id", row_group_size=100)
+          key_col="id", row_group_size=10_000)
 
 # Process B reads
 kernel_b, store_b = make_kernel()
