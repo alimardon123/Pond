@@ -176,6 +176,167 @@ int main(void) {
     free(big);
 
     /* ------------------------------------------------------------- */
+    /* Test 5: Decode Python-generated blobs (all encodings)         */
+    /*                                                               */
+    /* Loads PND2 blobs produced by pond-sdk's Python encoder and    */
+    /* verifies the C ABI decodes them correctly. This proves the    */
+    /* Rust decoder is byte-compatible with the Python encoder.      */
+    /* ------------------------------------------------------------- */
+    printf("\n[Test 5] Decode Python-generated blobs (all encodings)\n");
+
+    /* Helper: load a file into a malloc'd buffer. */
+    /* (We do this inline rather than via a helper function to keep the
+     * test self-contained — no extra headers beyond stdio.) */
+
+    struct blob_test {
+        const char *filename;
+        uint8_t expected_vtype;   /* 1=INT64, 2=FLOAT64, 3=STRING, 5=BINARY */
+        size_t expected_n_values; /* 0 = skip the count check */
+        const char *expected_col_name;
+    };
+
+    /* Paths are relative to the pond-rust/ directory (where the test
+     * binary lives in target/test_c_abi). */
+    struct blob_test tests[] = {
+        {"tests/test_blobs/i64_raw.bin",     1, 8,   "v"},
+        {"tests/test_blobs/f64_raw.bin",     2, 8,   "v"},
+        {"tests/test_blobs/str_raw.bin",     3, 5,   "v"},
+        {"tests/test_blobs/i64_rle.bin",     1, 100, "v"},
+        {"tests/test_blobs/str_dict.bin",    3, 10,  "v"},
+        {"tests/test_blobs/i64_bitpack.bin", 1, 200, "v"},
+        {"tests/test_blobs/bin_raw.bin",     5, 5,   "v"},
+    };
+    size_t n_tests = sizeof(tests) / sizeof(tests[0]);
+
+    for (size_t t = 0; t < n_tests; t++) {
+        const char *fname = tests[t].filename;
+        FILE *f = fopen(fname, "rb");
+        if (!f) {
+            /* Skip silently — blobs may not have been generated yet.
+             * User must run tests/generate_test_blobs.py first. */
+            printf("  [skip] %s (file not found — run tests/generate_test_blobs.py)\n", fname);
+            continue;
+        }
+        fseek(f, 0, SEEK_END);
+        long fsize = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        uint8_t *buf = malloc(fsize);
+        size_t nread = fread(buf, 1, fsize, f);
+        fclose(f);
+        CHECK(nread == (size_t)fsize, "blob file read fully");
+
+        PondResult *r = pond_pnd2_decode(buf, fsize);
+        CHECK(r != NULL, "decode Python-generated blob succeeds");
+
+        if (r != NULL) {
+            size_t n_cols = pond_result_num_columns(r);
+            CHECK(n_cols == 1, "Python blob has 1 column");
+
+            const char *cname = pond_result_column_name(r, 0);
+            CHECK(cname != NULL, "column name is non-null");
+            if (cname != NULL) {
+                CHECK(strcmp(cname, tests[t].expected_col_name) == 0,
+                      "column name matches expected");
+            }
+
+            uint8_t vtype = pond_result_column_vtype(r, 0);
+            CHECK(vtype == tests[t].expected_vtype,
+                  "column vtype matches expected");
+
+            if (tests[t].expected_n_values > 0) {
+                size_t n_vals = pond_result_column_len(r, 0);
+                CHECK(n_vals == tests[t].expected_n_values,
+                      "column has expected value count");
+            }
+
+            /* For INT64 columns, sanity-check the first value is accessible */
+            if (vtype == 1) {
+                const int64_t *p = pond_result_column_i64(r, 0);
+                CHECK(p != NULL, "i64 data pointer is non-null");
+            }
+
+            /* For FLOAT64 columns, sanity-check the data pointer */
+            if (vtype == 2) {
+                const double *p = pond_result_column_f64(r, 0);
+                CHECK(p != NULL, "f64 data pointer is non-null");
+            }
+
+            /* For STRING columns, sanity-check the first string */
+            if (vtype == 3) {
+                const char *s = pond_result_column_str(r, 0, 0);
+                CHECK(s != NULL, "first string value is non-null");
+            }
+
+            /* For BINARY columns, sanity-check the first value */
+            if (vtype == 5) {
+                const uint8_t *bin_ptr = NULL;
+                size_t bin_len = 0;
+                int32_t brc = pond_result_column_bin(r, 0, 0, &bin_ptr, &bin_len);
+                CHECK(brc == 0, "binary accessor returns 0");
+                CHECK(bin_ptr != NULL, "first binary value pointer is non-null");
+                CHECK(bin_len > 0, "first binary value has non-zero length");
+            }
+
+            /* Capture value count before freeing */
+            size_t decoded_n = pond_result_column_len(r, 0);
+            pond_result_free(r);
+            printf("  [ok]   %s (vtype=%u, n_values=%zu)\n",
+                   fname, vtype, decoded_n);
+        }
+
+        free(buf);
+    }
+
+    /* ------------------------------------------------------------- */
+    /* Test 6: FLOAT64 + STRING encode via the new C ABI encoders    */
+    /* ------------------------------------------------------------- */
+    printf("\n[Test 6] FLOAT64 + STRING C ABI encoders\n");
+    double f64_in[] = {1.5, 2.5, 3.5, -0.5, 99.99};
+    size_t f64_n = sizeof(f64_in) / sizeof(f64_in[0]);
+    uint8_t *f64_blob = NULL;
+    size_t f64_blob_len = 0;
+    rc = pond_pnd2_encode_f64(f64_in, f64_n, &f64_blob, &f64_blob_len);
+    CHECK(rc == 0, "pond_pnd2_encode_f64 returns 0");
+    CHECK(f64_blob != NULL, "f64 blob is non-null");
+    CHECK(f64_blob_len > 13, "f64 blob length exceeds header");
+
+    PondResult *f64_r = pond_pnd2_decode(f64_blob, f64_blob_len);
+    CHECK(f64_r != NULL, "decode f64 blob succeeds");
+    CHECK(pond_result_column_vtype(f64_r, 0) == 2, "f64 column vtype is FLOAT64");
+    CHECK(pond_result_column_len(f64_r, 0) == f64_n, "f64 column has correct length");
+    const double *f64_out = pond_result_column_f64(f64_r, 0);
+    int f64_match = 1;
+    for (size_t i = 0; i < f64_n; i++) {
+        if (f64_out[i] != f64_in[i]) { f64_match = 0; break; }
+    }
+    CHECK(f64_match, "all f64 values match after round-trip");
+    pond_result_free(f64_r);
+    pond_blob_free(f64_blob, f64_blob_len);
+
+    /* STRING encoder */
+    const char *str_in[] = {"alpha", "beta", "gamma", "delta", "epsilon"};
+    size_t str_n = sizeof(str_in) / sizeof(str_in[0]);
+    uint8_t *str_blob = NULL;
+    size_t str_blob_len = 0;
+    rc = pond_pnd2_encode_str(str_in, str_n, &str_blob, &str_blob_len);
+    CHECK(rc == 0, "pond_pnd2_encode_str returns 0");
+    CHECK(str_blob != NULL, "str blob is non-null");
+    CHECK(str_blob_len > 13, "str blob length exceeds header");
+
+    PondResult *str_r = pond_pnd2_decode(str_blob, str_blob_len);
+    CHECK(str_r != NULL, "decode str blob succeeds");
+    CHECK(pond_result_column_vtype(str_r, 0) == 3, "str column vtype is STRING");
+    CHECK(pond_result_column_len(str_r, 0) == str_n, "str column has correct length");
+    int str_match = 1;
+    for (size_t i = 0; i < str_n; i++) {
+        const char *s = pond_result_column_str(str_r, 0, i);
+        if (s == NULL || strcmp(s, str_in[i]) != 0) { str_match = 0; break; }
+    }
+    CHECK(str_match, "all str values match after round-trip");
+    pond_result_free(str_r);
+    pond_blob_free(str_blob, str_blob_len);
+
+    /* ------------------------------------------------------------- */
     /* Summary                                                       */
     /* ------------------------------------------------------------- */
     printf("\n=== Summary ===\n");

@@ -1,13 +1,16 @@
 // Pond Python Bindings — PyO3 wrapper around pond-core
 //
 // This crate compiles to a Python extension module named `pond_rust`.
-// It exposes the full PND2 decode/encode pipeline to Python, including
-// all encodings (RAW, RLE, DICT, BITPACK), all value types (INT64,
-// FLOAT64, STRING, BINARY, NULL), zstd decompression, and predicate
-// pushdown via Python-side filter functions.
+// It exposes the full PND2 decode/encode pipeline to Python.
 //
-// All pure-Rust logic (constants, parser, C ABI) lives in `pond-core`.
-// This file only contains the PyO3-specific glue.
+// All decode/encode LOGIC lives in `pond-core`. This file is the thin
+// PyO3 glue layer that:
+//   1. Accepts Python args (bytes, lists, tuples)
+//   2. Calls into pond-core's pure-Rust functions
+//   3. Converts the Rust result types into Python objects
+//
+// This is the correct architecture: the decoder is implemented ONCE in
+// pure Rust, and both the C ABI (in pond-core) and Python (here) use it.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
@@ -19,7 +22,7 @@ use pond_core::{
     COMPRESSION_NONE, COMPRESSION_ZSTD,
     VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY,
     ENC_RAW, ENC_RLE, ENC_DICT, ENC_BITPACK,
-    PND2Parser,
+    PND2Parser, PondColumn,
 };
 
 // ---------------------------------------------------------------------------
@@ -127,8 +130,10 @@ fn decode(
             continue;
         }
 
-        let values = decode_column(py, payload, *vtype, *enc, n_rows)?;
-        result.set_item(name, values)?;
+        // Delegate to pond-core's pure-Rust decoder
+        let col = pond_core::decode_column(payload, *vtype, *enc, n_rows);
+        let py_values = column_to_pylist(py, &col)?;
+        result.set_item(name, py_values)?;
     }
 
     // Predicate pushdown: filter rows in Python after decode.
@@ -139,6 +144,44 @@ fn decode(
     }
 
     Ok(result.into())
+}
+
+/// Convert a `pond_core::PondColumn` into a Python list of values.
+///
+/// Handles all value types: INT64, FLOAT64, STRING, BINARY.
+/// NULL values (which pond-core represents as empty strings/vecs for
+/// bitmap-encoded rows) become Python None.
+fn column_to_pylist(py: Python, col: &PondColumn) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    match col.vtype {
+        VT_INT64 => {
+            for v in &col.i64_data { list.append(*v)?; }
+        }
+        VT_FLOAT64 => {
+            for v in &col.f64_data { list.append(*v)?; }
+        }
+        VT_STRING => {
+            // CString → &str via to_str (safe — we know the bytes are valid UTF-8
+            // because pond-core built them via bytes_to_cstring which preserves
+            // the input bytes; if the input had invalid UTF-8, the original
+            // decode path used String::from_utf8_lossy so the bytes are already
+            // valid UTF-8 replacement sequences).
+            for v in &col.str_data {
+                let s = v.to_str().unwrap_or("").to_string();
+                list.append(s)?;
+            }
+        }
+        VT_BINARY => {
+            for v in &col.bin_data {
+                list.append(PyBytes::new_bound(py, v))?;
+            }
+        }
+        _ => {
+            // Unknown vtype — emit None for each row.
+            for _ in 0..col.n_values { list.append(py.None())?; }
+        }
+    }
+    Ok(list.into())
 }
 
 /// Apply row-level predicates to the decoded result, returning only matching rows.
@@ -210,419 +253,6 @@ fn apply_predicates(
     Ok(filtered.into())
 }
 
-/// Decode a single column's payload into a Python list.
-fn decode_column(
-    py: Python,
-    payload: &[u8],
-    vtype: u8,
-    enc: u8,
-    n_rows: usize,
-) -> PyResult<PyObject> {
-    match enc {
-        ENC_RAW => decode_raw(py, payload, vtype, n_rows),
-        ENC_BITPACK => decode_bitpack(py, payload, n_rows),
-        ENC_DICT => decode_dict(py, payload, vtype, n_rows),
-        ENC_RLE => decode_rle(py, payload, vtype, n_rows),
-        _ => Ok(PyList::empty_bound(py).into()),
-    }
-}
-
-/// Decode RAW encoding: value_type(1B) + bitmap(optional) + raw values
-fn decode_raw(py: Python, payload: &[u8], vtype: u8, n_rows: usize) -> PyResult<PyObject> {
-    if payload.is_empty() {
-        return Ok(PyList::empty_bound(py).into());
-    }
-
-    // BINARY (vtype=5) uses a DIFFERENT format:
-    //   n_values(4B) + [length(4B) + bytes] * n_values
-    if vtype == VT_BINARY {
-        let list = PyList::empty_bound(py);
-        if payload.len() < 4 {
-            return Ok(list.into());
-        }
-        let n_values = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-        let mut off = 4;
-        for _ in 0..n_values {
-            if off + 4 > payload.len() { break; }
-            let blen = u32::from_le_bytes([payload[off], payload[off+1], payload[off+2], payload[off+3]]);
-            off += 4;
-            if blen == 0xFFFFFFFF {
-                list.append(py.None())?;
-            } else if blen == 0 {
-                list.append(PyBytes::new_bound(py, b""))?;
-            } else if off + blen as usize <= payload.len() {
-                list.append(PyBytes::new_bound(py, &payload[off..off+blen as usize]))?;
-                off += blen as usize;
-            } else {
-                break;
-            }
-        }
-        return Ok(list.into());
-    }
-
-    // Non-BINARY: first byte is value_type
-    let data = &payload[1..];
-
-    match vtype {
-        VT_INT64 => {
-            let n = data.len() / 8;
-            let list = PyList::empty_bound(py);
-            for i in 0..n.min(n_rows) {
-                let o = i * 8;
-                let v = i64::from_le_bytes([
-                    data[o], data[o+1], data[o+2], data[o+3],
-                    data[o+4], data[o+5], data[o+6], data[o+7]
-                ]);
-                list.append(v)?;
-            }
-            Ok(list.into())
-        }
-        VT_FLOAT64 => {
-            let n = data.len() / 8;
-            let list = PyList::empty_bound(py);
-            for i in 0..n.min(n_rows) {
-                let o = i * 8;
-                let v = f64::from_le_bytes([
-                    data[o], data[o+1], data[o+2], data[o+3],
-                    data[o+4], data[o+5], data[o+6], data[o+7]
-                ]);
-                list.append(v)?;
-            }
-            Ok(list.into())
-        }
-        VT_STRING | VT_BINARY => {
-            // String/Binary RAW format with optional null bitmap.
-            let list = PyList::empty_bound(py);
-
-            let vals_data = data;
-            let mut vals: Vec<&[u8]> = Vec::with_capacity(n_rows);
-            let mut off = 0;
-            while off + 4 <= vals_data.len() && vals.len() < n_rows {
-                let slen = u32::from_le_bytes([
-                    vals_data[off], vals_data[off+1],
-                    vals_data[off+2], vals_data[off+3]
-                ]) as usize;
-                off += 4;
-                if slen == 0xFFFFFFFF {
-                    vals.push(&[]);
-                } else if off + slen <= vals_data.len() {
-                    vals.push(&vals_data[off..off+slen]);
-                    off += slen;
-                } else {
-                    break;
-                }
-            }
-
-            if vals.len() == n_rows {
-                for v in &vals {
-                    if vtype == VT_STRING {
-                        list.append(String::from_utf8_lossy(v).to_string())?;
-                    } else {
-                        list.append(PyBytes::new_bound(py, v))?;
-                    }
-                }
-            } else if vals.len() < n_rows {
-                // Maybe there's a null bitmap. Try parsing with bitmap.
-                let bitmap_size = (n_rows + 7) / 8;
-                if vals_data.len() > bitmap_size {
-                    let bitmap = &vals_data[..bitmap_size];
-                    let vals_after_bitmap = &vals_data[bitmap_size..];
-
-                    let mut vals2: Vec<&[u8]> = Vec::with_capacity(n_rows);
-                    let mut off2 = 0;
-                    while off2 + 4 <= vals_after_bitmap.len() && vals2.len() < n_rows {
-                        let slen = u32::from_le_bytes([
-                            vals_after_bitmap[off2], vals_after_bitmap[off2+1],
-                            vals_after_bitmap[off2+2], vals_after_bitmap[off2+3]
-                        ]) as usize;
-                        off2 += 4;
-                        if slen == 0xFFFFFFFF {
-                            vals2.push(&[]);
-                        } else if off2 + slen <= vals_after_bitmap.len() {
-                            vals2.push(&vals_after_bitmap[off2..off2+slen]);
-                            off2 += slen;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Apply bitmap: 1=null, 0=valid (Arrow convention)
-                    let mut val_idx = 0;
-                    for i in 0..n_rows {
-                        if bitmap[i / 8] & (1 << (i % 8)) != 0 {
-                            list.append(py.None())?;
-                        } else if val_idx < vals2.len() {
-                            if vtype == VT_STRING {
-                                list.append(String::from_utf8_lossy(vals2[val_idx]).to_string())?;
-                            } else {
-                                list.append(PyBytes::new_bound(py, vals2[val_idx]))?;
-                            }
-                            val_idx += 1;
-                        } else {
-                            list.append(py.None())?;
-                        }
-                    }
-                } else {
-                    for v in &vals {
-                        if vtype == VT_STRING {
-                            list.append(String::from_utf8_lossy(v).to_string())?;
-                        } else {
-                            list.append(PyBytes::new_bound(py, v))?;
-                        }
-                    }
-                    while list.len() < n_rows {
-                        list.append(py.None())?;
-                    }
-                }
-            } else {
-                for v in vals.iter().take(n_rows) {
-                    if vtype == VT_STRING {
-                        list.append(String::from_utf8_lossy(v).to_string())?;
-                    } else {
-                        list.append(PyBytes::new_bound(py, v))?;
-                    }
-                }
-            }
-            Ok(list.into())
-        }
-        _ => Ok(PyList::empty_bound(py).into()),
-    }
-}
-
-/// Decode BITPACK encoding: bitwidth(1B) + offset(8B) + min(8B) + max(8B) + packed bits
-fn decode_bitpack(py: Python, payload: &[u8], n_rows: usize) -> PyResult<PyObject> {
-    if payload.len() < 25 {
-        return Ok(PyList::empty_bound(py).into());
-    }
-
-    let bitwidth = payload[0] as usize;
-    let offset = i64::from_le_bytes([
-        payload[1], payload[2], payload[3], payload[4],
-        payload[5], payload[6], payload[7], payload[8]
-    ]);
-    let packed = &payload[25..];
-
-    if bitwidth == 0 || bitwidth > 64 {
-        return Ok(PyList::empty_bound(py).into());
-    }
-
-    let list = PyList::empty_bound(py);
-    let mut bit_pos = 0usize;
-
-    for _ in 0..n_rows {
-        let byte_pos = bit_pos / 8;
-        if byte_pos >= packed.len() { break; }
-
-        let mut val: u64 = 0;
-        for b in 0..bitwidth {
-            let bp = bit_pos + b;
-            let bp_byte = bp / 8;
-            if bp_byte >= packed.len() { break; }
-            if packed[bp_byte] & (1 << (bp % 8)) != 0 {
-                val |= 1u64 << b;
-            }
-        }
-
-        list.append(val as i64 + offset)?;
-        bit_pos += bitwidth;
-    }
-
-    Ok(list.into())
-}
-
-/// Decode DICT encoding: n_unique(4B) + value_type(1B) + [value_bytes]*N + code_bitwidth(1B) + packed_codes
-fn decode_dict(py: Python, payload: &[u8], vtype: u8, n_rows: usize) -> PyResult<PyObject> {
-    if payload.is_empty() {
-        return Ok(PyList::empty_bound(py).into());
-    }
-
-    let data = payload;
-    if data.len() < 5 {
-        return Ok(PyList::empty_bound(py).into());
-    }
-
-    let n_unique = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let dict_vtype = data[4];
-    let mut off = 5;
-
-    let mut dict_int_vals: Vec<i64> = Vec::new();
-    let mut dict_float_vals: Vec<f64> = Vec::new();
-    let mut dict_str_vals: Vec<Vec<u8>> = Vec::new();
-
-    match dict_vtype {
-        VT_INT64 => {
-            for _ in 0..n_unique {
-                if off + 8 > data.len() { break; }
-                dict_int_vals.push(i64::from_le_bytes([
-                    data[off], data[off+1], data[off+2], data[off+3],
-                    data[off+4], data[off+5], data[off+6], data[off+7]
-                ]));
-                off += 8;
-            }
-        }
-        VT_FLOAT64 => {
-            for _ in 0..n_unique {
-                if off + 8 > data.len() { break; }
-                dict_float_vals.push(f64::from_le_bytes([
-                    data[off], data[off+1], data[off+2], data[off+3],
-                    data[off+4], data[off+5], data[off+6], data[off+7]
-                ]));
-                off += 8;
-            }
-        }
-        VT_STRING | VT_BINARY => {
-            for _ in 0..n_unique {
-                if off + 4 > data.len() { break; }
-                let slen = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-                off += 4;
-                if off + slen <= data.len() {
-                    dict_str_vals.push(data[off..off+slen].to_vec());
-                    off += slen;
-                } else { break; }
-            }
-        }
-        _ => {}
-    }
-
-    if off >= data.len() {
-        return Ok(PyList::empty_bound(py).into());
-    }
-
-    let code_bitwidth = data[off] as usize;
-    off += 1;
-    let packed_codes = &data[off..];
-
-    if code_bitwidth == 0 || code_bitwidth > 64 {
-        return Ok(PyList::empty_bound(py).into());
-    }
-
-    let list = PyList::empty_bound(py);
-    let mut bit_pos = 0usize;
-
-    for _ in 0..n_rows {
-        let byte_pos = bit_pos / 8;
-        if byte_pos >= packed_codes.len() { break; }
-
-        let mut code: u64 = 0;
-        for b in 0..code_bitwidth {
-            let bp = bit_pos + b;
-            let bp_byte = bp / 8;
-            if bp_byte >= packed_codes.len() { break; }
-            if packed_codes[bp_byte] & (1 << (bp % 8)) != 0 {
-                code |= 1u64 << b;
-            }
-        }
-
-        let code_idx = code as usize;
-        match dict_vtype {
-            VT_INT64 => {
-                if code_idx < dict_int_vals.len() {
-                    list.append(dict_int_vals[code_idx])?;
-                } else { list.append(py.None())?; }
-            }
-            VT_FLOAT64 => {
-                if code_idx < dict_float_vals.len() {
-                    list.append(dict_float_vals[code_idx])?;
-                } else { list.append(py.None())?; }
-            }
-            VT_STRING => {
-                if code_idx < dict_str_vals.len() {
-                    list.append(String::from_utf8_lossy(&dict_str_vals[code_idx]).to_string())?;
-                } else { list.append(py.None())?; }
-            }
-            VT_BINARY => {
-                if code_idx < dict_str_vals.len() {
-                    list.append(PyBytes::new_bound(py, &dict_str_vals[code_idx]))?;
-                } else { list.append(py.None())?; }
-            }
-            _ => list.append(py.None())?,
-        }
-        bit_pos += code_bitwidth;
-    }
-
-    Ok(list.into())
-}
-
-/// Decode RLE encoding: n_runs(4B) + [value + run_length]*N
-fn decode_rle(py: Python, payload: &[u8], vtype: u8, n_rows: usize) -> PyResult<PyObject> {
-    if payload.is_empty() {
-        return Ok(PyList::empty_bound(py).into());
-    }
-
-    let data = &payload[1..];
-    if data.len() < 4 {
-        return Ok(PyList::empty_bound(py).into());
-    }
-
-    let n_runs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut off = 4;
-
-    let list = PyList::empty_bound(py);
-    let mut total_rows = 0usize;
-
-    for _ in 0..n_runs {
-        if total_rows >= n_rows { break; }
-
-        match vtype {
-            VT_INT64 => {
-                if off + 8 > data.len() { break; }
-                let v = i64::from_le_bytes([
-                    data[off], data[off+1], data[off+2], data[off+3],
-                    data[off+4], data[off+5], data[off+6], data[off+7]
-                ]);
-                off += 8;
-                if off + 4 > data.len() { break; }
-                let run_len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-                off += 4;
-                for _ in 0..run_len {
-                    if total_rows >= n_rows { break; }
-                    list.append(v)?;
-                    total_rows += 1;
-                }
-            }
-            VT_FLOAT64 => {
-                if off + 8 > data.len() { break; }
-                let v = f64::from_le_bytes([
-                    data[off], data[off+1], data[off+2], data[off+3],
-                    data[off+4], data[off+5], data[off+6], data[off+7]
-                ]);
-                off += 8;
-                if off + 4 > data.len() { break; }
-                let run_len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-                off += 4;
-                for _ in 0..run_len {
-                    if total_rows >= n_rows { break; }
-                    list.append(v)?;
-                    total_rows += 1;
-                }
-            }
-            VT_STRING | VT_BINARY => {
-                if off + 4 > data.len() { break; }
-                let slen = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-                off += 4;
-                if off + slen > data.len() { break; }
-                let val = &data[off..off+slen];
-                off += slen;
-                if off + 4 > data.len() { break; }
-                let run_len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-                off += 4;
-                for _ in 0..run_len {
-                    if total_rows >= n_rows { break; }
-                    if vtype == VT_STRING {
-                        list.append(String::from_utf8_lossy(val).to_string())?;
-                    } else {
-                        list.append(PyBytes::new_bound(py, val))?;
-                    }
-                    total_rows += 1;
-                }
-            }
-            _ => break,
-        }
-    }
-
-    Ok(list.into())
-}
-
 // ---------------------------------------------------------------------------
 // zstd decompression (uses Python's `zstandard` library — no Rust dep)
 // ---------------------------------------------------------------------------
@@ -648,7 +278,8 @@ fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 ///   - "blob": bytes — the PND2 blob
 ///   - "stats": list of (name, vtype, min, max, null_count) tuples
 ///
-/// Returns None for columns that need DICT/RLE/BITPACK (Python handles those).
+/// Returns None for columns that need DICT/RLE/BITPACK (Python handles those
+/// via pond_sdk.extensions.physical_structures.encoding).
 #[pyfunction]
 #[pyo3(signature = (columns, n_rows))]
 fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResult<PyObject> {
@@ -784,6 +415,12 @@ fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResu
     result.set_item("stats", stats_py)?;
     Ok(result.into())
 }
+
+// Suppress unused-import warning for the encoding constants — they're
+// kept in scope to make it easy to add future encode paths (RLE/DICT/
+// BITPACK) without re-importing.
+#[allow(unused_imports)]
+use {ENC_RAW as _, ENC_RLE as _, ENC_DICT as _, ENC_BITPACK as _};
 
 // ---------------------------------------------------------------------------
 // Python module definition

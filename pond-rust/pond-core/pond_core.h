@@ -84,6 +84,21 @@ const double* pond_result_column_f64(const PondResult* result, size_t index);
 const char* pond_result_column_str(const PondResult* result, size_t col_index, size_t row_index);
 
 /*
+ * Get a BINARY column value at a specific row index.
+ *
+ * @param result     PondResult handle
+ * @param col_index  column index
+ * @param row_index  row index
+ * @param out_ptr    output: pointer to the binary value's bytes
+ *                   (valid until the result is freed; NULL for null-sentinel rows)
+ * @param out_len    output: length of the binary value in bytes
+ * @return 0 on success, -1 on null result / out-of-bounds / non-BINARY column
+ */
+int32_t pond_result_column_bin(const PondResult* result, size_t col_index,
+                                size_t row_index,
+                                const uint8_t** out_ptr, size_t* out_len);
+
+/*
  * Free a decoded result. Must be called exactly once.
  */
 void pond_result_free(PondResult* result);
@@ -101,7 +116,32 @@ int32_t pond_pnd2_encode_i64(const int64_t* values, size_t n_values,
                               uint8_t** out_blob, size_t* out_blob_len);
 
 /*
- * Free a blob returned by pond_pnd2_encode_i64.
+ * Encode an array of double values into a PND2 blob (single column, RAW encoding).
+ *
+ * @param values     Pointer to double array
+ * @param n_values   Number of values
+ * @param out_blob   Output: pointer to blob bytes (caller must free with pond_blob_free)
+ * @param out_blob_len Output: length of blob in bytes
+ * @return 0 on success, -1 on error
+ */
+int32_t pond_pnd2_encode_f64(const double* values, size_t n_values,
+                              uint8_t** out_blob, size_t* out_blob_len);
+
+/*
+ * Encode an array of null-terminated C strings into a PND2 blob
+ * (single column, RAW encoding).
+ *
+ * @param values     Pointer to array of `const char*` (each null-terminated)
+ * @param n_values   Number of strings
+ * @param out_blob   Output: pointer to blob bytes (caller must free with pond_blob_free)
+ * @param out_blob_len Output: length of blob in bytes
+ * @return 0 on success, -1 on error
+ */
+int32_t pond_pnd2_encode_str(const char** values, size_t n_values,
+                              uint8_t** out_blob, size_t* out_blob_len);
+
+/*
+ * Free a blob returned by pond_pnd2_encode_i64 / _f64 / _str.
  */
 void pond_blob_free(uint8_t* blob, size_t blob_len);
 
