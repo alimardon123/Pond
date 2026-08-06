@@ -687,6 +687,13 @@ class UnifiedStorage:
         except ImportError:
             pass
 
+        # === SHARED THREAD POOL ===
+        # Reuse a single thread pool for ALL parallel operations instead of
+        # creating/destroying a new ThreadPoolExecutor per call (was 38+ creates).
+        # 32 workers — enough for parallel I/O (R2 supports 50+ connections).
+        from concurrent.futures import ThreadPoolExecutor
+        self._pool = ThreadPoolExecutor(max_workers=32)
+
     def _decode_blob(self, blob_bytes: bytes,
                       columns=None, predicates=None) -> dict[str, list]:
         """Decode a PND2 blob — uses Rust extension if available, else Python.
@@ -1326,8 +1333,14 @@ class UnifiedStorage:
         # merge("events", "feature1", "main"), the merge goes INTO `main`,
         # so `main`'s commit is the first parent (git semantics).
         #
-        # Resolve ALL 4 refs IN PARALLEL: 2 branch commit refs + 2 manifest refs.
-        # Was 4 sequential RTTs, now 1 RTT wall-clock.
+        # OPTIMIZATION: With PondPack, the manifest_ref points to the pack
+        # blob which contains BOTH the commit and the manifest. We only need
+        # to read the 2 packs (via manifest_ref) — NOT the commit blobs separately.
+        # This saves 2 GETs (180ms on R2).
+        #
+        # We also need the commit hashes for the parent pointers. The commit
+        # ref and manifest ref both point to the same pack hash, so
+        # target_head == target_manifest_hash (and same for branch).
         from concurrent.futures import ThreadPoolExecutor
 
         target_commit_ref = self._branch_ref(collection, target_branch)
@@ -1335,6 +1348,7 @@ class UnifiedStorage:
         target_manifest_ref = self._manifest_ref_for_branch(collection, target_branch)
         branch_manifest_ref = self._manifest_ref_for_branch(collection, branch_name)
 
+        # Resolve all 4 refs in parallel
         with ThreadPoolExecutor(max_workers=4) as pool:
             f_target_commit = pool.submit(self.kernel.resolve, target_commit_ref)
             f_branch_commit = pool.submit(self.kernel.resolve, branch_commit_ref)
@@ -1349,32 +1363,57 @@ class UnifiedStorage:
             raise ValueError(f"Branch '{branch_name}' does not exist")
 
         if target_head is None:
-            # Target branch doesn't exist yet — fall back to active branch's
-            # commit (backward compat for the no-target-branch case).
             target_head = self.kernel.resolve(self._active_commit_ref(collection))
 
-        # Batch ALL 4 reads in parallel: 2 commit blobs + 2 manifests
-        # (manifests read directly via manifest_ref, not via commit blob)
+        # Read ONLY the 2 packs (via manifest_ref) — skip separate commit blob reads.
+        # The pack contains both the commit metadata and the manifest.
+        # For old collections (no pack), the manifest_ref points to a PMAN blob,
+        # and we fall back to reading the commit blob separately.
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
-            if target_head:
-                futures["head_commit"] = pool.submit(self._read_commit_blob, target_head)
-            futures["branch_commit"] = pool.submit(self._read_commit_blob, branch_head)
+            # Read manifests (or packs) via manifest_ref
             if target_manifest_hash:
                 futures["head_manifest"] = pool.submit(
                     self._load_manifest_from_hash, target_manifest_hash)
             if branch_manifest_hash:
                 futures["branch_manifest"] = pool.submit(
                     self._load_manifest_from_hash, branch_manifest_hash)
+            # Also read commit blobs — needed for parent/index and for
+            # old collections where manifest_ref might not be set.
+            # But ONLY if commit hash differs from manifest hash (i.e., old format).
+            # With PondPack, commit hash == manifest hash (same pack), so
+            # reading the pack via manifest_ref already gives us the commit.
+            if target_head and target_head != target_manifest_hash:
+                futures["head_commit"] = pool.submit(self._read_commit_blob, target_head)
+            if branch_head and branch_head != target_manifest_hash:
+                futures["branch_commit"] = pool.submit(self._read_commit_blob, branch_head)
 
             head_commit = futures["head_commit"].result() if "head_commit" in futures else None
             branch_commit = futures["branch_commit"].result() if "branch_commit" in futures else None
             head_manifest = futures["head_manifest"].result() if "head_manifest" in futures else None
             branch_manifest = futures["branch_manifest"].result() if "branch_manifest" in futures else None
 
-        # Fallback: if manifest_ref wasn't set (old collection), use the
-        # commit blob's manifest hash to load the manifest. Use
-        # _load_manifest_from_hash which handles both pack and PMAN formats.
+        # With PondPack, the pack blob (read via manifest_ref) contains both
+        # the commit and the manifest. If we didn't read the commit separately
+        # (because commit hash == manifest hash), extract it from the pack.
+        # This avoids an extra GET — the pack bytes are already cached by
+        # _load_manifest_from_hash's kernel.read_blob call.
+        if head_commit is None and target_manifest_hash:
+            try:
+                pack_bytes = self.kernel.read_blob(target_manifest_hash)
+                if is_pack(pack_bytes):
+                    head_commit, _ = decode_pack(pack_bytes)
+            except Exception:
+                pass
+        if branch_commit is None and branch_manifest_hash:
+            try:
+                pack_bytes = self.kernel.read_blob(branch_manifest_hash)
+                if is_pack(pack_bytes):
+                    branch_commit, _ = decode_pack(pack_bytes)
+            except Exception:
+                pass
+
+        # Fallback for old collections
         if head_manifest is None and head_commit and head_commit.get("manifest"):
             try:
                 head_manifest = self._load_manifest_from_hash(head_commit["manifest"])
@@ -2411,6 +2450,183 @@ class UnifiedStorage:
         # Keep _schema_cache — it's valid across appends
 
         return shard_hash
+
+    def append_shard_batch(self, collection: str,
+                            shards: list[list[dict]],
+                            key_col: Optional[str] = None,
+                            row_group_size: int = 10_000,
+                            tx_id: Optional[str] = None) -> list[str]:
+        """Append MULTIPLE shards in ONE parallel batch — 1 RTT wall-clock.
+
+        Each shard in `shards` is a list of rows. This method encodes ALL
+        shards in parallel, then PUTs ALL blobs + ALL refs in one parallel
+        batch. For N shards, this turns N × 2 sequential PUTs into 1 RTT.
+
+        Example:
+            storage.append_shard_batch("events", [
+                [{"id": 1, "v": "a"}],
+                [{"id": 2, "v": "b"}],
+                [{"id": 3, "v": "c"}],
+            ], key_col="id")
+            # 3 shards written in ~1 RTT (was 3 × 300ms = 900ms → ~300ms)
+
+        Args:
+            collection: collection name
+            shards: list of row-lists, one per shard
+            key_col: sort key column
+            row_group_size: rows per row group within each shard
+            tx_id: optional transaction ID (makes all shards tentative)
+
+        Returns:
+            List of shard hashes (one per input shard).
+        """
+        if not shards:
+            return []
+
+        # Resolve schema once (shared across all shards)
+        cached_schema = self._schema_cache.get(collection)
+        if cached_schema:
+            schema_columns, existing_key_col, existing_rg_size = cached_schema
+            if key_col == "":
+                key_col = None
+            if key_col is None and existing_key_col:
+                key_col = existing_key_col
+        else:
+            existing_manifest = self._load_manifest(collection, skip_cache=True)
+            if existing_manifest is None:
+                # Collection doesn't exist — write the first shard as init
+                return [self.write(collection, shards[0], key_col=key_col,
+                                    row_group_size=row_group_size)] + [
+                    self.append_shard(collection, s, key_col=key_col,
+                                       row_group_size=row_group_size, tx_id=tx_id)
+                    for s in shards[1:]
+                ]
+            schema_columns = existing_manifest.columns
+            if key_col is None and existing_manifest.key_col:
+                key_col = existing_manifest.key_col
+            self._schema_cache[collection] = (
+                schema_columns, key_col or "", existing_manifest.row_group_size)
+
+        # Encode ALL shards in parallel (CPU-bound)
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _encode_shard(shard_rows):
+            """Encode one shard's rows into PND2 blob(s) + manifest entries."""
+            source = ListColumnSource(shard_rows)
+            n_rows = source.num_rows()
+            if n_rows == 0:
+                return None
+
+            if key_col is not None and key_col in source.column_names():
+                source = _sort_source_by(source, key_col)
+                key_array = source.column_slice(key_col, 0, n_rows)
+            else:
+                key_array = list(range(n_rows))
+
+            entries = []
+            pnd2_blobs = []
+            for start in range(0, n_rows, row_group_size):
+                end = min(start + row_group_size, n_rows)
+                group_source = _slice_source(source, start, end)
+                max_pk = key_array[end - 1]
+                rg_key = _format_rg_key(max_pk)
+                pnd2_bytes, col_stats = PND2.encode(group_source)
+                blob_hash = hash_bytes(pnd2_bytes)
+                entries.append({
+                    "rg_key": rg_key, "blob_hash": blob_hash,
+                    "n_rows": end - start, "col_stats": col_stats,
+                })
+                pnd2_blobs.append(pnd2_bytes)
+
+            entries.sort(key=lambda e: e["rg_key"])
+
+            # Inline shard (1 row group) or PMAN manifest (N row groups)
+            if len(entries) == 1:
+                return entries[0]["blob_hash"], None, pnd2_blobs, entries
+            else:
+                shard_manifest = CollectionManifest(self.kernel)
+                shard_manifest.set_schema(
+                    columns=schema_columns, key_col=key_col or "",
+                    row_group_size=row_group_size, chunk_size=0)
+                for entry in entries:
+                    rg = RowGroupEntry(
+                        key=entry["rg_key"], blob_hash=entry["blob_hash"],
+                        n_rows=entry["n_rows"], storage_mode=STORAGE_WHOLE_BLOB)
+                    for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
+                        rg.columns.append(ColumnStatsEntry(
+                            name=col_name, value_type=vtype, min=mn, max=mx,
+                            null_count=null_count, chunks=[]))
+                    shard_manifest.add_row_group(rg)
+                manifest_bytes = shard_manifest.encode()
+                manifest_hash = hash_bytes(manifest_bytes)
+                return manifest_hash, manifest_bytes, pnd2_blobs, entries
+
+        # Encode all shards in parallel
+        with ThreadPoolExecutor(max_workers=min(8, len(shards))) as pool:
+            encoded_shards = list(pool.map(_encode_shard, shards))
+
+        # Generate shard IDs and refs
+        try:
+            from uuid7 import uuidv7
+        except ImportError:
+            import time as _t
+            uuidv7 = lambda: f"{_t.time_ns():016x}"
+
+        branch = self._get_active_branch(collection)
+        shard_prefix = self._shards_prefix(collection, branch)
+
+        # Build the list of ALL PUTs (blobs + refs) across ALL shards
+        all_put_tasks = []
+        shard_hashes = []
+        for i, encoded in enumerate(encoded_shards):
+            if encoded is None:
+                shard_hashes.append("")
+                continue
+
+            shard_hash, manifest_bytes, pnd2_blobs, _entries = encoded
+            shard_hashes.append(shard_hash)
+
+            shard_id = uuidv7()
+            if tx_id:
+                shard_ref = f"{shard_prefix}tx_{tx_id}_{shard_id}"
+            else:
+                shard_ref = f"{shard_prefix}{shard_id}"
+
+            # Queue PND2 blob PUTs
+            for blob in pnd2_blobs:
+                def _put_blob(data=blob):
+                    self.kernel.store.put_blob(data)
+                all_put_tasks.append(_put_blob)
+
+            # Queue PMAN manifest PUT (if multi-row-group shard)
+            if manifest_bytes is not None:
+                def _put_pman(data=manifest_bytes):
+                    self.kernel.store.put_blob(data)
+                all_put_tasks.append(_put_pman)
+
+            # Queue ref PUT
+            def _put_ref(ref=shard_ref, h=shard_hash):
+                self.kernel.store.put_path(ref, h)
+            all_put_tasks.append(_put_ref)
+
+        # Execute ALL PUTs in parallel (1 RTT wall-clock for the whole batch)
+        if all_put_tasks and hasattr(self.kernel, 'store'):
+            with ThreadPoolExecutor(max_workers=min(32, len(all_put_tasks))) as pool:
+                futures = [pool.submit(t) for t in all_put_tasks]
+                for f in futures:
+                    f.result()
+
+            # Update stats
+            self.kernel.stats["writes"] += sum(len(s) if s else 0 for s in encoded_shards)
+            self.kernel.stats["ref_writes"] += len(shard_hashes)
+
+        # Invalidate caches
+        self._manifest_cache.pop(collection, None)
+        self._manifest_hash_cache.pop(collection, None)
+        self._head_cache.pop(collection, None)
+        self._invalidate_shard_cache(collection)
+
+        return shard_hashes
 
     def list_shards(self, collection: str, branch: Optional[str] = None) -> list[str]:
         """List all shard manifest hashes for a collection's branch.

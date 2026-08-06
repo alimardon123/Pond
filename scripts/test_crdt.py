@@ -206,6 +206,7 @@ def test_compaction_preserves_crdt():
 
     # Compact
     storage.compact_shards("compact_test")
+    storage.wait_for_background_tasks()
 
     # After compaction, the row should still be deleted
     final = PondStorage(kernel)

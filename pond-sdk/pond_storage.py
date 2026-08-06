@@ -382,6 +382,29 @@ class PondStorage:
             row_group_size=row_group_size,
             encoding_hints=encoding_hints, message=message, tx_id=tx_id)
 
+    def append_shard_batch(self, collection: str,
+                            shards: list[list[dict]],
+                            key_col: Optional[str] = None,
+                            row_group_size: int = 10_000,
+                            tx_id: Optional[str] = None) -> list[str]:
+        """Append MULTIPLE shards in ONE parallel batch — 1 RTT wall-clock.
+
+        For N shards, this turns N × 2 sequential PUTs into 1 parallel batch.
+        Example: 20 appends × 300ms = 6000ms → ~300ms with batch.
+
+        Args:
+            collection: collection name
+            shards: list of row-lists, one per shard
+            key_col: sort key column
+            row_group_size: rows per row group within each shard
+            tx_id: optional transaction ID (makes all shards tentative)
+        """
+        if self._unified is None:
+            raise RuntimeError("UnifiedStorage not available")
+        return self._unified.append_shard_batch(
+            collection, shards, key_col=key_col,
+            row_group_size=row_group_size, tx_id=tx_id)
+
     # ==================================================================
     # ACID Transactions — commit markers on top of CRDT shards
     # ==================================================================
