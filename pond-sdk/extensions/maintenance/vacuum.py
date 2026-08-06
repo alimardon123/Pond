@@ -309,7 +309,7 @@ class GarbageCollector:
         if data[:4] == b"PNPK":
             try:
                 from pond_pack import decode_pack
-                commit, manifest_bytes = decode_pack(data)
+                commit, manifest_bytes, _ = decode_pack(data)
 
                 # Walk commit fields (parent, second_parent)
                 # The "manifest" field in the commit points to the pack hash

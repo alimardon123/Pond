@@ -56,17 +56,37 @@ import json
 from typing import Optional, Any
 
 _PACK_MAGIC = b"PNPK"
-_PACK_VERSION = 1
+_PACK_VERSION = 2  # v2: optional inline data blobs
+
+# Flags
+_FLAG_HAS_INLINE_DATA = 0x01  # pack contains inline data blobs
 
 
-def encode_pack(commit: dict, manifest_bytes: bytes) -> bytes:
-    """Encode a commit dict + manifest bytes into ONE pack blob.
+def encode_pack(commit: dict, manifest_bytes: bytes,
+                inline_data: Optional[list[bytes]] = None) -> bytes:
+    """Encode a commit dict + manifest bytes + optional inline data into ONE pack blob.
+
+    PondPack v2 format:
+      Magic "PNPK" (4B)
+      Version: 2 (1B)
+      Flags: has_inline_data (1B)
+      commit_json_len: 4B (u32 LE)
+      commit_json: variable (UTF-8)
+      manifest_len: 4B (u32 LE)
+      manifest_bytes: variable (PMAN)
+      [if has_inline_data]:
+        n_data_blobs: 2B (u16 LE)
+        for each blob:
+          data_len: 4B (u32 LE)
+          data_bytes: variable (PND2)
 
     Args:
-        commit: the commit metadata dict (parent, second_parent, manifest_hash,
-                message, timestamp, index). Serialized as JSON.
-        manifest_bytes: the PMAN-encoded manifest bytes
-                        (from CollectionManifest.encode()).
+        commit: the commit metadata dict.
+        manifest_bytes: the PMAN-encoded manifest bytes.
+        inline_data: optional list of PND2 data blobs to inline into the pack.
+            When provided, readers can get the data directly from the pack
+            without a separate GET per data blob. Used for single-row-group
+            collections (point lookups, small scans).
 
     Returns:
         The pack blob bytes. Content-addressed — SHA-256 of these bytes
@@ -76,10 +96,23 @@ def encode_pack(commit: dict, manifest_bytes: bytes) -> bytes:
     buf = bytearray()
     buf += _PACK_MAGIC
     buf += struct.pack("<B", _PACK_VERSION)
+
+    flags = 0
+    if inline_data:
+        flags |= _FLAG_HAS_INLINE_DATA
+    buf += struct.pack("<B", flags)
+
     buf += struct.pack("<I", len(commit_json))
     buf += commit_json
     buf += struct.pack("<I", len(manifest_bytes))
     buf += manifest_bytes
+
+    if inline_data:
+        buf += struct.pack("<H", len(inline_data))
+        for data_blob in inline_data:
+            buf += struct.pack("<I", len(data_blob))
+            buf += data_blob
+
     return bytes(buf)
 
 
@@ -88,33 +121,59 @@ def is_pack(blob_bytes: bytes) -> bool:
     return len(blob_bytes) >= 5 and blob_bytes[:4] == _PACK_MAGIC
 
 
-def decode_pack(blob_bytes: bytes) -> tuple[dict, bytes]:
-    """Decode a pack blob into (commit_dict, manifest_bytes).
+def decode_pack(blob_bytes: bytes) -> tuple[dict, bytes, Optional[list[bytes]]]:
+    """Decode a pack blob into (commit_dict, manifest_bytes, inline_data).
 
-    Args:
-        blob_bytes: the pack blob bytes
+    Handles both v1 (no flags, no inline data) and v2 (flags + optional inline data).
 
     Returns:
-        Tuple of (commit_dict, manifest_bytes).
-
-    Raises:
-        ValueError if the blob is not a valid pack.
+        Tuple of (commit_dict, manifest_bytes, inline_data_or_None).
+        inline_data is a list of PND2 data blobs if the pack has inline data,
+        or None if the pack doesn't have inline data.
     """
     if not is_pack(blob_bytes):
         raise ValueError(f"Not a PNPK blob (magic={blob_bytes[:4]!r})")
     version = blob_bytes[4]
-    if version != _PACK_VERSION:
+    if version == 1:
+        # v1: no flags byte, no inline data
+        pos = 5
+        commit_json_len = struct.unpack("<I", blob_bytes[pos:pos+4])[0]
+        pos += 4
+        commit_json = blob_bytes[pos:pos+commit_json_len].decode("utf-8")
+        pos += commit_json_len
+        manifest_len = struct.unpack("<I", blob_bytes[pos:pos+4])[0]
+        pos += 4
+        manifest_bytes = blob_bytes[pos:pos+manifest_len]
+        commit = json.loads(commit_json)
+        return commit, manifest_bytes, None
+    elif version == 2:
+        # v2: flags byte + optional inline data
+        flags = blob_bytes[5]
+        pos = 6
+        commit_json_len = struct.unpack("<I", blob_bytes[pos:pos+4])[0]
+        pos += 4
+        commit_json = blob_bytes[pos:pos+commit_json_len].decode("utf-8")
+        pos += commit_json_len
+        manifest_len = struct.unpack("<I", blob_bytes[pos:pos+4])[0]
+        pos += 4
+        manifest_bytes = blob_bytes[pos:pos+manifest_len]
+        pos += manifest_len
+        commit = json.loads(commit_json)
+
+        inline_data = None
+        if flags & _FLAG_HAS_INLINE_DATA:
+            n_blobs = struct.unpack("<H", blob_bytes[pos:pos+2])[0]
+            pos += 2
+            inline_data = []
+            for _ in range(n_blobs):
+                data_len = struct.unpack("<I", blob_bytes[pos:pos+4])[0]
+                pos += 4
+                inline_data.append(blob_bytes[pos:pos+data_len])
+                pos += data_len
+
+        return commit, manifest_bytes, inline_data
+    else:
         raise ValueError(f"Unsupported PNPK version: {version}")
-    pos = 5
-    commit_json_len = struct.unpack("<I", blob_bytes[pos:pos+4])[0]
-    pos += 4
-    commit_json = blob_bytes[pos:pos+commit_json_len].decode("utf-8")
-    pos += commit_json_len
-    manifest_len = struct.unpack("<I", blob_bytes[pos:pos+4])[0]
-    pos += 4
-    manifest_bytes = blob_bytes[pos:pos+manifest_len]
-    commit = json.loads(commit_json)
-    return commit, manifest_bytes
 
 
 def extract_commit(blob_bytes: bytes) -> Optional[dict]:
@@ -123,7 +182,7 @@ def extract_commit(blob_bytes: bytes) -> Optional[dict]:
     Returns None if the blob is not a commit (e.g., it's a standalone manifest).
     """
     if is_pack(blob_bytes):
-        commit, _ = decode_pack(blob_bytes)
+        commit, _, _ = decode_pack(blob_bytes)
         return commit
     # Old format: JSON commit
     if blob_bytes and blob_bytes[0:1] == b"{":
@@ -140,7 +199,7 @@ def extract_manifest_bytes(blob_bytes: bytes) -> Optional[bytes]:
     Returns None if the blob is not a manifest-containing blob.
     """
     if is_pack(blob_bytes):
-        _, manifest_bytes = decode_pack(blob_bytes)
+        _, manifest_bytes, _ = decode_pack(blob_bytes)
         return manifest_bytes
     # Old format: standalone PMAN manifest
     if len(blob_bytes) >= 4 and blob_bytes[:4] == b"PMAN":

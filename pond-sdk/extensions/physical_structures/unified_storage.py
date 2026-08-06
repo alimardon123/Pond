@@ -743,6 +743,12 @@ class UnifiedStorage:
         from concurrent.futures import ThreadPoolExecutor
         self._pool = ThreadPoolExecutor(max_workers=32)
 
+        # === INLINE DATA CACHE ===
+        # When a pack blob (PNPK v2) contains inline data blobs, we cache them
+        # per-collection so subsequent reads (point_lookup, scan) can skip
+        # the data blob GET entirely. The cache is invalidated on any write.
+        self._inline_data_cache: dict[str, Optional[list[bytes]]] = {}
+
     def _decode_blob(self, blob_bytes: bytes,
                       columns=None, predicates=None) -> dict[str, list]:
         """Decode a PND2 blob — uses Rust extension if available, else Python.
@@ -881,9 +887,12 @@ class UnifiedStorage:
             KeyError if the blob is not found.
         """
         data = self.kernel.read_blob(blob_hash)
-        # Check if it's a PondPack blob (commit + manifest in one)
+        # Check if it's a PondPack blob (commit + manifest + optional inline data)
         if is_pack(data):
-            _commit, manifest_bytes = decode_pack(data)
+            _commit, manifest_bytes, inline_data = decode_pack(data)
+            # Cache inline data for this collection if present
+            if inline_data is not None:
+                self._inline_data_cache[blob_hash] = inline_data
             return CollectionManifest.decode(self.kernel, manifest_bytes)
         # Old format: standalone PMAN manifest
         return CollectionManifest.decode(self.kernel, data)
@@ -976,6 +985,10 @@ class UnifiedStorage:
         self._commit_index_cache.pop(collection, None)
         self._delta_chain_depth_cache.pop(collection, None)
         self._schema_cache.pop(collection, None)
+        # Also clear inline data cache for this collection
+        old_hash = self._manifest_hash_cache.get(collection)
+        if old_hash:
+            self._inline_data_cache.pop(old_hash, None)
 
     def wait_for_background_tasks(self, timeout: float = 30.0) -> None:
         """Wait for all background tombstone/vacuum threads to complete.
@@ -1211,7 +1224,7 @@ class UnifiedStorage:
             raw = self.kernel.read_blob(commit_hash)
             # Check if it's a PondPack blob
             if is_pack(raw):
-                commit, _manifest_bytes = decode_pack(raw)
+                commit, _manifest_bytes, _ = decode_pack(raw)
                 # The manifest is inside this pack blob. Set commit["manifest"]
                 # to the pack hash (commit_hash) so that all code reading
                 # commit["manifest"] gets the correct blob to load the manifest
@@ -1454,14 +1467,14 @@ class UnifiedStorage:
             try:
                 pack_bytes = self.kernel.read_blob(target_manifest_hash)
                 if is_pack(pack_bytes):
-                    head_commit, _ = decode_pack(pack_bytes)
+                    head_commit, _, _ = decode_pack(pack_bytes)
             except Exception:
                 pass
         if branch_commit is None and branch_manifest_hash:
             try:
                 pack_bytes = self.kernel.read_blob(branch_manifest_hash)
                 if is_pack(pack_bytes):
-                    branch_commit, _ = decode_pack(pack_bytes)
+                    branch_commit, _, _ = decode_pack(pack_bytes)
             except Exception:
                 pass
 
@@ -4060,11 +4073,9 @@ class UnifiedStorage:
             if pc:
                 commit_index = pc.get("index", 0) + 1
 
-        # BATCH-PUT: pack blob (commit + manifest in ONE) + 2 refs in parallel
-        # = 1 RTT wall-clock (was 3-4 RTTs sequential).
-        # PondPack combines commit JSON + manifest bytes into ONE blob, so
-        # we write 1 blob + 2 refs (both refs point to the pack hash).
-        # This saves 1 PUT vs the old format (separate commit + manifest blobs).
+        # BATCH-PUT: pack blob (commit + manifest + optional inline data) + refs
+        # = 1 RTT wall-clock. PondPack v2 can inline the data blob for
+        # single-row-group writes, eliminating 1 GET on cold reads.
         import json as _json
         import time as _time
         commit = {
@@ -4075,8 +4086,18 @@ class UnifiedStorage:
             "timestamp": _time.time(),
             "index": commit_index,
         }
-        # Build the pack: commit JSON + manifest bytes in ONE blob
-        pack_bytes = encode_pack(commit, manifest_bytes)
+
+        # INLINE DATA OPTIMIZATION:
+        # For single-row-group writes (the common case: point lookups, small
+        # collections, OLTP single-record writes), inline the PND2 data blob
+        # into the pack. This eliminates 1 GET on cold reads (3 GETs → 2 GETs).
+        # Threshold: only inline if the data blob is < 256KB (keeps pack size reasonable).
+        inline_data = None
+        if n_groups == 1 and len(pnd2_payloads[0]) < 256 * 1024:
+            inline_data = [pnd2_payloads[0]]
+
+        # Build the pack: commit JSON + manifest bytes + optional inline data
+        pack_bytes = encode_pack(commit, manifest_bytes, inline_data=inline_data)
         pack_hash = hash_bytes(pack_bytes)
 
         active = self._active_commit_ref(collection)
@@ -4518,14 +4539,34 @@ class UnifiedStorage:
             end_key = _format_rg_key(end_key)
 
         # Walk surviving row groups via manifest (in-memory pruning — 0 GETs)
-        # Fix (Round 21): use parallel fetch for surviving row groups (10-16x
-        # latency reduction at PB scale). Same infrastructure as read_as_columns.
         surviving = list(manifest.scan_with_pruning(predicates, start_key, end_key))
         if not surviving:
             return []
 
-        col_results = self._parallel_fetch_and_decode(
-            surviving, eff_columns, predicates)
+        # INLINE DATA FAST PATH: if the pack has inline data and all surviving
+        # row groups are in the inline data, skip the data blob GETs entirely.
+        if (manifest_hash is None and commit_hash is None and
+            len(surviving) <= 1):
+            # Check if we have inline data cached for the current manifest hash
+            current_manifest_hash = self._manifest_hash_cache.get(collection)
+            if current_manifest_hash and current_manifest_hash in self._inline_data_cache:
+                inline_data = self._inline_data_cache[current_manifest_hash]
+                if inline_data and len(inline_data) > 0:
+                    # Decode the inline data blob directly (0 GETs for data!)
+                    col_results = []
+                    for blob_bytes in inline_data[:len(surviving)]:
+                        col_data = self._decode_blob(blob_bytes, columns=eff_columns,
+                                                      predicates=predicates)
+                        col_results.append(col_data)
+                else:
+                    col_results = self._parallel_fetch_and_decode(
+                        surviving, eff_columns, predicates)
+            else:
+                col_results = self._parallel_fetch_and_decode(
+                    surviving, eff_columns, predicates)
+        else:
+            col_results = self._parallel_fetch_and_decode(
+                surviving, eff_columns, predicates)
 
         # Fast row assembly — use zip() instead of per-row dict comprehension.
         # zip is 3-5x faster than {c: col_data[c][i] for c in col_names}
@@ -4872,20 +4913,58 @@ class UnifiedStorage:
     def _point_lookup_head(self, collection: str, key: str,
                             columns: Optional[list[str]] = None,
                             manifest_hash: Optional[str] = None) -> Optional[dict]:
-        """Point lookup against the HEAD (or manifest_hash) manifest only."""
+        """Point lookup against the HEAD (or manifest_hash) manifest only.
+
+        INLINE DATA OPTIMIZATION:
+        If the pack blob (read via manifest_ref) contains inline data blobs,
+        we can skip the separate data blob GET entirely. The pack already
+        has everything: commit + manifest + data. This reduces cold point
+        lookup from 3 GETs → 2 GETs.
+        """
+        # If no manifest_hash specified, try the inline data fast path:
+        # read the pack via manifest_ref, check if it has inline data
+        if manifest_hash is None:
+            manifest_ref_hash = self.kernel.resolve(self._manifest_ref(collection))
+            if manifest_ref_hash is not None:
+                pack_bytes = self.kernel.read_blob(manifest_ref_hash)
+                if is_pack(pack_bytes):
+                    _commit, manifest_bytes, inline_data = decode_pack(pack_bytes)
+                    manifest = CollectionManifest.decode(self.kernel, manifest_bytes)
+
+                    # Find the row group
+                    target = _format_rg_key(key)
+                    rg = manifest.find_row_group(target)
+                    if rg is None:
+                        return None
+
+                    # Check if the data blob is inlined in the pack
+                    if inline_data and len(inline_data) > 0:
+                        # Use the first (and only) inline data blob
+                        blob_bytes = inline_data[0]
+                    else:
+                        # Data not inlined — fetch separately (1 GET)
+                        blob_bytes = self.kernel.read_blob(rg.blob_hash)
+
+                    return self._decode_and_filter_row(blob_bytes, manifest, key, columns)
+
+        # Standard path: load manifest, fetch data blob separately
         manifest = self._load_manifest(collection, manifest_hash=manifest_hash)
         if manifest is None:
             return None
 
-        # Find the row group with smallest key >= "rg/{key}"
-        # Fix (Round 3 Issue #1): use zero-padded key format for correct
-        # lexicographic ordering.
         target = _format_rg_key(key)
         rg = manifest.find_row_group(target)
         if rg is None:
             return None
 
         blob_bytes = self.kernel.read_blob(rg.blob_hash)
+        return self._decode_and_filter_row(blob_bytes, manifest, key, columns)
+
+    def _decode_and_filter_row(self, blob_bytes: bytes,
+                                manifest: CollectionManifest,
+                                key: str,
+                                columns: Optional[list[str]] = None) -> Optional[dict]:
+        """Decode a PND2 blob and return the single row matching `key`."""
         # Use the key column (manifest.key_col) as the predicate for
         # encoded eval — this returns only the surviving row(s) that
         # match the key, not the entire row group.

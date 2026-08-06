@@ -298,7 +298,7 @@ def law_4_derived_rebuild_produces_identical_hashes():
         pack_bytes1 = kernel.read_blob(pack_hash1)
         if pack_bytes1[:4] == b"PNPK":
             from pond_pack import decode_pack as _dp
-            _commit1, manifest_bytes1 = _dp(pack_bytes1)
+            _commit1, manifest_bytes1, _ = _dp(pack_bytes1)
         else:
             manifest_bytes1 = pack_bytes1  # old PMAN format
 
@@ -307,7 +307,7 @@ def law_4_derived_rebuild_produces_identical_hashes():
         pack_hash2 = kernel.resolve("collections/inv4/_branches/main/manifest")
         pack_bytes2 = kernel.read_blob(pack_hash2)
         if pack_bytes2[:4] == b"PNPK":
-            _commit2, manifest_bytes2 = _dp(pack_bytes2)
+            _commit2, manifest_bytes2, _ = _dp(pack_bytes2)
         else:
             manifest_bytes2 = pack_bytes2
 
@@ -521,7 +521,7 @@ def law_12_merge_true_dag():
     head_bytes = kernel.read_blob(head)
     if head_bytes[:4] == b"PNPK":
         from pond_pack import decode_pack as _dp
-        commit, _manifest_bytes = _dp(head_bytes)
+        commit, _manifest_bytes, _ = _dp(head_bytes)
     else:
         import json as _json2
         commit = _json2.loads(head_bytes)
@@ -784,7 +784,7 @@ def law_18_lakehouse_manifest_storage():
         # Both must contain a commit with a manifest reference.
         if raw[:4] == b"PNPK":
             from pond_pack import decode_pack as _dp
-            commit, manifest_bytes = _dp(raw)
+            commit, manifest_bytes, _ = _dp(raw)
         else:
             assert len(raw) > 0 and raw[0:1] == b'{', \
                 f"LAW 18 VIOLATED: commit is not JSON or PNPK (first byte: {raw[0] if raw else 'empty'})"
