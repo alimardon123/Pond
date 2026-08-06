@@ -3140,32 +3140,56 @@ class UnifiedStorage:
                 coarser pruning. Manifest-level compaction ignores this
                 parameter (it doesn't re-encode).
         """
-        head_manifest = self._load_manifest(collection)
-        # Read the live shards via ref-listing (the only source of truth
-        # now that the separate shard index has been removed).
+        # === PIPELINED COMPACTION READ PHASE ===
+        # Phase 1: Load HEAD manifest + list shards IN PARALLEL (1 RTT)
+        # Phase 2: Read ALL shard blobs IN PARALLEL (1 RTT)
+        # Was: sequential load_manifest → read_shard_index → N × _load_shard_manifest
         branch = self._get_active_branch(collection)
-        shard_hashes = self._read_shard_index(collection, branch)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Phase 1: Load HEAD manifest + list shard refs IN PARALLEL
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_manifest = pool.submit(self._load_manifest, collection)
+            f_shards = pool.submit(self._list_shard_refs_with_names, collection, branch)
+            head_manifest = f_manifest.result()
+            shard_refs = f_shards.result()
+
+        shard_hashes = [h for (_n, h) in shard_refs]
         if not shard_hashes:
             return None  # nothing to compact
 
-        # Schema + key_col from HEAD, used to build pseudo-manifests for
-        # inline (PND2) shards that have no PMAN manifest.
         head_schema = head_manifest.columns if head_manifest else None
         head_key_col = head_manifest.key_col if head_manifest else ""
 
-        # Level 1: merge row group entries (dedup by rg_key, shards override HEAD)
+        # Phase 2: Read ALL shard blobs IN PARALLEL (1 RTT for all)
+        shard_blobs = {}
+        if shard_hashes:
+            with ThreadPoolExecutor(max_workers=min(32, len(shard_hashes))) as pool:
+                futures = {pool.submit(self.kernel.read_blob, sh): sh
+                            for sh in shard_hashes if sh}
+                for f in futures:
+                    sh = futures[f]
+                    try:
+                        shard_blobs[sh] = f.result()
+                    except Exception:
+                        shard_blobs[sh] = None
+
+        # Decode shard blobs into manifests (no I/O — already fetched)
         merged: dict[str, Any] = {}
         if head_manifest:
             for rg in head_manifest.scan_with_pruning():
                 merged[rg.key] = rg
         shard_manifests = []
         for sh in shard_hashes:
-            sm = self._load_shard_manifest(
-                sh, head_schema, head_key_col)
-            if sm is not None:
-                shard_manifests.append(sm)
-                for rg in sm.scan_with_pruning():
-                    merged[rg.key] = rg
+            blob_bytes = shard_blobs.get(sh)
+            if blob_bytes:
+                sm = self._load_shard_manifest_from_bytes(
+                    sh, blob_bytes, head_schema, head_key_col)
+                if sm is not None:
+                    shard_manifests.append(sm)
+                    for rg in sm.scan_with_pruning():
+                        merged[rg.key] = rg
 
         if not merged:
             return None
