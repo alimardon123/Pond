@@ -1,0 +1,20 @@
+[package]
+name = "pond_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond CLI — the 'pond' command. Single binary, DuckDB philosophy."
+
+[[bin]]
+name = "pond"
+path = "src/main.rs"
+
+[dependencies]
+pond_kernel = { path = "../pond-kernel" }
+# clap for argument parsing — a mature, widely-used crate
+clap = { version = "4", features = ["derive", "env"] }
+# serde_json for reading/writing JSON data (the CLI accepts JSON input)
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

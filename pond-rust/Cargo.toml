@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pond-core", "pond-python"]
+members = ["pond-core", "pond-python", "pond-kernel", "pond-cli"]
 
 [workspace.package]
 version = "0.3.0"
@@ -8,11 +8,16 @@ edition = "2021"
 license = "MIT"
 authors = ["Pond Contributors"]
 repository = "https://github.com/zai/pond"
-description = "Pond storage system — Rust core (PND2 + C ABI) and Python bindings"
+description = "Pond storage system — Rust core (kernel + PND2 codec + C ABI), Python bindings, CLI"
 
 # Workspace-level release profile — fast builds, optimized for FFI hot paths
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# NOTE: panic = "abort" would break tests (which need unwind to catch panics).
+# We keep "unwind" for compatibility. The binary size difference is ~50KB.
+
+# Shared dependencies available to all workspace members
+[workspace.dependencies]
+tempfile = "3"

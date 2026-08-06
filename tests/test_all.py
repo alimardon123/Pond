@@ -306,3 +306,44 @@ def test_decode_benchmark():
     # The benchmark script doesn't exit non-zero on slow results; we just
     # verify it ran. The actual numbers are for human review.
     assert "Throughput" in output, "benchmark missing throughput column"
+
+
+def test_pond_cli():
+    """Verify the `pond` CLI binary exists and passes its Rust integration tests.
+
+    This is the DuckDB-philosophy v0.1 binary — a single executable that
+    does content-addressed storage with branching and time-travel.
+
+    Skips if cargo is unavailable or the binary isn't built.
+    """
+    import os, shutil, subprocess
+    cargo_bin = shutil.which("cargo")
+    if cargo_bin is None:
+        cargo_candidate = os.path.expanduser("~/.cargo/bin/cargo")
+        if os.path.exists(cargo_candidate):
+            cargo_bin = cargo_candidate
+    if cargo_bin is None:
+        import pytest
+        pytest.skip("cargo not available — skipping pond CLI test")
+
+    rust_dir = os.path.join(REPO_ROOT, "pond-rust")
+
+    # Run `cargo test --release -p pond_cli` (runs the Rust integration tests)
+    result = subprocess.run(
+        [cargo_bin, "test", "--release", "-p", "pond_cli"],
+        cwd=rust_dir, capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, \
+        f"pond CLI tests failed:\nSTDOUT:\n{result.stdout[-2000:]}\nSTDERR:\n{result.stderr[-1000:]}"
+
+    # Verify the binary exists and runs
+    pond_bin = os.path.join(rust_dir, "target", "release", "pond")
+    assert os.path.exists(pond_bin), f"pond binary not found at {pond_bin}"
+
+    result = subprocess.run([pond_bin, "version"], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, f"pond version failed: {result.stderr}"
+    assert "pond" in result.stdout, f"unexpected version output: {result.stdout}"
+
+    # Verify the binary is small (< 10MB, DuckDB philosophy)
+    binary_size = os.path.getsize(pond_bin)
+    assert binary_size < 10 * 1024 * 1024, \
+        f"pond binary is {binary_size / 1024 / 1024:.1f}MB — should be < 10MB"

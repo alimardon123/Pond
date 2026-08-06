@@ -1,0 +1,22 @@
+[package]
+name = "pond_kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond storage kernel — the 3 primitives (Write, Read, Ref) in pure Rust, with local FS backend"
+
+[lib]
+name = "pond_kernel"
+# rlib:      Rust crate (used by pond-cli and other Rust crates)
+# staticlib: C ABI static library (.a) for linking into Go/Java/Node/C
+# cdylib:    shared library (.so/.dylib/.dll) for dynamic FFI
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+# NONE — the kernel is pure Rust with no external deps, matching pond-core's
+# zero-dependency principle. This is critical for the single-binary
+# distribution model (no transitive crate dependencies to satisfy).
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -313,6 +313,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `docs/VETERAN_ARCHITECT_REVIEW_V2.md` | 1227 | **External review V2 (post-Tier-0) by the same veteran architect.** Verdict upgraded from "Invest narrowly" to "Invest, but specialize." Verifies the Tier 0 fixes are real (20 passed / 2 honestly skipped / 0 failed, KG 100%, credentials gone, ACID/IVF overclaims corrected). Identifies 8 residual doc-drift items (fixed in Task 67). Strategic answers to 7 questions about making Pond competitive, including a 6-month plan to ship a v1.0 versioned-lakehouse binary. |
 | `docs/VETERAN_REVIEW_PROCESS.md` | 130 | **The canonical workflow for running a Veteran Architect Review.** 5 steps: (1) audit & fix stale docs BEFORE the review, (2) run the review via subagent, (3) compare current vs. prior reviews to measure progress, (4) evaluate recommendations against the user's vision, (5) decide what to do next and write it down. Includes anti-patterns to avoid and the review history table. |
 | `docs/CURRENT_STATE_ANALYSIS.md` | 280 | **Post-V2 comprehensive analysis of where Pond stands.** Audits code health (LOC, tests, KG, known gaps), compares V1 vs V2 veteran reviews to measure progress, evaluates the veteran's 12 architectural suggestions + 6-month plan against the user's vision (Rust-first, DuckDB-philosophy, generic cross-language SDK), and proposes a 4-tier next-steps plan. The single highest-priority action: build the `pond` CLI binary. |
+| `docs/UNIVERSAL_STORAGE_ARROW_DESIGN.md` | 180 | **Design decision: Arrow as a read-path optimization, not a storage-format mandate.** Resolves the question "does adopting Arrow lock Pond into tabular-only storage?" The answer is NO — PND2 stays as the universal container (handles all vtypes including BINARY), and Arrow is one of several ways to materialize the data. Tabular workloads get Arrow; non-tabular (KV, streaming, git, unstructured) get raw bytes. The native Arrow path (Tier 1.1.1) closes the 2-4x DuckDB gap WITHOUT sacrificing universal storage. |
 | `docs/NEXT_STEPS_DEEP_REVIEW.md` | 492 | Post-Round-52 deep review + next steps: Rust-first vision with first-class Python SDK, distributed as a small minimal binary (DuckDB philosophy), with generic cross-language C ABI SDK. Captures the decode-path benchmark findings (Rust 3× Python; C ABI batch 5-11× PyO3 for numeric). |
 | `docs/DESIGN_REVIEW_2026_07_26.md` | 470 | Design review against the seven principles (42 findings, prioritized fix plan). |
 | `docs/GENERIC_DESIGN_VISION.md` | 110 | The promise: any app built on Pond gets infinite storage + versioning + branching + pruning + encoding on object stores. Documents the ColumnSource protocol, format-agnostic encode_fn/decode_fn, and the Vortex-style scan hierarchy. |
@@ -332,24 +333,29 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `KNOWLEDGE_GRAPH.md` | — | This file. The navigational map of the repo. |
 | `worklog.md` | 1928 | Append-only research log (Tasks 1-57). |
 
-### 2.10 pond-rust/ (Cross-language Rust core + Python bindings — 1 workspace, 2 crates)
+### 2.10 pond-rust/ (Cross-language Rust core + Python bindings + CLI — 1 workspace, 4 crates)
 
-Cargo workspace with two crates. The C ABI is the universal interop layer
-for Go/Java/Node/C/C++/Zig SDK ports.
+Cargo workspace with four crates. The C ABI is the universal interop layer
+for Go/Java/Node/C/C++/Zig SDK ports. The CLI is the DuckDB-philosophy binary.
 
 | File | LOC | Purpose |
 |---|---|---|
-| `pond-rust/Cargo.toml` | 16 | Workspace manifest. Members: `pond-core`, `pond-python`. |
+| `pond-rust/Cargo.toml` | 23 | Workspace manifest. Members: `pond-core`, `pond-python`, `pond-kernel`, `pond-cli`. |
 | `pond-rust/README.md` | 95 | Workspace overview: why split, build/test instructions, C ABI summary. |
 | `pond-rust/build.sh` | 41 | Build helper — runs `cargo build --release` + hardlinks `pond_rust.so`. |
-| `pond-rust/pond-core/Cargo.toml` | 14 | Pure-Rust crate (zero external deps). crate-type: `staticlib`, `cdylib`, `rlib`. |
-| `pond-rust/pond-core/pond_core.h` | 200 | C ABI header. Declares all `pond_pnd2_*` + `pond_result_*` + `pond_encoder_*` functions. |
+| `pond-rust/pond-core/Cargo.toml` | 14 | Pure-Rust PND2 codec crate (zero external deps). crate-type: `staticlib`, `cdylib`, `rlib`. |
+| `pond-rust/pond-core/pond_core.h` | 200 | C ABI header for PND2 codec. |
 | `pond-rust/pond-core/README.md` | 65 | Pure-Rust crate docs: design principles, Rust API, C ABI, tests. |
 | `pond-rust/pond-core/src/lib.rs` | 1700 | The full PND2 codec + C ABI. Constants, PND2Parser, pnd2_decode (all encodings, all vtypes), pnd2_encode_i64/f64/str/multi, PondResult handle, PondEncoder builder. 9 unit tests. |
 | `pond-rust/pond-python/Cargo.toml` | 11 | PyO3 wrapper crate. crate-type: `cdylib` (produces `pond_rust.so`). |
 | `pond-rust/pond-python/README.md` | 50 | PyO3 wrapper docs: Python API, feature comparison vs pond-core. |
 | `pond-rust/pond-python/src/lib.rs` | 415 | Thin PyO3 glue. Delegates all decode logic to pond-core's `decode_column`. Adds zstd decompression (via Python's `zstandard`), projection pushdown, predicate pushdown. |
-| `pond-rust/tests/test_c_abi.c` | 425 | End-to-end C ABI test. 131 checks: round-trips, NULL safety, error paths, 1000-value dataset, 7 Python-generated blobs (all encodings × all vtypes), multi-column encoder. |
+| `pond-rust/pond-kernel/Cargo.toml` | 22 | Rust storage kernel crate (3 primitives: Write, Read, Ref). crate-type: `rlib`, `staticlib`, `cdylib`. |
+| `pond-rust/pond-kernel/src/lib.rs` | 480 | The 3-primitive kernel in pure Rust: PondKernel struct (content-addressed blob storage on local FS, JSON-file name→hash map), hash_bytes (SHA-256), C ABI (pond_kernel_new/write/read/reference/resolve/free). 10 unit tests. |
+| `pond-rust/pond-cli/Cargo.toml` | 20 | CLI binary crate. Produces the `pond` executable. |
+| `pond-rust/pond-cli/src/main.rs` | 480 | The `pond` CLI: init, write (JSON/file/stdin), read, branch, merge, history, ls, cat (with prefix matching), version. Uses clap for arg parsing. Single binary, ~1MB, DuckDB philosophy. |
+| `pond-rust/pond-cli/tests/cli_integration.rs` | 170 | 10 integration tests: init, write/read JSON, write from file, write from stdin, dedup, ls, branch+merge, cat by prefix, version, persistence. All pass. |
+| `pond-rust/tests/test_c_abi.c` | 425 | End-to-end C ABI test for the PND2 codec. 131 checks: round-trips, NULL safety, error paths, 1000-value dataset, 7 Python-generated blobs (all encodings × all vtypes), multi-column encoder. |
 | `pond-rust/tests/generate_test_blobs.py` | 115 | Generates 7 PND2 blob files using pond-sdk's Python encoder for cross-language compatibility tests. |
 | `pond-rust/tests/test_blobs/*.bin` | 7 files | Binary PND2 blobs covering i64/f64/str/bin × raw/rle/dict/bitpack. Used by both C and Go tests. |
 
