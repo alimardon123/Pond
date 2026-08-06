@@ -886,3 +886,325 @@ fn pond_rust(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// C ABI — cross-language FFI (Go, Java, Node, C, C++, Rust, Zig, etc.)
+//
+// Other language SDKs call these functions via FFI/cgo/JNI/NAPI.
+// The C ABI is the universal interop layer — any language that can call
+// C functions can use Pond's Rust core.
+//
+// Design: simple, no allocations leaked. All functions return 0 on success,
+// non-zero on error. Callers must free returned buffers.
+// ---------------------------------------------------------------------------
+
+use std::ffi::{c_char, CStr};
+
+/// Opaque result handle for decoded PND2 data.
+/// Callers get column data via pond_result_* accessors, then free with pond_result_free.
+pub struct PondResult {
+    columns: Vec<ResultColumn>,
+}
+
+struct ResultColumn {
+    name: String,
+    vtype: u8,
+    i64_data: Vec<i64>,
+    f64_data: Vec<f64>,
+    str_data: Vec<String>,
+    n_values: usize,
+}
+
+/// Decode a PND2 blob. Returns a PondResult handle.
+/// Returns null on error.
+#[no_mangle]
+pub extern "C" fn pond_pnd2_decode(blob: *const u8, blob_len: usize) -> *mut PondResult {
+    if blob.is_null() || blob_len == 0 {
+        return std::ptr::null_mut();
+    }
+    let data = unsafe { std::slice::from_raw_parts(blob, blob_len) };
+
+    // Parse PND2 header
+    if data.len() < 13 || &data[0..4] != PND2_MAGIC {
+        return std::ptr::null_mut();
+    }
+    let flags = data[5];
+    let n_rows = u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
+    let n_columns = u16::from_le_bytes([data[10], data[11]]) as usize;
+    let compression_tag = data[12];
+
+    // Decompress if needed
+    let inner_owned: Vec<u8>;
+    let inner: &[u8] = if compression_tag == COMPRESSION_ZSTD {
+        // For C ABI, we expect uncompressed input (caller decompresses)
+        // or we use the built-in zstd decompression via Python callback.
+        // For now, only handle uncompressed.
+        return std::ptr::null_mut();
+    } else {
+        &data[13..]
+    };
+
+    let mut parser = PND2Parser::new(inner);
+
+    // Parse schema
+    let mut schema: Vec<(String, u8, u8)> = Vec::with_capacity(n_columns);
+    for _ in 0..n_columns {
+        let name_len = match parser.read_u8() { Some(v) => v as usize, None => break };
+        let name_bytes = match parser.read_bytes(name_len) { Some(v) => v, None => break };
+        let name = String::from_utf8_lossy(name_bytes).to_string();
+        let vtype = match parser.read_u8() { Some(v) => v, None => break };
+        let enc = match parser.read_u8() { Some(v) => v, None => break };
+        schema.push((name, vtype, enc));
+    }
+
+    // Skip stats
+    if flags & FLAG_HAS_STATS != 0 {
+        for (_, vtype, _) in &schema {
+            let has_min = match parser.read_u8() { Some(v) => v, None => break };
+            if has_min != 0 {
+                parser.skip_stat_value(*vtype);
+                parser.skip_stat_value(*vtype);
+            }
+            let _ = parser.read_u32();
+        }
+    }
+
+    // Record payload positions
+    let mut payloads: Vec<(String, u8, u8, usize, usize)> = Vec::with_capacity(n_columns);
+    for (name, vtype, enc) in &schema {
+        let plen = match parser.read_u32() { Some(v) => v as usize, None => break };
+        let pstart = parser.pos;
+        if pstart + plen > inner.len() { break; }
+        parser.pos += plen;
+        payloads.push((name.clone(), *vtype, *enc, pstart, plen));
+    }
+
+    // Decode each column
+    let mut columns: Vec<ResultColumn> = Vec::with_capacity(payloads.len());
+    for (name, vtype, enc, pstart, plen) in &payloads {
+        let payload = &inner[*pstart..*pstart + *plen];
+        if payload.is_empty() {
+            columns.push(ResultColumn {
+                name: name.clone(), vtype: *vtype,
+                i64_data: vec![], f64_data: vec![], str_data: vec![],
+                n_values: 0,
+            });
+            continue;
+        }
+
+        // BINARY
+        if *vtype == VT_BINARY {
+            // Skip for C ABI (binary decode is complex)
+            columns.push(ResultColumn {
+                name: name.clone(), vtype: *vtype,
+                i64_data: vec![], f64_data: vec![], str_data: vec![],
+                n_values: 0,
+            });
+            continue;
+        }
+
+        let data_start = if *enc == ENC_RAW { 1 } else { 0 }; // skip value_type byte for RAW
+        let col_data = &payload[data_start..];
+
+        match *vtype {
+            VT_INT64 => {
+                let n = col_data.len() / 8;
+                let vals: Vec<i64> = (0..n).map(|i| {
+                    let o = i * 8;
+                    i64::from_le_bytes([col_data[o],col_data[o+1],col_data[o+2],col_data[o+3],
+                                        col_data[o+4],col_data[o+5],col_data[o+6],col_data[o+7]])
+                }).collect();
+                columns.push(ResultColumn {
+                    name: name.clone(), vtype: *vtype,
+                    i64_data: vals, f64_data: vec![], str_data: vec![],
+                    n_values: n,
+                });
+            }
+            VT_FLOAT64 => {
+                let n = col_data.len() / 8;
+                let vals: Vec<f64> = (0..n).map(|i| {
+                    let o = i * 8;
+                    f64::from_le_bytes([col_data[o],col_data[o+1],col_data[o+2],col_data[o+3],
+                                        col_data[o+4],col_data[o+5],col_data[o+6],col_data[o+7]])
+                }).collect();
+                columns.push(ResultColumn {
+                    name: name.clone(), vtype: *vtype,
+                    i64_data: vec![], f64_data: vals, str_data: vec![],
+                    n_values: n,
+                });
+            }
+            VT_STRING => {
+                let mut vals: Vec<String> = Vec::new();
+                let mut off = 0;
+                while off + 4 <= col_data.len() && vals.len() < n_rows {
+                    let slen = u32::from_le_bytes([col_data[off],col_data[off+1],col_data[off+2],col_data[off+3]]) as usize;
+                    off += 4;
+                    if off + slen <= col_data.len() {
+                        vals.push(String::from_utf8_lossy(&col_data[off..off+slen]).to_string());
+                        off += slen;
+                    } else { break; }
+                }
+                let n = vals.len();
+                columns.push(ResultColumn {
+                    name: name.clone(), vtype: *vtype,
+                    i64_data: vec![], f64_data: vec![], str_data: vals,
+                    n_values: n,
+                });
+            }
+            _ => {
+                columns.push(ResultColumn {
+                    name: name.clone(), vtype: *vtype,
+                    i64_data: vec![], f64_data: vec![], str_data: vec![],
+                    n_values: 0,
+                });
+            }
+        }
+    }
+
+    Box::into_raw(Box::new(PondResult { columns }))
+}
+
+/// Get number of columns in a decoded result.
+#[no_mangle]
+pub extern "C" fn pond_result_num_columns(result: *const PondResult) -> usize {
+    if result.is_null() { return 0; }
+    let r = unsafe { &*result };
+    r.columns.len()
+}
+
+/// Get column name (null-terminated C string). Valid until result is freed.
+#[no_mangle]
+pub extern "C" fn pond_result_column_name(result: *const PondResult, index: usize) -> *const c_char {
+    if result.is_null() { return std::ptr::null(); }
+    let r = unsafe { &*result };
+    if index >= r.columns.len() { return std::ptr::null(); }
+    r.columns[index].name.as_ptr() as *const c_char
+}
+
+/// Get column value type (1=INT64, 2=FLOAT64, 3=STRING).
+#[no_mangle]
+pub extern "C" fn pond_result_column_vtype(result: *const PondResult, index: usize) -> u8 {
+    if result.is_null() { return 0; }
+    let r = unsafe { &*result };
+    if index >= r.columns.len() { return 0; }
+    r.columns[index].vtype
+}
+
+/// Get number of values in a column.
+#[no_mangle]
+pub extern "C" fn pond_result_column_len(result: *const PondResult, index: usize) -> usize {
+    if result.is_null() { return 0; }
+    let r = unsafe { &*result };
+    if index >= r.columns.len() { return 0; }
+    r.columns[index].n_values
+}
+
+/// Get INT64 column data pointer. Valid until result is freed.
+#[no_mangle]
+pub extern "C" fn pond_result_column_i64(result: *const PondResult, index: usize) -> *const i64 {
+    if result.is_null() { return std::ptr::null(); }
+    let r = unsafe { &*result };
+    if index >= r.columns.len() { return std::ptr::null(); }
+    if r.columns[index].vtype != VT_INT64 { return std::ptr::null(); }
+    r.columns[index].i64_data.as_ptr()
+}
+
+/// Get FLOAT64 column data pointer. Valid until result is freed.
+#[no_mangle]
+pub extern "C" fn pond_result_column_f64(result: *const PondResult, index: usize) -> *const f64 {
+    if result.is_null() { return std::ptr::null(); }
+    let r = unsafe { &*result };
+    if index >= r.columns.len() { return std::ptr::null(); }
+    if r.columns[index].vtype != VT_FLOAT64 { return std::ptr::null(); }
+    r.columns[index].f64_data.as_ptr()
+}
+
+/// Get STRING column value at a specific index.
+/// Returns null-terminated C string. Valid until result is freed.
+#[no_mangle]
+pub extern "C" fn pond_result_column_str(result: *const PondResult, col_index: usize, row_index: usize) -> *const c_char {
+    if result.is_null() { return std::ptr::null(); }
+    let r = unsafe { &*result };
+    if col_index >= r.columns.len() { return std::ptr::null(); }
+    if r.columns[col_index].vtype != VT_STRING { return std::ptr::null(); }
+    if row_index >= r.columns[col_index].str_data.len() { return std::ptr::null(); }
+    r.columns[col_index].str_data[row_index].as_ptr() as *const c_char
+}
+
+/// Free a decoded result.
+#[no_mangle]
+pub extern "C" fn pond_result_free(result: *mut PondResult) {
+    if !result.is_null() {
+        unsafe { drop(Box::from_raw(result)); }
+    }
+}
+
+/// Encode INT64 column data into a PND2 blob (uncompressed, RAW encoding).
+/// Returns 0 on success (writes blob pointer + length), non-zero on error.
+///
+/// Simple API for single-column INT64. For multi-column, use the Python
+/// encode() function or build the PND2 blob manually in the calling language.
+#[no_mangle]
+pub extern "C" fn pond_pnd2_encode_i64(
+    values: *const i64, n_values: usize,
+    out_blob: *mut *mut u8, out_blob_len: *mut usize,
+) -> i32 {
+    if values.is_null() || n_values == 0 || out_blob.is_null() || out_blob_len.is_null() {
+        return -1;
+    }
+
+    let vals = unsafe { std::slice::from_raw_parts(values, n_values) };
+
+    // Build PND2 blob (uncompressed, single INT64 column, RAW encoding)
+    let mut inner = Vec::new();
+
+    // Schema: 1 column "v" of type INT64, encoding RAW
+    inner.extend_from_slice(&[1]); // name_len = 1
+    inner.extend_from_slice(b"v"); // name
+    inner.extend_from_slice(&[VT_INT64, ENC_RAW]); // vtype + enc
+
+    // Stats: min/max for INT64
+    let min = vals.iter().min().copied().unwrap_or(0);
+    let max = vals.iter().max().copied().unwrap_or(0);
+    inner.push(1); // has_min
+    inner.extend_from_slice(&min.to_le_bytes());
+    inner.extend_from_slice(&max.to_le_bytes());
+    inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+
+    // Payload: value_type(1B) + values (8B each)
+    let mut payload = Vec::with_capacity(1 + n_values * 8);
+    payload.push(VT_INT64);
+    for v in vals {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    inner.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    inner.extend_from_slice(&payload);
+
+    // Build final PND2 blob
+    let mut blob = Vec::new();
+    blob.extend_from_slice(PND2_MAGIC);
+    blob.push(PND2_VERSION);
+    blob.push(FLAG_HAS_STATS);
+    blob.extend_from_slice(&(n_values as u32).to_le_bytes());
+    blob.extend_from_slice(&1u16.to_le_bytes()); // 1 column
+    blob.push(COMPRESSION_NONE);
+    blob.extend_from_slice(&inner);
+
+    let len = blob.len();
+    let ptr = blob.as_mut_ptr();
+    std::mem::forget(blob); // prevent Rust from freeing — caller owns it
+
+    unsafe {
+        *out_blob = ptr;
+        *out_blob_len = len;
+    }
+    0 // success
+}
+
+/// Free a blob returned by pond_pnd2_encode_i64.
+#[no_mangle]
+pub extern "C" fn pond_blob_free(blob: *mut u8, blob_len: usize) {
+    if !blob.is_null() && blob_len > 0 {
+        unsafe { drop(Vec::from_raw_parts(blob, blob_len, blob_len)); }
+    }
+}

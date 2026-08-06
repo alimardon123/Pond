@@ -1,11 +1,15 @@
 [package]
 name = "pond_rust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Pond storage system — Rust core (PND2 encode/decode, C ABI for cross-language SDKs)"
+license = "MIT"
 
 [lib]
 name = "pond_rust"
-crate-type = ["cdylib"]
+# cdylib: Python extension module (.so/.dylib/.dll)
+# staticlib: C ABI static library (.a/.lib) for linking into Go/Java/Node
+crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
