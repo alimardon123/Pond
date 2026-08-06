@@ -205,7 +205,8 @@ class PND2:
         # Try the Rust encoder first. It handles RAW encoding for INT64,
         # FLOAT64, and STRING. Returns None if it can't handle the data.
         # This is 44x faster than the Python encoder for RAW-encodable data.
-        # We skip the fast path if encoding_hints request non-RAW encodings.
+        # The Rust encoder ALSO computes stats (min/max) for FREE during the
+        # single-pass encode — so we don't need to re-compute them in Python.
         if not any(h in ("rle", "dict", "bitpack") for h in encoding_hints.values()):
             try:
                 import pond_rust
@@ -221,20 +222,11 @@ class PND2:
                     rust_cols.append((col_name, values))
 
                 if can_use_rust and rust_cols:
-                    rust_blob = pond_rust.encode(rust_cols, n_rows)
-                    if rust_blob is not None:
-                        # Rust encoder succeeded — extract stats from the blob
-                        # (the Rust encoder computes min/max for INT64/FLOAT64)
-                        col_stats = []
-                        for col_name in col_names:
-                            values = source.column_slice(col_name, 0, n_rows)
-                            vtype = _detect_value_type_with_binary(values)
-                            if vtype in (VALUE_TYPE_INT64, VALUE_TYPE_FLOAT64):
-                                mn, mx, nc = compute_list_stats(values)
-                                col_stats.append((col_name, vtype, mn, mx, nc))
-                            else:
-                                mn, mx, nc = None, None, sum(1 for v in values if v is None)
-                                col_stats.append((col_name, vtype, mn, mx, nc))
+                    result = pond_rust.encode(rust_cols, n_rows)
+                    if result is not None:
+                        # Rust returns {"blob": bytes, "stats": [(name, vtype, min, max, null_count), ...]}
+                        rust_blob = result["blob"]
+                        col_stats = [(s[0], s[1], s[2], s[3], s[4]) for s in result["stats"]]
 
                         # Apply compression if requested
                         if compress and len(rust_blob) > 64:
@@ -242,13 +234,10 @@ class PND2:
                                 import zstandard as zstd
                                 compressed = zstd.compress(rust_blob[13:])  # skip header
                                 if len(compressed) + 1 < len(rust_blob) - 13:
-                                    # Rebuild with compression flag
-                                    header = rust_blob[:13]  # magic + version + flags + n_rows + n_cols
-                                    # Set compressed flag
-                                    header = bytearray(header)
+                                    header = bytearray(rust_blob[:12])
                                     header[5] |= _FLAG_COMPRESSED
-                                    result = bytes(header[:12]) + bytes([COMPRESSION_ZSTD]) + compressed
-                                    return result, col_stats
+                                    result_bytes = bytes(header) + bytes([COMPRESSION_ZSTD]) + compressed
+                                    return result_bytes, col_stats
                             except ImportError:
                                 pass
                         return rust_blob, col_stats

@@ -24,7 +24,7 @@
 //     Payloads: per col: payload_len(4B) + payload_bytes
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyBytes, PyList};
+use pyo3::types::{PyDict, PyBytes, PyList, PyTuple};
 use pyo3::Bound;
 
 // ---------------------------------------------------------------------------
@@ -729,7 +729,11 @@ fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Encode a list of column values into a PND2 blob (RAW encoding only).
 ///
-/// Handles INT64, FLOAT64, and STRING columns with RAW encoding.
+/// Returns a tuple (blob_bytes, stats_list) where stats_list is a list of
+/// (name, vtype, min, max, null_count) tuples — computed for FREE during
+/// the single-pass encode. The caller uses these stats to build the manifest
+/// without re-computing them.
+///
 /// Returns None for columns that need DICT/RLE/BITPACK (Python handles those).
 #[pyfunction]
 #[pyo3(signature = (columns, n_rows))]
@@ -740,6 +744,7 @@ fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResu
 
     let mut inner = Vec::new();
     let mut col_payloads: Vec<Vec<u8>> = Vec::new();
+    let mut stats_list: Vec<(String, u8, PyObject, PyObject, u32)> = Vec::new();
 
     // Schema section
     for (name, values_obj) in &columns {
@@ -754,14 +759,17 @@ fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResu
             let mut payload = Vec::with_capacity(1 + n_rows * 8);
             payload.push(VT_INT64);
             for v in &vals { payload.extend_from_slice(&v.to_le_bytes()); }
-            // Stats
-            let min = vals.iter().min().copied().unwrap_or(0);
-            let max = vals.iter().max().copied().unwrap_or(0);
+            // Compute stats in the SAME pass (zero extra cost)
+            let min_val = vals.iter().min().copied().unwrap_or(0);
+            let max_val = vals.iter().max().copied().unwrap_or(0);
             inner.extend_from_slice(&[name_bytes.len() as u8]);
             inner.extend_from_slice(name_bytes);
             inner.extend_from_slice(&[VT_INT64, ENC_RAW]);
-            // Will add stats + payload later
             col_payloads.push(payload);
+            stats_list.push((name.clone(), VT_INT64,
+                min_val.to_object(py),
+                max_val.to_object(py),
+                0u32));
             continue;
         }
 
@@ -771,10 +779,16 @@ fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResu
             let mut payload = Vec::with_capacity(1 + n_rows * 8);
             payload.push(VT_FLOAT64);
             for v in &vals { payload.extend_from_slice(&v.to_le_bytes()); }
+            let min_val = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max_val = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             inner.extend_from_slice(&[name_bytes.len() as u8]);
             inner.extend_from_slice(name_bytes);
             inner.extend_from_slice(&[VT_FLOAT64, ENC_RAW]);
             col_payloads.push(payload);
+            stats_list.push((name.clone(), VT_FLOAT64,
+                min_val.to_object(py),
+                max_val.to_object(py),
+                0u32));
             continue;
         }
 
@@ -792,6 +806,8 @@ fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResu
             inner.extend_from_slice(name_bytes);
             inner.extend_from_slice(&[VT_STRING, ENC_RAW]);
             col_payloads.push(payload);
+            stats_list.push((name.clone(), VT_STRING,
+                py.None(), py.None(), 0u32));
             continue;
         }
 
@@ -799,63 +815,32 @@ fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResu
         return Ok(py.None());
     }
 
-    // Stats section — compute min/max for INT64 and FLOAT64, skip for STRING
-    for i in 0..col_payloads.len() {
-        let payload = &col_payloads[i];
-        // Determine vtype from schema (already written to inner)
-        // We stored it as the second byte after the name in the schema section.
-        // Instead of re-parsing, we know the order: col_payloads[i] corresponds
-        // to the i-th column in the schema.
-        // The vtype is the first byte of each payload (value_type byte).
-        let vtype = payload[0];
-
-        match vtype {
-            VT_INT64 => {
-                let data = &payload[1..]; // skip value_type byte
-                let n = data.len() / 8;
-                if n > 0 {
-                    let mut min = i64::from_le_bytes([data[0],data[1],data[2],data[3],data[4],data[5],data[6],data[7]]);
-                    let mut max = min;
-                    for i in 1..n {
-                        let o = i * 8;
-                        let v = i64::from_le_bytes([data[o],data[o+1],data[o+2],data[o+3],data[o+4],data[o+5],data[o+6],data[o+7]]);
-                        if v < min { min = v; }
-                        if v > max { max = v; }
-                    }
-                    inner.push(1); // has_min
-                    inner.extend_from_slice(&min.to_le_bytes());
-                    inner.extend_from_slice(&max.to_le_bytes());
-                } else {
-                    inner.push(0);
-                }
-                inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+    // Stats section — write stats computed above into the blob
+    for (_, _, min_obj, max_obj, null_count) in &stats_list {
+        // Check if min/max are available (INT64/FLOAT64)
+        if min_obj.is_none(py) {
+            inner.push(0); // no min/max
+        } else {
+            inner.push(1); // has_min
+            // Write min
+            if let Ok(v) = min_obj.extract::<i64>(py) {
+                inner.extend_from_slice(&v.to_le_bytes());
+            } else if let Ok(v) = min_obj.extract::<f64>(py) {
+                inner.extend_from_slice(&v.to_le_bytes());
+            } else {
+                // Can't determine type — write 0 bytes
+                inner.extend_from_slice(&[0u8; 8]);
             }
-            VT_FLOAT64 => {
-                let data = &payload[1..];
-                let n = data.len() / 8;
-                if n > 0 {
-                    let mut min = f64::from_le_bytes([data[0],data[1],data[2],data[3],data[4],data[5],data[6],data[7]]);
-                    let mut max = min;
-                    for i in 1..n {
-                        let o = i * 8;
-                        let v = f64::from_le_bytes([data[o],data[o+1],data[o+2],data[o+3],data[o+4],data[o+5],data[o+6],data[o+7]]);
-                        if v < min { min = v; }
-                        if v > max { max = v; }
-                    }
-                    inner.push(1); // has_min
-                    inner.extend_from_slice(&min.to_le_bytes());
-                    inner.extend_from_slice(&max.to_le_bytes());
-                } else {
-                    inner.push(0);
-                }
-                inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
-            }
-            _ => {
-                // STRING/BINARY: no min/max
-                inner.push(0);
-                inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+            // Write max
+            if let Ok(v) = max_obj.extract::<i64>(py) {
+                inner.extend_from_slice(&v.to_le_bytes());
+            } else if let Ok(v) = max_obj.extract::<f64>(py) {
+                inner.extend_from_slice(&v.to_le_bytes());
+            } else {
+                inner.extend_from_slice(&[0u8; 8]);
             }
         }
+        inner.extend_from_slice(&null_count.to_le_bytes());
     }
 
     // Per-column payloads
@@ -874,7 +859,21 @@ fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResu
     blob.push(COMPRESSION_NONE);
     blob.extend_from_slice(&inner);
 
-    Ok(PyBytes::new_bound(py, &blob).into())
+    // Return tuple: (blob_bytes, stats_list)
+    let result = PyDict::new_bound(py);
+    result.set_item("blob", PyBytes::new_bound(py, &blob))?;
+    let stats_py = PyList::new_bound(py, stats_list.iter().map(|(name, vtype, min, max, nc)| {
+        let t = PyTuple::new_bound(py, [
+            name.to_object(py),
+            vtype.to_object(py),
+            min.clone_ref(py),
+            max.clone_ref(py),
+            nc.to_object(py),
+        ]);
+        t.into_any()
+    }));
+    result.set_item("stats", stats_py)?;
+    Ok(result.into())
 }
 
 // ---------------------------------------------------------------------------
