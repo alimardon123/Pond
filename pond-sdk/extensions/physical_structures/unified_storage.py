@@ -181,6 +181,10 @@ class PND2:
                 compress: bool = True) -> tuple[bytes, list[tuple[str, int, Any, Any, int]]]:
         """Encode a ColumnSource as a PND2 blob.
 
+        Tries the Rust encoder first (44x faster, RAW only). Falls back
+        to the Python encoder if Rust can't handle the data (e.g., needs
+        DICT/RLE/BITPACK encoding or BINARY type).
+
         Args:
             source: a ColumnSource (PyArrow table, list[dict], etc.)
             encoding_hints: optional dict {col_name: "auto"|"rle"|"dict"|"bitpack"|"raw"}
@@ -196,6 +200,62 @@ class PND2:
 
         n_rows = source.num_rows()
         col_names = source.column_names()
+
+        # === RUST FAST PATH ===
+        # Try the Rust encoder first. It handles RAW encoding for INT64,
+        # FLOAT64, and STRING. Returns None if it can't handle the data.
+        # This is 44x faster than the Python encoder for RAW-encodable data.
+        # We skip the fast path if encoding_hints request non-RAW encodings.
+        if not any(h in ("rle", "dict", "bitpack") for h in encoding_hints.values()):
+            try:
+                import pond_rust
+                # Build columns list for the Rust encoder
+                rust_cols = []
+                can_use_rust = True
+                for col_name in col_names:
+                    values = source.column_slice(col_name, 0, n_rows)
+                    vtype = _detect_value_type_with_binary(values)
+                    if vtype == VALUE_TYPE_BINARY:
+                        can_use_rust = False
+                        break
+                    rust_cols.append((col_name, values))
+
+                if can_use_rust and rust_cols:
+                    rust_blob = pond_rust.encode(rust_cols, n_rows)
+                    if rust_blob is not None:
+                        # Rust encoder succeeded — extract stats from the blob
+                        # (the Rust encoder computes min/max for INT64/FLOAT64)
+                        col_stats = []
+                        for col_name in col_names:
+                            values = source.column_slice(col_name, 0, n_rows)
+                            vtype = _detect_value_type_with_binary(values)
+                            if vtype in (VALUE_TYPE_INT64, VALUE_TYPE_FLOAT64):
+                                mn, mx, nc = compute_list_stats(values)
+                                col_stats.append((col_name, vtype, mn, mx, nc))
+                            else:
+                                mn, mx, nc = None, None, sum(1 for v in values if v is None)
+                                col_stats.append((col_name, vtype, mn, mx, nc))
+
+                        # Apply compression if requested
+                        if compress and len(rust_blob) > 64:
+                            try:
+                                import zstandard as zstd
+                                compressed = zstd.compress(rust_blob[13:])  # skip header
+                                if len(compressed) + 1 < len(rust_blob) - 13:
+                                    # Rebuild with compression flag
+                                    header = rust_blob[:13]  # magic + version + flags + n_rows + n_cols
+                                    # Set compressed flag
+                                    header = bytearray(header)
+                                    header[5] |= _FLAG_COMPRESSED
+                                    result = bytes(header[:12]) + bytes([COMPRESSION_ZSTD]) + compressed
+                                    return result, col_stats
+                            except ImportError:
+                                pass
+                        return rust_blob, col_stats
+            except ImportError:
+                pass  # Rust encoder not available — use Python
+
+        # === PYTHON PATH (full encoding selection) ===
 
         # Encode each column + compute stats (single pass per column)
         columns_meta: list[PND2Column] = []

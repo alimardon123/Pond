@@ -799,13 +799,63 @@ fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResu
         return Ok(py.None());
     }
 
-    // Stats section (we need to re-derive min/max from payloads)
-    // For simplicity, we store has_min=0 for all (Python encoder computes
-    // proper stats; the Rust encoder is a fast path that skips stats).
-    // The reader handles has_min=0 gracefully.
-    for _ in &col_payloads {
-        inner.push(0); // no min/max
-        inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+    // Stats section — compute min/max for INT64 and FLOAT64, skip for STRING
+    for i in 0..col_payloads.len() {
+        let payload = &col_payloads[i];
+        // Determine vtype from schema (already written to inner)
+        // We stored it as the second byte after the name in the schema section.
+        // Instead of re-parsing, we know the order: col_payloads[i] corresponds
+        // to the i-th column in the schema.
+        // The vtype is the first byte of each payload (value_type byte).
+        let vtype = payload[0];
+
+        match vtype {
+            VT_INT64 => {
+                let data = &payload[1..]; // skip value_type byte
+                let n = data.len() / 8;
+                if n > 0 {
+                    let mut min = i64::from_le_bytes([data[0],data[1],data[2],data[3],data[4],data[5],data[6],data[7]]);
+                    let mut max = min;
+                    for i in 1..n {
+                        let o = i * 8;
+                        let v = i64::from_le_bytes([data[o],data[o+1],data[o+2],data[o+3],data[o+4],data[o+5],data[o+6],data[o+7]]);
+                        if v < min { min = v; }
+                        if v > max { max = v; }
+                    }
+                    inner.push(1); // has_min
+                    inner.extend_from_slice(&min.to_le_bytes());
+                    inner.extend_from_slice(&max.to_le_bytes());
+                } else {
+                    inner.push(0);
+                }
+                inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+            }
+            VT_FLOAT64 => {
+                let data = &payload[1..];
+                let n = data.len() / 8;
+                if n > 0 {
+                    let mut min = f64::from_le_bytes([data[0],data[1],data[2],data[3],data[4],data[5],data[6],data[7]]);
+                    let mut max = min;
+                    for i in 1..n {
+                        let o = i * 8;
+                        let v = f64::from_le_bytes([data[o],data[o+1],data[o+2],data[o+3],data[o+4],data[o+5],data[o+6],data[o+7]]);
+                        if v < min { min = v; }
+                        if v > max { max = v; }
+                    }
+                    inner.push(1); // has_min
+                    inner.extend_from_slice(&min.to_le_bytes());
+                    inner.extend_from_slice(&max.to_le_bytes());
+                } else {
+                    inner.push(0);
+                }
+                inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+            }
+            _ => {
+                // STRING/BINARY: no min/max
+                inner.push(0);
+                inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+            }
+        }
     }
 
     // Per-column payloads
