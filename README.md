@@ -35,7 +35,7 @@ UnifiedStorage (ONE storage engine)
   - Shards (CRDT G-Set) + row-level version vectors
   - Parallel fetch (~1 RTT wall-clock)
   ↓
-Kernel (FROZEN — 3 primitives)
+Kernel (6 substrates + 3 ops + batch helpers)
   Write(bytes) → hash  |  Read(hash) → bytes  |  Ref(name, hash) → ()
 ```
 
@@ -88,17 +88,23 @@ Kernel (FROZEN — 3 primitives)
 ### Vector Search (IVF)
 - `build_ann_index(collection, n_clusters)` — k-means clustering
 - `search(collection, query, k, n_probe)` — auto-accelerated ANN
-- 100× reduction at PB scale (10M vectors, 1000 clusters)
-- 97% recall (n_probe=5 of 20 clusters)
+- ⚠️ **Known limitation:** the current IVF implementation reads ALL vectors
+  per search (no per-cluster blob fetching yet). IVF reduces CPU distance
+  computations but NOT I/O. At PB scale this is a known gap, not a
+  competitive feature. See `docs/HONEST_COMPETITOR_COMPARISON.md` §2.
 
 ### Maintenance
 - `gc(collection)` — read-only reachability analysis
 - `vacuum(collections, preserve_days)` — delete dead blobs
 - `optimize(collection)` — compact shards + flatten manifests
 
-### Hierarchical Namespaces
+### Hierarchical Namespaces (collection naming, not a catalog)
 - Collection names with `/` for organization: `dev/events`, `prod/users`
 - `list_namespaces(parent)` — browse one level at a time
+- ⚠️ This is hierarchical **naming**, not a catalog service (no schema
+  registry, no table discovery, no cross-collection metadata). A real
+  catalog (REST/Glue/Nessie-compatible) is a future milestone. See
+  `docs/HONEST_COMPETITOR_COMPARISON.md` §1.
 
 ---
 
@@ -214,7 +220,7 @@ No format conversion needed — blobs and paths use the same layout.
 ## Repository Structure
 
 ```
-pond-core/          Kernel (FROZEN — 3 primitives, ~200 LOC)
+pond-core/          Kernel (6 substrates + 3 ops + batch helpers, ~285 LOC)
 pond-sdk/           Unified SDK (PondStorage + UnifiedStorage + extensions)
   extensions/
     physical_structures/  PND2, CollectionManifest, StatsTree, Compression

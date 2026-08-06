@@ -80,13 +80,12 @@ docs overclaim), the entry stays open until the code is fixed.
   purpose of IVF. The IVF *format* is correct (centroids + cluster
   assignments); the *integration* with `UnifiedStorage` is not.
   Status: **open** — needs per-cluster blob fetching.
-- **`LakehouseLens` and `OLTPLens` do NOT extend `PondLens`.**
-  `class LakehouseLens:` and `class OLTPLens:` declare no base class
-  (verified in source). This is a **documented exception, not a bug**
-  — both lenses are thin wrappers over `PondStorage`/
-  `UnifiedStorage` and own their own read/write API. Callers cannot
-  assume `(PondLens)`-shaped methods on every production lens. See
-  `SDK_SPEC.md` §1.3 for the per-lens table.
+- **`LakehouseLens` and `OLTPLens` now extend `PondLens`** (fixed in
+  Tier 0 — Task 66). Both previously declared no base class; both now
+  inherit `branch`/`list_collections`/`set_definition`/`get_definition`/
+  `history` from `PondLens` for free. `KeylessLens(KeyValueLens)` is
+  a documented exception (legitimate variant, same file, auto-generates
+  UUIDv7 keys).
 - **"ACID transactions" are atomic publication only.** The
   `commit_tx` path provides atomic publication across collections
   (all-or-nothing HEAD pointer moves via a transaction marker) — but
@@ -414,11 +413,11 @@ frozen.
 |---|---|---|---|
 | `pond-core` | 0 | ~1630 | The kernel + storage backends: `kernel.py` (PondMinimal, 274 LOC; NOT FROZEN — has `write_batch`/`read_blob_batch` same-collection helpers) + `object_store_native_kernel.py` (ObjectStoreNativeKernel, no SQLite, ~280 LOC) + `local_fs_object_store.py` (443 LOC) + `s3_object_store.py` (519 LOC) + `s3_mock_backend.py` (latency-injecting mock) + `make_kernel.py` (112 LOC unified factory). |
 | `pond-sdk` | 1–2 | ~3000 | `base_lens.py` (PondLens shared namespace), `pond_storage.py` (PondStorage — the unified SDK class), `pond_config.py`, `maintenance.py`, `uuid7.py`, `hlc.py`, `row_query.py`, extensions (`physical_structures/`: `unified_storage.py` THE universal storage backend, `collection_manifest.py`, `stats_tree.py`, `encoding.py`, `compression.py`, `column_source.py`, `embedded_stats.py`, `pond_pack.py`; `indexing/`: `collection_index.py`, `ivf_index.py`, `hnsw_index.py`; `maintenance/vacuum.py`; `semantic/`). The legacy `prolly_tree.py`/`binary_encoding.py`/`collection_metadata.py` referenced in older docs are in `archive/legacy-sdk/` and `archive/legacy-extensions/`. |
-| `lenses/lakehouse` | 3 | ~2200 | LakehouseLens (Parquet + DuckDB + SQL pushdown). Flagship tabular lens. **NO base class** (documented exception — see §1.1 Known Gaps). |
+| `lenses/lakehouse` | 3 | ~2200 | LakehouseLens (Parquet + DuckDB + SQL pushdown). Flagship tabular lens. Extends `PondLens` directly. |
 | `lenses/keyvalue` | 3 | ~760 | KeyValueLens (UnifiedStorage-backed; extends `PondLens` directly). |
 | `lenses/vector` | 3 | ~530 | VectorLens (k-NN search; UnifiedStorage-backed; extends `PondLens` directly). IVF index exists but does NOT yet reduce I/O (see §1.1 Known Gaps). HNSW index exists. |
 | `lenses/streaming` | 3 | ~400 | StreamingLens (chunked segments + range reads; extends `PondLens` directly). Kafka-like features (topics, partitions, consumer groups). `commit_hash` time-travel is NOT implemented in the unified path (see §1.1 Known Gaps). |
-| `lenses/oltp` | 3 | ~184 | OLTPLens (in-memory memtable + batch flush to CRDT shards; **NO base class** — documented exception). |
+| `lenses/oltp` | 3 | ~184 | OLTPLens (in-memory memtable + batch flush to CRDT shards; extends `PondLens` directly). |
 | `services/` | 3 | ~500 | Schema registry, replication coordinator, transport (production) |
 | `pond-labs/` | 3 | ~3000 | Demos, benchmarks, tracks (validation suite) |
 

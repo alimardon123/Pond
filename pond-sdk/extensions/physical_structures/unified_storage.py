@@ -3622,9 +3622,22 @@ class UnifiedStorage:
                 f.result()
 
     # ------------------------------------------------------------------
-    # ACID TRANSACTIONS — commit markers on top of CRDT shards
+    # ATOMIC PUBLICATION — commit markers on top of CRDT shards
     #
-    # ACID = CRDT + commit markers. Same model, thin extension.
+    # Atomic publication = CRDT + commit markers. Same model, thin extension.
+    #
+    # IMPORTANT: this is NOT full ACID. It provides atomic VISIBILITY
+    # (once the commit marker exists, all tentative shards become visible
+    # together) but does NOT provide:
+    #   - Isolation (readers can see committed state from other txns
+    #     mid-read; no snapshot isolation)
+    #   - Rollback (abort_tx is a no-op; tentative shards are orphaned
+    #     until GC)
+    #   - Conflict detection (two txns can write the same _rowid; merge
+    #     is LWW by _version)
+    #   - Serializability
+    # See docs/HONEST_COMPETITOR_COMPARISON.md §3 for the honest
+    # description of what this provides vs. real ACID.
     #
     #   tx = storage.begin_tx()
     #   storage.append_shard("users", rows, tx_id=tx)

@@ -94,24 +94,21 @@ KeyValueLens is NOT the universal base class — that's `PondLens`
 in `pond-sdk/base_lens.py`. KeyValueLens is a peer of `LakehouseLens`,
 `VectorLens`, `StreamingLens`, and `OLTPLens`.
 
-> **Honesty note (Task 65).** The previous version of this section
-> claimed "all three extend `PondLens` directly." That is **only true
-> for three of the five production lenses**:
+> **Honesty note (updated Task 66).** All 5 production lenses now
+> extend `PondLens` directly:
 >
 > | Lens | Class declaration | Extends `PondLens`? |
 > |---|---|---|
 > | `KeyValueLens` | `class KeyValueLens(PondLens):` | ✅ Yes |
 > | `VectorLens`   | `class VectorLens(PondLens):`   | ✅ Yes |
 > | `StreamingLens`| `class StreamingLens(PondLens):`| ✅ Yes |
-> | `LakehouseLens`| `class LakehouseLens:`          | ❌ No (documented exception) |
-> | `OLTPLens`     | `class OLTPLens:`               | ❌ No (documented exception) |
+> | `LakehouseLens`| `class LakehouseLens(PondLens):` | ✅ Yes (fixed in Tier 0 — Task 66) |
+> | `OLTPLens`     | `class OLTPLens(PondLens):`     | ✅ Yes (fixed in Tier 0 — Task 66) |
 >
-> `LakehouseLens` and `OLTPLens` declare no base class because they
-> do not need the ref-namespace operations `PondLens` provides — they
-> are thin wrappers over `PondStorage` / `UnifiedStorage` that own
-> their own read/write API. This is a **documented exception**, NOT a
-> bug — but it does mean callers cannot assume `(PondLens)`-shaped
-> methods on every production lens. See `DESIGN_GOALS.md` Known Gaps.
+> All 5 production lenses now extend `PondLens` directly. `KeylessLens`
+> in `lenses/keyvalue/keyvalue_lens.py` is a documented exception — it
+> subclasses `KeyValueLens` to auto-generate UUIDv7 keys, which is a
+> legitimate variant pattern (same file, thin override of `put()`).
 
 No production lens inherits from another lens.
 
@@ -154,7 +151,10 @@ The collection name appears in:
 ### 1.5. Lifetime
 
 The kernel holds an open SQLite connection. Call `kernel.close()` to
-release it. The kernel is NOT thread-safe by default.
+release it. The kernel IS thread-safe as of Tier 0 (Task 66) — the
+SQLite connection uses `check_same_thread=False` and all mutations are
+guarded by a `threading.RLock`. This allows `UnifiedStorage`'s
+`ThreadPoolExecutor` to call the kernel from worker threads.
 
 ---
 
