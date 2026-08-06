@@ -64,9 +64,9 @@ class LocalFSObjectStore:
         """
         self._base_dir = os.path.abspath(base_dir)
         # NEW short blob dir
-        self._blobs_dir = os.path.join(self._base_dir, "b")
+        self._blobs_dir = os.path.join(self._base_dir, "blobs")
         # OLD blob dir (for backward compat reads)
-        self._old_blobs_dir = os.path.join(self._base_dir, "blobs")
+        self._old_blobs_dir = os.path.join(self._base_dir, "b")
         os.makedirs(self._blobs_dir, exist_ok=True)
 
         self._lock = threading.Lock()
@@ -339,34 +339,49 @@ class LocalFSObjectStore:
         pass
 
     def list_paths(self, prefix: str = "") -> list[str]:
-        """List all paths with the given prefix.
+        """List all paths (refs) with the given prefix.
 
-        Scans both NEW ({base_dir}/{prefix}) and OLD ({base_dir}/paths/{prefix})
-        locations, merges results.
+        The prefix is a full path like "collections/users/branches/main/shards/"
+        or "transactions/". We scan the base directory for matching paths.
+        Also scans legacy locations (r/, paths/) for backward compat.
         """
         paths = []
 
-        # NEW location
-        new_prefix_dir = self._paths_prefix_dir(prefix)
-        if os.path.isdir(new_prefix_dir):
-            for root, _dirs, files in os.walk(new_prefix_dir):
-                for f in files:
-                    full = os.path.join(root, f)
-                    rel = os.path.relpath(full, self._base_dir)
-                    p = rel.replace(os.sep, "/")
-                    # Skip blob directory
-                    if not p.startswith("b/"):
-                        paths.append(p)
+        # If prefix already starts with a known top-level dir, scan directly
+        known_prefixes = ["collections/", "transactions/", "r/", "paths/"]
+        if any(prefix.startswith(kp) for kp in known_prefixes):
+            # Scan directly under base_dir with the full prefix
+            dir_path = os.path.join(self._base_dir, prefix)
+            if os.path.isdir(dir_path):
+                for root, _dirs, files in os.walk(dir_path):
+                    for f in files:
+                        full = os.path.join(root, f)
+                        rel = os.path.relpath(full, self._base_dir)
+                        p = rel.replace(os.sep, "/")
+                        if not p.startswith("blobs/") and not p.startswith("b/"):
+                            paths.append(p)
+        else:
+            # No known prefix — scan all known ref directories
+            for dirname in ["collections", "transactions", "r"]:
+                dir_path = os.path.join(self._base_dir, dirname, prefix) if prefix else os.path.join(self._base_dir, dirname)
+                if os.path.isdir(dir_path):
+                    for root, _dirs, files in os.walk(dir_path):
+                        for f in files:
+                            full = os.path.join(root, f)
+                            rel = os.path.relpath(full, self._base_dir)
+                            p = rel.replace(os.sep, "/")
+                            if not p.startswith("blobs/") and not p.startswith("b/"):
+                                paths.append(p)
 
-        # OLD location (backward compat)
-        old_prefix_dir = os.path.join(self._base_dir, "paths", prefix)
-        if os.path.isdir(old_prefix_dir):
+            # Original "paths/" layout
             old_paths_dir = os.path.join(self._base_dir, "paths")
-            for root, _dirs, files in os.walk(old_prefix_dir):
-                for f in files:
-                    full = os.path.join(root, f)
-                    rel = os.path.relpath(full, old_paths_dir)
-                    paths.append(rel.replace(os.sep, "/"))
+            old_dir = os.path.join(old_paths_dir, prefix) if prefix else old_paths_dir
+            if os.path.isdir(old_dir):
+                for root, _dirs, files in os.walk(old_dir):
+                    for f in files:
+                        full = os.path.join(root, f)
+                        rel = os.path.relpath(full, old_paths_dir)
+                        paths.append(rel.replace(os.sep, "/"))
 
         return sorted(set(paths))
 

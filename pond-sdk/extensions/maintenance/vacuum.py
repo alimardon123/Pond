@@ -232,7 +232,7 @@ class GarbageCollector:
             for n in names:
                 for coll in collections:
                     # Check both NEW (r/{coll}/) and OLD (collections/{coll}/) formats
-                    if n.startswith(f"r/{coll}/") or n.startswith(f"collections/{coll}/"):
+                    if n.startswith(f"collections/{coll}/") or n.startswith(f"r/{coll}/"):
                         filtered.append(n)
                         break
             names = filtered
@@ -267,7 +267,7 @@ class GarbageCollector:
                 if tx_id:
                     # Check both NEW (r/tx/{tx_id}) and OLD (transactions/{tx_id}) formats
                     tx_hash = None
-                    for tx_ref in [f"r/tx/{tx_id}", f"transactions/{tx_id}"]:
+                    for tx_ref in [f"transactions/{tx_id}", f"r/tx/{tx_id}"]:
                         tx_hash = self.kernel.resolve(tx_ref)
                         if tx_hash is not None:
                             break
@@ -443,7 +443,7 @@ class GarbageCollector:
 
         preserved: Set[str] = set()
         for name in names:
-            if "/shards/tx_" not in name:
+            if "/shards/tx_" not in name and "/s/tx_" not in name:
                 continue
             shard_part = name.split("/shards/tx_")[-1]
             tx_id = shard_part.split("_", 1)[0] if "_" in shard_part else ""

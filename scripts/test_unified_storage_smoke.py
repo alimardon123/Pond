@@ -294,7 +294,7 @@ def test_workload_unification():
 
         # All three have manifests
         for name in ["tabular", "kv", "binary"]:
-            manifest_hash = kernel.resolve(f"r/{name}/main/manifest")
+            manifest_hash = kernel.resolve(f"collections/{name}/branches/main/manifest")
             assert manifest_hash is not None, f"no manifest for {name}"
 
         print("PASS: test_workload_unification")

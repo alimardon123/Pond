@@ -95,15 +95,15 @@ class PondLens:
         branch is 'main'. External callers that need the active branch's
         commit ref should use UnifiedStorage._active_commit_ref() instead.
         """
-        return f"r/{name}/main/commit"
+        return f"collections/{name}/branches/main/commit"
 
     @staticmethod
     def _branch_ref(name: str, branch: str) -> str:
-        return f"r/{name}/{branch}/commit"
+        return f"collections/{name}/branches/{branch}/commit"
 
     @staticmethod
     def _definition_ref(name: str) -> str:
-        return f"r/{name}/definition"
+        return f"collections/{name}/definition"
 
     # ==================================================================
     # Generic operations on the namespace (no format awareness)
@@ -160,7 +160,25 @@ class PondLens:
         names = self.kernel.list_names()
         collections = set()
         for n in names:
-            # NEW format: r/{name}/definition
+            # CURRENT format: collections/{name}/definition
+            if n.startswith("collections/") and n.endswith("/definition"):
+                coll = n[len("collections/"):-len("/definition")]
+                if not coll or coll == "branches":
+                    continue
+                if namespace and not (coll == namespace or coll.startswith(namespace + "/")):
+                    continue
+                collections.add(coll)
+                continue
+            # CURRENT format: collections/{name}/branches/main/commit (fallback)
+            if n.startswith("collections/") and n.endswith("/branches/main/commit"):
+                coll = n[len("collections/"):-len("/branches/main/commit")]
+                if not coll:
+                    continue
+                if namespace and not (coll == namespace or coll.startswith(namespace + "/")):
+                    continue
+                collections.add(coll)
+                continue
+            # LEGACY format: r/{name}/definition (previous short layout)
             if n.startswith("r/") and n.endswith("/definition"):
                 coll = n[len("r/"):-len("/definition")]
                 if not coll:
@@ -169,7 +187,7 @@ class PondLens:
                     continue
                 collections.add(coll)
                 continue
-            # NEW format: r/{name}/main/commit (fallback)
+            # LEGACY format: r/{name}/main/commit
             if n.startswith("r/") and n.endswith("/main/commit"):
                 coll = n[len("r/"):-len("/main/commit")]
                 if not coll:
@@ -178,16 +196,7 @@ class PondLens:
                     continue
                 collections.add(coll)
                 continue
-            # OLD format: collections/{name}/definition (backward compat)
-            if n.startswith("collections/") and n.endswith("/definition"):
-                coll = n[len("collections/"):-len("/definition")]
-                if not coll:
-                    continue
-                if namespace and not (coll == namespace or coll.startswith(namespace + "/")):
-                    continue
-                collections.add(coll)
-                continue
-            # OLD format: collections/{name}/_branches/main/commit (backward compat)
+            # LEGACY format: collections/{name}/_branches/main/commit (original layout)
             if n.startswith("collections/") and n.endswith("/_branches/main/commit"):
                 coll = n[len("collections/"):-len("/_branches/main/commit")]
                 if not coll:

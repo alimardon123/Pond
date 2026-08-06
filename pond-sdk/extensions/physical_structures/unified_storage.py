@@ -780,11 +780,11 @@ class UnifiedStorage:
         long path are still readable.
         """
         branch = self._get_active_branch(collection)
-        return f"r/{collection}/{branch}/manifest"
+        return f"collections/{collection}/branches/{branch}/manifest"
 
     def _manifest_ref_for_branch(self, collection: str, branch: str) -> str:
         """The manifest ref path for a SPECIFIC branch (not the active one)."""
-        return f"r/{collection}/{branch}/manifest"
+        return f"collections/{collection}/branches/{branch}/manifest"
 
     @staticmethod
     def _head_ref(collection: str) -> str:
@@ -792,7 +792,7 @@ class UnifiedStorage:
 
         Returns the default branch's commit ref (main/commit).
         """
-        return f"r/{collection}/main/commit"
+        return f"collections/{collection}/branches/main/commit"
 
     def _active_commit_ref(self, collection: str) -> str:
         """The ref for the currently active branch's commit (replaces HEAD).
@@ -1036,7 +1036,7 @@ class UnifiedStorage:
         NEW short layout: r/{collection}/{branch}/commit
         (was: collections/{collection}/_branches/{branch}/commit)
         """
-        return f"r/{collection}/{branch}/commit"
+        return f"collections/{collection}/branches/{branch}/commit"
 
     def _write_commit_blob(self, collection: str,
                             manifest_hash: str,
@@ -1271,25 +1271,27 @@ class UnifiedStorage:
     def list_branches(self, collection: str) -> list[str]:
         """List all branches for a collection.
 
-        Branch state lives at collections/{c}/_branches/{branch}/ — a branch
+        Branch state lives at collections/{c}/branches/{branch}/ — a branch
         is identified by having a `commit` (or `manifest`) file inside its
         directory. We list all refs under branches/ and collect the unique
         branch names (ignoring `shards/` subpaths).
         """
-        prefix = f"collections/{collection}/_branches/"
         branches = set()
         for n in self.kernel.list_names():
-            if not n.startswith(prefix):
-                continue
-            # n is like collections/{c}/_branches/{branch}/commit
-            # or collections/{c}/_branches/{branch}/manifest
-            # or collections/{c}/_branches/{branch}/shards/{uuid}
-            rest = n[len(prefix):]
-            parts = rest.split("/")
-            if len(parts) >= 2:
-                branch_name = parts[0]
-                if parts[1] in ("commit", "manifest"):
-                    branches.add(branch_name)
+            # Try all known path formats
+            for prefix in [
+                f"collections/{collection}/branches/",
+                f"r/{collection}/",  # legacy
+                f"collections/{collection}/_branches/",  # original
+            ]:
+                if n.startswith(prefix):
+                    rest = n[len(prefix):]
+                    parts = rest.split("/")
+                    if len(parts) >= 2:
+                        branch_name = parts[0]
+                        if parts[1] in ("commit", "manifest"):
+                            branches.add(branch_name)
+                    break  # matched a prefix, don't try others
         return sorted(branches)
 
     def merge(self, collection: str, source_branch: str,
@@ -1839,7 +1841,7 @@ class UnifiedStorage:
         NEW short layout: r/{collection}/{branch}/s/
         (was: collections/{collection}/_branches/{branch}/shards/)
         """
-        return f"r/{collection}/{branch}/s/"
+        return f"collections/{collection}/branches/{branch}/shards/"
 
     def _get_active_branch(self, collection: str) -> str:
         """Get the active branch for a collection (default: main)."""
@@ -1848,7 +1850,7 @@ class UnifiedStorage:
             # active is stored as the full ref path — extract branch name.
             # NEW format: r/{collection}/{branch}/commit
             # OLD format: collections/{collection}/_branches/{branch}/commit
-            for prefix in [f"r/{collection}/", f"collections/{collection}/_branches/"]:
+            for prefix in [f"collections/{collection}/branches/", f"r/{collection}/", f"collections/{collection}/_branches/"]:
                 if active.startswith(prefix):
                     rest = active[len(prefix):]  # {branch}/commit
                     return rest.rsplit("/commit", 1)[0]
@@ -3283,7 +3285,7 @@ class UnifiedStorage:
         NEW short layout: r/tx/{tx_id}
         (was: transactions/{tx_id})
         """
-        return f"r/tx/{tx_id}"
+        return f"transactions/{tx_id}"
 
     def begin_tx(self) -> str:
         """Begin a transaction. Returns the tx_id.

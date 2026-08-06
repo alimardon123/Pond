@@ -97,8 +97,8 @@ class S3ObjectStore:
         """
         shard = hash_val[:2]
         if self._prefix:
-            return f"{self._prefix}/b/{shard}/{hash_val}"
-        return f"b/{shard}/{hash_val}"
+            return f"{self._prefix}/blobs/{shard}/{hash_val}"
+        return f"blobs/{shard}/{hash_val}"
 
     def _old_blob_key(self, hash_val: str) -> str:
         """OLD blob key format for backward compat."""
@@ -125,16 +125,16 @@ class S3ObjectStore:
         return f"paths/{path}"
 
     def _paths_prefix(self) -> str:
-        """The S3 prefix for listing all paths."""
+        """The S3 prefix for listing all paths (refs)."""
         if self._prefix:
-            return f"{self._prefix}/r/"
-        return "r/"
+            return f"{self._prefix}/collections/"
+        return "collections/"
 
     def _blobs_prefix(self) -> str:
         """The S3 prefix for listing all blobs."""
         if self._prefix:
-            return f"{self._prefix}/b/"
-        return "b/"
+            return f"{self._prefix}/blobs/"
+        return "blobs/"
 
     # ------------------------------------------------------------------
     # Content-addressed blob operations
@@ -395,33 +395,48 @@ class S3ObjectStore:
             return False
 
     def list_paths(self, prefix: str = "") -> list[str]:
-        """List all paths with the given prefix.
+        """List all paths (refs) with the given prefix.
 
-        Scans both NEW ({prefix}/{path}) and OLD ({prefix}/paths/{path}) locations.
+        The prefix is a full path like "collections/users/branches/main/shards/"
+        or "". Scans all known top-level directories.
         """
         paths = []
         paginator = self._client.get_paginator("list_objects_v2")
 
-        # NEW location: {prefix}/{path}
-        new_full_prefix = f"{self._prefix}/{prefix}" if self._prefix else prefix
-        new_strip = len(f"{self._prefix}/") if self._prefix else 0
-        for page in paginator.paginate(Bucket=self._bucket, Prefix=new_full_prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.startswith(new_full_prefix):
-                    p = key[new_strip:]
-                    # Skip blob keys
-                    if not p.startswith("b/"):
-                        paths.append(p)
+        known_prefixes = ["collections/", "transactions/", "r/", "paths/"]
 
-        # OLD location: {prefix}/paths/{path}
-        old_full_prefix = f"{self._prefix}/paths/{prefix}" if self._prefix else f"paths/{prefix}"
-        old_strip = len(f"{self._prefix}/paths/") if self._prefix else len("paths/")
-        for page in paginator.paginate(Bucket=self._bucket, Prefix=old_full_prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.startswith(old_full_prefix):
-                    paths.append(key[old_strip:])
+        # If prefix already starts with a known top-level dir, scan directly
+        if any(prefix.startswith(kp) for kp in known_prefixes):
+            full_prefix = f"{self._prefix}/{prefix}" if self._prefix else prefix
+            strip = len(f"{self._prefix}/") if self._prefix else 0
+            for page in paginator.paginate(Bucket=self._bucket, Prefix=full_prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if key.startswith(full_prefix):
+                        p = key[strip:]
+                        if not p.startswith("blobs/") and not p.startswith("b/"):
+                            paths.append(p)
+        else:
+            # No known prefix — scan all known ref directories
+            for dirname in ["collections", "transactions", "r"]:
+                full_prefix = f"{self._prefix}/{dirname}/{prefix}" if self._prefix else f"{dirname}/{prefix}"
+                strip = len(f"{self._prefix}/") if self._prefix else 0
+                for page in paginator.paginate(Bucket=self._bucket, Prefix=full_prefix):
+                    for obj in page.get("Contents", []):
+                        key = obj["Key"]
+                        if key.startswith(full_prefix):
+                            p = key[strip:]
+                            if not p.startswith("blobs/") and not p.startswith("b/"):
+                                paths.append(p)
+
+            # Original "paths/" layout
+            old_prefix = f"{self._prefix}/paths/{prefix}" if self._prefix else f"paths/{prefix}"
+            old_strip = len(f"{self._prefix}/paths/") if self._prefix else len("paths/")
+            for page in paginator.paginate(Bucket=self._bucket, Prefix=old_prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if key.startswith(old_prefix):
+                        paths.append(key[old_strip:])
 
         return sorted(set(paths))
 
