@@ -112,3 +112,70 @@ def test_replication_coordinator():
 def test_knowledge_graph_coverage():
     ok, output = _run_script("scripts/verify_knowledge_graph.py")
     assert ok, f"KG coverage check failed:\n{output[-500:]}"
+
+
+def test_rust_python_roundtrip():
+    """Verify the pond_rust PyO3 module (built from pond-rust/ workspace)
+    can encode + decode PND2 blobs end-to-end from Python."""
+    import os, sys
+    rust_so = os.path.join(REPO_ROOT, "pond-rust", "target", "release",
+                           "pond_rust.so")
+    if not os.path.exists(rust_so):
+        import pytest
+        pytest.skip(f"pond_rust.so not built — run pond-rust/build.sh")
+    sys.path.insert(0, os.path.dirname(rust_so))
+    try:
+        import pond_rust
+        cols = [("id", [1, 2, 3, 4, 5]),
+                ("name", ["alice", "bob", "carol", "dave", "eve"]),
+                ("score", [1.5, 2.5, 3.5, 4.5, 5.5])]
+        result = pond_rust.encode(cols, 5)
+        assert result["blob"][:4] == b"PND2", "encode should produce PND2 magic"
+        decoded = pond_rust.decode(result["blob"])
+        assert decoded["id"] == [1, 2, 3, 4, 5]
+        assert decoded["name"] == ["alice", "bob", "carol", "dave", "eve"]
+        assert decoded["score"] == [1.5, 2.5, 3.5, 4.5, 5.5]
+        # Projection pushdown
+        proj = pond_rust.decode(result["blob"], columns=["id"])
+        assert list(proj.keys()) == ["id"]
+        # Predicate pushdown
+        filt = pond_rust.decode(result["blob"], predicates=[("id", ">", 2)])
+        assert filt["id"] == [3, 4, 5]
+        assert filt["name"] == ["carol", "dave", "eve"]
+    finally:
+        sys.path.pop(0)
+
+
+def test_rust_c_abi():
+    """Verify the pond-core C ABI works end-to-end from a C program.
+    Skips if cargo or cc is unavailable."""
+    import os, shutil, subprocess
+    # cargo may be in ~/.cargo/bin (not on PATH in some environments)
+    cargo_bin = shutil.which("cargo")
+    if cargo_bin is None:
+        cargo_candidate = os.path.expanduser("~/.cargo/bin/cargo")
+        if os.path.exists(cargo_candidate):
+            cargo_bin = cargo_candidate
+    if cargo_bin is None or not shutil.which("cc"):
+        import pytest
+        pytest.skip("cargo or cc not available — skipping C ABI test")
+    rust_dir = os.path.join(REPO_ROOT, "pond-rust")
+    static_lib = os.path.join(rust_dir, "target", "release", "libpond_core.a")
+    if not os.path.exists(static_lib):
+        # Build it
+        subprocess.run([cargo_bin, "build", "--release", "-p", "pond_core"],
+                       cwd=rust_dir, check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+    test_bin = os.path.join(rust_dir, "target", "test_c_abi")
+    test_src = os.path.join(rust_dir, "tests", "test_c_abi.c")
+    # Compile: link the static lib directly (avoids pulling libpython via .so)
+    cc_cmd = ["cc", test_src, "-I", os.path.join(rust_dir, "pond-core"),
+              static_lib, "-lpthread", "-ldl", "-lm", "-o", test_bin]
+    result = subprocess.run(cc_cmd, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"cc failed:\n{result.stderr}"
+    # Run
+    result = subprocess.run([test_bin], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, \
+        f"C ABI test failed:\n{result.stdout}\n{result.stderr}"
+    assert "ALL C ABI TESTS PASSED" in result.stdout, \
+        f"C ABI test missing success marker:\n{result.stdout}"

@@ -1,15 +1,18 @@
-[package]
-name = "pond_rust"
-version = "0.2.0"
+[workspace]
+resolver = "2"
+members = ["pond-core", "pond-python"]
+
+[workspace.package]
+version = "0.3.0"
 edition = "2021"
-description = "Pond storage system — Rust core (PND2 encode/decode, C ABI for cross-language SDKs)"
 license = "MIT"
+authors = ["Pond Contributors"]
+repository = "https://github.com/zai/pond"
+description = "Pond storage system — Rust core (PND2 + C ABI) and Python bindings"
 
-[lib]
-name = "pond_rust"
-# cdylib: Python extension module (.so/.dylib/.dll)
-# staticlib: C ABI static library (.a/.lib) for linking into Go/Java/Node
-crate-type = ["cdylib", "staticlib"]
-
-[dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+# Workspace-level release profile — fast builds, optimized for FFI hot paths
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

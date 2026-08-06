@@ -1,0 +1,18 @@
+[package]
+name = "pond_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond storage — pure-Rust PND2 codec + C ABI for cross-language SDK bindings (Go, Java, Node, C, C++, Zig)"
+
+[lib]
+name = "pond_core"
+# staticlib: C ABI static library (.a/.lib) for linking into Go/Java/Node/C/C++/Zig
+# rlib:      Rust crate so pond-python (and other Rust crates) can depend on it
+# cdylib:    shared library (.so/.dylib/.dll) for dynamic FFI loading
+crate-type = ["staticlib", "rlib", "cdylib"]
+
+[dependencies]
+# NONE — pond-core is pure Rust with no external deps. This is critical for
+# cross-language linking: consumers (Go, Java, Node) must not have to satisfy
+# transitive Rust crate dependencies.
