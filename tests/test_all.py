@@ -179,3 +179,56 @@ def test_rust_c_abi():
         f"C ABI test failed:\n{result.stdout}\n{result.stderr}"
     assert "ALL C ABI TESTS PASSED" in result.stdout, \
         f"C ABI test missing success marker:\n{result.stdout}"
+
+
+def test_go_sdk():
+    """Verify the Go SDK (sdk-go/) builds and its tests pass.
+    Skips if Go or cargo is unavailable."""
+    import os, shutil, subprocess
+    # Locate go binary (may be in ~/.local/go/bin)
+    go_bin = shutil.which("go")
+    if go_bin is None:
+        go_candidate = os.path.expanduser("~/.local/go/bin/go")
+        if os.path.exists(go_candidate):
+            go_bin = go_candidate
+    cargo_bin = shutil.which("cargo")
+    if cargo_bin is None:
+        cargo_candidate = os.path.expanduser("~/.cargo/bin/cargo")
+        if os.path.exists(cargo_candidate):
+            cargo_bin = cargo_candidate
+    if go_bin is None or cargo_bin is None:
+        import pytest
+        pytest.skip("go or cargo not available — skipping Go SDK test")
+
+    rust_dir = os.path.join(REPO_ROOT, "pond-rust")
+    sdk_go_dir = os.path.join(REPO_ROOT, "sdk-go")
+
+    # Ensure libpond_core.a is built
+    static_lib = os.path.join(rust_dir, "target", "release", "libpond_core.a")
+    if not os.path.exists(static_lib):
+        subprocess.run([cargo_bin, "build", "--release", "-p", "pond_core"],
+                       cwd=rust_dir, check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+
+    # Ensure Python test blobs exist (the Go test decodes them for cross-lang compat)
+    blob_dir = os.path.join(rust_dir, "tests", "test_blobs")
+    if not os.path.isdir(blob_dir) or len(os.listdir(blob_dir)) == 0:
+        # Generate them
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.path.join(REPO_ROOT, "pond-sdk") + ":" + \
+                            os.path.join(rust_dir, "target", "release")
+        subprocess.run(["python3",
+                        os.path.join(rust_dir, "tests", "generate_test_blobs.py")],
+                       cwd=REPO_ROOT, check=True, env=env, timeout=120,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    # Run `go test ./...` in sdk-go/
+    env = dict(os.environ)
+    env["PATH"] = os.path.dirname(go_bin) + ":" + env.get("PATH", "")
+    result = subprocess.run([go_bin, "test", "-v", "./..."],
+                            cwd=sdk_go_dir, capture_output=True, text=True,
+                            env=env, timeout=300)
+    assert result.returncode == 0, \
+        f"go test failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    assert "PASS" in result.stdout and "FAIL" not in result.stdout, \
+        f"go test reported failures:\n{result.stdout}"

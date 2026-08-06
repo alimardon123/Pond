@@ -942,6 +942,88 @@ pub fn pnd2_encode_i64(values: &[i64]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Pure-Rust encode — multi-column encoder (RAW only, all numeric/string vtypes)
+// ---------------------------------------------------------------------------
+
+/// A column spec for `pnd2_encode_multi`. Each column carries its name,
+/// value type, and a slice of raw bytes for its payload (which the caller
+/// is responsible for laying out in PND2 RAW format).
+///
+/// This is a low-level API — callers must understand the RAW payload
+/// layout for their chosen vtype. For single-column convenience, use
+/// `pnd2_encode_i64` / `pnd2_encode_f64` / `pnd2_encode_str`.
+pub struct EncodeMultiColumn<'a> {
+    pub name: &'a str,
+    pub vtype: u8,
+    /// RAW payload bytes (NOT including the outer `payload_len` u32 — that's
+    /// added by `pnd2_encode_multi`). For VT_INT64/FLOAT64 the payload is
+    /// `value_type(1B) + values(N*8B)`. For VT_STRING it's
+    /// `value_type(1B) + [len(4B) + bytes]*N`. For VT_BINARY it's
+    /// `n_values(4B) + [len(4B) + bytes]*N`.
+    pub payload: &'a [u8],
+    /// Optional stats: (min_bytes, max_bytes, null_count).
+    /// - INT64: 8 bytes each for min/max
+    /// - FLOAT64: 8 bytes each
+    /// - STRING/BINARY: None (no stats written)
+    pub stats: Option<(&'a [u8], &'a [u8], u32)>,
+}
+
+/// Encode multiple columns into a single PND2 blob (RAW encoding only,
+/// no compression). Each column's payload is provided directly by the
+/// caller — this function just assembles the outer PND2 container.
+///
+/// Returns the assembled blob.
+///
+/// This is the foundation for cross-language SDK ports that need to build
+/// multi-column PND2 blobs without reimplementing the format assembly.
+pub fn pnd2_encode_multi(columns: &[EncodeMultiColumn], n_rows: usize) -> Vec<u8> {
+    let mut inner = Vec::new();
+
+    // Schema section
+    for col in columns {
+        let name_bytes = col.name.as_bytes();
+        let name_len = name_bytes.len().min(255) as u8;
+        inner.push(name_len);
+        inner.extend_from_slice(&name_bytes[..name_len as usize]);
+        inner.push(col.vtype);
+        inner.push(ENC_RAW);
+    }
+
+    // Stats section
+    for col in columns {
+        match &col.stats {
+            None => {
+                inner.push(0); // has_min = 0
+                inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+            }
+            Some((min_bytes, max_bytes, null_count)) => {
+                inner.push(1); // has_min = 1
+                inner.extend_from_slice(min_bytes);
+                inner.extend_from_slice(max_bytes);
+                inner.extend_from_slice(&null_count.to_le_bytes());
+            }
+        }
+    }
+
+    // Per-column payloads
+    for col in columns {
+        inner.extend_from_slice(&(col.payload.len() as u32).to_le_bytes());
+        inner.extend_from_slice(col.payload);
+    }
+
+    // Final PND2 blob
+    let mut blob = Vec::with_capacity(13 + inner.len());
+    blob.extend_from_slice(PND2_MAGIC);
+    blob.push(PND2_VERSION);
+    blob.push(FLAG_HAS_STATS);
+    blob.extend_from_slice(&(n_rows as u32).to_le_bytes());
+    blob.extend_from_slice(&(columns.len() as u16).to_le_bytes());
+    blob.push(COMPRESSION_NONE);
+    blob.extend_from_slice(&inner);
+    blob
+}
+
+// ---------------------------------------------------------------------------
 // C ABI — extern "C" wrappers around the pure-Rust functions above
 // ---------------------------------------------------------------------------
 
@@ -1217,6 +1299,210 @@ pub extern "C" fn pond_pnd2_encode_str(
 }
 
 // ---------------------------------------------------------------------------
+// C ABI — multi-column encoder (builder pattern)
+// ---------------------------------------------------------------------------
+//
+// The single-column encoders (pond_pnd2_encode_i64/f64/str) are convenient
+// for simple cases but don't compose into multi-column blobs. This builder
+// API lets C/Go/Java callers incrementally build a multi-column PND2 blob:
+//
+//   PondEncoder* enc = pond_encoder_new(n_rows);
+//   pond_encoder_add_i64_column(enc, "id", id_values, n_rows);
+//   pond_encoder_add_f64_column(enc, "score", score_values, n_rows);
+//   pond_encoder_add_str_column(enc, "name", name_ptrs, n_rows);
+//   uint8_t* blob; size_t blob_len;
+//   pond_encoder_build(enc, &blob, &blob_len);
+//   pond_encoder_free(enc);
+//   // ... use blob ...
+//   pond_blob_free(blob, blob_len);
+//
+// All added columns MUST have the same n_rows value passed to
+// pond_encoder_new(). Adding a column with a different length returns -1.
+
+/// Multi-column encoder state. Built up via `pond_encoder_add_*` calls,
+/// then finalized via `pond_encoder_build`.
+pub struct PondEncoder {
+    n_rows: usize,
+    columns: Vec<EncodeMultiColumnOwned>,
+}
+
+/// Owned version of EncodeMultiColumn (the borrows don't work cleanly across
+/// the C ABI boundary, so we copy the data in).
+struct EncodeMultiColumnOwned {
+    name: String,
+    vtype: u8,
+    payload: Vec<u8>,
+    stats: Option<(Vec<u8>, Vec<u8>, u32)>,
+}
+
+/// Create a new multi-column encoder.
+///
+/// # Arguments
+///   - `n_rows`: the number of rows that EVERY column must have. Adding a
+///     column with a different row count returns -1.
+///
+/// # Returns
+///   Pointer to a `PondEncoder`, or NULL on alloc failure. Caller must free
+///   it with `pond_encoder_free`.
+#[no_mangle]
+pub extern "C" fn pond_encoder_new(n_rows: usize) -> *mut PondEncoder {
+    Box::into_raw(Box::new(PondEncoder {
+        n_rows,
+        columns: Vec::new(),
+    }))
+}
+
+/// Add an INT64 column to the encoder. Computes min/max stats for free.
+///
+/// # Returns
+///   0 on success, -1 on null pointer / wrong n_rows.
+#[no_mangle]
+pub extern "C" fn pond_encoder_add_i64_column(
+    enc: *mut PondEncoder,
+    name: *const c_char,
+    values: *const i64,
+    n_values: usize,
+) -> i32 {
+    let enc = unsafe { match enc.as_mut() { Some(e) => e, None => return -1 } };
+    if name.is_null() || values.is_null() { return -1; }
+    if n_values != enc.n_rows { return -1; }
+
+    let name = unsafe { std::ffi::CStr::from_ptr(name) };
+    let name_str = name.to_string_lossy().into_owned();
+    let vals = unsafe { std::slice::from_raw_parts(values, n_values) };
+
+    // Build RAW payload: value_type(1B) + values(N*8B)
+    let mut payload = Vec::with_capacity(1 + n_values * 8);
+    payload.push(VT_INT64);
+    for v in vals { payload.extend_from_slice(&v.to_le_bytes()); }
+
+    // Compute stats
+    let min = vals.iter().min().copied().unwrap_or(0);
+    let max = vals.iter().max().copied().unwrap_or(0);
+    let stats = (min.to_le_bytes().to_vec(), max.to_le_bytes().to_vec(), 0u32);
+
+    enc.columns.push(EncodeMultiColumnOwned {
+        name: name_str, vtype: VT_INT64, payload, stats: Some(stats),
+    });
+    0
+}
+
+/// Add a FLOAT64 column to the encoder. Computes min/max stats for free.
+#[no_mangle]
+pub extern "C" fn pond_encoder_add_f64_column(
+    enc: *mut PondEncoder,
+    name: *const c_char,
+    values: *const f64,
+    n_values: usize,
+) -> i32 {
+    let enc = unsafe { match enc.as_mut() { Some(e) => e, None => return -1 } };
+    if name.is_null() || values.is_null() { return -1; }
+    if n_values != enc.n_rows { return -1; }
+
+    let name = unsafe { std::ffi::CStr::from_ptr(name) };
+    let name_str = name.to_string_lossy().into_owned();
+    let vals = unsafe { std::slice::from_raw_parts(values, n_values) };
+
+    let mut payload = Vec::with_capacity(1 + n_values * 8);
+    payload.push(VT_FLOAT64);
+    for v in vals { payload.extend_from_slice(&v.to_le_bytes()); }
+
+    let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let stats = (min.to_le_bytes().to_vec(), max.to_le_bytes().to_vec(), 0u32);
+
+    enc.columns.push(EncodeMultiColumnOwned {
+        name: name_str, vtype: VT_FLOAT64, payload, stats: Some(stats),
+    });
+    0
+}
+
+/// Add a STRING column to the encoder. No stats (strings don't have
+/// meaningful min/max in the PND2 stat layout).
+#[no_mangle]
+pub extern "C" fn pond_encoder_add_str_column(
+    enc: *mut PondEncoder,
+    name: *const c_char,
+    values: *mut *const c_char,
+    n_values: usize,
+) -> i32 {
+    let enc = unsafe { match enc.as_mut() { Some(e) => e, None => return -1 } };
+    if name.is_null() || values.is_null() { return -1; }
+    if n_values != enc.n_rows { return -1; }
+
+    let name = unsafe { std::ffi::CStr::from_ptr(name) };
+    let name_str = name.to_string_lossy().into_owned();
+    let ptrs = unsafe { std::slice::from_raw_parts(values, n_values) };
+
+    // Build RAW payload: value_type(1B) + [len(4B) + bytes]*N
+    let mut payload = Vec::with_capacity(1 + n_values * 12);
+    payload.push(VT_STRING);
+    for p in ptrs {
+        let s = if p.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(*p) }
+                .to_string_lossy().into_owned()
+        };
+        let sb = s.as_bytes();
+        payload.extend_from_slice(&(sb.len() as u32).to_le_bytes());
+        payload.extend_from_slice(sb);
+    }
+
+    enc.columns.push(EncodeMultiColumnOwned {
+        name: name_str, vtype: VT_STRING, payload, stats: None,
+    });
+    0
+}
+
+/// Build the PND2 blob from all added columns.
+///
+/// # Returns
+///   0 on success (writes blob pointer + length), -1 on error.
+///   The caller owns the blob and must free it with `pond_blob_free`.
+#[no_mangle]
+pub extern "C" fn pond_encoder_build(
+    enc: *mut PondEncoder,
+    out_blob: *mut *mut u8,
+    out_blob_len: *mut usize,
+) -> i32 {
+    if enc.is_null() || out_blob.is_null() || out_blob_len.is_null() { return -1; }
+    let enc = unsafe { &*enc };
+
+    // Convert owned columns to borrowed EncodeMultiColumn for pnd2_encode_multi
+    let borrowed: Vec<EncodeMultiColumn> = enc.columns.iter().map(|c| {
+        let stats = c.stats.as_ref().map(|(mn, mx, nc)| {
+            (mn.as_slice(), mx.as_slice(), *nc)
+        });
+        EncodeMultiColumn {
+            name: &c.name,
+            vtype: c.vtype,
+            payload: &c.payload,
+            stats,
+        }
+    }).collect();
+
+    let mut blob = pnd2_encode_multi(&borrowed, enc.n_rows);
+    let len = blob.len();
+    let ptr = blob.as_mut_ptr();
+    std::mem::forget(blob);
+
+    unsafe {
+        *out_blob = ptr;
+        *out_blob_len = len;
+    }
+    0
+}
+
+/// Free a `PondEncoder`. Safe to call on NULL.
+#[no_mangle]
+pub extern "C" fn pond_encoder_free(enc: *mut PondEncoder) {
+    if !enc.is_null() {
+        unsafe { drop(Box::from_raw(enc)); }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — pure Rust unit tests for the encode/decode logic
 // ---------------------------------------------------------------------------
 
@@ -1330,5 +1616,88 @@ mod tests {
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].vtype, VT_STRING);
         assert_eq!(cols[0].n_values, 0);
+    }
+
+    #[test]
+    fn test_encode_multi_roundtrip() {
+        // Build a 3-column blob (INT64 + FLOAT64 + STRING) using pnd2_encode_multi
+        let n_rows = 4usize;
+
+        // Column 1: INT64 "id"
+        let id_vals: Vec<i64> = vec![10, 20, 30, 40];
+        let mut id_payload = Vec::with_capacity(1 + n_rows * 8);
+        id_payload.push(VT_INT64);
+        for v in &id_vals { id_payload.extend_from_slice(&v.to_le_bytes()); }
+        let id_min = *id_vals.iter().min().unwrap();
+        let id_max = *id_vals.iter().max().unwrap();
+        let id_min_bytes = id_min.to_le_bytes();
+        let id_max_bytes = id_max.to_le_bytes();
+
+        // Column 2: FLOAT64 "score"
+        let score_vals: Vec<f64> = vec![1.5, 2.5, 3.5, 4.5];
+        let mut score_payload = Vec::with_capacity(1 + n_rows * 8);
+        score_payload.push(VT_FLOAT64);
+        for v in &score_vals { score_payload.extend_from_slice(&v.to_le_bytes()); }
+        let score_min = score_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let score_max = score_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let score_min_bytes = score_min.to_le_bytes();
+        let score_max_bytes = score_max.to_le_bytes();
+
+        // Column 3: STRING "name" (no stats)
+        let name_vals: Vec<&str> = vec!["alice", "bob", "carol", "dave"];
+        let mut name_payload = Vec::new();
+        name_payload.push(VT_STRING);
+        for v in &name_vals {
+            let vb = v.as_bytes();
+            name_payload.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+            name_payload.extend_from_slice(vb);
+        }
+
+        let cols = vec![
+            EncodeMultiColumn {
+                name: "id",
+                vtype: VT_INT64,
+                payload: &id_payload,
+                stats: Some((id_min_bytes.as_slice(),
+                            id_max_bytes.as_slice(), 0)),
+            },
+            EncodeMultiColumn {
+                name: "score",
+                vtype: VT_FLOAT64,
+                payload: &score_payload,
+                stats: Some((score_min_bytes.as_slice(),
+                            score_max_bytes.as_slice(), 0)),
+            },
+            EncodeMultiColumn {
+                name: "name",
+                vtype: VT_STRING,
+                payload: &name_payload,
+                stats: None,
+            },
+        ];
+
+        let blob = pnd2_encode_multi(&cols, n_rows);
+        assert_eq!(&blob[0..4], PND2_MAGIC);
+
+        // Decode and verify
+        let decoded = pnd2_decode(&blob).expect("decode should succeed");
+        assert_eq!(decoded.len(), 3);
+
+        assert_eq!(decoded[0].name.to_str().unwrap(), "id");
+        assert_eq!(decoded[0].vtype, VT_INT64);
+        assert_eq!(decoded[0].n_values, n_rows);
+        assert_eq!(decoded[0].i64_data, id_vals);
+
+        assert_eq!(decoded[1].name.to_str().unwrap(), "score");
+        assert_eq!(decoded[1].vtype, VT_FLOAT64);
+        assert_eq!(decoded[1].n_values, n_rows);
+        assert_eq!(decoded[1].f64_data, score_vals);
+
+        assert_eq!(decoded[2].name.to_str().unwrap(), "name");
+        assert_eq!(decoded[2].vtype, VT_STRING);
+        assert_eq!(decoded[2].n_values, n_rows);
+        for (i, expected) in name_vals.iter().enumerate() {
+            assert_eq!(decoded[2].str_data[i].to_str().unwrap(), *expected);
+        }
     }
 }

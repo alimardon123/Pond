@@ -75,6 +75,21 @@ pond_repo/
 │       ├── sql_pushdown_benchmark.py # SQL pushdown end-to-end
 │       └── loc_benchmark.py     # LOC saved vs from-scratch
 │
+├── pond-rust/                   # Cross-language Rust core + Python bindings
+│   ├── pond-core/               # Pure-Rust PND2 codec + C ABI (zero deps)
+│   │   ├── src/lib.rs           # pnd2_decode (all encodings) + pnd2_encode_* + C ABI
+│   │   └── pond_core.h          # C ABI header for Go/Java/Node/C/C++/Zig
+│   ├── pond-python/             # PyO3 wrapper (produces pond_rust.so)
+│   │   └── src/lib.rs           # Thin glue — delegates to pond-core
+│   └── tests/                   # C ABI test + Python blob generator
+│       ├── test_c_abi.c         # 131-check end-to-end C ABI test
+│       └── test_blobs/          # 7 binary blobs (all encodings × vtypes)
+│
+├── sdk-go/                      # Go SDK (PND2 codec bindings via cgo)
+│   ├── pond/                    # Public Go API (Result, Column, Encoder)
+│   ├── internal/cabi/           # Private cgo layer over libpond_core.a
+│   └── go.mod                   # Module github.com/pond/pond-go
+│
 ├── tests/                       # All tests, organized by purpose
 │   ├── test_all.py              # Single pytest entry point (24 tests)
 │   ├── architecture/            # 18 architecture laws (executable spec)
@@ -97,6 +112,13 @@ pond-sdk (base_lens, prolly_tree, collection_metadata, extensions/)
 lenses/ (keyvalue, lakehouse, vector — each extends PondLens directly)
     ↓
 pond-labs/ (experimental code, depends on everything)
+
+pond-rust/pond-core (pure-Rust PND2 codec + C ABI, zero deps)
+    ↓                              ↓
+pond-rust/pond-python           sdk-go/ (cgo over libpond_core.a)
+(PyO3 wrapper → pond_rust.so)
+    ↓
+(importable by pond-sdk for fast encode/decode)
 ```
 
 **Rules:**
@@ -105,6 +127,12 @@ pond-labs/ (experimental code, depends on everything)
 - Services depend only on pond-core (not on pond-sdk or lenses).
 - Extensions are data-side (collection-level), not lens-side.
 - pond-labs depends on everything (it's experimental).
+- pond-rust/pond-core has ZERO external dependencies (so it can be
+  statically linked from Go/Java/Node without dragging transitive crates).
+- pond-rust/pond-python depends on pond-rust/pond-core + PyO3.
+- sdk-go depends on pond-rust/pond-core (via cgo over libpond_core.a).
+  It does NOT depend on Python — Go programs can encode/decode PND2
+  blobs without any Python runtime.
 
 ## The weekly question
 

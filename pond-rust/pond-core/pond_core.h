@@ -141,9 +141,61 @@ int32_t pond_pnd2_encode_str(const char** values, size_t n_values,
                               uint8_t** out_blob, size_t* out_blob_len);
 
 /*
- * Free a blob returned by pond_pnd2_encode_i64 / _f64 / _str.
+ * Free a blob returned by pond_pnd2_encode_i64 / _f64 / _str / encoder_build.
  */
 void pond_blob_free(uint8_t* blob, size_t blob_len);
+
+/* ============================================================= *
+ * Multi-column encoder (builder pattern)
+ *
+ * The single-column encoders above don't compose into multi-column
+ * blobs. This builder API lets you incrementally build a multi-column
+ * PND2 blob:
+ *
+ *   PondEncoder* enc = pond_encoder_new(n_rows);
+ *   pond_encoder_add_i64_column(enc, "id", id_values, n_rows);
+ *   pond_encoder_add_f64_column(enc, "score", score_values, n_rows);
+ *   pond_encoder_add_str_column(enc, "name", name_ptrs, n_rows);
+ *   uint8_t* blob; size_t blob_len;
+ *   pond_encoder_build(enc, &blob, &blob_len);
+ *   pond_encoder_free(enc);
+ *   // ... use blob ...
+ *   pond_blob_free(blob, blob_len);
+ *
+ * All added columns MUST have the same n_rows value passed to
+ * pond_encoder_new(). Adding a column with a different length returns -1.
+ * ============================================================= */
+
+/* Opaque handle for the multi-column encoder. */
+typedef struct PondEncoder PondEncoder;
+
+/* Create a new encoder. Caller must free with pond_encoder_free. */
+PondEncoder* pond_encoder_new(size_t n_rows);
+
+/* Add an INT64 column. Computes min/max stats for free.
+ * Returns 0 on success, -1 on null pointer / wrong n_rows. */
+int32_t pond_encoder_add_i64_column(PondEncoder* enc, const char* name,
+                                     const int64_t* values, size_t n_values);
+
+/* Add a FLOAT64 column. Computes min/max stats for free.
+ * Returns 0 on success, -1 on null pointer / wrong n_rows. */
+int32_t pond_encoder_add_f64_column(PondEncoder* enc, const char* name,
+                                     const double* values, size_t n_values);
+
+/* Add a STRING column. No stats (strings don't have meaningful min/max).
+ * `values` is an array of `const char*` (each null-terminated).
+ * Returns 0 on success, -1 on null pointer / wrong n_rows. */
+int32_t pond_encoder_add_str_column(PondEncoder* enc, const char* name,
+                                     const char** values, size_t n_values);
+
+/* Build the PND2 blob from all added columns.
+ * Returns 0 on success (writes blob + length), -1 on error.
+ * Caller owns the blob and must free it with pond_blob_free. */
+int32_t pond_encoder_build(PondEncoder* enc,
+                            uint8_t** out_blob, size_t* out_blob_len);
+
+/* Free a PondEncoder. Safe to call on NULL. */
+void pond_encoder_free(PondEncoder* enc);
 
 #ifdef __cplusplus
 }

@@ -15,6 +15,10 @@ pond_repo/
 ├── lenses/             # Layer 3: Production-ready Lens implementations
 ├── services/           # Cross-cutting services (transport, schema, replication)
 ├── pond-labs/          # Development & experimental code (NOT production)
+├── pond-rust/          # Cross-language Rust core + Python PyO3 bindings
+│   ├── pond-core/      #   Pure-Rust PND2 codec + C ABI (zero deps, linkable from C/Go/Java/Node)
+│   └── pond-python/    #   PyO3 wrapper (produces pond_rust.so for Python)
+├── sdk-go/             # Go SDK — PND2 codec bindings via cgo (peer to pond-sdk/)
 ├── tests/              # All tests, organized by type/purpose
 ├── scripts/            # Verification scripts (property tests, differentials, hazards)
 ├── docs/               # Documentation (whitepaper, formal algebras, RFCs)
@@ -101,6 +105,65 @@ pond-labs/
   - SDK extensions → `pond-sdk/extensions/`
   - SDK core → `pond-sdk/`
 - The promotion is documented in the worklog with a clear rationale.
+
+### 2.5b `pond-rust/` — Cross-language Rust core + Python PyO3 bindings
+
+**Contains:** A Cargo workspace with two crates that provide the canonical
+Rust implementation of Pond's PND2 binary format. The C ABI is the
+universal interop layer for Go/Java/Node/C/C++/Zig SDK ports.
+
+```
+pond-rust/
+├── Cargo.toml          # Workspace manifest
+├── pond-core/          # Pure-Rust PND2 codec + C ABI (zero external deps)
+│   ├── Cargo.toml      #   crate-type = ["staticlib", "cdylib", "rlib"]
+│   ├── pond_core.h     #   C ABI header (the contract for cross-language SDKs)
+│   └── src/lib.rs      #   pnd2_decode (all encodings) + pnd2_encode_* + C ABI
+├── pond-python/        # PyO3 wrapper, produces pond_rust.so for Python
+│   ├── Cargo.toml      #   crate-type = ["cdylib"]
+│   └── src/lib.rs      #   Thin glue — delegates to pond-core's decoder
+└── tests/
+    ├── test_c_abi.c    # End-to-end C ABI test (131 checks)
+    └── test_blobs/     # Binary PND2 blobs for cross-language compat tests
+```
+
+**Rule:** pond-rust/pond-core has ZERO external dependencies (so it can be
+statically linked from Go/Java/Node without dragging transitive Rust
+crates). pond-rust/pond-python depends on pond-rust/pond-core + PyO3.
+
+**Why split:** Originally a single crate mixed PyO3 with the C ABI, but
+the static library contained PyO3's libpython symbol references, breaking
+links from C/Go/Java. The split puts the C ABI in a crate with no PyO3
+dependency, so `libpond_core.a` is a clean, self-contained static library.
+
+### 2.5c `sdk-go/` — Go SDK (PND2 codec bindings via cgo)
+
+**Contains:** Go bindings for `libpond_core.a`. Peer to `pond-sdk/`
+(Python SDK) — both bind to pond-core's storage layer. Currently exposes
+PND2 codec operations only (no storage kernel access).
+
+```
+sdk-go/
+├── go.mod              # Module github.com/pond/pond-go
+├── pond/               # Public Go API (import this package)
+│   ├── pond.go         #   Result, Column, Encoder, Encode*/Decode
+│   └── pond_test.go    #   End-to-end tests + Python-blob cross-lang compat
+└── internal/           # Private packages (not importable externally)
+    └── cabi/           #   cgo layer over libpond_core.a
+        └── cabi.go     #   Direct C function wrappers
+```
+
+**Rule:** sdk-go depends on pond-rust/pond-core (via cgo over
+`libpond_core.a`) and NOTHING else. It does NOT depend on Python — Go
+programs can encode/decode PND2 blobs without any Python runtime.
+
+**Scope:** PND2 codec only (encode + decode). Storage kernel operations
+(Write/Read/Ref) require the Python kernel — a future Rust implementation
+of the storage kernel would enable full Go storage support. This is
+documented honestly in `sdk-go/README.md`.
+
+**Removability test:** Deleting `sdk-go/` breaks no lower layer. The
+Python SDK, Rust core, and storage kernel are all unaffected.
 
 ### 2.6 `tests/` — All tests, organized by type/purpose
 

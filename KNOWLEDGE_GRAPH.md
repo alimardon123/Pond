@@ -261,7 +261,42 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `KNOWLEDGE_GRAPH.md` | — | This file. The navigational map of the repo. |
 | `worklog.md` | 1928 | Append-only research log (Tasks 1-57). |
 
-### 2.10 archive/ (Historical — 124 files, preserved for reference)
+### 2.10 pond-rust/ (Cross-language Rust core + Python bindings — 1 workspace, 2 crates)
+
+Cargo workspace with two crates. The C ABI is the universal interop layer
+for Go/Java/Node/C/C++/Zig SDK ports.
+
+| File | LOC | Purpose |
+|---|---|---|
+| `pond-rust/Cargo.toml` | 16 | Workspace manifest. Members: `pond-core`, `pond-python`. |
+| `pond-rust/README.md` | 95 | Workspace overview: why split, build/test instructions, C ABI summary. |
+| `pond-rust/build.sh` | 41 | Build helper — runs `cargo build --release` + hardlinks `pond_rust.so`. |
+| `pond-rust/pond-core/Cargo.toml` | 14 | Pure-Rust crate (zero external deps). crate-type: `staticlib`, `cdylib`, `rlib`. |
+| `pond-rust/pond-core/pond_core.h` | 200 | C ABI header. Declares all `pond_pnd2_*` + `pond_result_*` + `pond_encoder_*` functions. |
+| `pond-rust/pond-core/README.md` | 65 | Pure-Rust crate docs: design principles, Rust API, C ABI, tests. |
+| `pond-rust/pond-core/src/lib.rs` | 1700 | The full PND2 codec + C ABI. Constants, PND2Parser, pnd2_decode (all encodings, all vtypes), pnd2_encode_i64/f64/str/multi, PondResult handle, PondEncoder builder. 9 unit tests. |
+| `pond-rust/pond-python/Cargo.toml` | 11 | PyO3 wrapper crate. crate-type: `cdylib` (produces `pond_rust.so`). |
+| `pond-rust/pond-python/README.md` | 50 | PyO3 wrapper docs: Python API, feature comparison vs pond-core. |
+| `pond-rust/pond-python/src/lib.rs` | 415 | Thin PyO3 glue. Delegates all decode logic to pond-core's `decode_column`. Adds zstd decompression (via Python's `zstandard`), projection pushdown, predicate pushdown. |
+| `pond-rust/tests/test_c_abi.c` | 425 | End-to-end C ABI test. 131 checks: round-trips, NULL safety, error paths, 1000-value dataset, 7 Python-generated blobs (all encodings × all vtypes), multi-column encoder. |
+| `pond-rust/tests/generate_test_blobs.py` | 115 | Generates 7 PND2 blob files using pond-sdk's Python encoder for cross-language compatibility tests. |
+| `pond-rust/tests/test_blobs/*.bin` | 7 files | Binary PND2 blobs covering i64/f64/str/bin × raw/rle/dict/bitpack. Used by both C and Go tests. |
+
+### 2.11 sdk-go/ (Go SDK — PND2 codec bindings — 1 module, 2 packages)
+
+Go SDK that binds to `libpond_core.a` via cgo. Peer to `pond-sdk/`
+(Python SDK) — both bind to pond-core's storage layer. Currently exposes
+PND2 codec operations only (no storage kernel access).
+
+| File | LOC | Purpose |
+|---|---|---|
+| `sdk-go/go.mod` | 13 | Go module declaration. Module `github.com/pond/pond-go`, Go 1.22. |
+| `sdk-go/README.md` | 130 | Architectural role, scope, build instructions, quick start, design principles followed. |
+| `sdk-go/pond/pond.go` | 230 | Public Go API: `Result`, `Column`, `Encoder`, `Encode*`/`Decode` functions. Idiomatic Go types (no cgo leak). |
+| `sdk-go/pond/pond_test.go` | 195 | 6 tests + 7 subtests: round-trips (i64/f64/str), multi-column encoder, Python-blob cross-lang compat, error paths. |
+| `sdk-go/internal/cabi/cabi.go` | 330 | cgo layer over `libpond_core.a`. Wraps every C function. Returns Go-owned slices (copies) to avoid C/Go memory lifetime bugs. |
+
+### 2.12 archive/ (Historical — 124 files, preserved for reference)
 
 Contains:
 - `prototype/` — early experimental code (7420 LOC)

@@ -337,6 +337,89 @@ int main(void) {
     pond_blob_free(str_blob, str_blob_len);
 
     /* ------------------------------------------------------------- */
+    /* Test 7: Multi-column encoder (builder pattern)                */
+    /* ------------------------------------------------------------- */
+    printf("\n[Test 7] Multi-column encoder (builder pattern)\n");
+
+    size_t mc_n_rows = 4;
+    PondEncoder *enc = pond_encoder_new(mc_n_rows);
+    CHECK(enc != NULL, "pond_encoder_new returns non-null handle");
+
+    int64_t mc_id[] = {10, 20, 30, 40};
+    int32_t rc_i = pond_encoder_add_i64_column(enc, "id", mc_id, mc_n_rows);
+    CHECK(rc_i == 0, "add_i64_column returns 0");
+
+    double mc_score[] = {1.5, 2.5, 3.5, 4.5};
+    int32_t rc_f = pond_encoder_add_f64_column(enc, "score", mc_score, mc_n_rows);
+    CHECK(rc_f == 0, "add_f64_column returns 0");
+
+    const char *mc_name[] = {"alice", "bob", "carol", "dave"};
+    int32_t rc_s = pond_encoder_add_str_column(enc, "name", mc_name, mc_n_rows);
+    CHECK(rc_s == 0, "add_str_column returns 0");
+
+    /* Adding a column with wrong n_rows should fail */
+    int64_t wrong_n[] = {1, 2, 3};
+    int32_t rc_bad = pond_encoder_add_i64_column(enc, "bad", wrong_n, 3);
+    CHECK(rc_bad != 0, "add_i64_column with wrong n_rows returns non-zero");
+
+    uint8_t *mc_blob = NULL;
+    size_t mc_blob_len = 0;
+    int32_t rc_build = pond_encoder_build(enc, &mc_blob, &mc_blob_len);
+    CHECK(rc_build == 0, "encoder_build returns 0");
+    CHECK(mc_blob != NULL, "blob is non-null");
+    CHECK(mc_blob_len > 13, "blob length exceeds header");
+    CHECK(memcmp(mc_blob, "PND2", 4) == 0, "blob has PND2 magic");
+
+    pond_encoder_free(enc);
+
+    /* Decode the blob and verify all 3 columns */
+    PondResult *mc_r = pond_pnd2_decode(mc_blob, mc_blob_len);
+    CHECK(mc_r != NULL, "decode multi-column blob succeeds");
+    CHECK(pond_result_num_columns(mc_r) == 3, "blob has 3 columns");
+
+    /* Column 0: id (INT64) */
+    CHECK(pond_result_column_vtype(mc_r, 0) == 1, "col 0 vtype is INT64");
+    CHECK(pond_result_column_len(mc_r, 0) == mc_n_rows, "col 0 has correct length");
+    CHECK(strcmp(pond_result_column_name(mc_r, 0), "id") == 0, "col 0 name is 'id'");
+    const int64_t *mc_id_out = pond_result_column_i64(mc_r, 0);
+    CHECK(mc_id_out != NULL, "col 0 i64 pointer is non-null");
+    int id_match = 1;
+    for (size_t i = 0; i < mc_n_rows; i++) {
+        if (mc_id_out[i] != mc_id[i]) { id_match = 0; break; }
+    }
+    CHECK(id_match, "col 0 i64 values match after round-trip");
+
+    /* Column 1: score (FLOAT64) */
+    CHECK(pond_result_column_vtype(mc_r, 1) == 2, "col 1 vtype is FLOAT64");
+    CHECK(pond_result_column_len(mc_r, 1) == mc_n_rows, "col 1 has correct length");
+    CHECK(strcmp(pond_result_column_name(mc_r, 1), "score") == 0, "col 1 name is 'score'");
+    const double *mc_score_out = pond_result_column_f64(mc_r, 1);
+    CHECK(mc_score_out != NULL, "col 1 f64 pointer is non-null");
+    int score_match = 1;
+    for (size_t i = 0; i < mc_n_rows; i++) {
+        if (mc_score_out[i] != mc_score[i]) { score_match = 0; break; }
+    }
+    CHECK(score_match, "col 1 f64 values match after round-trip");
+
+    /* Column 2: name (STRING) */
+    CHECK(pond_result_column_vtype(mc_r, 2) == 3, "col 2 vtype is STRING");
+    CHECK(pond_result_column_len(mc_r, 2) == mc_n_rows, "col 2 has correct length");
+    CHECK(strcmp(pond_result_column_name(mc_r, 2), "name") == 0, "col 2 name is 'name'");
+    int name_match = 1;
+    for (size_t i = 0; i < mc_n_rows; i++) {
+        const char *s = pond_result_column_str(mc_r, 2, i);
+        if (s == NULL || strcmp(s, mc_name[i]) != 0) { name_match = 0; break; }
+    }
+    CHECK(name_match, "col 2 str values match after round-trip");
+
+    pond_result_free(mc_r);
+    pond_blob_free(mc_blob, mc_blob_len);
+
+    /* pond_encoder_free(NULL) is safe */
+    pond_encoder_free(NULL);
+    printf("  (multi-column encoder OK)\n");
+
+    /* ------------------------------------------------------------- */
     /* Summary                                                       */
     /* ------------------------------------------------------------- */
     printf("\n=== Summary ===\n");
