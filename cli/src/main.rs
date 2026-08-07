@@ -6,9 +6,21 @@
 //
 // Design principles:
 //   - DuckDB philosophy: one binary, no server, embedded
+//   - Git-style auto-discovery: `pond init` creates a `.pond/` marker;
+//     subsequent commands find it by walking up from CWD
 //   - Universal storage: accepts any data format (JSON, CSV, raw bytes)
 //   - Simple: delegates to pond_storage for all logic
 //   - Beautiful: CLI is a thin UI layer over the storage library
+//
+// STORAGE DISCOVERY (in priority order):
+//   1. --root <url>           (explicit override)
+//   2. POND_ROOT env var      (explicit override)
+//   3. .pond/config file      (auto-discovery — walks up from CWD)
+//   4. . (current directory)  (fallback)
+//
+// The .pond/ marker directory contains a `config` file:
+//   - For local FS: "storage=local" (or empty)
+//   - For S3: "storage=s3://bucket/prefix?region=...&endpoint=..."
 
 use clap::{Parser, Subcommand};
 use pond_kernel::PondKernel;
@@ -20,15 +32,13 @@ use std::io::{self, Read as IoRead, Write as IoWrite};
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Content-addressed storage with branching and time-travel")]
 struct Cli {
-    /// Storage root. Can be a local path or an S3 URL:
-    ///   file:///var/lib/pond       (local filesystem)
-    ///   ./pond-data                (local filesystem, relative)
-    ///   s3://bucket/prefix?region=us-east-1&endpoint=https://s3.amazonaws.com
+    /// Storage root URL. Overrides .pond/ auto-discovery.
+    /// Can be a local path or an S3 URL:
+    ///   /var/lib/pond                                   (local filesystem)
+    ///   s3://bucket/prefix?region=us-east-1&endpoint=... (S3-compatible)
     ///
-    /// S3 credentials are read from the environment:
-    ///   AWS_ACCESS_KEY_ID (or AWS_ACCESS_KEY)
-    ///   AWS_SECRET_ACCESS_KEY (or AWS_SECRET_KEY)
-    ///   AWS_SESSION_TOKEN (optional, for STS temporary credentials)
+    /// If not provided, the CLI auto-discovers a .pond/ marker by walking
+    /// up from the current directory (like git finds .git/).
     #[arg(long, env = "POND_ROOT", global = true)]
     root: Option<String>,
 
@@ -38,7 +48,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Init { #[arg(default_value = ".")] path: String },
+    /// Initialize a new Pond repository.
+    /// Creates a .pond/ marker directory with a config file.
+    /// For local FS: `pond init` or `pond init /path`
+    /// For S3: `pond init "s3://bucket/prefix?region=..."`
+    Init {
+        /// Path (local FS) or S3 URL. Defaults to current directory.
+        #[arg(default_value = ".")]
+        location: String,
+    },
     Write { collection: String, #[arg(group = "input")] file: Option<String>,
             #[arg(long, group = "input")] json: Option<String>,
             #[arg(long, group = "input")] bytes: bool,
@@ -62,22 +80,20 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { path } => {
-            // If --root is provided, use it; otherwise use the path argument.
-            // This supports both `pond init /path` and `pond --root /path init`.
-            let init_path = cli.root.unwrap_or(path);
-            cmd_init(&init_path);
+        Commands::Init { location } => {
+            cmd_init(&location, cli.root.as_deref());
         }
         Commands::Version => {
             println!("pond {}", env!("CARGO_PKG_VERSION"));
         }
         cmd => {
-            let root = cli.root.unwrap_or_else(|| ".".to_string());
-            let storage = match open_storage(&root) {
+            // Resolve the storage location using the discovery chain.
+            let storage_url = resolve_storage_url(cli.root.as_deref());
+            let storage = match open_storage(&storage_url) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("Error: failed to open storage at {}: {}", root, e);
-                    eprintln!("Hint: run 'pond init' first, or set --root / POND_ROOT");
+                    eprintln!("Error: failed to open storage: {}", e);
+                    eprintln!("Hint: run 'pond init' first, or use --root / POND_ROOT");
                     std::process::exit(1);
                 }
             };
@@ -151,6 +167,69 @@ fn persist_active_branch(storage: &UnifiedStorage, collection: &str, branch: &st
 }
 
 // ---------------------------------------------------------------------------
+// Storage discovery (git-style .pond/ marker)
+// ---------------------------------------------------------------------------
+
+/// Resolve the storage URL using the discovery chain:
+///   1. --root <url>           (explicit override)
+///   2. POND_ROOT env var      (already in cli.root via clap's env=)
+///   3. .pond/config file      (auto-discovery — walks up from CWD)
+///   4. . (current directory)  (fallback)
+fn resolve_storage_url(explicit_root: Option<&str>) -> String {
+    // 1. Explicit --root or POND_ROOT env var
+    if let Some(root) = explicit_root {
+        return root.to_string();
+    }
+
+    // 3. Auto-discover .pond/ by walking up from CWD
+    if let Some(pond_dir) = find_pond_marker() {
+        let repo_root = pond_dir.parent().unwrap_or(std::path::Path::new("."));
+        let config_path = pond_dir.join("config");
+        if let Ok(config) = std::fs::read_to_string(&config_path) {
+            // Parse "storage=<url>" from config.
+            // "storage=local" means use the repo root directory (local FS).
+            // "storage=s3://..." means use that S3 URL.
+            for line in config.lines() {
+                let line = line.trim();
+                if let Some(url) = line.strip_prefix("storage=") {
+                    if url.is_empty() || url == "local" {
+                        // Local FS — use the repo root directory
+                        return repo_root.to_string_lossy().to_string();
+                    } else {
+                        // S3 or other URL
+                        return url.to_string();
+                    }
+                }
+            }
+            // Config exists but no storage= line → use the repo root (local FS)
+            return repo_root.to_string_lossy().to_string();
+        }
+        // .pond/ exists but no config file → use the repo root (local FS)
+        return repo_root.to_string_lossy().to_string();
+    }
+
+    // 4. Fallback: current directory
+    ".".to_string()
+}
+
+/// Walk up from CWD looking for a `.pond/` directory (like git finds `.git/`).
+/// Returns the path to the `.pond/` directory if found.
+fn find_pond_marker() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut current: &std::path::Path = &cwd;
+    loop {
+        let pond_dir = current.join(".pond");
+        if pond_dir.is_dir() {
+            return Some(pond_dir);
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Command implementations — thin wrappers over pond_storage
 // ---------------------------------------------------------------------------
 
@@ -188,18 +267,40 @@ fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>
     }
 }
 
-fn cmd_init(path: &str) {
-    if path.starts_with("s3://") {
-        // For S3, "init" is a no-op — the bucket must already exist.
-        // We verify connectivity by trying to list the prefix.
+/// Initialize a new Pond repository.
+///
+/// Creates a `.pond/` marker directory with a `config` file.
+/// For local FS: `pond init` or `pond init /path`
+/// For S3: `pond init "s3://bucket/prefix?region=..."`
+///
+/// If `--root` is provided, it overrides the location argument.
+fn cmd_init(location: &str, explicit_root: Option<&str>) {
+    // --root overrides the location argument
+    let location = explicit_root.unwrap_or(location);
+
+    if location.starts_with("s3://") {
+        // For S3, "init" verifies connectivity and saves the URL to .pond/config
         #[cfg(feature = "s3")]
         {
-            match pond_s3::S3ObjectStore::from_url(path) {
+            match pond_s3::S3ObjectStore::from_url(location) {
                 Ok(store) => {
                     use pond_kernel::ObjectStore;
                     match store.list_paths("") {
                         Ok(_) => {
-                            println!("Connected to S3 storage: {}", path);
+                            // Create .pond/ marker in the CWD with the S3 URL
+                            let pond_dir = std::path::Path::new(".pond");
+                            if let Err(e) = std::fs::create_dir_all(pond_dir) {
+                                eprintln!("Error: failed to create .pond/ marker: {}", e);
+                                std::process::exit(1);
+                            }
+                            let config = format!("storage={}\n", location);
+                            if let Err(e) = std::fs::write(pond_dir.join("config"), config) {
+                                eprintln!("Error: failed to write .pond/config: {}", e);
+                                std::process::exit(1);
+                            }
+                            println!("Connected to S3 storage: {}", location);
+                            println!("Created .pond/config (auto-discovery enabled)");
+                            println!("Now you can run: pond write users --json '[...]' -m init");
                         }
                         Err(e) => {
                             eprintln!("Error: cannot access S3 storage: {}", e);
@@ -221,13 +322,32 @@ fn cmd_init(path: &str) {
         return;
     }
 
-    // Local FS init: create the blobs/ directory
-    let path_stripped = path.strip_prefix("file://").unwrap_or(path);
-    let blobs_dir = std::path::Path::new(path_stripped).join("blobs");
-    match std::fs::create_dir_all(&blobs_dir) {
-        Ok(()) => println!("Initialized empty Pond repository in {}", path_stripped),
-        Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+    // Local FS init
+    let path_stripped = location.strip_prefix("file://").unwrap_or(location);
+    let base_path = std::path::Path::new(path_stripped);
+    let blobs_dir = base_path.join("blobs");
+    let pond_dir = base_path.join(".pond");
+
+    // Create blobs/ directory (where data is stored)
+    if let Err(e) = std::fs::create_dir_all(&blobs_dir) {
+        eprintln!("Error: failed to create blobs directory: {}", e);
+        std::process::exit(1);
     }
+
+    // Create .pond/ marker directory with config
+    if let Err(e) = std::fs::create_dir_all(&pond_dir) {
+        eprintln!("Error: failed to create .pond/ marker: {}", e);
+        std::process::exit(1);
+    }
+    let config = "storage=local\n";
+    if let Err(e) = std::fs::write(pond_dir.join("config"), config) {
+        eprintln!("Error: failed to write .pond/config: {}", e);
+        std::process::exit(1);
+    }
+
+    println!("Initialized empty Pond repository in {}", path_stripped);
+    println!("Created .pond/ marker (auto-discovery enabled)");
+    println!("Now you can run: pond write users --json '[...]' -m init");
 }
 
 fn cmd_write(storage: &UnifiedStorage, collection: &str, file: Option<String>,

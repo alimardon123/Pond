@@ -38,3 +38,4 @@ target/
 # Go build artifacts
 *.exe
 bindings/go/pond.test
+.pond/

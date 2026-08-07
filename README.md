@@ -88,24 +88,40 @@ pond_repo/
 # Build the CLI (with S3 support enabled by default)
 cargo build -p pond_cli
 
-# Local filesystem
-pond init /var/lib/pond
-pond --root /var/lib/pond write users --json '[{"id":1,"name":"alice"}]' -m "first"
-pond --root /var/lib/pond read users
+# Local filesystem (git-style auto-discovery)
+cd /var/lib/pond
+pond init                          # creates .pond/ marker
+pond write users --json '[{"id":1,"name":"alice"}]' -m "first"
+pond read users
+pond branch users dev
+pond checkout -b users dev
+pond merge users dev -m "merge"
+pond history users
+pond ls
+
+# Works from subdirectories too (like git)
+cd /var/lib/pond/subdir
+pond read users                    # auto-discovers .pond/
 
 # S3-compatible storage (AWS S3, R2, MinIO, etc.)
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
-pond --root "s3://my-bucket/prod?region=us-east-1" init
-pond --root "s3://my-bucket/prod?region=us-east-1" write users --json '[{"id":1}]' -m "first"
-pond --root "s3://my-bucket/prod?region=us-east-1" read users
+pond init "s3://my-bucket/prod?region=us-east-1"
+pond write users --json '[{"id":1}]' -m "first"   # no --root needed!
+pond read users
 
 # Cloudflare R2
-pond --root "s3://my-bucket/prod?region=auto&endpoint=https://<account>.r2.cloudflarestorage.com" init
+pond init "s3://bucket/prefix?region=auto&endpoint=https://<account>.r2.cloudflarestorage.com"
 
 # MinIO
-pond --root "s3://my-bucket/prod?region=us-east-1&endpoint=http://localhost:9000" init
+pond init "s3://bucket/prefix?region=us-east-1&endpoint=http://localhost:9000"
 ```
+
+**How it works:** `pond init` creates a `.pond/` marker directory with a
+`config` file. Subsequent commands auto-discover it by walking up from CWD
+(just like `git` finds `.git/`). No need for `--root` on every command.
+
+`--root` and `POND_ROOT` env var still work as overrides (for scripts/CI).
 
 ### Using the Python SDK
 
