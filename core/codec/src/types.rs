@@ -1,0 +1,80 @@
+// types.rs — `PondColumn` and the small `CString` helpers used by the decoder.
+//
+// `PondColumn` is the language-agnostic representation of a decoded PND2
+// column: it owns its data (so it can outlive the input blob) and uses
+// `CString` for the column name and STRING values so that `as_ptr()`
+// returns a null-terminated `*const c_char` directly — required by the C
+// ABI accessors `pond_result_column_name` and `pond_result_column_str`.
+//
+// `bytes_to_cstring` / `str_to_cstring` are `pub(crate)` helpers that strip
+// interior null bytes (which are invalid in C strings) and wrap the result
+// in a `CString`. They're used by both `types.rs` (in `PondColumn::empty`)
+// and `decode.rs` (when materializing STRING values from RAW/DICT/RLE
+// payloads).
+
+use std::ffi::CString;
+
+/// A decoded PND2 column. Owns its data so it can outlive the input blob.
+///
+/// Each column stores its values in the `*_data` vec matching its `vtype`:
+///   - VT_INT64   → `i64_data`
+///   - VT_FLOAT64 → `f64_data`
+///   - VT_STRING  → `str_data`  (Vec<CString> — null-terminated for C ABI)
+///   - VT_BINARY  → `bin_data`
+///   - VT_NULL    → all vecs empty, `n_values` = row count
+///
+/// `name` and `str_data` use `CString` (not `String`) so that `as_ptr()`
+/// returns a null-terminated `*const c_char` directly — required by the
+/// C ABI accessors `pond_result_column_name` and `pond_result_column_str`.
+///
+/// `n_values` is the logical row count of the column (always set, even when
+/// the data vecs are empty — e.g. for VT_NULL columns or unsupported encodings).
+#[derive(Clone, Debug)]
+pub struct PondColumn {
+    pub name: CString,
+    pub vtype: u8,
+    pub i64_data: Vec<i64>,
+    pub f64_data: Vec<f64>,
+    pub str_data: Vec<CString>,
+    pub bin_data: Vec<Vec<u8>>,
+    pub n_values: usize,
+}
+
+impl PondColumn {
+    /// Create an empty column with the given name and vtype.
+    /// `name_bytes` is the raw UTF-8 bytes of the column name (interior
+    /// null bytes are stripped — they're invalid in C strings).
+    pub fn empty(name_bytes: &[u8], vtype: u8) -> Self {
+        Self {
+            name: bytes_to_cstring(name_bytes),
+            vtype,
+            i64_data: vec![],
+            f64_data: vec![],
+            str_data: vec![],
+            bin_data: vec![],
+            n_values: 0,
+        }
+    }
+
+    /// Same as `empty` but takes a `&str` for ergonomic callers.
+    pub fn empty_named(name: &str, vtype: u8) -> Self {
+        Self::empty(name.as_bytes(), vtype)
+    }
+}
+
+/// Convert raw bytes to a `CString`, stripping any interior null bytes
+/// (which are invalid in C strings). For invalid UTF-8 the bytes are
+/// kept as-is — callers that need lossy UTF-8 conversion should do it
+/// before calling this.
+pub(crate) fn bytes_to_cstring(b: &[u8]) -> CString {
+    let mut v: Vec<u8> = b.to_vec();
+    v.retain(|&c| c != 0);
+    // Safety: we just stripped all 0x00 bytes, so v contains no interior nulls.
+    // CString::new would also work but does a redundant scan.
+    CString::new(v).unwrap_or_else(|_| CString::new("").unwrap())
+}
+
+/// Convert a `&str` to a `CString` (lossy — interior nulls are stripped).
+pub(crate) fn str_to_cstring(s: &str) -> CString {
+    bytes_to_cstring(s.as_bytes())
+}
