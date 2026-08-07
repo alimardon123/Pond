@@ -178,3 +178,274 @@ mod tests {
                    "collections/users/_branches/experiment/commit");
     }
 }
+
+// ===========================================================================
+// C ABI — extern "C" wrappers for cross-language SDKs (Go, Java, Node, C)
+// ===========================================================================
+//
+// These functions expose the full UnifiedStorage API through a C ABI.
+// Any language that can call C functions (Go via cgo, Java via JNI, Node
+// via N-API, C/C++ directly) gets full Pond storage access.
+//
+// Memory management:
+//   - Strings returned by pond_storage_* functions are heap-allocated.
+//     Caller MUST free them with pond_string_free().
+//   - Data returned via out-params is heap-allocated.
+//     Caller MUST free with pond_data_free().
+//   - Handles (PondStorageHandle*) must be freed with pond_storage_free().
+//
+// Error handling:
+//   - Functions that return strings return NULL on error.
+//   - Functions that return int return 0 on success, -1 on error.
+//   - Functions that return handles return NULL on error.
+
+use std::ffi::{c_char, CStr, CString};
+use std::ptr;
+
+/// Opaque handle for UnifiedStorage.
+pub struct PondStorageHandle {
+    storage: UnifiedStorage,
+}
+
+/// Create a new UnifiedStorage with a local FS backend.
+/// Returns NULL on error.
+#[no_mangle]
+pub extern "C" fn pond_storage_new(base_dir: *const c_char) -> *mut PondStorageHandle {
+    if base_dir.is_null() { return ptr::null_mut(); }
+    let dir = match unsafe { CStr::from_ptr(base_dir) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+    match UnifiedStorage::new_local(dir) {
+        Ok(storage) => Box::into_raw(Box::new(PondStorageHandle { storage })),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Free a PondStorageHandle. Safe on NULL.
+#[no_mangle]
+pub extern "C" fn pond_storage_free(handle: *mut PondStorageHandle) {
+    if !handle.is_null() {
+        unsafe { drop(Box::from_raw(handle)); }
+    }
+}
+
+/// Get the active branch for a collection.
+/// Returns a heap-allocated string (caller must free with pond_string_free).
+/// Returns NULL if the collection has no active branch (defaults to "main").
+#[no_mangle]
+pub extern "C" fn pond_storage_get_active_branch(
+    handle: *const PondStorageHandle,
+    collection: *const c_char,
+) -> *mut c_char {
+    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return ptr::null_mut() }};
+    if collection.is_null() { return ptr::null_mut(); }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() {
+        Ok(s) => s, Err(_) => return ptr::null_mut(),
+    };
+    let branch = handle.storage.get_active_branch(coll);
+    CString::new(branch).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut())
+}
+
+/// Set the active branch for a collection (in-memory only).
+#[no_mangle]
+pub extern "C" fn pond_storage_set_active_branch(
+    handle: *mut PondStorageHandle,
+    collection: *const c_char,
+    branch: *const c_char,
+) {
+    let handle = unsafe { match handle.as_mut() { Some(h) => h, None => return }};
+    if collection.is_null() || branch.is_null() { return; }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return };
+    let br = match unsafe { CStr::from_ptr(branch) }.to_str() { Ok(s) => s, Err(_) => return };
+    handle.storage.set_active_branch(coll, br);
+}
+
+/// Write data to a collection on the active branch.
+/// Returns the commit hash (heap-allocated, caller must free), or NULL on error.
+#[no_mangle]
+pub extern "C" fn pond_storage_write(
+    handle: *mut PondStorageHandle,
+    collection: *const c_char,
+    data: *const u8,
+    data_len: usize,
+    message: *const c_char,
+) -> *mut c_char {
+    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return ptr::null_mut() }};
+    if collection.is_null() || data.is_null() { return ptr::null_mut(); }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
+    let msg = if message.is_null() { "" } else {
+        match unsafe { CStr::from_ptr(message) }.to_str() { Ok(s) => s, Err(_) => "" }
+    };
+    let data_slice = unsafe { std::slice::from_raw_parts(data, data_len) };
+    let active = handle.storage.get_active_branch(coll);
+    match write::write(handle.storage.kernel(), coll, &active, data_slice, msg) {
+        Ok(hash) => CString::new(hash).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut()),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Read data from a collection's active branch.
+/// Writes the data pointer + length into out-params.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn pond_storage_read(
+    handle: *const PondStorageHandle,
+    collection: *const c_char,
+    out_data: *mut *const u8,
+    out_len: *mut usize,
+) -> i32 {
+    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return -1 }};
+    if collection.is_null() || out_data.is_null() || out_len.is_null() { return -1; }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return -1 };
+    let active = handle.storage.get_active_branch(coll);
+    match read::read(handle.storage.kernel(), coll, &active) {
+        Ok(data) => {
+            let mut boxed = data.into_boxed_slice();
+            let p = boxed.as_ptr();
+            let len = boxed.len();
+            std::mem::forget(boxed);
+            unsafe { *out_data = p; *out_len = len; }
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Create a branch from the active branch.
+/// Returns the commit hash (caller must free), or NULL on error.
+#[no_mangle]
+pub extern "C" fn pond_storage_branch(
+    handle: *mut PondStorageHandle,
+    collection: *const c_char,
+    branch_name: *const c_char,
+) -> *mut c_char {
+    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return ptr::null_mut() }};
+    if collection.is_null() || branch_name.is_null() { return ptr::null_mut(); }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
+    let br = match unsafe { CStr::from_ptr(branch_name) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
+    let active = handle.storage.get_active_branch(coll);
+    match branch::branch(handle.storage.kernel(), coll, br, &active) {
+        Ok(hash) => CString::new(hash).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut()),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Checkout a branch (verify it exists + set active).
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn pond_storage_checkout(
+    handle: *mut PondStorageHandle,
+    collection: *const c_char,
+    branch_name: *const c_char,
+) -> i32 {
+    let handle = unsafe { match handle.as_mut() { Some(h) => h, None => return -1 }};
+    if collection.is_null() || branch_name.is_null() { return -1; }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return -1 };
+    let br = match unsafe { CStr::from_ptr(branch_name) }.to_str() { Ok(s) => s, Err(_) => return -1 };
+    match branch::checkout(handle.storage.kernel(), coll, br) {
+        Ok(()) => {
+            handle.storage.set_active_branch(coll, br);
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Merge a source branch into a target branch.
+/// If target is NULL, uses the active branch.
+/// Returns the merge commit hash (caller must free), or NULL on error.
+#[no_mangle]
+pub extern "C" fn pond_storage_merge(
+    handle: *mut PondStorageHandle,
+    collection: *const c_char,
+    source_branch: *const c_char,
+    target_branch: *const c_char,
+    message: *const c_char,
+) -> *mut c_char {
+    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return ptr::null_mut() }};
+    if collection.is_null() || source_branch.is_null() { return ptr::null_mut(); }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
+    let src = match unsafe { CStr::from_ptr(source_branch) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
+    let tgt = if target_branch.is_null() {
+        handle.storage.get_active_branch(coll)
+    } else {
+        match unsafe { CStr::from_ptr(target_branch) }.to_str() { Ok(s) => s.to_string(), Err(_) => return ptr::null_mut() }
+    };
+    let msg = if message.is_null() { "" } else {
+        match unsafe { CStr::from_ptr(message) }.to_str() { Ok(s) => s, Err(_) => "" }
+    };
+    match branch::merge(handle.storage.kernel(), coll, src, &tgt, msg) {
+        Ok(hash) => CString::new(hash).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut()),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Undo the last N commits on the active branch.
+/// Returns the new HEAD hash (caller must free), or NULL on error.
+#[no_mangle]
+pub extern "C" fn pond_storage_undo(
+    handle: *mut PondStorageHandle,
+    collection: *const c_char,
+    steps: usize,
+) -> *mut c_char {
+    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return ptr::null_mut() }};
+    if collection.is_null() { return ptr::null_mut(); }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
+    let active = handle.storage.get_active_branch(coll);
+    match branch::undo(handle.storage.kernel(), coll, &active, steps) {
+        Ok(hash) => CString::new(hash).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut()),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Revert the active branch to a specific commit.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn pond_storage_revert(
+    handle: *mut PondStorageHandle,
+    collection: *const c_char,
+    commit_hash: *const c_char,
+) -> i32 {
+    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return -1 }};
+    if collection.is_null() || commit_hash.is_null() { return -1; }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return -1 };
+    let hash = match unsafe { CStr::from_ptr(commit_hash) }.to_str() { Ok(s) => s, Err(_) => return -1 };
+    let active = handle.storage.get_active_branch(coll);
+    match branch::revert(handle.storage.kernel(), coll, &active, hash) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// List branches for a collection.
+/// Returns a newline-separated string of branch names (caller must free).
+/// Returns NULL on error.
+#[no_mangle]
+pub extern "C" fn pond_storage_list_branches(
+    handle: *const PondStorageHandle,
+    collection: *const c_char,
+) -> *mut c_char {
+    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return ptr::null_mut() }};
+    if collection.is_null() { return ptr::null_mut(); }
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
+    let branches = branch::list_branches(handle.storage.kernel(), coll);
+    let joined = branches.join("\n");
+    CString::new(joined).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut())
+}
+
+/// Free a string returned by pond_storage_* functions.
+#[no_mangle]
+pub extern "C" fn pond_storage_string_free(s: *mut c_char) {
+    if !s.is_null() {
+        unsafe { drop(CString::from_raw(s)); }
+    }
+}
+
+/// Free data returned by pond_storage_read.
+#[no_mangle]
+pub extern "C" fn pond_storage_data_free(data: *mut u8, len: usize) {
+    if !data.is_null() && len > 0 {
+        unsafe { drop(Vec::from_raw_parts(data, len, len)); }
+    }
+}
