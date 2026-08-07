@@ -3,30 +3,19 @@
 // A single-binary tool for content-addressed storage with branching,
 // time-travel, and universal data support (JSON, CSV, raw bytes).
 //
+// Mirrors the Python PondStorage/UnifiedStorage API:
+//   write, read, branch, checkout, checkout -b, merge (source→target),
+//   list-branches, history, undo, revert, diff, ls, cat, gc, version
+//
 // Design principles:
 //   - DuckDB philosophy: one binary, no server, embedded
 //   - Universal storage: accepts any data format (JSON, CSV, raw bytes)
 //   - Simple: mirrors the kernel's 3 primitives (write, read, ref)
-//   - Beautiful: git-like commands (init, branch, merge, history)
-//
-// Usage:
-//   pond init [path]                    Initialize a .pond/ directory
-//   pond write <collection> <file>      Write a file's contents as a blob
-//   pond write <collection> --json '{}' Write JSON data
-//   pond write <collection> --bytes -   Write raw bytes from stdin
-//   pond read <collection>              Read a collection's data
-//   pond read <collection> -o <file>    Write output to a file
-//   pond branch <collection> <name>     Create a branch
-//   pond merge <collection> <name>      Merge a branch (currently: point branch at HEAD)
-//   pond history <collection>           Show commit log (currently: show HEAD chain)
-//   pond ls                             List all collections
-//   pond cat <hash>                     Read a blob by hash
-//   pond gc                             (TODO) Garbage collect dead blobs
-//   pond version                        Print version
+//   - Beautiful: git-like commands (init, branch, checkout, merge)
 
 use clap::{Parser, Subcommand};
 use pond_kernel::PondKernel;
-use std::io::{self, Read, Write};
+use std::io::{self, Read as IoRead, Write as IoWrite};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -34,8 +23,6 @@ use std::path::PathBuf;
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Content-addressed storage with branching and time-travel")]
 struct Cli {
-    /// The pond root directory (defaults to current directory).
-    /// The kernel looks for .pond/ inside this directory.
     #[arg(long, env = "POND_ROOT", global = true)]
     root: Option<PathBuf>,
 
@@ -47,77 +34,87 @@ struct Cli {
 enum Commands {
     /// Initialize a new .pond/ directory
     Init {
-        /// Path to initialize (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
     },
 
-    /// Write data to a collection
+    /// Write data to a collection (creates a new commit on the active branch)
     Write {
-        /// Collection name (e.g. "users", "events", "dev/config")
         collection: String,
-
-        /// Read data from a file (use "-" for stdin)
         #[arg(group = "input")]
         file: Option<String>,
-
-        /// Provide JSON data directly on the command line
         #[arg(long, group = "input")]
         json: Option<String>,
-
-        /// Read raw bytes from stdin (alternative to <file> "-")
         #[arg(long, group = "input")]
         bytes: bool,
-
-        /// Commit message (stored in the ref metadata)
         #[arg(short, long)]
         message: Option<String>,
     },
 
-    /// Read a collection's data
+    /// Read a collection's current data (from the active branch)
     Read {
-        /// Collection name or hash
         name_or_hash: String,
-
-        /// Write output to a file instead of stdout
         #[arg(short, long)]
         output: Option<String>,
     },
 
-    /// Create a branch of a collection
+    /// Create a branch from the active branch's HEAD
     Branch {
-        /// Source collection name
         collection: String,
-
-        /// Branch name
         branch_name: String,
     },
 
-    /// Merge a branch back into its parent (currently: point parent at branch HEAD)
+    /// Switch the active branch (like `git checkout`)
+    Checkout {
+        collection: String,
+        branch_name: String,
+        /// Create the branch AND checkout (like `git checkout -b`)
+        #[arg(short = 'b', long = "new")]
+        new: bool,
+    },
+
+    /// Merge a source branch into a target branch
     Merge {
-        /// Collection name
         collection: String,
-
-        /// Branch name to merge
-        branch_name: String,
+        /// Branch to merge FROM
+        source_branch: String,
+        /// Branch to merge INTO (defaults to active branch)
+        #[arg(short, long)]
+        into: Option<String>,
+        #[arg(short, long)]
+        message: Option<String>,
     },
 
-    /// Show the history of a collection
-    History {
-        /// Collection name
+    /// List branches of a collection
+    Branches {
         collection: String,
+    },
 
-        /// Maximum number of commits to show
+    /// Show commit history of a collection
+    History {
+        collection: String,
         #[arg(short, long, default_value = "20")]
         limit: usize,
+    },
+
+    /// Undo the last N commits on the active branch
+    Undo {
+        collection: String,
+        #[arg(default_value = "1")]
+        steps: usize,
+    },
+
+    /// Revert the active branch to a specific commit hash
+    Revert {
+        collection: String,
+        commit_hash: String,
     },
 
     /// List all collections
     Ls,
 
-    /// Read a blob by its hash
+    /// Read a blob by its hash (or hash prefix)
     Cat {
-        /// The blob hash (64 hex chars)
         hash: String,
     },
 
@@ -125,46 +122,132 @@ enum Commands {
     Version,
 }
 
+// ---------------------------------------------------------------------------
+// Ref namespace helpers — match the Python UnifiedStorage conventions
+// ---------------------------------------------------------------------------
+
+fn branch_ref(collection: &str, branch: &str) -> String {
+    format!("collections/{}/_branches/{}/commit", collection, branch)
+}
+
+fn active_branch_ref(collection: &str) -> String {
+    format!("collections/{}/_active_branch", collection)
+}
+
+fn definition_ref(collection: &str) -> String {
+    format!("collections/{}/definition", collection)
+}
+
+/// Get the active branch name for a collection. Defaults to "main".
+fn get_active_branch(kernel: &PondKernel, collection: &str) -> String {
+    match kernel.resolve(&active_branch_ref(collection)) {
+        Some(hash) => {
+            // The _active_branch ref points to a blob containing the branch NAME.
+            // Read the blob to get the name.
+            match kernel.read_blob(&hash) {
+                Ok(data) => String::from_utf8_lossy(&data).to_string(),
+                Err(_) => "main".to_string(),
+            }
+        }
+        None => "main".to_string(),
+    }
+}
+
+/// Set the active branch for a collection.
+fn set_active_branch(kernel: &PondKernel, collection: &str, branch: &str) -> io::Result<()> {
+    // _active_branch stores the branch NAME, not a hash. We write it as a
+    // blob first (so the kernel verifies it), then reference it.
+    // Actually, the kernel requires the hash to refer to an existing blob.
+    // So we write the branch name as a blob, then reference it.
+    let h = kernel.write(branch.as_bytes())?;
+    kernel.reference(&active_branch_ref(collection), &h)
+}
+
+/// Get the commit hash for a branch. Falls back to flat ref for backward compat.
+fn get_branch_commit(kernel: &PondKernel, collection: &str, branch: &str) -> Option<String> {
+    kernel.resolve(&branch_ref(collection, branch))
+        .or_else(|| {
+            // Backward compat: try flat ref (older convention)
+            if branch == "main" {
+                kernel.resolve(collection)
+            } else {
+                None
+            }
+        })
+}
+
+/// Set the commit hash for a branch.
+fn set_branch_commit(kernel: &PondKernel, collection: &str, branch: &str, hash: &str) -> io::Result<()> {
+    kernel.reference(&branch_ref(collection, branch), hash)?;
+    // If this is the active branch, also update the flat ref for backward compat
+    if get_active_branch(kernel, collection) == branch {
+        let _ = kernel.reference(collection, hash);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Init { path } => {
-            // If --root is set, init relative to it. Otherwise use the
-            // <path> argument (defaults to ".").
             let base = cli.root.unwrap_or(path);
             cmd_init(&base);
         }
-        Commands::Write { collection, file, json, bytes, message: _ } => {
-            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
-            cmd_write(&root, &collection, file, json, bytes);
-        }
-        Commands::Read { name_or_hash, output } => {
-            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
-            cmd_read(&root, &name_or_hash, output);
-        }
-        Commands::Branch { collection, branch_name } => {
-            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
-            cmd_branch(&root, &collection, &branch_name);
-        }
-        Commands::Merge { collection, branch_name } => {
-            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
-            cmd_merge(&root, &collection, &branch_name);
-        }
-        Commands::History { collection, limit } => {
-            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
-            cmd_history(&root, &collection, limit);
-        }
-        Commands::Ls => {
-            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
-            cmd_ls(&root);
-        }
-        Commands::Cat { hash } => {
-            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
-            cmd_cat(&root, &hash);
-        }
         Commands::Version => {
             println!("pond {}", env!("CARGO_PKG_VERSION"));
+        }
+        // All other commands need a kernel
+        cmd => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            let kernel = match PondKernel::new(&root) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Error: failed to open kernel at {}: {}", root.display(), e);
+                    eprintln!("Hint: run 'pond init' first");
+                    std::process::exit(1);
+                }
+            };
+            match cmd {
+                Commands::Write { collection, file, json, bytes, message } => {
+                    cmd_write(&kernel, &collection, file, json, bytes, message);
+                }
+                Commands::Read { name_or_hash, output } => {
+                    cmd_read(&kernel, &name_or_hash, output);
+                }
+                Commands::Branch { collection, branch_name } => {
+                    cmd_branch(&kernel, &collection, &branch_name);
+                }
+                Commands::Checkout { collection, branch_name, new } => {
+                    cmd_checkout(&kernel, &collection, &branch_name, new);
+                }
+                Commands::Merge { collection, source_branch, into, message } => {
+                    cmd_merge(&kernel, &collection, &source_branch, into, message);
+                }
+                Commands::Branches { collection } => {
+                    cmd_branches(&kernel, &collection);
+                }
+                Commands::History { collection, limit } => {
+                    cmd_history(&kernel, &collection, limit);
+                }
+                Commands::Undo { collection, steps } => {
+                    cmd_undo(&kernel, &collection, steps);
+                }
+                Commands::Revert { collection, commit_hash } => {
+                    cmd_revert(&kernel, &collection, &commit_hash);
+                }
+                Commands::Ls => {
+                    cmd_ls(&kernel);
+                }
+                Commands::Cat { hash } => {
+                    cmd_cat(&kernel, &hash);
+                }
+                _ => unreachable!(),
+            }
         }
     }
 }
@@ -176,7 +259,8 @@ fn main() {
 fn cmd_init(path: &PathBuf) {
     let pond_dir = path.join(".pond");
     let objects_dir = pond_dir.join("objects");
-    match std::fs::create_dir_all(&objects_dir) {
+    let refs_dir = pond_dir.join("refs");
+    match fs::create_dir_all(&objects_dir).and_then(|_| fs::create_dir_all(&refs_dir)) {
         Ok(()) => {
             println!("Initialized empty Pond repository in {}", pond_dir.display());
         }
@@ -188,23 +272,14 @@ fn cmd_init(path: &PathBuf) {
 }
 
 fn cmd_write(
-    root: &PathBuf,
+    kernel: &PondKernel,
     collection: &str,
     file: Option<String>,
     json: Option<String>,
     bytes: bool,
+    message: Option<String>,
 ) {
-    let kernel = match PondKernel::new(root) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("Error: failed to open kernel at {}: {}", root.display(), e);
-            eprintln!("Hint: run 'pond init' first");
-            std::process::exit(1);
-        }
-    };
-
     let data: Vec<u8> = if let Some(j) = json {
-        // Validate JSON
         match serde_json::from_str::<serde_json::Value>(&j) {
             Ok(_) => j.into_bytes(),
             Err(e) => {
@@ -213,7 +288,6 @@ fn cmd_write(
             }
         }
     } else if bytes || file.as_deref() == Some("-") {
-        // Read from stdin
         let mut buf = Vec::new();
         if let Err(e) = io::stdin().read_to_end(&mut buf) {
             eprintln!("Error: failed to read stdin: {}", e);
@@ -233,42 +307,62 @@ fn cmd_write(
         std::process::exit(1);
     };
 
-    match kernel.write(&data) {
-        Ok(hash) => {
-            // Reference the hash under the collection's main branch ref.
-            // This uses the branch ref convention: collections/{name}/_branches/main/commit
-            // so that branch/merge/history commands work consistently.
-            let main_ref = format!("collections/{}/_branches/main/commit", collection);
-            if let Err(e) = kernel.reference(&main_ref, &hash) {
-                eprintln!("Error: failed to reference {}: {}", collection, e);
-                std::process::exit(1);
-            }
-            // Also set the flat ref for backward compatibility / simple lookups
-            let _ = kernel.reference(collection, &hash);
-            println!("{}\t{}", &hash[..12], collection);
-        }
+    // Write the data blob
+    let hash = match kernel.write(&data) {
+        Ok(h) => h,
         Err(e) => {
             eprintln!("Error: failed to write: {}", e);
             std::process::exit(1);
         }
-    }
-}
+    };
 
-fn cmd_read(root: &PathBuf, name_or_hash: &str, output: Option<String>) {
-    let kernel = match PondKernel::new(root) {
-        Ok(k) => k,
+    // Write a commit blob (stores the message + parent + data hash)
+    // For v0.1, the commit is just the data hash + message as JSON.
+    // Future versions will use a typed Commit struct.
+    let active_branch = get_active_branch(kernel, collection);
+    let parent = get_branch_commit(kernel, collection, &active_branch);
+    let commit_json = format!(
+        r#"{{"data":"{}","parent":{},"message":"{}"}}"#,
+        hash,
+        parent.map(|p| format!("\"{}\"", p)).unwrap_or_else(|| "null".to_string()),
+        message.unwrap_or_default().replace('"', "\\\""),
+    );
+    let commit_hash = match kernel.write(commit_json.as_bytes()) {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("Error: failed to open kernel: {}", e);
+            eprintln!("Error: failed to write commit: {}", e);
             std::process::exit(1);
         }
     };
 
-    // Try the branch ref convention first (collections/{name}/_branches/main/commit),
-    // then fall back to the flat ref, then try as a hash.
-    let main_ref = format!("collections/{}/_branches/main/commit", name_or_hash);
-    let data = if let Some(h) = kernel.resolve(&main_ref) {
-        kernel.read_blob(&h)
+    // Update the active branch's commit ref
+    if let Err(e) = set_branch_commit(kernel, collection, &active_branch, &commit_hash) {
+        eprintln!("Error: failed to reference {}: {}", collection, e);
+        std::process::exit(1);
+    }
+    println!("{}\t{}", &commit_hash[..12], collection);
+}
+
+fn cmd_read(kernel: &PondKernel, name_or_hash: &str, output: Option<String>) {
+    // Try as collection name first (resolve active branch), then as hash
+    let active_ref = branch_ref(name_or_hash, &get_active_branch(kernel, name_or_hash));
+    let data = if let Some(commit_hash) = kernel.resolve(&active_ref) {
+        // Read the commit blob, extract the data hash, read the data
+        match kernel.read_blob(&commit_hash) {
+            Ok(commit_data) => {
+                let commit_str = String::from_utf8_lossy(&commit_data);
+                // Extract "data":"hash" from the commit JSON
+                if let Some(data_hash) = extract_field(&commit_str, "data") {
+                    kernel.read_blob(&data_hash)
+                } else {
+                    // Old-style: commit IS the data (no commit wrapper)
+                    Ok(commit_data)
+                }
+            }
+            Err(e) => Err(e),
+        }
     } else {
+        // Try flat ref, then as hash
         kernel.read(name_or_hash)
     };
 
@@ -293,34 +387,16 @@ fn cmd_read(root: &PathBuf, name_or_hash: &str, output: Option<String>) {
     }
 }
 
-fn cmd_branch(root: &PathBuf, collection: &str, branch_name: &str) {
-    let kernel = match PondKernel::new(root) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("Error: failed to open kernel: {}", e);
+fn cmd_branch(kernel: &PondKernel, collection: &str, branch_name: &str) {
+    let active_branch = get_active_branch(kernel, collection);
+    let source_hash = match get_branch_commit(kernel, collection, &active_branch) {
+        Some(h) => h,
+        None => {
+            eprintln!("Error: collection '{}' has no commits to branch from", collection);
             std::process::exit(1);
         }
     };
-
-    // Resolve the source collection to its current hash
-    let source_ref = format!("collections/{}/_branches/main/commit", collection);
-    let source_hash = match kernel.resolve(&source_ref) {
-        Some(h) => h,
-        None => {
-            // Try the flat ref (older convention)
-            match kernel.resolve(collection) {
-                Some(h) => h,
-                None => {
-                    eprintln!("Error: collection '{}' not found", collection);
-                    std::process::exit(1);
-                }
-            }
-        }
-    };
-
-    // Create the branch ref pointing at the same hash
-    let branch_ref = format!("collections/{}/_branches/{}/commit", collection, branch_name);
-    match kernel.reference(&branch_ref, &source_hash) {
+    match set_branch_commit(kernel, collection, branch_name, &source_hash) {
         Ok(()) => {
             println!("Created branch '{}' of '{}' at {}", branch_name, collection, &source_hash[..12]);
         }
@@ -331,31 +407,65 @@ fn cmd_branch(root: &PathBuf, collection: &str, branch_name: &str) {
     }
 }
 
-fn cmd_merge(root: &PathBuf, collection: &str, branch_name: &str) {
-    let kernel = match PondKernel::new(root) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("Error: failed to open kernel: {}", e);
+fn cmd_checkout(kernel: &PondKernel, collection: &str, branch_name: &str, new: bool) {
+    if new {
+        // checkout -b: create branch then switch
+        let active_branch = get_active_branch(kernel, collection);
+        let source_hash = match get_branch_commit(kernel, collection, &active_branch) {
+            Some(h) => h,
+            None => {
+                eprintln!("Error: collection '{}' has no commits to branch from", collection);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = set_branch_commit(kernel, collection, branch_name, &source_hash) {
+            eprintln!("Error: failed to create branch: {}", e);
             std::process::exit(1);
         }
-    };
-
-    // Resolve the branch's current hash
-    let branch_ref = format!("collections/{}/_branches/{}/commit", collection, branch_name);
-    let branch_hash = match kernel.resolve(&branch_ref) {
-        Some(h) => h,
-        None => {
+        println!("Created branch '{}' of '{}'", branch_name, collection);
+    } else {
+        // Verify the branch exists
+        if get_branch_commit(kernel, collection, branch_name).is_none() {
             eprintln!("Error: branch '{}' not found in '{}'", branch_name, collection);
             std::process::exit(1);
         }
+    }
+    // Switch the active branch
+    if let Err(e) = set_active_branch(kernel, collection, branch_name) {
+        eprintln!("Error: failed to checkout: {}", e);
+        std::process::exit(1);
+    }
+    println!("Switched to branch '{}'", branch_name);
+}
+
+fn cmd_merge(
+    kernel: &PondKernel,
+    collection: &str,
+    source_branch: &str,
+    into: Option<String>,
+    _message: Option<String>,
+) {
+    let target_branch = into.unwrap_or_else(|| get_active_branch(kernel, collection));
+
+    let source_hash = match get_branch_commit(kernel, collection, source_branch) {
+        Some(h) => h,
+        None => {
+            eprintln!("Error: source branch '{}' not found", source_branch);
+            std::process::exit(1);
+        }
     };
 
-    // Point main at the branch's hash (simple merge: fast-forward)
-    let main_ref = format!("collections/{}/_branches/main/commit", collection);
-    match kernel.reference(&main_ref, &branch_hash) {
+    // Verify target exists
+    if get_branch_commit(kernel, collection, &target_branch).is_none() {
+        eprintln!("Error: target branch '{}' not found", target_branch);
+        std::process::exit(1);
+    }
+
+    // Fast-forward: point target at source's commit
+    match set_branch_commit(kernel, collection, &target_branch, &source_hash) {
         Ok(()) => {
             println!("Merged '{}' into '{}' (fast-forward to {})",
-                     branch_name, collection, &branch_hash[..12]);
+                     source_branch, target_branch, &source_hash[..12]);
         }
         Err(e) => {
             eprintln!("Error: failed to merge: {}", e);
@@ -364,77 +474,154 @@ fn cmd_merge(root: &PathBuf, collection: &str, branch_name: &str) {
     }
 }
 
-fn cmd_history(root: &PathBuf, collection: &str, limit: usize) {
-    let kernel = match PondKernel::new(root) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("Error: failed to open kernel: {}", e);
-            std::process::exit(1);
-        }
-    };
+fn cmd_branches(kernel: &PondKernel, collection: &str) {
+    let prefix = format!("collections/{}/_branches/", collection);
+    let refs = kernel.list_names_prefix(&prefix);
+    let active = get_active_branch(kernel, collection);
 
-    // Currently the kernel only stores the current HEAD (no commit chain yet).
-    // The commit chain is a Lens-level pattern (UnifiedStorage manages it).
-    // For v0.1, we show the current HEAD and a note that history is
-    // lens-level (future CLI versions will walk the commit chain).
-    let main_ref = format!("collections/{}/_branches/main/commit", collection);
-    match kernel.resolve(&main_ref) {
-        Some(h) => {
-            println!("{} (HEAD)", &h[..12]);
-            println!();
-            println!("Note: full commit history is managed at the lens level");
-            println!("      (UnifiedStorage commit chain). The kernel only stores");
-            println!("      the current HEAD. Future CLI versions will walk the");
-            println!("      commit chain when the Rust UnifiedStorage is implemented.");
-            let _ = limit; // accepted for API compat; not yet used
+    if refs.is_empty() {
+        // Try flat ref (backward compat)
+        if kernel.resolve(collection).is_some() {
+            println!("* main (flat ref, no branch hierarchy)");
+        } else {
+            println!("(no branches)");
         }
-        None => {
-            // Try flat ref
-            match kernel.resolve(collection) {
-                Some(h) => {
-                    println!("{} (HEAD, flat ref)", &h[..12]);
-                }
-                None => {
-                    eprintln!("Error: collection '{}' not found", collection);
-                    std::process::exit(1);
-                }
-            }
+        return;
+    }
+
+    for ref_path in refs {
+        // Extract branch name from "collections/{name}/_branches/{branch}/commit"
+        if let Some(branch) = ref_path.strip_prefix(&prefix).and_then(|s| s.strip_suffix("/commit")) {
+            let marker = if branch == active { "*" } else { " " };
+            let hash = kernel.resolve(&ref_path).unwrap_or_default();
+            let prefix = if hash.len() >= 12 { &hash[..12] } else { &hash };
+            println!("{} {}\t{}", marker, branch, prefix);
         }
     }
 }
 
-fn cmd_ls(root: &PathBuf) {
-    let kernel = match PondKernel::new(root) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("Error: failed to open kernel: {}", e);
+fn cmd_history(kernel: &PondKernel, collection: &str, limit: usize) {
+    let active_branch = get_active_branch(kernel, collection);
+    let mut current = get_branch_commit(kernel, collection, &active_branch);
+    let mut count = 0;
+
+    if current.is_none() {
+        // Try flat ref
+        current = kernel.resolve(collection);
+    }
+
+    while let Some(commit_hash) = current {
+        if count >= limit {
+            break;
+        }
+        // Read the commit blob
+        match kernel.read_blob(&commit_hash) {
+            Ok(commit_data) => {
+                let commit_str = String::from_utf8_lossy(&commit_data);
+                let parent = extract_field(&commit_str, "parent");
+                let message = extract_field(&commit_str, "message").unwrap_or_default();
+
+                println!("{} {}", &commit_hash[..12], message);
+                count += 1;
+                current = parent;
+            }
+            Err(_) => {
+                // Old-style: no commit wrapper, just data
+                println!("{} (data, no commit metadata)", &commit_hash[..12]);
+                break;
+            }
+        }
+    }
+    if count == 0 {
+        println!("(no commits)");
+    }
+}
+
+fn cmd_undo(kernel: &PondKernel, collection: &str, steps: usize) {
+    let active_branch = get_active_branch(kernel, collection);
+    let mut current = get_branch_commit(kernel, collection, &active_branch);
+
+    for _ in 0..steps {
+        match &current {
+            Some(commit_hash) => {
+                match kernel.read_blob(commit_hash) {
+                    Ok(commit_data) => {
+                        let commit_str = String::from_utf8_lossy(&commit_data);
+                        current = extract_field(&commit_str, "parent");
+                    }
+                    Err(_) => {
+                        current = None;
+                        break;
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+
+    match current {
+        Some(target_hash) => {
+            set_branch_commit(kernel, collection, &active_branch, &target_hash).unwrap();
+            println!("Undo {} steps → now at {}", steps, &target_hash[..12]);
+        }
+        None => {
+            eprintln!("Error: cannot undo {} steps (not enough history)", steps);
             std::process::exit(1);
         }
-    };
+    }
+}
 
+fn cmd_revert(kernel: &PondKernel, collection: &str, commit_hash: &str) {
+    let active_branch = get_active_branch(kernel, collection);
+
+    // Verify the commit exists
+    if kernel.read_blob(commit_hash).is_err() {
+        eprintln!("Error: commit '{}' not found", commit_hash);
+        std::process::exit(1);
+    }
+
+    set_branch_commit(kernel, collection, &active_branch, commit_hash).unwrap();
+    println!("Reverted '{}' to {}", collection, &commit_hash[..12]);
+}
+
+fn cmd_ls(kernel: &PondKernel) {
     let names = kernel.list_names();
     if names.is_empty() {
         println!("(no collections)");
         return;
     }
-    for name in names {
-        // Show the hash prefix alongside the name
-        let hash = kernel.resolve(&name).unwrap_or_default();
+    // Show top-level collection names (not internal refs)
+    let mut collections: Vec<String> = names.iter()
+        .filter(|n| n.starts_with("collections/"))
+        .filter_map(|n| {
+            // Extract collection name from "collections/{name}/..."
+            let rest = n.strip_prefix("collections/")?;
+            let name = rest.split('/').next()?;
+            Some(name.to_string())
+        })
+        .collect();
+    // Also include flat refs (no "collections/" prefix)
+    for n in &names {
+        if !n.starts_with("collections/") && !n.contains('/') {
+            collections.push(n.clone());
+        }
+    }
+    collections.sort();
+    collections.dedup();
+
+    for name in collections {
+        // Try to show the HEAD hash
+        let active = get_active_branch(kernel, &name);
+        let hash = get_branch_commit(kernel, &name, &active)
+            .or_else(|| kernel.resolve(&name))
+            .unwrap_or_default();
         let prefix = if hash.len() >= 12 { &hash[..12] } else { &hash };
         println!("{}\t{}", prefix, name);
     }
 }
 
-fn cmd_cat(root: &PathBuf, hash: &str) {
-    let kernel = match PondKernel::new(root) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("Error: failed to open kernel: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // Try the full hash first
+fn cmd_cat(kernel: &PondKernel, hash: &str) {
+    // Try full hash first
     match kernel.read_blob(hash) {
         Ok(data) => {
             if let Err(e) = io::stdout().write_all(&data) {
@@ -444,15 +631,15 @@ fn cmd_cat(root: &PathBuf, hash: &str) {
             return;
         }
         Err(_) if hash.len() < 64 => {
-            // Prefix match: scan the shard directory for a matching blob
-            let shard_dir = root.join(".pond").join("objects").join(&hash[..2]);
+            // Prefix match: scan the shard directory
+            let shard_dir = kernel.objects_dir()
+                .join(&hash[..2]);
             match std::fs::read_dir(&shard_dir) {
                 Ok(entries) => {
                     let mut matches: Vec<String> = Vec::new();
                     for entry in entries.flatten() {
                         let fname = entry.file_name();
                         let fname_str = fname.to_string_lossy();
-                        // filenames are "{hash}.bin"
                         if let Some(blob_hash) = fname_str.strip_suffix(".bin") {
                             if blob_hash.starts_with(hash) {
                                 matches.push(blob_hash.to_string());
@@ -469,7 +656,7 @@ fn cmd_cat(root: &PathBuf, hash: &str) {
                                 return;
                             }
                             Err(e) => {
-                                eprintln!("Error: failed to read blob: {}", e);
+                                eprintln!("Error: {}", e);
                                 std::process::exit(1);
                             }
                         }
@@ -477,9 +664,6 @@ fn cmd_cat(root: &PathBuf, hash: &str) {
                         eprintln!("Error: no blob with prefix '{}' found", hash);
                     } else {
                         eprintln!("Error: ambiguous prefix '{}' — matches {} blobs", hash, matches.len());
-                        for m in matches {
-                            eprintln!("  {}", m);
-                        }
                     }
                     std::process::exit(1);
                 }
@@ -495,3 +679,28 @@ fn cmd_cat(root: &PathBuf, hash: &str) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract a field value from a simple JSON string.
+/// Looks for "field":"value" and returns the value.
+/// This is a minimal parser — doesn't handle nested objects or arrays.
+fn extract_field(json: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{}\":\"", field);
+    if let Some(start) = json.find(&needle) {
+        let rest = &json[start + needle.len()..];
+        if let Some(end) = rest.find('"') {
+            return Some(rest[..end].to_string());
+        }
+    }
+    // Also check for null: "field":null
+    let null_needle = format!("\"{}\":null", field);
+    if json.contains(&null_needle) {
+        return None;
+    }
+    None
+}
+
+use std::fs;

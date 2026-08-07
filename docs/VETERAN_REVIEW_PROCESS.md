@@ -53,6 +53,55 @@ code is correct.
 reviewer reading any doc can trust that it accurately describes the
 code. If you can't honestly say that, fix the docs before proceeding.
 
+### Step 1.5 — Design principles compliance check (NEW)
+
+**Goal:** verify the code/repo structure follows all 8 design principles.
+This is a structural check, not just a doc check — it examines the actual
+code organization, dependency graph, and API design.
+
+**What to check** (against DESIGN_GOALS.md §3, the 8 principles):
+
+1. **Simple (3.1):** Can the kernel be described in one sentence? Has it
+   grown beyond "intellectually small"? Count the public API surface —
+   if it's >10 methods, it may be too complex. Check: does any new
+   feature add a kernel primitive that should be a lens/extension pattern?
+
+2. **Powerful (3.2):** Can the proposed capability be expressed as data +
+   a Lens? If a new feature requires kernel changes, it violates this
+   principle. Check: are there kernel methods that should be lens-level?
+
+3. **Performant (3.3):** Are optimizations in the right layer? The kernel
+   should not cache, compress, index, or batch (beyond simple I/O
+   batching). Check: is there optimization logic in pond-core/ that
+   belongs in pond-sdk/ or pond-rust/?
+
+4. **Scalable (3.4):** The removability test — if package X is deleted
+   entirely, does any lower-layer package break? Check: `grep -r` for
+   imports that cross dependency boundaries (e.g., pond-core importing
+   from pond-sdk).
+
+5. **Efficient (3.5):** Are derived structures rebuildable from
+   snapshots? Check: is there any authoritative metadata that can't
+   be regenerated from the content-addressed blobs?
+
+6. **Beautiful (3.6):** Is the dependency graph a DAG with all edges
+   pointing downward? Check: draw the import graph and verify no cycles.
+   Are folder names intuitive? Is the file structure ergonomic?
+
+7. **Functional (3.7):** Before claiming "Pond can't do X," check:
+   is there a missing Lens? A missing Physical Structure? A coordinator
+   that could layer on the kernel? Most "can't" claims are missing
+   lenses, not missing kernel primitives.
+
+8. **Storage-Independent (3.8):** Can you switch execution engines
+   without rewriting storage? Check: is any execution engine (DuckDB,
+   Spark, Polars) imported in pond-core/ or pond-sdk/ (vs. only in
+   pond-labs/ or lenses/)?
+
+**Output:** a compliance table with ✅/❌/⚠️ for each principle, plus
+specific file/line citations for any violations found. This table
+becomes part of the review document (§"Design principles compliance").
+
 ### Step 2 — Run the Veteran Review (via subagent)
 
 **Goal:** get an independent, brutally honest assessment from a
