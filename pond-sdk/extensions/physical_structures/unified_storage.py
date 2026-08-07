@@ -1366,6 +1366,81 @@ class UnifiedStorage:
                     break  # matched a prefix, don't try others
         return sorted(branches)
 
+    def _merge_with_row_level_crdt(self, collection: str,
+                                     seen: dict, schema, key_col: str,
+                                     head_manifest, branch_manifest) -> list:
+        """Row-level CRDT merge for collections with _rowid/_version columns.
+
+        Decodes all row groups from the union, applies _rowid/_version CRDT
+        merge (latest _version wins, tombstones suppress), and re-encodes
+        as new row groups. This ensures that if dev updated row X (v=2)
+        and main updated row X (v=3), the merge keeps v=3 (main's newer
+        version), NOT the branch's row-group-level winner.
+
+        Args:
+            seen: dict of rg_key → RowGroupEntry (the row-group-level union)
+            schema: column schema list
+            key_col: sort key column name
+            head_manifest, branch_manifest: the source manifests
+
+        Returns:
+            List of merged row group entries (same format as merged_entries)
+        """
+        # Decode all row groups into rows
+        all_rows = []
+        col_names = [c.name if hasattr(c, 'name') else c[0] for c in schema]
+
+        for rg in seen.values():
+            try:
+                blob_bytes = self.kernel.read_blob(rg.blob_hash)
+                decoded = self._decode_blob(blob_bytes)
+                if decoded:
+                    n_rows = len(next(iter(decoded.values()), []))
+                    for i in range(n_rows):
+                        row = {col: decoded[col][i] for col in decoded
+                               if i < len(decoded[col])}
+                        all_rows.append(row)
+            except Exception:
+                continue  # skip corrupt blobs
+
+        if not all_rows:
+            # No rows decoded — fall back to row-group-level union
+            return [{
+                "rg_key": rg.key,
+                "blob_hash": rg.blob_hash,
+                "n_rows": rg.n_rows,
+                "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                for c in rg.columns],
+            } for rg in sorted(seen.values(), key=lambda r: r.key)]
+
+        # Apply row-level CRDT merge: dedup by _rowid, latest _version wins
+        merged_rows = self._merge_rows_by_rowid(all_rows, key_col=key_col or None)
+
+        # Re-encode as new row groups using the standard write path.
+        # We use _build_manifest which encodes rows into PND2 blobs and
+        # returns the manifest entries.
+        rg_size = 10_000
+        new_entries = []
+        for chunk_start in range(0, len(merged_rows), rg_size):
+            chunk = merged_rows[chunk_start:chunk_start + rg_size]
+            rg_key = f"merged_{chunk_start // rg_size:010d}"
+
+            # Encode chunk as PND2 blob using the existing encode path
+            from column_source import ListColumnSource
+            source = ListColumnSource([(col, [r.get(col) for r in chunk])
+                                        for col in col_names])
+            pnd2_bytes, chunk_stats = PND2.encode(source)
+            blob_hash = self.kernel.write(pnd2_bytes)
+
+            new_entries.append({
+                "rg_key": rg_key,
+                "blob_hash": blob_hash,
+                "n_rows": len(chunk),
+                "col_stats": chunk_stats,
+            })
+
+        return new_entries
+
     def merge(self, collection: str, source_branch: str,
               target_branch: Optional[str] = None,
               message: str = "") -> str:
@@ -1380,7 +1455,8 @@ class UnifiedStorage:
 
         THREE-LEVEL MERGE:
           1. Row-group level: union target HEAD + source HEAD + all shards from both
-          2. Row level: dedup by _rowid, latest _version wins
+          2. Row level: dedup by _rowid, latest _version wins (ONLY if _rowid/_version
+             columns are present in the schema — otherwise row-group union is final)
           3. Branch level: writes merge commit with two parents, clears shards
 
         Also merges both branches' shards into the target's HEAD and clears
@@ -1541,32 +1617,69 @@ class UnifiedStorage:
                         all_shard_manifests.append(sm)
 
         # Union row group entries from target HEAD + source branch HEAD + all shards
+        #
+        # ROW-GROUP LEVEL: dedup by rg_key (last writer wins at the row-group
+        # level — if both branches wrote to the same rg_key, the branch's
+        # version replaces the target's).
+        #
+        # ROW-LEVEL CRDT: if the data has _rowid/_version columns (from
+        # upsert_shard/delete_shard), the row-group union alone is NOT
+        # sufficient — two branches may have different rows in the same
+        # rg_key. We need to decode the blobs and apply _rowid/_version
+        # CRDT merge. This is done below if CRDT columns are detected.
         seen: dict[str, RowGroupEntry] = {}
         if head_manifest:
             for rg in head_manifest.scan_with_pruning():
                 seen[rg.key] = rg
         if branch_manifest:
             for rg in branch_manifest.scan_with_pruning():
-                seen[rg.key] = rg  # branch wins
+                seen[rg.key] = rg  # branch wins at row-group level
         for shard_manifest in all_shard_manifests:
             for rg in shard_manifest.scan_with_pruning():
                 seen[rg.key] = rg
 
-        # Build merged manifest
-        merged_entries = []
-        for rg in sorted(seen.values(), key=lambda r: r.key):
-            merged_entries.append({
-                "rg_key": rg.key,
-                "blob_hash": rg.blob_hash,
-                "n_rows": rg.n_rows,
-                "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
-                                for c in rg.columns],
-            })
-
+        # Detect if this collection has CRDT columns (_rowid, _version)
+        # by checking the schema. If so, we need row-level CRDT merge
+        # to correctly handle concurrent updates to the same _rowid.
         schema = (head_manifest or branch_manifest).columns if \
             (head_manifest or branch_manifest) else []
         key_col = (head_manifest or branch_manifest).key_col if \
             (head_manifest or branch_manifest) else ""
+        schema_names = {c.name if hasattr(c, 'name') else c[0] for c in schema}
+        has_crdt_columns = {"_rowid", "_version"}.issubset(schema_names)
+
+        if has_crdt_columns:
+            # ROW-LEVEL CRDT MERGE: decode all row groups, apply _rowid/_version
+            # dedup (latest _version wins), re-encode as new row groups.
+            # This ensures that if dev updated row X (v=2) and main updated
+            # row X (v=3), the merge keeps v=3 (main's newer version), NOT
+            # the branch's row-group-level winner.
+            try:
+                merged_entries = self._merge_with_row_level_crdt(
+                    collection, seen, schema, key_col, head_manifest, branch_manifest)
+            except Exception:
+                # Fallback: if row-level decode fails (e.g., corrupt blob),
+                # use the row-group-level union (better than crashing)
+                merged_entries = []
+                for rg in sorted(seen.values(), key=lambda r: r.key):
+                    merged_entries.append({
+                        "rg_key": rg.key,
+                        "blob_hash": rg.blob_hash,
+                        "n_rows": rg.n_rows,
+                        "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                        for c in rg.columns],
+                    })
+        else:
+            # No CRDT columns — row-group-level union is sufficient
+            merged_entries = []
+            for rg in sorted(seen.values(), key=lambda r: r.key):
+                merged_entries.append({
+                    "rg_key": rg.key,
+                    "blob_hash": rg.blob_hash,
+                    "n_rows": rg.n_rows,
+                    "col_stats": [(c.name, c.value_type, c.min, c.max, c.null_count)
+                                    for c in rg.columns],
+                })
 
         manifest_hash, manifest_bytes = self._build_manifest(
             collection, merged_entries, schema, key_col,

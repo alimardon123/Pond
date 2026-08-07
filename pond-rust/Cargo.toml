@@ -7,7 +7,7 @@ version = "0.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["Pond Contributors"]
-repository = "https://github.com/zai/pond"
+repository = "https://github.com/alimardon123/Pond"
 description = "Pond storage system — Rust core (kernel + PND2 codec + C ABI), Python bindings, CLI"
 
 # Workspace-level release profile — fast builds, optimized for FFI hot paths

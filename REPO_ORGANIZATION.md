@@ -15,10 +15,13 @@ pond_repo/
 ├── lenses/             # Layer 3: Production-ready Lens implementations
 ├── services/           # Cross-cutting services (transport, schema, replication)
 ├── pond-labs/          # Development & experimental code (NOT production)
-├── pond-rust/          # Cross-language Rust core + Python PyO3 bindings
-│   ├── pond-core/      #   Pure-Rust PND2 codec + C ABI (zero deps, linkable from C/Go/Java/Node)
-│   └── pond-python/    #   PyO3 wrapper (produces pond_rust.so for Python)
+├── pond-rust/          # Cross-language Rust core + Python PyO3 bindings + CLI
+│   ├── pond-core/      #   Pure-Rust PND2 codec + C ABI (zero deps)
+│   ├── pond-python/    #   PyO3 wrapper (produces pond_rust.so for Python)
+│   ├── pond-kernel/    #   Rust storage kernel (3 primitives + ObjectStore trait)
+│   └── pond-cli/       #   The 'pond' CLI binary (DuckDB philosophy)
 ├── sdk-go/             # Go SDK — PND2 codec bindings via cgo (peer to pond-sdk/)
+├── pond/               # Pip-installable package shim (re-exports pond-core/pond-sdk)
 ├── tests/              # All tests, organized by type/purpose
 ├── scripts/            # Verification scripts (property tests, differentials, hazards)
 ├── docs/               # Documentation (whitepaper, formal algebras, RFCs)
