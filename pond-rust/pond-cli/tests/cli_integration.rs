@@ -26,8 +26,7 @@ fn run(root: &std::path::Path, args: &[&str]) -> String {
 fn test_init_creates_pond_dir() {
     let dir = TempDir::new().unwrap();
     run(dir.path(), &["init", "."]);
-    assert!(dir.path().join(".pond/objects").exists());
-    assert!(dir.path().join(".pond/refs").exists());
+    assert!(dir.path().join("blobs").exists());
 }
 
 #[test]

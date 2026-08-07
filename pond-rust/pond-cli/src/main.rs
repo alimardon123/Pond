@@ -204,7 +204,7 @@ fn main() {
         // All other commands need a kernel
         cmd => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
-            let kernel = match PondKernel::new(&root) {
+            let kernel = match PondKernel::new_local(&root) {
                 Ok(k) => k,
                 Err(e) => {
                     eprintln!("Error: failed to open kernel at {}: {}", root.display(), e);
@@ -257,15 +257,13 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn cmd_init(path: &PathBuf) {
-    let pond_dir = path.join(".pond");
-    let objects_dir = pond_dir.join("objects");
-    let refs_dir = pond_dir.join("refs");
-    match fs::create_dir_all(&objects_dir).and_then(|_| fs::create_dir_all(&refs_dir)) {
+    let blobs_dir = path.join("blobs");
+    match fs::create_dir_all(&blobs_dir) {
         Ok(()) => {
-            println!("Initialized empty Pond repository in {}", pond_dir.display());
+            println!("Initialized empty Pond repository in {}", path.display());
         }
         Err(e) => {
-            eprintln!("Error: failed to create {}: {}", pond_dir.display(), e);
+            eprintln!("Error: failed to create {}: {}", blobs_dir.display(), e);
             std::process::exit(1);
         }
     }
@@ -631,47 +629,28 @@ fn cmd_cat(kernel: &PondKernel, hash: &str) {
             return;
         }
         Err(_) if hash.len() < 64 => {
-            // Prefix match: scan the shard directory
-            let shard_dir = kernel.objects_dir()
-                .join(&hash[..2]);
-            match std::fs::read_dir(&shard_dir) {
-                Ok(entries) => {
-                    let mut matches: Vec<String> = Vec::new();
-                    for entry in entries.flatten() {
-                        let fname = entry.file_name();
-                        let fname_str = fname.to_string_lossy();
-                        if let Some(blob_hash) = fname_str.strip_suffix(".bin") {
-                            if blob_hash.starts_with(hash) {
-                                matches.push(blob_hash.to_string());
-                            }
+            // Prefix match: list blobs with this prefix
+            let matches = kernel.list_blobs_prefix(hash);
+            if matches.len() == 1 {
+                match kernel.read_blob(&matches[0]) {
+                    Ok(data) => {
+                        if let Err(e) = io::stdout().write_all(&data) {
+                            eprintln!("Error: failed to write stdout: {}", e);
+                            std::process::exit(1);
                         }
+                        return;
                     }
-                    if matches.len() == 1 {
-                        match kernel.read_blob(&matches[0]) {
-                            Ok(data) => {
-                                if let Err(e) = io::stdout().write_all(&data) {
-                                    eprintln!("Error: failed to write stdout: {}", e);
-                                    std::process::exit(1);
-                                }
-                                return;
-                            }
-                            Err(e) => {
-                                eprintln!("Error: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    } else if matches.is_empty() {
-                        eprintln!("Error: no blob with prefix '{}' found", hash);
-                    } else {
-                        eprintln!("Error: ambiguous prefix '{}' — matches {} blobs", hash, matches.len());
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
                     }
-                    std::process::exit(1);
                 }
-                Err(_) => {
-                    eprintln!("Error: blob '{}' not found", hash);
-                    std::process::exit(1);
-                }
+            } else if matches.is_empty() {
+                eprintln!("Error: no blob with prefix '{}' found", hash);
+            } else {
+                eprintln!("Error: ambiguous prefix '{}' — matches {} blobs", hash, matches.len());
             }
+            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("Error: blob '{}' not found: {}", hash, e);
