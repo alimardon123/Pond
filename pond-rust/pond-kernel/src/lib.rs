@@ -1,5 +1,7 @@
-// Pond Storage Kernel — the 3 primitives in pure Rust
-//
+// Pond Storage Kernel — the 3 primitives + CRDT utilities in pure Rust
+
+pub mod crdt;
+
 // ARCHITECTURE (matches the Python pond-core/object_store_native_kernel.py):
 //
 //   ObjectStore trait (put_blob, get_blob, put_path, get_path, ...)
