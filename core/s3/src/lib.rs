@@ -525,14 +525,154 @@ impl ObjectStore for S3ObjectStore {
     }
 
     fn put_blob_batch(&self, items: &[Vec<u8>]) -> io::Result<Vec<String>> {
-        // TODO: parallel implementation with a thread pool.
-        // For now, sequential — matches LocalFSObjectStore's default impl
-        // but S3 latency makes parallel worthwhile. Future improvement.
-        let mut hashes = Vec::with_capacity(items.len());
-        for data in items {
-            hashes.push(self.put_blob(data)?);
+        if items.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(hashes)
+        if items.len() == 1 {
+            return self.put_blob(&items[0]).map(|h| vec![h]);
+        }
+
+        // Parallel implementation using std::thread::scope (stable since Rust 1.63).
+        // No external thread-pool dependency — uses OS threads via scoped threads.
+        //
+        // S3 PUT latency is ~50-300ms per request. With 32 parallel requests,
+        // 100 blobs take ~1 second instead of ~20 seconds sequential.
+        //
+        // We split the work into chunks of MAX_PARALLEL and process them
+        // concurrently. Results are collected in order.
+        const MAX_PARALLEL: usize = 32;
+        let n = items.len();
+        // Pre-compute all hashes (CPU work, no I/O) so we can return them in order
+        // even if some PUTs fail.
+        let precomputed: Vec<String> = items.iter()
+            .map(|data| pond_kernel::hash_bytes(data))
+            .collect();
+
+        // Process in batches of MAX_PARALLEL
+        for chunk_start in (0..n).step_by(MAX_PARALLEL) {
+            let chunk_end = std::cmp::min(chunk_start + MAX_PARALLEL, n);
+            let chunk_items = &items[chunk_start..chunk_end];
+            let chunk_hashes = &precomputed[chunk_start..chunk_end];
+
+            // Collect errors from threads (first error wins)
+            let errors: Vec<Option<io::Error>> = std::thread::scope(|s| {
+                let threads: Vec<_> = chunk_items.iter().zip(chunk_hashes.iter())
+                    .map(|(data, hash)| {
+                        s.spawn(move || {
+                            let key = self.blob_key(hash);
+                            self.s3_request("PUT", &key, None, Some(data), &[])
+                                .err()
+                        })
+                    })
+                    .collect();
+
+                threads.into_iter()
+                    .map(|t| t.join().unwrap_or_else(|_| Some(io::Error::new(
+                        io::ErrorKind::Other, "thread panicked"
+                    ))))
+                    .collect()
+            });
+
+            // Return the first error if any
+            for e in errors {
+                if let Some(e) = e {
+                    return Err(e);
+                }
+            }
+        }
+
+        // All PUTs succeeded — update stats and return hashes
+        let total_bytes: u64 = items.iter().map(|d| d.len() as u64).sum();
+        let mut s = self.stats.lock().unwrap();
+        s.puts += n as u64;
+        s.bytes_written += total_bytes;
+
+        Ok(precomputed)
+    }
+
+    /// Override get_blob_batch with a parallel implementation.
+    /// This is called by the default trait method, which we override here
+    /// for S3 (parallel GETs reduce wall-clock from N×RTT to ~1 RTT).
+    fn get_blob_batch(&self, hashes: &[String]) -> io::Result<Vec<Vec<u8>>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if hashes.len() == 1 {
+            return self.get_blob(&hashes[0]).map(|d| vec![d]);
+        }
+
+        // Parallel GET — same pattern as put_blob_batch.
+        const MAX_PARALLEL: usize = 32;
+        let n = hashes.len();
+        // Use a slot map so we can place results in order
+        let mut slot_map: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
+        let mut first_error: Option<io::Error> = None;
+
+        for chunk_start in (0..n).step_by(MAX_PARALLEL) {
+            let chunk_end = std::cmp::min(chunk_start + MAX_PARALLEL, n);
+            let chunk_hashes = &hashes[chunk_start..chunk_end];
+
+            let results: Vec<Result<(usize, Vec<u8>), io::Error>> = std::thread::scope(|s| {
+                let threads: Vec<_> = chunk_hashes.iter().enumerate()
+                    .map(|(i, hash)| {
+                        let global_idx = chunk_start + i;
+                        s.spawn(move || {
+                            let key = self.blob_key(hash);
+                            match self.s3_request("GET", &key, None, None, &[]) {
+                                Ok(resp) => {
+                                    let mut body = Vec::new();
+                                    match resp.into_reader().read_to_end(&mut body) {
+                                        Ok(_) => Ok((global_idx, body)),
+                                        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        })
+                    })
+                    .collect();
+
+                threads.into_iter()
+                    .map(|t| t.join().unwrap_or_else(|_| Err(io::Error::new(
+                        io::ErrorKind::Other, "thread panicked"
+                    ))))
+                    .collect()
+            });
+
+            // Place successful results in the slot map; capture first error
+            for r in results {
+                match r {
+                    Ok((idx, body)) => slot_map[idx] = Some(body),
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
+        // Collect in order
+        let mut results = Vec::with_capacity(n);
+        let mut total_bytes: u64 = 0;
+        for opt in slot_map {
+            let body = opt.ok_or_else(|| io::Error::new(
+                io::ErrorKind::Other,
+                "missing result from parallel batch (should not happen)"
+            ))?;
+            total_bytes += body.len() as u64;
+            results.push(body);
+        }
+
+        let mut s = self.stats.lock().unwrap();
+        s.gets += n as u64;
+        s.bytes_read += total_bytes;
+
+        Ok(results)
     }
 
     fn put_path(&self, path: &str, hash: &str) -> io::Result<()> {

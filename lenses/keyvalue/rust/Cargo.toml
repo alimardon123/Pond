@@ -1,0 +1,19 @@
+[package]
+name = "pond_keyvalue_lens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "KeyValueLens — key-value lens over Pond's UnifiedStorage (Rust port)"
+
+[lib]
+name = "pond_keyvalue_lens"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+pond_kernel = { path = "../../../core/kernel" }
+pond_storage = { path = "../../../core/storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

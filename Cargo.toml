@@ -8,6 +8,7 @@ members = [
     "core/s3",
     "cli",
     "bindings/python/pyo3",
+    "lenses/keyvalue/rust",
 ]
 
 [workspace.package]

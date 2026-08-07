@@ -1,10 +1,18 @@
 # Pond Documentation
 
-> Start here. The rest is in `archive/` for historical reference.
+> Start here. The rest is organized by purpose.
+
+## Current Status
+
+**[`STATUS.md`](STATUS.md)** — What's done, what's in progress, what's next.
+The migration from Python to Rust is underway: Rust core is done, Python
+lenses are still in production use.
+
+---
 
 ## Essential reading (in order)
 
-1. **[`../README.md`](../README.md)** — 5-minute intro.
+1. **[`../README.md`](../README.md)** — 5-minute intro + quick start.
 2. **[`UNIFIED_STORAGE_DESIGN.md`](UNIFIED_STORAGE_DESIGN.md)** — the
    current architecture. ONE format (PND2), ONE write path, ONE read
    path, ANY workload. This is the canonical reference for the unified
@@ -30,30 +38,35 @@
 10. **[`NON_GOALS.md`](NON_GOALS.md)** — what Pond deliberately doesn't do.
 11. **[`BINARY_ENCODING_FORMAT.md`](BINARY_ENCODING_FORMAT.md)** — PND1
     column encoding spec (used inside PND2 blobs).
+12. **[`UNIVERSAL_STORAGE_ARROW_DESIGN.md`](UNIVERSAL_STORAGE_ARROW_DESIGN.md)** —
+    design decision for Arrow integration at PB scale.
 
 ## If you want to verify the claims
 
-12. **[`POND_FORMAL_ALGEBRAS.md`](POND_FORMAL_ALGEBRAS.md)** — formal model.
-13. **[`POSTMORTEM_PROLLY_TREE_BUG.md`](POSTMORTEM_PROLLY_TREE_BUG.md)** —
+13. **[`POND_FORMAL_ALGEBRAS.md`](POND_FORMAL_ALGEBRAS.md)** — formal model.
+14. **[`POSTMORTEM_PROLLY_TREE_BUG.md`](POSTMORTEM_PROLLY_TREE_BUG.md)** —
     postmortem of the critical Prolly tree encoding bug.
-14. **[`GENERIC_DESIGN_VISION.md`](GENERIC_DESIGN_VISION.md)** — the
+15. **[`GENERIC_DESIGN_VISION.md`](GENERIC_DESIGN_VISION.md)** — the
     "any app" promise.
+16. **[`POND_PHASE_Q_BENCHMARKS.md`](POND_PHASE_Q_BENCHMARKS.md)** —
+    head-to-head benchmarks vs Git, Dolt, Iceberg.
 
-## Architecture reviews (historical)
+## Architecture reviews (historical, in `archive/`)
 
+- **[`archive/superseded/VETERAN_ARCHITECT_REVIEW_V2.md`](archive/superseded/VETERAN_ARCHITECT_REVIEW_V2.md)** —
+  latest (V2) review. V1 is also in archive.
 - **[`archive/ARCHITECTURE_REVIEW_2_UNIFIED_STORAGE.md`](archive/ARCHITECTURE_REVIEW_2_UNIFIED_STORAGE.md)** —
   proposed the manifest + stats tree (now implemented).
 - **[`archive/ARCHITECTURE_REVIEW_3_COMPLETE.md`](archive/ARCHITECTURE_REVIEW_3_COMPLETE.md)** —
   5 critical findings (all addressed by 3 rounds of fixes).
 - **[`archive/DESIGN_REVIEW_2026_07_26.md`](archive/DESIGN_REVIEW_2026_07_26.md)** —
   42 findings on pre-fix code (superseded by unified storage).
-- **[`archive/WORKLOAD_ANALYSIS_PB_SCALE.md`](archive/WORKLOAD_ANALYSIS_PB_SCALE.md)** —
-  proposed hierarchical stats tree (now implemented as `stats_tree.py`).
 
-## Active docs (16 total)
+## Active docs
 
 | Doc | Purpose |
 |---|---|
+| `STATUS.md` | Current migration status + next steps |
 | `README.md` | This index |
 | `UNIFIED_STORAGE_DESIGN.md` | ONE format, ONE write/read path (current architecture) |
 | `HONEST_COMPETITOR_COMPARISON.md` | Where Pond wins/loses vs Iceberg, FAISS, Redis, Kafka |
@@ -65,26 +78,22 @@
 | `GETTING_STARTED.md` | 5-minute tutorial |
 | `NON_GOALS.md` | What Pond doesn't do |
 | `BINARY_ENCODING_FORMAT.md` | PND1 column encoding spec |
+| `UNIVERSAL_STORAGE_ARROW_DESIGN.md` | Arrow integration design decision |
 | `GENERIC_DESIGN_VISION.md` | The "any app" promise |
 | `POND_FORMAL_ALGEBRAS.md` | 17 algebras, 10 axioms |
-| `POND_PHASE_Q_BENCHMARKS.md` | Head-to-head benchmarks (legacy kernel) |
+| `POND_PHASE_Q_BENCHMARKS.md` | Head-to-head benchmarks |
 | `POSTMORTEM_PROLLY_TREE_BUG.md` | Prolly tree bug postmortem |
-| `../DESIGN_GOALS.md` | Canonical entry point for the project |
+| `VETERAN_ARCHITECT_REVIEW_V2.md` | Latest architect review |
 
 ## Archive
 
-The `archive/` subdirectory contains 23+ historical documents:
-- `ARCHITECTURE_REVIEW_EXTERNAL.md` (pre-Round-1 review, findings addressed)
-- Architecture reviews #2, #3 (findings implemented)
-- Design review 2026-07-26 (42 findings, all addressed)
-- Workload analysis PB scale (hierarchical stats tree now implemented)
-- Phase L/N/O/P/Q reports (superseded by whitepaper)
-- Second and Third Red Team reviews (findings folded into formal algebras)
-- Original storage model paper (superseded by whitepaper)
-- Original mathematical model (superseded by formal algebras)
-- 3 lens docs (merged into LENS_GUIDE.md)
-- DELETE_90_PERCENT.md (recommendation executed)
-- RFCs (13 design docs, decisions folded into formal algebras)
+The `archive/` subdirectory contains historical documents:
 
-These are kept for historical reference. They are not needed to
-understand Pond.
+- **`archive/superseded/`** — docs that have been superseded by current code
+  or newer docs (architecture redesign, repo reorganization plans, migration
+  strategy, cross-language SDK design, veteran review process, etc.)
+- **`archive/`** (root) — older architecture reviews, phase reports, RFCs,
+  red team reviews, formal specs (all superseded by the active docs above)
+
+These are kept for historical reference. They are not needed to understand
+Pond's current state — read `STATUS.md` for that.

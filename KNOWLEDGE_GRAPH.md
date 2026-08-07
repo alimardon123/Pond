@@ -334,6 +334,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `docs/GENERIC_DESIGN_VISION.md` | 110 | The promise: any app built on Pond gets infinite storage + versioning + branching + pruning + encoding on object stores. Documents the ColumnSource protocol, format-agnostic encode_fn/decode_fn, and the Vortex-style scan hierarchy. |
 | `docs/BINARY_ENCODING_FORMAT.md` | 165 | **Format spec v1.0:** SIMD-ready binary encoding for all 4 encodings (RAW, RLE, DICT, BITPACK). Stable, documented, directly mmappable to numpy/Arrow. Any execution engine (DuckDB, Polars, DataFusion) can read Pond's encoded chunks natively. |
 | `docs/README.md` | 58 | Doc index. |
+| `docs/STATUS.md` | — | **Current migration status.** What's done (Rust core, S3, CLI, Go SDK), what's in progress (Python lenses), what's next (Rust lenses, parallel S3, Java/Node SDKs). Replaces the archived `MIGRATION_STRATEGY.md` and `NEXT_STEPS_DEEP_REVIEW.md`. |
 | `docs/archive/` | (18+ files) | Historical docs (Phase reports, red teams, RFCs, etc.). |
 
 ### 2.9 Top-level files
@@ -367,12 +368,33 @@ for Go/Java/Node/C/C++/Zig SDK ports. The CLI is the DuckDB-philosophy binary.
 | `bindings/python/pyo3/src/lib.rs` | 415 | Thin PyO3 glue. Delegates all decode logic to pond-core's `decode_column`. Adds zstd decompression (via Python's `zstandard`), projection pushdown, predicate pushdown. |
 | `core/kernel/Cargo.toml` | 22 | Rust storage kernel crate (3 primitives: Write, Read, Ref). crate-type: `rlib`, `staticlib`, `cdylib`. |
 | `core/kernel/src/lib.rs` | 480 | The 3-primitive kernel in pure Rust: PondKernel struct (content-addressed blob storage on local FS, JSON-file name→hash map), hash_bytes (SHA-256), C ABI (pond_kernel_new/write/read/reference/resolve/free). 10 unit tests. |
+| `core/kernel/src/object_store.rs` | 259 | `ObjectStore` trait (put_blob, get_blob, put_path, get_path, delete_path, list_paths, blob_exists, delete_blob) + `LocalFSObjectStore` implementation (POSIX atomic writes via temp+rename). |
+| `core/kernel/src/crdt.rs` | — | CRDT operations: UUIDv7 generation, HLC (Hybrid Logical Clock), upsert_shard, delete_shard, three-level merge (O(conflicting) strategy — only decodes conflicting row groups). |
+| `core/kernel/src/c_abi.rs` | — | C ABI for the kernel: pond_kernel_new, pond_kernel_write, pond_kernel_read, pond_kernel_reference, pond_kernel_resolve, pond_kernel_free. |
+| `core/s3/Cargo.toml` | 26 | S3-compatible object store crate. Deps: pond_kernel, pond_storage, sha2, ureq (sync HTTP), hex, chrono, url. crate-type: rlib, staticlib, cdylib. |
+| `core/s3/src/lib.rs` | 940 | **S3ObjectStore** — S3-compatible content-addressed store implementing `ObjectStore` trait. SigV4 signing implemented FROM SCRATCH (HMAC-SHA256 on top of sha2, no AWS SDK, no hmac crate). Sync HTTP via ureq (no tokio). Supports AWS S3, Cloudflare R2, MinIO, LocalStack, Wasabi. 6 unit tests (RFC 4231 HMAC vectors, AWS SigV4 signing key vector). C ABI: pond_s3_store_new, pond_storage_new_s3. |
+| `core/storage/Cargo.toml` | — | UnifiedStorage crate. Deps: pond_kernel, serde_json. |
+| `core/storage/src/lib.rs` | 453 | `UnifiedStorage` + `PondStorageHandle` (C ABI handle). new_local, new_with_store, active_branch management, 14 C ABI functions (pond_storage_new/write/read/branch/checkout/merge/undo/revert/list_branches/etc.). |
+| `core/storage/src/commit.rs` | — | Commit format: write_commit, read_commit, history (walk commit DAG). |
+| `core/storage/src/manifest.rs` | — | CollectionManifest: one manifest blob per commit, inline stats + chunk hashes. |
+| `core/storage/src/branch.rs` | — | Branch operations: branch, checkout, list_branches, merge (three-level CRDT merge). |
+| `core/storage/src/shard.rs` | — | Shard operations: append_shard, upsert_shard, delete_shard, list_shards, read_with_shards, compact_shards. |
+| `core/storage/src/write.rs` | — | Write path: write collection data, create commit, update manifest. |
+| `core/storage/src/read.rs` | — | Read path: read, read_at_snapshot, read_full (HEAD + shards). |
+| `core/storage/src/transaction.rs` | — | Transaction markers: begin_tx, commit_tx, abort_tx, is_tx_committed. |
+| `core/storage/src/maintenance.rs` | — | Maintenance: drop_name, is_dropped, resolve_active, compact_tombstones. |
+| `core/arrow/Cargo.toml` | — | PND2 → Arrow bridge crate. Deps: pond_codec, arrow. |
+| `core/arrow/src/lib.rs` | — | PND2 → Arrow direct conversion (near-zero copy). |
 | `cli/Cargo.toml` | 20 | CLI binary crate. Produces the `pond` executable. |
 | `cli/src/main.rs` | 480 | The `pond` CLI: init, write (JSON/file/stdin), read, branch, merge, history, ls, cat (with prefix matching), version. Uses clap for arg parsing. Single binary, ~1MB, DuckDB philosophy. |
 | `cli/tests/cli_integration.rs` | 170 | 10 integration tests: init, write/read JSON, write from file, write from stdin, dedup, ls, branch+merge, cat by prefix, version, persistence. All pass. |
 | `bindings/base/test_c_abi.c` | 425 | End-to-end C ABI test for the PND2 codec. 131 checks: round-trips, NULL safety, error paths, 1000-value dataset, 7 Python-generated blobs (all encodings × all vtypes), multi-column encoder. |
 | `bindings/base/generate_test_blobs.py` | 115 | Generates 7 PND2 blob files using pond-sdk's Python encoder for cross-language compatibility tests. |
 | `bindings/base/test_blobs/*.bin` | 7 files | Binary PND2 blobs covering i64/f64/str/bin × raw/rle/dict/bitpack. Used by both C and Go tests. |
+| `bindings/base/test_storage_c_abi.c` | — | C ABI test for the storage layer (write, read, branch, merge, undo). |
+| `bindings/base/README.md` | — | Documents the shared cross-language C ABI files: pond.h, test programs, test blobs. Includes linking instructions and memory management conventions. |
+| `bindings/python/README.md` | — | Documents the Python bindings directory: pyo3/ (Rust codec wrapper), sdk/ (Python SDK), core/ (Python reference kernel). Quick start + migration status. |
+| `cli/README.md` | — | CLI documentation: build (with/without S3), all commands, S3 URL format, env vars, test suite. |
 
 ### 2.11 bindings/go/ (Go SDK — PND2 codec bindings — 1 module, 2 packages)
 
