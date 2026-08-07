@@ -119,13 +119,12 @@ class KeyValueLens(PondLens):
                   There is now only ONE storage path — the unified
                   manifest-based architecture. All lenses use PND2
                   blobs + CollectionManifest + JSON commit blobs.
-            compact_after_commit: if True (default), call compact_shards()
-                  after every commit that uses append(). This keeps HEAD
-                  current so branch/merge/history see the latest data
-                  immediately. Set to False for high-write-throughput
-                  workloads where you accept eventual consistency on
-                  HEAD (read_with_shards still sees all data; only
-                  history()/branch() need a separate compact call).
+            compact_after_commit: if False (default), shards are NOT compacted
+                  after every commit. This is the correct default for
+                  multi-writer workloads — compaction is O(N) and should
+                  be done periodically (background job or explicit call to
+                  compact_shards). Set to True only for single-writer
+                  workloads where HEAD must be current immediately.
                   See VETERAN_ARCHITECT_REVIEW.md §3.7 for the tradeoff.
         """
         super().__init__(kernel)

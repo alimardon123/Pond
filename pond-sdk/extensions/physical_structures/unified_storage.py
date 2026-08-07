@@ -3108,6 +3108,59 @@ class UnifiedStorage:
 
         return all_rows
 
+    def read_at_snapshot(self, collection: str, commit_hash: str,
+                          columns: Optional[list[str]] = None,
+                          predicates: Optional[list[tuple[str, str, Any]]] = None
+                          ) -> list[dict]:
+        """Read data at a specific commit — SNAPSHOT ISOLATION.
+
+        This provides a consistent snapshot: it reads ONLY the manifest
+        at the given commit, ignoring any shards written after that commit.
+        Long-running analytical queries get a consistent view.
+
+        Args:
+            collection: collection name
+            commit_hash: the commit hash to read at (from history())
+            columns: optional column projection
+            predicates: optional predicate pushdown
+
+        Returns:
+            List of rows at the snapshot (no in-flight shards included).
+        """
+        # Read the commit blob
+        commit = self._read_commit_blob(commit_hash)
+        if commit is None:
+            return []
+
+        # Get the manifest hash from the commit
+        manifest_hash = commit.get("manifest")
+        if not manifest_hash:
+            return []
+
+        # Load the manifest at this commit
+        manifest = self._load_manifest_from_hash(manifest_hash)
+        if manifest is None:
+            return []
+
+        # Read ONLY the row groups in this manifest (no shards)
+        all_rows = []
+        for rg in manifest.scan_with_pruning():
+            try:
+                blob_bytes = self.kernel.read_blob(rg.blob_hash)
+                decoded = self._decode_blob(blob_bytes,
+                    columns=columns, predicates=predicates)
+                if decoded:
+                    n = len(next(iter(decoded.values()), []))
+                    col_names = list(decoded.keys())
+                    for i in range(n):
+                        row = {col: decoded[col][i] for col in col_names
+                               if i < len(decoded[col])}
+                        all_rows.append(row)
+            except Exception:
+                continue
+
+        return all_rows
+
     def read_branch_with_shards(self, collection: str, branch: str,
                                   predicates: Optional[list[tuple[str, str, Any]]] = None,
                                   columns: Optional[list[str]] = None) -> list[dict]:

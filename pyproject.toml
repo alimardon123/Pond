@@ -1,45 +1,36 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
 
 [project]
-name = "pond-storage"
-version = "0.1.0"
-description = "Unified content-addressed storage system — one copy of data, all workloads"
+name = "pond-rust"
+description = "Pond storage system — Rust-accelerated PND2 codec for Python"
 readme = "README.md"
-license = {text = "MIT"}
-requires-python = ">=3.10"
-authors = [{name = "Pond Contributors"}]
-keywords = ["storage", "content-addressed", "lakehouse", "vector-db", "streaming", "crdt"]
+license = { text = "MIT" }
+requires-python = ">=3.8"
+keywords = ["storage", "content-addressed", "columnar", "lakehouse", "pnd2"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
     "Topic :: Database",
-    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-
-dependencies = [
-    "zstandard>=0.23",
-]
+dynamic = ["version"]
 
 [project.optional-dependencies]
-s3 = ["boto3>=1.34"]
-lakehouse = ["pyarrow>=15.0", "duckdb>=1.0"]
-test = ["pytest>=8.0", "moto>=5.0"]
-dev = ["pyarrow>=15.0", "duckdb>=1.0", "boto3>=1.34", "pytest>=8.0", "moto>=5.0"]
+zstd = ["zstandard"]
+test = ["pytest", "pyarrow"]
 
-[project.urls]
-Homepage = "https://github.com/alimardon123/Pond"
-Repository = "https://github.com/alimardon123/Pond"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["pond*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "pond_rust"
+python-source = "python"
+manifest-path = "pond-rust/pond-python/Cargo.toml"

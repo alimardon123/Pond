@@ -1,0 +1,17 @@
+[package]
+name = "pond_arrow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond → Arrow bridge: PND2 decode directly to Arrow RecordBatch (zero-copy for numeric columns)"
+
+[lib]
+name = "pond_arrow"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+pond_core = { path = "../pond-core" }
+arrow = "53"
+
+[dev-dependencies]
+tempfile = { workspace = true }

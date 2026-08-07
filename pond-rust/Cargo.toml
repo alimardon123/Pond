@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pond-core", "pond-python", "pond-kernel", "pond-cli"]
+members = ["pond-core", "pond-python", "pond-kernel", "pond-cli", "pond-arrow"]
 
 [workspace.package]
 version = "0.3.0"

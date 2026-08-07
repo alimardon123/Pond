@@ -362,16 +362,37 @@ This lets tools (and humans) answer:
 
 ---
 
-## 4. No lens-to-lens inheritance for production lenses
+## 4. No implicit coupling between production lenses
 
-**Rule:** Production lenses (in `lenses/`) MUST NOT inherit from each other.
-Each lens extends `PondLens` directly and owns its own storage code.
+**Rule:** Production lenses (in `lenses/`) MUST NOT have IMPLICIT coupling.
+Each lens either extends `PondLens` directly OR explicitly subclasses
+another lens with a documented reason.
+
+**What "implicit coupling" means:**
+- Lens A imports Lens B's internal helpers (not the public API)
+- Lens A depends on Lens B's private ref naming conventions
+- Removing Lens B breaks Lens A in a non-obvious way
+
+**What is ALLOWED (explicit, documented coupling):**
+- `KeylessLens(KeyValueLens)` — a thin variant that auto-generates UUIDv7
+  keys. It overrides `put()` and inherits everything else. This is
+  documented in the class docstring and is a legitimate code-reuse pattern.
+- A lens importing another lens's PUBLIC API (e.g., `from keyvalue_lens
+  import KeyValueLens`) — this is normal composition, not coupling.
+
+**What is NOT allowed:**
+- `FeatureStoreLens(LakehouseLens)` without documentation — this was the
+  old pattern and was removed. FeatureStoreLens now extends PondLens directly.
 
 **Rationale:**
-- Lens-to-lens inheritance creates coupling. If Lens A inherits from Lens B,
-  removing Lens B breaks Lens A.
-- Duplication is preferred over coupling for production code. The design
-  principles value independence (each lens is removable) over DRY.
+The original "no lens-to-lens inheritance" rule was too strict — it forbade
+legitimate variants like KeylessLens. The right rule is "no IMPLICIT coupling."
+Explicit, documented inheritance for thin variants is fine. Implicit
+dependency on another lens's internals is not.
+
+**Exception:** Lenses in `pond-labs/` (experimental) may inherit from
+production lenses during prototyping. But before promotion to `lenses/`,
+any implicit coupling must be removed or made explicit.
 - Shared infrastructure lives in `pond-sdk/` (PondLens base, ProllyTreeIndex
   storage, mixins). Lenses USE this infrastructure; they don't inherit from
   each other.
