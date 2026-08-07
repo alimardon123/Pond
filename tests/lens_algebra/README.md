@@ -56,4 +56,4 @@ hard constraint, target 0).
 
 ## Dependencies
 
-- `pond-core/`, `pond-sdk/`
+- `bindings/python/core/`, `bindings/python/sdk/`

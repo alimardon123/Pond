@@ -48,8 +48,8 @@ import threading
 from typing import Optional, Callable
 from collections import defaultdict
 
-# Make pond-core importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pond-core"))
+# Make bindings/python/core importable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bindings/python/core"))
 from kernel import PondMinimal  # noqa: E402
 
 

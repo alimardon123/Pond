@@ -23,7 +23,7 @@ Plus 2 Scale Laws (regression tests for the Prolly tree build bug):
   10. Index Law       — index rebuild at scale must succeed without decode errors.
 
 Run:
-    python pond-sdk/architecture_laws.py
+    python bindings/python/sdk/architecture_laws.py
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ import os, sys, shutil, json, hashlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-sys.path.insert(0, os.path.join(REPO, "pond-core"))
-sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/core"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk"))
 
 from kernel import PondMinimal
 
@@ -43,7 +43,7 @@ from kernel import PondMinimal
 # this kernel validate the actual production architecture.
 from object_store_native_kernel import ObjectStoreNativeKernel
 from local_fs_object_store import LocalFSObjectStore
-sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))
+sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue", "python"))
 from keyvalue_lens import KeyValueLens
 
 
@@ -113,7 +113,7 @@ class _BaseShim:
     def read_all(self) -> dict:
         """Return {key: blob_hash} for all row groups in the collection."""
         import sys as _sys
-        _sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions",
+        _sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk", "extensions",
                                           "physical_structures"))
         try:
             from collection_manifest import CollectionManifest
@@ -349,7 +349,7 @@ def law_5_history_replay_equals_snapshot():
     # manifest. Walk the commit chain and verify that every commit's
     # manifest row groups are consistent with HEAD's state.
     import json as _json
-    sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions",
+    sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk", "extensions",
                                       "physical_structures"))
     from collection_manifest import CollectionManifest
 
@@ -563,7 +563,7 @@ def _make_lakehouse():
     tmpdir = tempfile.mkdtemp(prefix="pond_lh_law_")
     kernel = PondMinimal(tmpdir)
     # Add lakehouse to path
-    sys.path.insert(0, os.path.join(HERE, "..", "..", "lenses", "lakehouse"))
+    sys.path.insert(0, os.path.join(HERE, "..", "..", "lenses", "lakehouse", "python"))
     from lakehouse_lens import LakehouseLens
     lens = LakehouseLens(kernel)
     return kernel, lens, tmpdir, LakehouseLens
@@ -795,7 +795,7 @@ def law_18_lakehouse_manifest_storage():
             "LAW 18 VIOLATED: commit has no manifest hash"
 
         # Verify the manifest contains row group entries
-        sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_structures"))
+        sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk", "extensions", "physical_structures"))
         from collection_manifest import CollectionManifest
         if manifest_bytes is not None:
             manifest = CollectionManifest.decode(kernel, manifest_bytes)

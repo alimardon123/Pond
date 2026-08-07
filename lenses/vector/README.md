@@ -50,14 +50,14 @@ reading the same collection sees them.
 
 ## Architecture
 
-Extends `PondLens` directly (from `pond-sdk/base_lens.py`) per the
+Extends `PondLens` directly (from `bindings/python/sdk/base_lens.py`) per the
 "no lens-to-lens inheritance" rule in `REPO_ORGANIZATION.md §4`.
 The packed binary encoding is the lens-specific logic; everything
 else (branching, history, ProllyTreeIndex storage) is shared
-infrastructure from `pond-sdk`.
+infrastructure from `bindings/python/sdk`.
 
 ## Dependencies
 
-- `pond-core/` (kernel)
-- `pond-sdk/` (PondLens, ProllyLensBase, CollectionMetadata)
+- `bindings/python/core/` (kernel)
+- `bindings/python/sdk/` (PondLens, ProllyLensBase, CollectionMetadata)
 - Python stdlib only

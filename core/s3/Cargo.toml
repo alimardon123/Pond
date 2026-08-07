@@ -1,0 +1,26 @@
+[package]
+name = "pond_s3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "S3-compatible object store for Pond — implements the ObjectStore trait"
+
+[lib]
+name = "pond_s3"
+# rlib:      for use by pond_cli and other Rust crates
+# staticlib: C ABI static library for cross-language linking
+# cdylib:    shared library for dynamic FFI
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+pond_kernel = { path = "../kernel" }
+pond_storage = { path = "../storage" }
+sha2 = "0.10"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+hex = "0.4"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

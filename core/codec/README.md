@@ -1,4 +1,4 @@
-# pond-core — Pure-Rust PND2 codec + C ABI
+# bindings/python/core — Pure-Rust PND2 codec + C ABI
 
 This crate is the language-agnostic core of Pond's binary storage layer.
 
@@ -44,12 +44,12 @@ cargo build --release -p pond_core
 
 ## What's here vs. `pond-python`
 
-| Feature | `pond-core` (pure Rust) | `pond-python` (PyO3 wrapper) |
+| Feature | `bindings/python/core` (pure Rust) | `pond-python` (PyO3 wrapper) |
 |---------|------------------------|-----------------------------|
-| Constants (VT_*, ENC_*, etc.) | ✅ | re-exports from pond-core |
-| PND2Parser | ✅ | re-exports from pond-core |
-| Pure-Rust decode (all encodings, all vtypes) | ✅ (`pnd2_decode`, `decode_column`) | delegates to pond-core |
-| Pure-Rust encode (i64 / f64 / &str) | ✅ | delegates to pond-core |
+| Constants (VT_*, ENC_*, etc.) | ✅ | re-exports from bindings/python/core |
+| PND2Parser | ✅ | re-exports from bindings/python/core |
+| Pure-Rust decode (all encodings, all vtypes) | ✅ (`pnd2_decode`, `decode_column`) | delegates to bindings/python/core |
+| Pure-Rust encode (i64 / f64 / &str) | ✅ | delegates to bindings/python/core |
 | C ABI (`extern "C"`) | ✅ | n/a |
 | PyO3 `#[pyfunction]` wrappers | n/a | ✅ (`decode`, `encode`) |
 | Multi-column Python encode (RAW) | n/a | ✅ |

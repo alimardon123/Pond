@@ -13,6 +13,6 @@ name = "pond_core"
 crate-type = ["staticlib", "rlib", "cdylib"]
 
 [dependencies]
-# NONE — pond-core is pure Rust with no external deps. This is critical for
+# NONE — bindings/python/core is pure Rust with no external deps. This is critical for
 # cross-language linking: consumers (Go, Java, Node) must not have to satisfy
 # transitive Rust crate dependencies.

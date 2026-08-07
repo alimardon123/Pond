@@ -43,9 +43,9 @@ import tempfile
 import shutil
 from typing import Optional
 
-# Make pond-core importable
+# Make bindings/python/core importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/core"))
 from kernel import PondMinimal  # noqa: E402
 
 

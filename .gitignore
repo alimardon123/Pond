@@ -9,7 +9,6 @@ __pycache__/
 
 # Test artifacts (created by running the benchmarks)
 /tmp/pond_*
-prototype/__pycache__/
 
 # Local credentials (NEVER commit)
 .env
@@ -37,5 +36,5 @@ tla/_*.tla
 target/
 
 # Go build artifacts
-sdk-go/pond.test
 *.exe
+bindings/go/pond.test

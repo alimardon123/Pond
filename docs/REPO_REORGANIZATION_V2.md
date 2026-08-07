@@ -170,12 +170,12 @@ extensions/                      # Data-side extensions (cross-language)
 5. **No implicit coupling**: each lens directory is independent. Removing
    `lenses/vector/` doesn't affect `lenses/keyvalue/`.
 
-### What about the Python SDK extensions currently in `pond-sdk/extensions/`?
+### What about the Python SDK extensions currently in `bindings/python/sdk/extensions/`?
 
 They move to `extensions/`:
-- `pond-sdk/extensions/indexing/` → `extensions/indexing/python/`
-- `pond-sdk/extensions/semantic/` → `extensions/semantic/python/`
-- `pond-sdk/extensions/physical_structures/` → `extensions/physical_structures/python/`
+- `bindings/python/sdk/extensions/indexing/` → `extensions/indexing/python/`
+- `bindings/python/sdk/extensions/semantic/` → `extensions/semantic/python/`
+- `bindings/python/sdk/extensions/physical_structures/` → `extensions/physical_structures/python/`
 
 The Rust implementations (when ported) go in the `rust/` subdirectory.
 
@@ -391,9 +391,9 @@ pond_repo/
 
 ### Execution plan (5 phases):
 
-1. **Phase 1**: Rename `pond-rust/` → `core/`, rename internal crates (pond-core→codec, pond-kernel→kernel, pond-storage→storage, pond-arrow→arrow, pond-python→sdk/python/pyo3, pond-cli→cli)
+1. **Phase 1**: Rename `` → `core/`, rename internal crates (pond-core→codec, pond-kernel→kernel, pond-storage→storage, pond-arrow→arrow, pond-python→sdk/python/pyo3, pond-cli→cli)
 2. **Phase 2**: Split large files (codec lib.rs into 7 files, kernel lib.rs into 4 files, storage C ABI into separate file)
 3. **Phase 3**: Create `sdk/base/` with shared files (pond.h, C ABI tests, test blobs)
-4. **Phase 4**: Move `sdk-go/` → `sdk/go/`, move `pond-sdk/` → `sdk/python/`
+4. **Phase 4**: Move `bindings/go/` → `sdk/go/`, move `bindings/python/sdk/` → `sdk/python/`
 5. **Phase 5**: Reorganize `lenses/` and `extensions/` with rust/python subdirectories
 6. **Phase 6**: Update all READMEs, comments, and documentation

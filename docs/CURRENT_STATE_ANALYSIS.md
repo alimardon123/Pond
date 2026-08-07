@@ -17,8 +17,8 @@
 
 | Metric | Value | Notes |
 |---|---|---|
-| Active Python LOC | ~59,700 | across pond-core, pond-sdk, lenses, services, pond-labs, scripts, tests |
-| Rust LOC | ~2,200 | pond-core (1,800) + pond-python (400) |
+| Active Python LOC | ~59,700 | across bindings/python/core, bindings/python/sdk, lenses, services, pond-labs, scripts, tests |
+| Rust LOC | ~2,200 | bindings/python/core (1,800) + pond-python (400) |
 | Go LOC | ~1,150 | sdk-go (public + internal/cabi) |
 | Test suite | 20 passed, 2 skipped, 0 failed | was 17/5 before Tier 0 |
 | Property tests | 491 pass, 0 fail | was 490/1 before Tier 0 |
@@ -46,8 +46,8 @@
 - ✅ 3-primitive kernel (Write, Read, Ref) + batch helpers (thread-safe as of Tier 0)
 - ✅ UnifiedStorage backend (PND2 format + CollectionManifest + CRDT shards)
 - ✅ 5 production lenses: KeyValue, Lakehouse, Vector, Streaming, OLTP (all extend PondLens)
-- ✅ Rust PND2 codec (pond-core) with full decoder parity (all encodings, all vtypes)
-- ✅ PyO3 wrapper (pond-python) — thin glue, delegates to pond-core
+- ✅ Rust PND2 codec (bindings/python/core) with full decoder parity (all encodings, all vtypes)
+- ✅ PyO3 wrapper (pond-python) — thin glue, delegates to bindings/python/core
 - ✅ Go SDK (sdk-go) — PND2 codec bindings via cgo
 - ✅ C ABI (pond_core.h) — 131 checks passing, multi-column encoder builder
 - ✅ Cross-language compatibility proven (Go decodes Python-generated blobs)
@@ -168,7 +168,7 @@ demonstrates the architecture works." This is the DuckDB-v0.1
 equivalent.
 
 **1.0.1 — Build the `pond` CLI binary** (3-5 days)
-- Create `pond-rust/pond-cli/` (new workspace member)
+- Create `cli/` (new workspace member)
 - CLI commands: `pond init`, `pond write <coll> <file>`, `pond read <coll>`,
   `pond branch <coll> <name>`, `pond merge <coll> <name>`, `pond history <coll>`
 - Local FS backend only (no S3 for v0.1)
@@ -243,7 +243,7 @@ equivalent.
 - Matches user's "generic cross-language SDK" vision
 
 **1.3.3 — WASM target** (1 week)
-- Compile pond-core to wasm32-unknown-unknown
+- Compile bindings/python/core to wasm32-unknown-unknown
 - Enables Pond-in-browser (local-first apps, in-browser ML)
 - Matches veteran's recommendation (f)
 
@@ -257,14 +257,14 @@ is Python-only. Porting it to Rust would:
 - Enable the single-binary distribution model
 
 **2.1 — Rust storage kernel skeleton** (2-3 weeks)
-- Port `pond-core/kernel.py` to Rust: `Write`, `Read`, `Ref`, `Resolve`
+- Port `bindings/python/core/kernel.py` to Rust: `Write`, `Read`, `Ref`, `Resolve`
 - In-memory backend first (BTreeMap), then local FS
 - C ABI: `pond_write`, `pond_read`, `pond_ref`, `pond_resolve`
 - This was originally Tier 1 in my pre-review proposal; it's still the right next step
 
 **2.2 — Rust UnifiedStorage** (4-6 weeks)
 - Port `unified_storage.py` (5,540 LOC) to Rust
-- PND2 encode/decode already in Rust (pond-core)
+- PND2 encode/decode already in Rust (bindings/python/core)
 - CollectionManifest, CRDT shards, commit chain
 - This is the big port — but the Python implementation is the reference
 

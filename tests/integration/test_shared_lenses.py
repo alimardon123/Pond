@@ -20,7 +20,7 @@ just multiple View instances with the same name, each with its own
 encode/decode.
 
 Run:
-    python pond-sdk/test_shared_views.py
+    python bindings/python/sdk/test_shared_views.py
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ import json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-sys.path.insert(0, os.path.join(REPO, "pond-core"))
-sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/core"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk"))
 
 from kernel import PondMinimal
 sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))

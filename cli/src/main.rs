@@ -14,15 +14,23 @@ use clap::{Parser, Subcommand};
 use pond_kernel::PondKernel;
 use pond_storage::{UnifiedStorage, branch, commit, shard, write, read, transaction};
 use std::io::{self, Read as IoRead, Write as IoWrite};
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "pond")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Content-addressed storage with branching and time-travel")]
 struct Cli {
+    /// Storage root. Can be a local path or an S3 URL:
+    ///   file:///var/lib/pond       (local filesystem)
+    ///   ./pond-data                (local filesystem, relative)
+    ///   s3://bucket/prefix?region=us-east-1&endpoint=https://s3.amazonaws.com
+    ///
+    /// S3 credentials are read from the environment:
+    ///   AWS_ACCESS_KEY_ID (or AWS_ACCESS_KEY)
+    ///   AWS_SECRET_ACCESS_KEY (or AWS_SECRET_KEY)
+    ///   AWS_SESSION_TOKEN (optional, for STS temporary credentials)
     #[arg(long, env = "POND_ROOT", global = true)]
-    root: Option<PathBuf>,
+    root: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -30,7 +38,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Init { #[arg(default_value = ".")] path: PathBuf },
+    Init { #[arg(default_value = ".")] path: String },
     Write { collection: String, #[arg(group = "input")] file: Option<String>,
             #[arg(long, group = "input")] json: Option<String>,
             #[arg(long, group = "input")] bytes: bool,
@@ -55,19 +63,21 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init { path } => {
-            let base = cli.root.unwrap_or(path);
-            cmd_init(&base);
+            // If --root is provided, use it; otherwise use the path argument.
+            // This supports both `pond init /path` and `pond --root /path init`.
+            let init_path = cli.root.unwrap_or(path);
+            cmd_init(&init_path);
         }
         Commands::Version => {
             println!("pond {}", env!("CARGO_PKG_VERSION"));
         }
         cmd => {
-            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
-            let storage = match UnifiedStorage::new_local(&root) {
+            let root = cli.root.unwrap_or_else(|| ".".to_string());
+            let storage = match open_storage(&root) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("Error: failed to open storage at {}: {}", root.display(), e);
-                    eprintln!("Hint: run 'pond init' first");
+                    eprintln!("Error: failed to open storage at {}: {}", root, e);
+                    eprintln!("Hint: run 'pond init' first, or set --root / POND_ROOT");
                     std::process::exit(1);
                 }
             };
@@ -144,10 +154,78 @@ fn persist_active_branch(storage: &UnifiedStorage, collection: &str, branch: &st
 // Command implementations — thin wrappers over pond_storage
 // ---------------------------------------------------------------------------
 
-fn cmd_init(path: &PathBuf) {
-    let blobs_dir = path.join("blobs");
+/// Open a storage backend from a root URL/path.
+///
+/// Supported formats:
+///   - `s3://bucket/prefix?region=...&endpoint=...` — S3-compatible storage
+///   - `file:///path/to/dir` — local filesystem
+///   - `/path/to/dir` or `./relative/path` — local filesystem (default)
+///
+/// S3 credentials are read from the environment:
+///   AWS_ACCESS_KEY_ID (or AWS_ACCESS_KEY)
+///   AWS_SECRET_ACCESS_KEY (or AWS_SECRET_KEY)
+///   AWS_SESSION_TOKEN (optional)
+fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>> {
+    if root.starts_with("s3://") {
+        #[cfg(feature = "s3")]
+        {
+            let store = pond_s3::S3ObjectStore::from_url(root)?;
+            let kernel = PondKernel::new_with_store(Box::new(store));
+            Ok(UnifiedStorage::new(kernel))
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            Err(format!(
+                "S3 support not compiled in (built with --no-default-features). \
+                 Cannot open '{}'. Rebuild with `cargo build` (default features include s3).",
+                root
+            ).into())
+        }
+    } else if let Some(path) = root.strip_prefix("file://") {
+        UnifiedStorage::new_local(path).map_err(|e| e.into())
+    } else {
+        UnifiedStorage::new_local(root).map_err(|e| e.into())
+    }
+}
+
+fn cmd_init(path: &str) {
+    if path.starts_with("s3://") {
+        // For S3, "init" is a no-op — the bucket must already exist.
+        // We verify connectivity by trying to list the prefix.
+        #[cfg(feature = "s3")]
+        {
+            match pond_s3::S3ObjectStore::from_url(path) {
+                Ok(store) => {
+                    use pond_kernel::ObjectStore;
+                    match store.list_paths("") {
+                        Ok(_) => {
+                            println!("Connected to S3 storage: {}", path);
+                        }
+                        Err(e) => {
+                            eprintln!("Error: cannot access S3 storage: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: invalid S3 URL: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            eprintln!("Error: S3 support not compiled in.");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Local FS init: create the blobs/ directory
+    let path_stripped = path.strip_prefix("file://").unwrap_or(path);
+    let blobs_dir = std::path::Path::new(path_stripped).join("blobs");
     match std::fs::create_dir_all(&blobs_dir) {
-        Ok(()) => println!("Initialized empty Pond repository in {}", path.display()),
+        Ok(()) => println!("Initialized empty Pond repository in {}", path_stripped),
         Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     }
 }

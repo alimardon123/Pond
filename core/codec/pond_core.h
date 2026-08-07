@@ -2,7 +2,7 @@
  * Pond Core — C ABI Header
  *
  * This header defines the C ABI for Pond's pure-Rust core library
- * (`pond-core`, produces `libpond_core.a` / `libpond_core.so`).
+ * (`bindings/python/core`, produces `libpond_core.a` / `libpond_core.so`).
  *
  * Other language SDKs (Go, Java, Node, C, C++, Zig) call these
  * functions via FFI/cgo/JNI/NAPI to get native PND2 encode/decode.

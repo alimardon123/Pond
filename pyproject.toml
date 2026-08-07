@@ -33,4 +33,4 @@ test = ["pytest", "pyarrow"]
 features = ["pyo3/extension-module"]
 module-name = "pond_rust"
 python-source = "python"
-manifest-path = "pond-rust/pond-python/Cargo.toml"
+manifest-path = "bindings/python/pyo3/Cargo.toml"

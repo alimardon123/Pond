@@ -73,7 +73,7 @@ docs overclaim), the entry stays open until the code is fixed.
   partitioned topics. Status: **open** — needs a HEAD-pointer walk in
   `UnifiedStorage.read`.
 - **IVF vector index does NOT reduce I/O.**
-  `pond-sdk/extensions/indexing/ivf_index.py:363-381` admits: the
+  `bindings/python/sdk/extensions/indexing/ivf_index.py:363-381` admits: the
   implementation reads ALL vectors via `storage.read(collection)`
   then filters by target_ids in Python. Every search reads the
   entire collection. At PB scale (10M+ vectors) this defeats the
@@ -119,7 +119,7 @@ underneath those things — and underneath things that don't exist yet.
 
 This is a research goal stated as an engineering goal. "Smallest"
 is measured by **substrate count (currently 6, honest)** and by
-lines of code in `pond-core` (currently 274 LOC in `kernel.py` +
+lines of code in `bindings/python/core` (currently 274 LOC in `kernel.py` +
 ~280 LOC in `object_store_native_kernel.py` + 443 LOC in
 `local_fs_object_store.py` + 519 LOC in `s3_object_store.py` +
 112 LOC in `make_kernel.py` — NOT ~140 LOC as previously claimed).
@@ -175,10 +175,10 @@ The seven principles, in priority order:
 ### 3.1 Simple — the kernel remains intellectually small
 
 The kernel is 6 substrates + 3 operations + same-collection batch
-I/O helpers. `pond-core/kernel.py` is currently 274 LOC (was ~140;
+I/O helpers. `bindings/python/core/kernel.py` is currently 274 LOC (was ~140;
 grew after the thread-safety round added `write_batch` and
 `read_blob_batch`). The object-store-native variant
-(`pond-core/object_store_native_kernel.py`) adds ~280 LOC, plus
+(`bindings/python/core/object_store_native_kernel.py`) adds ~280 LOC, plus
 storage backends (`local_fs_object_store.py` 443 LOC,
 `s3_object_store.py` 519 LOC) and the `make_kernel.py` factory (112
 LOC). The kernel is NOT "FROZEN" in the implementation sense — it
@@ -343,8 +343,8 @@ proven first.
 
 From the architecture review that produced this document:
 
-> Every week, ask: **If I deleted everything except `pond-core` and
-> `pond-sdk`, would the architecture still make sense?**
+> Every week, ask: **If I deleted everything except `bindings/python/core` and
+> `bindings/python/sdk`, would the architecture still make sense?**
 >
 > If the answer is yes, you're preserving the design principles you
 > started with.
@@ -407,12 +407,12 @@ frozen.
 | `docs/POND_FORMAL_ALGEBRAS.md` | 17 algebras, 10 axioms |
 | `docs/archive/` | Historical docs (Phase L-Q reports, Red Team reviews, RFCs) |
 
-### 5.4 Code (`pond-core/`, `pond-sdk/`, `lenses/`)
+### 5.4 Code (`bindings/python/core/`, `bindings/python/sdk/`, `lenses/`)
 
 | Package | Layer | LOC | Responsibility |
 |---|---|---|---|
-| `pond-core` | 0 | ~1630 | The kernel + storage backends: `kernel.py` (PondMinimal, 274 LOC; NOT FROZEN — has `write_batch`/`read_blob_batch` same-collection helpers) + `object_store_native_kernel.py` (ObjectStoreNativeKernel, no SQLite, ~280 LOC) + `local_fs_object_store.py` (443 LOC) + `s3_object_store.py` (519 LOC) + `s3_mock_backend.py` (latency-injecting mock) + `make_kernel.py` (112 LOC unified factory). |
-| `pond-sdk` | 1–2 | ~3000 | `base_lens.py` (PondLens shared namespace), `pond_storage.py` (PondStorage — the unified SDK class), `pond_config.py`, `maintenance.py`, `uuid7.py`, `hlc.py`, `row_query.py`, extensions (`physical_structures/`: `unified_storage.py` THE universal storage backend, `collection_manifest.py`, `stats_tree.py`, `encoding.py`, `compression.py`, `column_source.py`, `embedded_stats.py`, `pond_pack.py`; `indexing/`: `collection_index.py`, `ivf_index.py`, `hnsw_index.py`; `maintenance/vacuum.py`; `semantic/`). The legacy `prolly_tree.py`/`binary_encoding.py`/`collection_metadata.py` referenced in older docs are in `archive/legacy-sdk/` and `archive/legacy-extensions/`. |
+| `bindings/python/core` | 0 | ~1630 | The kernel + storage backends: `kernel.py` (PondMinimal, 274 LOC; NOT FROZEN — has `write_batch`/`read_blob_batch` same-collection helpers) + `object_store_native_kernel.py` (ObjectStoreNativeKernel, no SQLite, ~280 LOC) + `local_fs_object_store.py` (443 LOC) + `s3_object_store.py` (519 LOC) + `s3_mock_backend.py` (latency-injecting mock) + `make_kernel.py` (112 LOC unified factory). |
+| `bindings/python/sdk` | 1–2 | ~3000 | `base_lens.py` (PondLens shared namespace), `pond_storage.py` (PondStorage — the unified SDK class), `pond_config.py`, `maintenance.py`, `uuid7.py`, `hlc.py`, `row_query.py`, extensions (`physical_structures/`: `unified_storage.py` THE universal storage backend, `collection_manifest.py`, `stats_tree.py`, `encoding.py`, `compression.py`, `column_source.py`, `embedded_stats.py`, `pond_pack.py`; `indexing/`: `collection_index.py`, `ivf_index.py`, `hnsw_index.py`; `maintenance/vacuum.py`; `semantic/`). The legacy `prolly_tree.py`/`binary_encoding.py`/`collection_metadata.py` referenced in older docs are in `archive/legacy-sdk/` and `archive/legacy-extensions/`. |
 | `lenses/lakehouse` | 3 | ~2200 | LakehouseLens (Parquet + DuckDB + SQL pushdown). Flagship tabular lens. Extends `PondLens` directly. |
 | `lenses/keyvalue` | 3 | ~760 | KeyValueLens (UnifiedStorage-backed; extends `PondLens` directly). |
 | `lenses/vector` | 3 | ~530 | VectorLens (k-NN search; UnifiedStorage-backed; extends `PondLens` directly). IVF index exists but does NOT yet reduce I/O (see §1.1 Known Gaps). HNSW index exists. |
@@ -428,7 +428,7 @@ frozen.
 
 **Removability rule:** Every package above must be removable without
 changing any lower layer. If removing `pond-feature-store` requires
-changing `pond-sdk`, something is wrong.
+changing `bindings/python/sdk`, something is wrong.
 
 ### 5.5 Engineering (`engineering/`) — production hardening
 
@@ -822,7 +822,7 @@ kernel. Five tracks executed:
 
 > **Task 65 correction.** The "kernel is FROZEN" claim here refers to
 > the Phase L *snapshot*, not the current implementation. As of the
-> thread-safety round, `pond-core/kernel.py` is 274 LOC and has gained
+> thread-safety round, `bindings/python/core/kernel.py` is 274 LOC and has gained
 > `write_batch` / `read_blob_batch` (same-collection performance
 > primitives). The *substrate/operation count* (6 substrates, 3
 > operations) is still frozen — adding a new substrate or operation
@@ -958,7 +958,7 @@ and conceptual tests.
 | TLA+ invariants | 6 proven across 56 reachable states |
 | **Total checks** | **683, all passing** |
 | Kernel LOC | ~140 (FROZEN throughout K, L, N, O, P) *(Task 65 correction: now 274 LOC; substrate/operation count still FROZEN, implementation gained `write_batch`/`read_blob_batch` — see §3.1)* |
-| Packages built | pond-core, pond-sdk, pond-feature-store, pond-arrow, pond-transport (ref + prod), pond-schema, pond-replication |
+| Packages built | bindings/python/core, bindings/python/sdk, pond-feature-store, pond-arrow, pond-transport (ref + prod), pond-schema, pond-replication |
 
 ### Status: internal consistency established; external validation pending
 
@@ -999,7 +999,7 @@ Pond is the right abstraction is not yet decided.**
 
 > **Task 65 correction.** "The kernel is FROZEN at ~140 LOC" was true
 > at Phase P snapshot time. As of the thread-safety round,
-> `pond-core/kernel.py` is 274 LOC and has gained same-collection
+> `bindings/python/core/kernel.py` is 274 LOC and has gained same-collection
 > batch I/O helpers (`write_batch`, `read_blob_batch`). What is still
 > FROZEN is the *substrate/operation count* (6 substrates, 3
 > operations) — see §3.1. The model (17 algebras) is unchanged.
@@ -1158,25 +1158,25 @@ If you are an agent picking up Pond work, do this in order:
 
 ### What's been built (unified storage layer)
 
-1. **`ObjectStoreNativeKernel`** (`pond-core/object_store_native_kernel.py`) —
+1. **`ObjectStoreNativeKernel`** (`bindings/python/core/object_store_native_kernel.py`) —
    a kernel with NO SQLite. Refs are stored as content-addressed blobs in
    the object store (the Git HEAD→commit→tree pattern). Every ref
    resolution is 2 S3 GETs cold (root pointer + root ref blob), 0 warm
    (SDK-cached). This is the object-store-native kernel the whitepaper
    always described but didn't have.
 
-2. **`UnifiedStorage`** (`pond-sdk/extensions/physical_structures/unified_storage.py`) —
+2. **`UnifiedStorage`** (`bindings/python/sdk/extensions/physical_structures/unified_storage.py`) —
    ONE binary format (PND2), ONE write path (`write`/`append`), ONE read
    path (`read`/`point_lookup`). Replaces the 3 write modes + 7+ read
    methods of the old LakehouseLens. Stats computed during encode (zero
    overhead). Non-destructive `append()`. Range scans via `start_key`/`end_key`.
 
-3. **`CollectionManifest`** (`pond-sdk/extensions/physical_structures/collection_manifest.py`) —
+3. **`CollectionManifest`** (`bindings/python/sdk/extensions/physical_structures/collection_manifest.py`) —
    ONE index blob per commit with ALL row-group stats + blob hashes inline.
    At PB scale (>25K row groups), delegates to a hierarchical `StatsTree`
    for O(log N) reads. Manifest blob stays at ~64 bytes regardless of scale.
 
-4. **`StatsTreeReader`** (`pond-sdk/extensions/physical_structures/stats_tree.py`) —
+4. **`StatsTreeReader`** (`bindings/python/sdk/extensions/physical_structures/stats_tree.py`) —
    lazy hierarchical stats tree with aggregated min/max at internal nodes.
    Content-addressed nodes (cached by SDK). O(log N) point lookups and
    pruned scans at PB scale.
@@ -1216,7 +1216,7 @@ streaming) to be competitive.
 > first.
 
 - **No HNSW/IVF for vector search** — linear scan only. Not usable at >100K vectors.
-  *(Task 65 status: **partly outdated.** `pond-sdk/extensions/indexing/hnsw_index.py`
+  *(Task 65 status: **partly outdated.** `bindings/python/sdk/extensions/indexing/hnsw_index.py`
   and `ivf_index.py` now exist. HNSW is implemented per its docstring.
   IVF exists but does NOT reduce I/O — it reads all vectors then filters
   in Python. See §1.1 Known Gaps.)*
@@ -1235,7 +1235,7 @@ streaming) to be competitive.
   routes `file://` and `s3://` URLs to `ObjectStoreNativeKernel`; whether
   LakehouseLens actually uses this path by default is unverified.)*
 - **No production S3 backend** — only InMemoryObjectStore with simulated latency.
-  *(Task 65 status: **outdated.** `pond-core/s3_object_store.py` is a real
+  *(Task 65 status: **outdated.** `bindings/python/core/s3_object_store.py` is a real
   boto3-backed store. R2/S3 integration tests (`scripts/test_s3_integration.py`,
   `scripts/benchmark_full_r2.py`) exercise it against moto and real R2.)*
 - **No PB-scale benchmark** — max tested is 30K row groups (smoke test, not perf).

@@ -249,7 +249,7 @@ Task: Respond to architecture review (Phase A+C: formalize Views, deletion as da
 ## Work Log
 
 1. Read the user's architecture review in full. Scored the project: kernel 9.8/10, layered arch 9.7/10, SDK 9.3/10, docs 8.7/10, ecosystem 8.5/10, DX 6/10, production readiness 6.5/10. Key insights: weaknesses are now product engineering, not architecture; external validation was the most valuable thing done; the missing delete operation deserves careful thought; the biggest missing piece is a formal model of "what is a Lens?"; roadmap should be Phase A (freeze) → B (polish SDK) → C (formalize Views) → D (compatibility) → E (one flagship).
-2. Inspected repo state: pond-core/pond_minimal.py (~140 LOC, 3 primitives), existing RFCs 0001-0006, validation/vector_report.md (DX 5/10, finding F: "impossible to delete a name"), engineering/02_gc.py (existing PondGC), docs/NON_GOALS.md (already lists GC as Lens-level utility).
+2. Inspected repo state: bindings/python/core/pond_minimal.py (~140 LOC, 3 primitives), existing RFCs 0001-0006, validation/vector_report.md (DX 5/10, finding F: "impossible to delete a name"), engineering/02_gc.py (existing PondGC), docs/NON_GOALS.md (already lists GC as Lens-level utility).
 3. Drafted RFC-0007: View Algebra. Supersedes RFC-0001's draft definition. Formal 5-tuple V = (Σ, A, E, D, M) with 6 laws (round-trip, purity, encoding preservation, materialization determinism, composition, kernel independence). Verified all 8 existing Views satisfy the algebra. Proved Views compose via ⊕ (parallel) and ∘ (sequential). Settled the Semantic-adapter question: OssieView, CubeView, DbtView are Views, not adapters-as-afterthought.
 4. Drafted RFC-0008: Deletion as Data. Addresses external validation finding F. Conclusion: do NOT add a fourth primitive. Deletion is expressible as data via Reference(name, TOMBSTONE_HASH) — a Layer 1 convention. Physical name-row reclamation is a Layer 0.5 maintenance op (compact_tombstones), analogous to VACUUM/git gc. Privacy-mandated deletion handled by prompt compaction + SQLite VACUUM; Layer 0 names should not contain sensitive data (usage guideline).
 5. Reconciled RFC-0008 with existing engineering/02_gc.py PondGC implementation. PondGC handles blob reclamation via heuristic reachability walk (regex [0-9a-f]{64}); tombstones complement it by handling name-row reclamation. No conflict: tombstones operate on names, PondGC operates on blobs. The existing PondGC works unchanged with tombstones (the tombstone blob is tiny and shared; the previously-pointed-to blob becomes unreachable and gets swept).
@@ -258,7 +258,7 @@ Task: Respond to architecture review (Phase A+C: formalize Views, deletion as da
 8. Created top-level DESIGN_GOALS.md: the canonical entry-point document for any agent (human or AI, local or remote) joining Pond. Captures: what Pond is, the main goal, the six design principles (Simple, Powerful, Performant, Scalable, Efficient, Beautiful), the weekly question, the repo map, the outcome vocabulary, the six-goal checklist, the current Phase A-E roadmap, and explicit guidance for future AI agents (kernel is FROZEN, do not add kernel features to solve Lens-level problems, use outcome vocabulary, append to worklog).
 9. Updated PACKAGES.md: added §3 Removability Discipline (every package must be removable without changing any lower layer — operationalizes Design Goal 3.4 and metric C2 from RFC-0009), §4 Adding a new package (6-step checklist including View algebra specification), §5 Removing a package. Updated package list to include pond-vector. Updated RFC list to include RFC-0007, 0008, 0009.
 10. Updated rfcs/README.md: RFC-0001 marked as superseded by RFC-0007; RFC-0005 marked as renamed to Materialization Calculus; RFC-0007, 0008, 0009 added to active RFCs table. DESIGN_GOALS.md added to reference documents list with "read this first" annotation.
-11. Did NOT modify pond-core (kernel stays FROZEN at ~140 LOC, 3 primitives). Did NOT add a fourth primitive. Did NOT modify any Lens code. This session was Phase A (freeze) + Phase C (formalize) only — no feature additions, no code changes, only RFCs and foundational documents.
+11. Did NOT modify bindings/python/core (kernel stays FROZEN at ~140 LOC, 3 primitives). Did NOT add a fourth primitive. Did NOT modify any Lens code. This session was Phase A (freeze) + Phase C (formalize) only — no feature additions, no code changes, only RFCs and foundational documents.
 12. Appended this worklog entry.
 
 ## Stage Summary
@@ -272,26 +272,26 @@ Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_r
 
 ## Work Log
 
-1. Read validation/vector_report.md findings A–J in full. Read current SDK code: pond-sdk/lens_sdk.py (542 LOC), pond-sdk/prolly_view.py (612 LOC), pond-sdk/auto_index.py (513 LOC), pond-sdk/binary_encoding.py (binary commit format). Inspected existing PondGC at engineering/02_gc.py.
-2. Created pond-sdk/maintenance.py (RFC-0008 tombstone helpers):
+1. Read validation/vector_report.md findings A–J in full. Read current SDK code: bindings/python/sdk/lens_sdk.py (542 LOC), bindings/python/sdk/prolly_view.py (612 LOC), bindings/python/sdk/auto_index.py (513 LOC), bindings/python/sdk/binary_encoding.py (binary commit format). Inspected existing PondGC at engineering/02_gc.py.
+2. Created bindings/python/sdk/maintenance.py (RFC-0008 tombstone helpers):
    - TOMBSTONE_HASH constant (SHA-256 of b"__pond_tombstone__")
    - drop_name(kernel, name): logically delete a name (rebind to TOMBSTONE_HASH)
    - is_dropped(kernel, name): True iff name is tombstoned
    - resolve_active(kernel, name): resolve returning None for unbound OR tombstoned
    - compact_tombstones(kernel): Layer 0.5 maintenance, removes tombstoned name rows
    - 3 tests: round-trip, drop isolation, tombstone+PondGC composition — ALL PASS
-3. Updated pond-sdk/lens_sdk.py:
+3. Updated bindings/python/sdk/lens_sdk.py:
    - Imported tombstone helpers from maintenance.py
    - Rewrote drop_index to use drop_name (tombstone pattern, per RFC-0008) instead of "empty tree" workaround
    - Updated lookup_by_index to use resolve_active (returns None for tombstoned indexes immediately)
    - Added list_all_indexes() for diagnostic tools (includes tombstoned)
    - list_indexes() now excludes tombstoned indexes
-4. Updated pond-sdk/auto_index.py:
+4. Updated bindings/python/sdk/auto_index.py:
    - Imported tombstone helpers
    - Rewrote unregister_index to use drop_name (tombstone pattern)
    - Added is_index_registered() helper (True iff registered AND not tombstoned)
    - Updated find_by() to return None immediately for tombstoned indexes
-5. Ran existing tests: pond-sdk/lens_sdk.py index test PASSES (drop_index returns None immediately). pond-sdk/auto_index.py full test suite PASSES (lazy/eager/incremental, 98.5x speedup preserved). Pre-existing OssieSemanticView NameError is unchanged (not introduced by this session).
+5. Ran existing tests: bindings/python/sdk/lens_sdk.py index test PASSES (drop_index returns None immediately). bindings/python/sdk/auto_index.py full test suite PASSES (lazy/eager/incremental, 98.5x speedup preserved). Pre-existing OssieSemanticView NameError is unchanged (not introduced by this session).
 6. Created SDK_SPEC.md (top-level, ~430 lines): authoritative SDK contract settling all 10 ambiguities:
    - A (§1.1): PondMinimal(base_dir) IS the kernel, not a factory
    - B (§4.2): extractor receives decoded data only, returns str
@@ -303,7 +303,7 @@ Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_r
    - H (§6.2): history() returns list of dicts with exactly {commit, message, timestamp, index, type}
    - I (§2.3): put_raw stages existing blob_hash, no encode, no kernel.write
    - J (§7): full binary commit format documented (1B type + 32B parent + 32B snapshot + deltas + msg + ts + index)
-7. Created pond-sdk/lens_laws.py (property-test harness for RFC-0007's 6 laws):
+7. Created bindings/python/sdk/lens_laws.py (property-test harness for RFC-0007's 6 laws):
    - ViewContract dataclass: adapter mapping a Lens's API to the harness
    - ViewLaws class with check_all() running all 6 law checks
    - Law 1: round-trip (decode(encode(d)) == d)
@@ -315,13 +315,13 @@ Task: Phase B SDK polish — address all 10 ambiguities from validation/vector_r
    - LawReport and LawResult dataclasses for structured output
 8. Ran lens_laws.py against default View class: ALL 6 LAWS PASS.
 9. Ran lens_laws.py against IndexedView class (with eager index as materialization): ALL 6 LAWS PASS.
-10. Updated DESIGN_GOALS.md: added SDK_SPEC.md to top-level docs list, updated pond-sdk entry to mention maintenance.py and lens_laws.py.
-11. Updated PACKAGES.md: added SDK_SPEC.md to top-level file list, added maintenance.py and lens_laws.py to pond-sdk structure.
+10. Updated DESIGN_GOALS.md: added SDK_SPEC.md to top-level docs list, updated bindings/python/sdk entry to mention maintenance.py and lens_laws.py.
+11. Updated PACKAGES.md: added SDK_SPEC.md to top-level file list, added maintenance.py and lens_laws.py to bindings/python/sdk structure.
 12. Appended this worklog entry.
 
 ## Stage Summary
 
-Phase B (SDK polish) complete: all 10 validation ambiguities (A–J) are settled in SDK_SPEC.md with concrete contracts. Tombstones (RFC-0008) are implemented in pond-sdk/maintenance.py and wired into drop_index/unregister_index. The lens_laws.py harness verifies RFC-0007's 6 algebra laws; both default View and IndexedView pass all 6. Existing tests still pass (index ops work correctly with tombstones; auto-index lazy/eager/incremental all work; tombstones compose cleanly with existing PondGC — tombstoned blobs get swept on next collection). No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). No new packages — maintenance.py and lens_laws.py live inside pond-sdk, preserving the removability discipline. Phase B success criterion (a second external implementation scoring 9/10 DX) is now ready to be measured: re-run validation/vector_challenge_prompt.md with a fresh agent using SDK_SPEC.md as the spec. Phase C (formalize Views) is also unblocked: RFC-0007 can move from Draft to Accepted once lens_laws.py runs as CI on every commit.
+Phase B (SDK polish) complete: all 10 validation ambiguities (A–J) are settled in SDK_SPEC.md with concrete contracts. Tombstones (RFC-0008) are implemented in bindings/python/sdk/maintenance.py and wired into drop_index/unregister_index. The lens_laws.py harness verifies RFC-0007's 6 algebra laws; both default View and IndexedView pass all 6. Existing tests still pass (index ops work correctly with tombstones; auto-index lazy/eager/incremental all work; tombstones compose cleanly with existing PondGC — tombstoned blobs get swept on next collection). No kernel changes (bindings/python/core still FROZEN at ~140 LOC, 3 primitives). No new packages — maintenance.py and lens_laws.py live inside bindings/python/sdk, preserving the removability discipline. Phase B success criterion (a second external implementation scoring 9/10 DX) is now ready to be measured: re-run validation/vector_challenge_prompt.md with a fresh agent using SDK_SPEC.md as the spec. Phase C (formalize Views) is also unblocked: RFC-0007 can move from Draft to Accepted once lens_laws.py runs as CI on every commit.
 
 ---
 Task ID: 12
@@ -329,11 +329,11 @@ Agent: general-purpose (external validation)
 Task: Build GraphView from SDK_SPEC.md (external validation #2 — Phase B success criterion)
 
 Work Log:
-- Read worklog (324 lines, ended at Task 11 Phase B SDK polish). Read SDK_SPEC.md (611 lines, settles A–J), pond-core/pond_minimal.py (200 LOC, the 3 primitives), RFC-0003 (kernel laws), RFC-0007 (View algebra 5-tuple + 6 laws), RFC-0008 (tombstones), DESIGN_GOALS.md head. Did NOT read pond-sdk/, pond-vector/, vector_report.md, or any other Lens code — task constraints honored.
+- Read worklog (324 lines, ended at Task 11 Phase B SDK polish). Read SDK_SPEC.md (611 lines, settles A–J), bindings/python/core/pond_minimal.py (200 LOC, the 3 primitives), RFC-0003 (kernel laws), RFC-0007 (View algebra 5-tuple + 6 laws), RFC-0008 (tombstones), DESIGN_GOALS.md head. Did NOT read bindings/python/sdk/, pond-vector/, vector_report.md, or any other Lens code — task constraints honored.
 - Built /home/z/my-project/pond_repo/validation/graph_view_external.py (~600 LOC). Chose option (b): build directly on the kernel primitives rather than re-implementing ProllyViewBase/IndexedView, because (i) spec §7 says "Views do NOT need to know this format" for the binary commit format, (ii) the Prolly tree structure is referenced but never defined in the spec, (iii) building directly lets me follow the spec's described BEHAVIOR without guessing Prolly internals. Used JSON for commits and indexes (spec-permitted per §7/§9). Implemented all required ops: add_node, add_edge, get_node, get_neighbors (with edge_type filter), find_nodes_by_type, find_edges_by_type (both use indexes), delete_node (cascades to edges both directions), delete_edge, count_nodes, count_edges, commit, branch, checkout, merge, history. Plus diff (per §6.3) and drop_index (per §4.5 tombstone pattern). Eager index rebuild on every commit (§4.3 "eager" mode). COMPACTION_THRESHOLD=4 (§7) with first-commit-is-snapshot rule (had to invent — spec doesn't say but a delta with no parent is nonsensical).
 - Built /home/z/my-project/pond_repo/validation/graph_view_external_test.py (12 test sections, 64 assertions). First run: 53/64 pass. Two failures, both spec gaps not my bugs: (1) tombstone marker blob must exist on disk before kernel.reference(name, TOMBSTONE_HASH) succeeds — kernel's reference() validates blob existence (pond_minimal.py:155-156) but SDK_SPEC §4.5 / RFC-0008 §6 example code doesn't write the marker first; on a fresh kernel the example crashes. Invented _ensure_tombstone_blob(kernel) workaround. (2) First commit must be a snapshot (no parent to delta against); spec §7 only says "after every 4 deltas, next is snapshot" without specifying the parent=None case. Fixed by `is_snapshot = (parent is None) OR (deltas_since_last_snapshot >= 4)`.
 - Second run: 64/64 pass. All A–J contracts verified by tests: history shape (5 keys, 12-char commit, float timestamp, int index, str type), merge union+merged-branch-wins (test #5 confirms merged branch's value silently wins on conflict), diff hash-prefix parameters (test #6), put_raw zero-copy (test #9 confirms blob hash shared not re-encoded), tombstone-based drop_index (test #7 — idempotent, revivable, falls back to linear scan), branching/checkout staging-clear (test #12), empty-commit raises ValueError (test #10), branch-before-commit raises ValueError (test #11), get() correctness across the snapshot/delta compaction boundary (test #8 — 6 commits, snapshot at c0, deltas c1-c4, snapshot at c5).
-- Wrote /home/z/my-project/pond_repo/validation/graph_challenge_report.md with the 5 required sections. DX score: 7/10 (original vector validation was 5/10; +2 for cleanly settling all 10 A–J ambiguities, verified by tests; -3 for new gaps — see report). NEW ambiguities found (beyond A–J): (1) tombstone marker blob must be pre-written to kernel before reference() will accept it — spec example crashes otherwise (most painful finding); (2) Prolly tree format referenced but never defined — spec-literal index implementation impossible for external dev; (3) find_by() return shape undefined; (4) multi-valued index storage undefined; (5) View constructor signature unspecified; (6) current-branch tracking location unspecified (in-memory vs kernel namespace); (7) merge commit parent count (1 vs 2) unspecified; (8) history() index semantics for branched DAGs unspecified; (9) key naming convention unspecified; (10) import path for pond-sdk/maintenance.py unspecified; (11) §7 self-contradicts ("Views do NOT need to know this format" vs "for developers building alternative View implementations"); (12) View-vs-IndexedView choice for kernel-direct Views unspecified.
+- Wrote /home/z/my-project/pond_repo/validation/graph_challenge_report.md with the 5 required sections. DX score: 7/10 (original vector validation was 5/10; +2 for cleanly settling all 10 A–J ambiguities, verified by tests; -3 for new gaps — see report). NEW ambiguities found (beyond A–J): (1) tombstone marker blob must be pre-written to kernel before reference() will accept it — spec example crashes otherwise (most painful finding); (2) Prolly tree format referenced but never defined — spec-literal index implementation impossible for external dev; (3) find_by() return shape undefined; (4) multi-valued index storage undefined; (5) View constructor signature unspecified; (6) current-branch tracking location unspecified (in-memory vs kernel namespace); (7) merge commit parent count (1 vs 2) unspecified; (8) history() index semantics for branched DAGs unspecified; (9) key naming convention unspecified; (10) import path for bindings/python/sdk/maintenance.py unspecified; (11) §7 self-contradicts ("Views do NOT need to know this format" vs "for developers building alternative View implementations"); (12) View-vs-IndexedView choice for kernel-direct Views unspecified.
 - Appended this worklog entry.
 
 Stage Summary:
@@ -358,9 +358,9 @@ Task: Phase B.2 — apply SDK_SPEC.md fixes from graph_challenge_report (Task 12
    - §6.1: documented merge commit has 1 parent (not git-style 2); history() walks single-parent chain
    - §6.2: clarified history() index is per-branch count, not global DAG topological order
    - §7: clarified who needs to know the commit format (Lens authors extending View/IndexedView: no; alternative implementations: any format is fine); added first-commit-is-snapshot rule
-   - §8: documented import path (add pond-sdk/ to PYTHONPATH, then `from maintenance import ...`); documented that drop_name handles marker-blob pre-write internally
+   - §8: documented import path (add bindings/python/sdk/ to PYTHONPATH, then `from maintenance import ...`); documented that drop_name handles marker-blob pre-write internally
    - §11: relaxed compliance checklist to allow kernel-direct Views per §7; clarified index format flexibility; clarified tombstone usage via drop_name (not direct kernel.reference)
-3. Created pond-sdk/run_lens_laws_ci.py: CI entry point that runs lens_laws.py against Default View, IndexedView, and SemanticView. Exits 0 if all pass, 1 if any fail, 2 on harness error. All 3 Views pass all 6 laws.
+3. Created bindings/python/sdk/run_lens_laws_ci.py: CI entry point that runs lens_laws.py against Default View, IndexedView, and SemanticView. Exits 0 if all pass, 1 if any fail, 2 on harness error. All 3 Views pass all 6 laws.
 4. Created validation/run_graph_lens_laws.py: runs lens_laws.py against the externally-built GraphView (from Task 12). The external GraphView PASSES all 6 laws — confirming the algebra is a real specification, not just a description of pond-sdk's own Views. This is the strongest possible test of RFC-0007's generality.
 5. Promoted RFC-0007 from Draft to Accepted:
    - Updated Status section: documented acceptance evidence (lens_laws.py harness + CI runner + external GraphView compliance)
@@ -370,7 +370,7 @@ Task: Phase B.2 — apply SDK_SPEC.md fixes from graph_challenge_report (Task 12
 
 ## Stage Summary
 
-Phase B.2 complete. The external validation (Task 12) measured DX at 7/10 (up from 5/10 baseline — +2 points, all 10 A-J ambiguities settled). The validator's 7 most actionable NEW findings are now fixed in SDK_SPEC.md. The lens_laws.py harness is now CI-runnable (pond-sdk/run_lens_laws_ci.py) and passes for all 3 SDK Views AND for the externally-built GraphView — confirming RFC-0007's algebra is a real specification, not a tautology. RFC-0007 promoted from Draft to Accepted; the 6 View algebra laws are now release-blocking constraints (metric E1 of RFC-0009, target 0). Remaining NEW ambiguities from the validator's report are lower-severity (mostly "behavior described but implementation unspecified" — fixable in a future spec revision). The next Phase B iteration would target DX 9/10 by addressing those; the next major step is Phase D (compatibility: Arrow/DuckDB/Polars/Lance adapter Views) or Phase E (one flagship productionized). No kernel changes; no new packages; pond-core still FROZEN at ~140 LOC.
+Phase B.2 complete. The external validation (Task 12) measured DX at 7/10 (up from 5/10 baseline — +2 points, all 10 A-J ambiguities settled). The validator's 7 most actionable NEW findings are now fixed in SDK_SPEC.md. The lens_laws.py harness is now CI-runnable (bindings/python/sdk/run_lens_laws_ci.py) and passes for all 3 SDK Views AND for the externally-built GraphView — confirming RFC-0007's algebra is a real specification, not a tautology. RFC-0007 promoted from Draft to Accepted; the 6 View algebra laws are now release-blocking constraints (metric E1 of RFC-0009, target 0). Remaining NEW ambiguities from the validator's report are lower-severity (mostly "behavior described but implementation unspecified" — fixable in a future spec revision). The next Phase B iteration would target DX 9/10 by addressing those; the next major step is Phase D (compatibility: Arrow/DuckDB/Polars/Lance adapter Views) or Phase E (one flagship productionized). No kernel changes; no new packages; bindings/python/core still FROZEN at ~140 LOC.
 
 ---
 Task ID: 14
@@ -379,7 +379,7 @@ Task: Answer three user questions (multikey indexes, no-PK views, Liquid Cluster
 
 ## Work Log
 
-1. Inspected pond-sdk for Q1 (multikey indexes) and Q2 (no-PK views). Found: register_index takes extractor: Callable[[Any], str] (single-key only, no multi-valued support); put(key, data) requires a key (no auto-key mode). Documented both findings with recommendations.
+1. Inspected bindings/python/sdk for Q1 (multikey indexes) and Q2 (no-PK views). Found: register_index takes extractor: Callable[[Any], str] (single-key only, no multi-valued support); put(key, data) requires a key (no auto-key mode). Documented both findings with recommendations.
 2. Researched Databricks Liquid Clustering via web_search (8 results) + page_reader (Databricks official docs + Medium deep-dive). Key findings: (1) Hilbert curves instead of Z-order (better data locality), (2) incremental clustering via stable/unstable Z-cubes (low write amplification), (3) mutable cluster keys (metadata-only ALTER TABLE).
 3. Wrote docs/LIQUID_CLUSTERING_COMPARISON.md (~350 lines): full comparison of Pond vs Liquid Clustering. Conclusion: they solve DIFFERENT problems (Pond = storage algebra for multi-workload composition; LC = single-table layout optimizer for multi-column range queries). Pond is better at: multi-workload, point lookups, versioning, content addressing, backend independence. LC is better at: multi-column range queries, layout mutability without rewrite, incremental layout optimization, PB-scale production maturity. Pond can learn 3 lessons: (1) Hilbert-curve multi-dimensional clustering as a Layer 2 materialization, (2) "stable chunk" concept to reduce write amplification, (3) mutable cluster keys as commit-metadata. Pond should NOT learn: UUID file IDs (Pond's content-addressing is strictly better), tight runtime coupling (would break backend independence).
 4. Started Phase D: built pond-arrow/arrow_view.py (~540 LOC including tests). ArrowLens extends View, encodes pyarrow.Table as Arrow IPC bytes, decodes back. Provides put_row/get_row/scan/to_arrow/to_duckdb/to_polars/to_pandas. Index integration via create_arrow_index/find_by_arrow (simplified: O(N) for now, future work for O(log N)).
@@ -392,7 +392,7 @@ Task: Answer three user questions (multikey indexes, no-PK views, Liquid Cluster
 
 ## Stage Summary
 
-Three user questions answered: (Q1) multikey indexes not supported but design extension proposed (extractor returns str|list[str]); (Q2) Views require keys but auto-key mode is a viable SDK addition; (Q3) full Liquid Clustering comparison written — Pond and LC solve different problems, Pond can absorb LC's Hilbert-curve innovation as a Layer 2 materialization without inheriting LC's limitations. Phase D started: ArrowView built, 6/6 tests pass (including DuckDB + Polars interop on Pond data), all 6 RFC-0007 algebra laws pass via lens_laws.py harness. RFC-0010 Accepted. Pond now interoperates with the entire Arrow ecosystem (DuckDB, Polars, pandas, DataFusion, Lance) without those systems knowing Pond exists. This is the LTAP vision made concrete. No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). pond-arrow is removable (depends only on pond-sdk; lower layers unaffected). Next: Phase D continued (Lance, DuckDB-native, Polars-native adapters) or Phase E (one flagship productionized).
+Three user questions answered: (Q1) multikey indexes not supported but design extension proposed (extractor returns str|list[str]); (Q2) Views require keys but auto-key mode is a viable SDK addition; (Q3) full Liquid Clustering comparison written — Pond and LC solve different problems, Pond can absorb LC's Hilbert-curve innovation as a Layer 2 materialization without inheriting LC's limitations. Phase D started: ArrowView built, 6/6 tests pass (including DuckDB + Polars interop on Pond data), all 6 RFC-0007 algebra laws pass via lens_laws.py harness. RFC-0010 Accepted. Pond now interoperates with the entire Arrow ecosystem (DuckDB, Polars, pandas, DataFusion, Lance) without those systems knowing Pond exists. This is the LTAP vision made concrete. No kernel changes (bindings/python/core still FROZEN at ~140 LOC, 3 primitives). pond-arrow is removable (depends only on bindings/python/sdk; lower layers unaffected). Next: Phase D continued (Lance, DuckDB-native, Polars-native adapters) or Phase E (one flagship productionized).
 
 ---
 Task ID: 15
@@ -402,21 +402,21 @@ Task: Phase B.3 SDK polish — multikey indexes, auto-key mode, primary-keyless 
 ## Work Log
 
 1. Read user's architecture review guidance: (1) finish Phase D carefully by tightening SDK contract around multikey / auto-key / primary-keyless Views + cross-View semantics; (2) keep ArrowView as compatibility anchor, add only one more adapter if it teaches something new; (3) make CI/property-test story mandatory; (4) choose one flagship and push to production-quality. Strongest advice: do NOT let Liquid Clustering pull Pond into layout-tuning as a core concern; borrow the incremental adaptive-materialization idea but keep at View layer.
-2. Multikey indexes: extended `register_index` extractor signature in `pond-sdk/auto_index.py` from `Callable[[Any], str]` to `Callable[[Any], Union[str, list[str]]]`. Added `AutoIndex.extract_keys` static method that normalizes extractor return to `list[str]` (handles str, list, None, other). Updated `put` and `_rebuild_index` to call `extract_keys` and index the row under each returned key. Backward-compatible: single-string extractors still work unchanged. Verified with new multikey test: indexing docs by tags list, find_by returns correct row for each tag.
+2. Multikey indexes: extended `register_index` extractor signature in `bindings/python/sdk/auto_index.py` from `Callable[[Any], str]` to `Callable[[Any], Union[str, list[str]]]`. Added `AutoIndex.extract_keys` static method that normalizes extractor return to `list[str]` (handles str, list, None, other). Updated `put` and `_rebuild_index` to call `extract_keys` and index the row under each returned key. Backward-compatible: single-string extractors still work unchanged. Verified with new multikey test: indexing docs by tags list, find_by returns correct row for each tag.
 3. Fixed pre-existing bug in `find_by`: for EAGER indexes registered AFTER data was already committed, `tree_root` was None and `find_by` didn't trigger a rebuild (only LAZY mode did). Refactored: `if idx.tree_root is None: self._rebuild_index(idx)` runs for ALL modes now, then LAZY staleness check is layered on top. This also fixes the case where the user calls find_by before any commit.
 4. Auto-key mode: added `put_auto(data) -> str` to both `View` (lens_sdk.py) and `IndexedView` (auto_index.py). Generates a UUID4 hex key (32 chars, no dashes), calls `put(key, data)` internally, returns the key so caller can retrieve later. Imported `uuid` module. Documented collision probability (~10^-37 for 10^12 records).
 5. Primary-keyless Views: added `KeylessView` class to lens_sdk.py. Subclass of View that overrides `put` to require `key=None` (raises TypeError otherwise). Adds `put_many(rows)` for batch inserts. The class makes primary-keyless a first-class design choice, not a per-call decision.
 6. CrossView semantics: rewrote `CrossView` class with explicit class docstring documenting 5 rules: (1) source = HEAD of currently-checked-out branch, (2) tombstoned indexes are skipped, (3) zero-copy sharing (copies HASH not CONTENT), (4) no cross-View atomicity, (5) pipe is non-transactional (caller must commit). Added per-method docstrings.
 7. Updated SDK_SPEC.md: added 3 new entries to ambiguity table (K: multikey indexes §4.2.1, L: auto-key + primary-keyless §2.6, M: CrossView semantics §8.1). Wrote full sections for each: §2.6 has 4 subsections (put_auto, KeylessView, indexed lookups on keyless data, when-to-use table); §4.2.1 documents extractor return semantics with a 4-row table; §8.1 has 5 explicit semantics rules with code example.
-8. Updated `pond-sdk/lens_laws.py` Law 3 and Law 5 checks: now capture the key returned by `contract.put(key, data)` and use it for the subsequent `get`, falling back to the original key if returned_key is None or doesn't retrieve. This makes the harness work with auto-key Views (KeylessView) where the caller-supplied key is ignored.
-9. Added 2 new contracts to `pond-sdk/run_lens_laws_ci.py`: `make_multikey_view_contract` (IndexedView with list-returning extractor for tags + single-key extractor for id; sample data has tags list field) and `make_keyless_view_contract` (KeylessView with `keyless_put` adapter that calls `view.put(None, data)`). CI now runs 5 View contracts: Default, Indexed, Semantic, Multikey, Keyless.
+8. Updated `bindings/python/sdk/lens_laws.py` Law 3 and Law 5 checks: now capture the key returned by `contract.put(key, data)` and use it for the subsequent `get`, falling back to the original key if returned_key is None or doesn't retrieve. This makes the harness work with auto-key Views (KeylessView) where the caller-supplied key is ignored.
+9. Added 2 new contracts to `bindings/python/sdk/run_lens_laws_ci.py`: `make_multikey_view_contract` (IndexedView with list-returning extractor for tags + single-key extractor for id; sample data has tags list field) and `make_keyless_view_contract` (KeylessView with `keyless_put` adapter that calls `view.put(None, data)`). CI now runs 5 View contracts: Default, Indexed, Semantic, Multikey, Keyless.
 10. Verified ALL 5 View contracts pass all 6 RFC-0007 algebra laws. Verified ArrowView and external GraphView still pass (no regressions from lens_laws.py changes). Verified maintenance.py tombstone tests still pass. Verified auto_index.py and lens_sdk.py existing tests still pass.
 11. Created `.github/workflows/view-laws.yml`: GitHub Actions workflow that runs on every push/PR to main. Installs pyarrow/duckdb/polars. Runs 6 test commands: run_lens_laws_ci.py (5 SDK Views), run_arrow_lens_laws.py (ArrowView), run_graph_lens_laws.py (external GraphView), arrow_view.py (functional tests), maintenance.py (tombstone tests). Makes RFC-0007 compliance MANDATORY — any violation blocks merge.
 12. Appended this worklog entry.
 
 ## Stage Summary
 
-Phase B.3 SDK polish complete. All 4 user-identified gaps addressed: (1) multikey indexes now support list-returning extractors (one row -> many index keys, for tags/categories/list-fields); (2) auto-key mode via put_auto() generates UUID4 keys; (3) primary-keyless Views are first-class via KeylessView class; (4) CrossView read/write semantics are explicit (5 rules: HEAD-source, tombstone-skip, zero-copy, no-cross-View-atomicity, non-transactional-pipe). All changes are Layer 2 SDK additions — NO kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). SDK_SPEC.md now settles 13 ambiguities (A-M). CI is mandatory via .github/workflows/view-laws.yml — runs 5 SDK Views + ArrowView + external GraphView + functional + tombstone tests on every push/PR. Per user's guidance, did NOT add more adapters (ArrowView remains the single Phase D adapter for now) and did NOT pull Liquid Clustering into layout-tuning as a core concern (kept its lesson narrowly at materialization layer per docs/LIQUID_CLUSTERING_COMPARISON.md). Next: per user's sequencing, choose ONE flagship application and push to production-quality (Phase E).
+Phase B.3 SDK polish complete. All 4 user-identified gaps addressed: (1) multikey indexes now support list-returning extractors (one row -> many index keys, for tags/categories/list-fields); (2) auto-key mode via put_auto() generates UUID4 keys; (3) primary-keyless Views are first-class via KeylessView class; (4) CrossView read/write semantics are explicit (5 rules: HEAD-source, tombstone-skip, zero-copy, no-cross-View-atomicity, non-transactional-pipe). All changes are Layer 2 SDK additions — NO kernel changes (bindings/python/core still FROZEN at ~140 LOC, 3 primitives). SDK_SPEC.md now settles 13 ambiguities (A-M). CI is mandatory via .github/workflows/view-laws.yml — runs 5 SDK Views + ArrowView + external GraphView + functional + tombstone tests on every push/PR. Per user's guidance, did NOT add more adapters (ArrowView remains the single Phase D adapter for now) and did NOT pull Liquid Clustering into layout-tuning as a core concern (kept its lesson narrowly at materialization layer per docs/LIQUID_CLUSTERING_COMPARISON.md). Next: per user's sequencing, choose ONE flagship application and push to production-quality (Phase E).
 
 ---
 Task ID: 16
@@ -430,7 +430,7 @@ Task: Phase B.4 SDK hardening + Phase E flagship (Feature Store to production qu
    - §2.6.1 put_auto: added 5 hardening notes (key format fixed, per-View uniqueness, no commit, not thread-safe, returns primary key not blob hash).
    - §4.2.1 multikey: added 6 hardening notes (order preserved but irrelevant, dedup, last-writer-wins for find_by, extractor exceptions propagate, extractor called once per rebuild, receives decoded data).
    - §8.1 CrossView: added 6 hardening notes (pipe iterates arbitrary order, pipe not atomic vs source, share_blob doesn't verify blob existence, no transaction log, write_to no conflict check, not thread-safe).
-3. Audited existing pond-feature-store/feature_store.py (369 LOC). Found: path bug (../../prototype should be ../pond-core), stale OssieSemanticView reference, duplicate file in applications/feature_store/. Fixed all three.
+3. Audited existing pond-feature-store/feature_store.py (369 LOC). Found: path bug (../../prototype should be ../bindings/python/core), stale OssieSemanticView reference, duplicate file in applications/feature_store/. Fixed all three.
 4. Identified 10 production gaps in the existing Feature Store: no schema validation, no error handling, O(N) get_feature_value fallback, no batch online serving, no feature versioning, no entity registry, no point-in-time JOIN (THE killer ML feature), O(N) get_freshness, no CLI tests, no persistence test.
 5. Rewrote pond-feature-store/feature_store.py to production quality (~600 LOC). New features:
    - Schema validation: write_feature_value validates value against feature's declared type (int/float/string/bool/vector/any/json). Rejects type-mismatched writes with ValueError. Prevents corrupt data from breaking downstream ML models.
@@ -450,7 +450,7 @@ Task: Phase B.4 SDK hardening + Phase E flagship (Feature Store to production qu
 
 ## Stage Summary
 
-Phase B.4 (SDK hardening) + Phase E (Feature Store flagship) complete. SDK_SPEC.md now has 17 hardening notes across put_auto (5), multikey (6), and CrossView (6) — future agents cannot reintroduce ambiguity. Feature Store is now production-quality: schema validation prevents corrupt data, feature versioning enables reproducible ML, point-in-time JOIN prevents label leakage (THE killer feature), batch online serving is 500x faster than naive, O(1) freshness via cache, and data survives process restart. All 7 production test sections pass. RFC-0011 Accepted. No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). pond-feature-store is removable (depends only on pond-sdk). Per user's sequencing, did NOT add more adapters and did NOT revisit replication. Next (per user's step 4): only after the flagship stabilizes, add one more external adapter OR revisit deeper replication work.
+Phase B.4 (SDK hardening) + Phase E (Feature Store flagship) complete. SDK_SPEC.md now has 17 hardening notes across put_auto (5), multikey (6), and CrossView (6) — future agents cannot reintroduce ambiguity. Feature Store is now production-quality: schema validation prevents corrupt data, feature versioning enables reproducible ML, point-in-time JOIN prevents label leakage (THE killer feature), batch online serving is 500x faster than naive, O(1) freshness via cache, and data survives process restart. All 7 production test sections pass. RFC-0011 Accepted. No kernel changes (bindings/python/core still FROZEN at ~140 LOC, 3 primitives). pond-feature-store is removable (depends only on bindings/python/sdk). Per user's sequencing, did NOT add more adapters and did NOT revisit replication. Next (per user's step 4): only after the flagship stabilizes, add one more external adapter OR revisit deeper replication work.
 
 ---
 Task ID: 17
@@ -488,8 +488,8 @@ Agent: general-purpose (external user validation)
 Task: External user validation of the Pond Feature Store — built a Customer Analytics Dashboard end-to-end (200 customers, 8 features, point-in-time training set, online + batch serving, ArrowView->DuckDB SQL analytics, restart test).
 
 Work Log:
-- Read DESIGN_GOALS.md, SDK_SPEC.md (1096 lines), pond-core/pond_minimal.py (~140 LOC), pond-feature-store/feature_store.py (~1047 LOC incl. tests), docs/FEATURE_STORE_USE_CASE.md, and the worklog's last ~200 lines for context. Did NOT read e2e_workflow.py, cli.py, other Layer 3 Views, or Task 12 validation reports (per the task constraints — avoiding bias).
-- Read pond-sdk/lens_sdk.py (View, KeylessView, CrossView, SemanticView — ~726 LOC) and pond-sdk/auto_index.py (IndexedView, AutoIndex — ~605 LOC) to understand the API surface the FeatureStore inherits. Read pond-arrow/arrow_view.py (ArrowView — ~642 LOC) for the DuckDB integration path.
+- Read DESIGN_GOALS.md, SDK_SPEC.md (1096 lines), bindings/python/core/pond_minimal.py (~140 LOC), pond-feature-store/feature_store.py (~1047 LOC incl. tests), docs/FEATURE_STORE_USE_CASE.md, and the worklog's last ~200 lines for context. Did NOT read e2e_workflow.py, cli.py, other Layer 3 Views, or Task 12 validation reports (per the task constraints — avoiding bias).
+- Read bindings/python/sdk/lens_sdk.py (View, KeylessView, CrossView, SemanticView — ~726 LOC) and bindings/python/sdk/auto_index.py (IndexedView, AutoIndex — ~605 LOC) to understand the API surface the FeatureStore inherits. Read pond-arrow/arrow_view.py (ArrowView — ~642 LOC) for the DuckDB integration path.
 - Built /home/z/my-project/pond_repo/validation/customer_analytics_app.py (~440 LOC) from scratch using only Pond kernel + SDK + FeatureStore + ArrowView + stdlib. The app: (1) generates 200 synthetic customers with customer_id/signup_date/region/plan/lifetime_value/churn_risk_score; (2) ingests them as a source View; (3) defines 8 features (5 raw: customer_ltv, customer_churn_risk, customer_region, customer_plan_tier, customer_tenure_days; 3 derived: is_high_value, is_at_risk, region_avg_ltv); (4) writes 1600 feature values in one batch commit; (5) builds a 50-row churn training set via get_training_dataset (point-in-time JOIN, no label leakage — verified); (6) does online lookup for one customer; (7) builds a 200x8 batch dashboard via get_feature_matrix; (8) loads the matrix into ArrowView and runs 3 DuckDB SQL queries (region GROUP BY, at-risk high-value filter, plan tier distribution); (9) closes the kernel, reopens, verifies all 8 features + entity type + point-in-time JOIN survive restart.
 - Ran the app end-to-end successfully. All 8 sections complete. Restart test PASS. Region GROUP BY returns correct averages (NA=$604.73, EU=$444.78, APAC=$619.95, LATAM=$663.04). Point-in-time JOIN returns 50 rows with 0 missing features. Pseudo-model signal: avg churn_risk for churned=0.553 vs clean=0.357 (correct direction).
 - Probed the by_entity index behavior with a dedicated perf script: 1 feature/entity = 0.194 ms/lookup; 8 features/entity looking up first-written feature = 1.483 ms/lookup (8x slower); 8 features/entity looking up last-written feature = 0.759 ms/lookup. Confirmed the by_entity index returns LAST-WRITTEN record per entity_id (per SDK_SPEC §4.2.1 hardening note 3), so any multi-feature workload falls through to O(N) scan in get_feature_value. This contradicts the documented 4.5ms / O(log N) claim in FEATURE_STORE_USE_CASE.md §6.
@@ -542,7 +542,7 @@ Task: Acknowledge Phase F roadmap shift (features -> evidence) + implement elega
 
 1. Read user's extensive architecture review. Key message: the project has shifted from "can Pond do this?" to "does Pond still feel elegant doing this?" The next phase is EVIDENCE, not features. Six evidence gaps identified: scale, long-lived history, multiple simultaneous materializations, failure modes, independent implementations, Derived Structure calculus. Concrete ask: "more direct, easy, simple and elegant way of reading data from other views" so future execution engines can access data seamlessly.
 2. Updated DESIGN_GOALS.md §8 with Phase F (Evidence, not features) as the CURRENT phase. Documented the 6 evidence gaps and what's explicitly NOT in Phase F (no new domain packages, no new SDK surface unless validation exposes a gap, no Raft). Marked Phase E (Feature Store) as COMPLETE.
-3. Built pond-sdk/lens_query.py (~200 LOC): ViewQuery class — a lazy, composable query API for Lenses. Makes a Lens feel like a collection:
+3. Built bindings/python/sdk/lens_query.py (~200 LOC): ViewQuery class — a lazy, composable query API for Lenses. Makes a Lens feel like a collection:
    - __iter__: for row in view (yields decoded rows, not keys)
    - __len__: len(view) == view.count()
    - __contains__: key in view == view.exists(key)
@@ -554,7 +554,7 @@ Task: Acknowledge Phase F roadmap shift (features -> evidence) + implement elega
    - count(), first(), take(n): terminal operations
    - JoinedQuery: result of join, supports further chaining
 4. Wired ViewQuery into View class (lens_sdk.py): added __iter__, __len__, __contains__, where, select, map, join methods. These are thin wrappers that return ViewQuery(self).where(...) etc. No kernel changes, no new abstractions — just making the existing View feel like a collection.
-5. Wrote pond-sdk/test_lens_query.py (~300 LOC, 7 tests): basic iteration, where filter (kwargs + predicate + chain), select projection, map transform, cross-view JOIN (LEFT JOIN semantics, merge, chain), laziness (no eval until iterate, first stops early), elegant pattern (join + where + map + collect in 5 lines). All 7 tests pass.
+5. Wrote bindings/python/sdk/test_lens_query.py (~300 LOC, 7 tests): basic iteration, where filter (kwargs + predicate + chain), select projection, map transform, cross-view JOIN (LEFT JOIN semantics, merge, chain), laziness (no eval until iterate, first stops early), elegant pattern (join + where + map + collect in 5 lines). All 7 tests pass.
 6. Verified all existing tests still pass: lens_laws CI (5 Views, 6 algebra laws), ArrowView (7 tests), Feature Store production tests, e2e workflow (12 steps). The __iter__ addition to View doesn't break anything.
 7. Updated GETTING_STARTED.md with a new "Elegant cross-view reading (ViewQuery)" section showing the full pattern: iteration, len/in, where (kwargs + predicate), select, map, join, chain, collect. Explained why the laziness matters for future execution engines.
 8. Added test_lens_query.py to CI workflow (.github/workflows/view-laws.yml). CI now runs 9 test commands.
@@ -562,7 +562,7 @@ Task: Acknowledge Phase F roadmap shift (features -> evidence) + implement elega
 
 ## Stage Summary
 
-Phase F roadmap shift documented in DESIGN_GOALS.md. The elegant cross-view reading API (ViewQuery) is the concrete ask from the user's review. It makes a Lens feel like a collection: `for row in view`, `view.where(region="US")`, `orders.join(customers, on="customer_id")`. The query is LAZY — nothing runs until you iterate or collect — which is designed for future execution engines (SQL, Polars, DataFusion) to push down filters and projections to the kernel level. All 7 ViewQuery tests pass. All existing tests pass (no regressions from __iter__/__len__/__contains__ on View). No kernel changes (pond-core still FROZEN). No new domain packages. No new RFC. This is a polish of existing surface, not a new feature — it makes the Lens the user already has feel like the collection it always should have been. Per the user's roadmap: next is evidence experiments (scale, history, multi-materialization, failure modes, independent implementations, Derived Structure calculus), NOT more features.
+Phase F roadmap shift documented in DESIGN_GOALS.md. The elegant cross-view reading API (ViewQuery) is the concrete ask from the user's review. It makes a Lens feel like a collection: `for row in view`, `view.where(region="US")`, `orders.join(customers, on="customer_id")`. The query is LAZY — nothing runs until you iterate or collect — which is designed for future execution engines (SQL, Polars, DataFusion) to push down filters and projections to the kernel level. All 7 ViewQuery tests pass. All existing tests pass (no regressions from __iter__/__len__/__contains__ on View). No kernel changes (bindings/python/core still FROZEN). No new domain packages. No new RFC. This is a polish of existing surface, not a new feature — it makes the Lens the user already has feel like the collection it always should have been. Per the user's roadmap: next is evidence experiments (scale, history, multi-materialization, failure modes, independent implementations, Derived Structure calculus), NOT more features.
 
 ---
 Task ID: 21
@@ -572,7 +572,7 @@ Task: SharedDataset + NativeView — the "data is just bytes, Views are lenses" 
 ## Work Log
 
 1. Read user's vision: data should be like a Linux filesystem — bytes are just bytes, Views are readers that interpret them differently. No copying, no translation. A manifest (sidecar file) tracks which Views are enabled. Test with DuckDB, Polars, etc.
-2. Built pond-sdk/shared_dataset.py (~450 LOC including tests):
+2. Built bindings/python/sdk/shared_dataset.py (~450 LOC including tests):
    - SharedDataset: a named collection of Arrow IPC bytes in the kernel with a commit DAG and a manifest. Extends View (inherits branching, history, etc.). Data is stored as Arrow IPC — the canonical format that DuckDB, Polars, DataFusion, pandas all read natively (zero-copy).
    - NativeView: abstract thin reader. Subclasses: ArrowNativeView (raw Arrow Table), DuckDBView (SQL via DuckDB), PolarsView (OLAP via Polars), PandasView (pandas DataFrame), DataFusionView (DataFusion SQL). Each reads the SAME Arrow bytes and presents them differently.
    - Manifest system: enable_view/disable_view/list_enabled_views/is_view_enabled. The manifest is a small JSON blob stored alongside the data (like a sidecar file in a Linux directory). Tracks which Views are enabled with versions and metadata.
@@ -590,7 +590,7 @@ Task: SharedDataset + NativeView — the "data is just bytes, Views are lenses" 
 
 ## Stage Summary
 
-The "data is just bytes, Views are lenses" pattern is now implemented. A SharedDataset stores data as Arrow IPC (canonical format). Multiple NativeView readers (DuckDB, Polars, pandas, Arrow, DataFusion) read the SAME bytes and present them differently — zero copying, zero translation, zero duplication. A manifest (sidecar file) tracks which Views are enabled, with versions and schemas. This is the Linux filesystem analogy the user described: bytes are bytes, readers interpret them. Key test result: write 4 orders once, read via DuckDB (SQL GROUP BY), Polars (filter + sum), pandas (filter), and Arrow (raw) — all see total=650.0 from the same bytes. This aligns with all 6 design goals: Simple (one shared dataset, thin readers), Powerful (same data, many interpretations), Performant (zero-copy Arrow), Scalable (readers are independent), Efficient (one copy of bytes), Beautiful (Linux filesystem analogy). No kernel changes (pond-core still FROZEN). This is the architectural pattern the user asked for — future execution engines (DuckDB, DataFusion, Polars) can plug into Pond data natively, reading the shared Arrow bytes without any Pond-specific translation layer.
+The "data is just bytes, Views are lenses" pattern is now implemented. A SharedDataset stores data as Arrow IPC (canonical format). Multiple NativeView readers (DuckDB, Polars, pandas, Arrow, DataFusion) read the SAME bytes and present them differently — zero copying, zero translation, zero duplication. A manifest (sidecar file) tracks which Views are enabled, with versions and schemas. This is the Linux filesystem analogy the user described: bytes are bytes, readers interpret them. Key test result: write 4 orders once, read via DuckDB (SQL GROUP BY), Polars (filter + sum), pandas (filter), and Arrow (raw) — all see total=650.0 from the same bytes. This aligns with all 6 design goals: Simple (one shared dataset, thin readers), Powerful (same data, many interpretations), Performant (zero-copy Arrow), Scalable (readers are independent), Efficient (one copy of bytes), Beautiful (Linux filesystem analogy). No kernel changes (bindings/python/core still FROZEN). This is the architectural pattern the user asked for — future execution engines (DuckDB, DataFusion, Polars) can plug into Pond data natively, reading the shared Arrow bytes without any Pond-specific translation layer.
 
 ---
 Task ID: 22
@@ -600,8 +600,8 @@ Task: Correct the shared-data pattern — remove SharedDataset (Arrow-specific +
 ## Work Log
 
 1. Read user's correction: the SharedDataset/NativeView approach was wrong. (a) It stored Arrow IPC bytes — that's format-aware storage. The kernel shouldn't know about Arrow. (b) It had a manifest with enable_view metadata — that's exactly the overhead the user said to avoid (like Apache XTable / Delta Uniform). The user wants: the existing Pond kernel already stores raw bytes. Multiple Views (Git, SQL, Notebook, FeatureStore) should share the same underlying data by reading/writing the same Prolly tree. Each View is just a translation layer (encode/decode). No metadata. No manifest. No overhead. One write → all Lenses see it.
-2. Removed pond-sdk/shared_dataset.py (the wrong approach). Updated CI workflow to replace it.
-3. Built pond-sdk/test_shared_views.py (~350 LOC, 6 tests): the correct pattern. Multiple View subclasses (JsonView, RawView, TextView, CsvView) all with the same Lens name "shared" — they share the same Prolly tree. Each has its own encode/decode. The bytes are format-agnostic (the kernel doesn't know what format they're in).
+2. Removed bindings/python/sdk/shared_dataset.py (the wrong approach). Updated CI workflow to replace it.
+3. Built bindings/python/sdk/test_shared_views.py (~350 LOC, 6 tests): the correct pattern. Multiple View subclasses (JsonView, RawView, TextView, CsvView) all with the same Lens name "shared" — they share the same Prolly tree. Each has its own encode/decode. The bytes are format-agnostic (the kernel doesn't know what format they're in).
 4. Tests:
    - test_shared_data_one_write_all_read: THE KEY TEST. JsonView writes {"name":"Alice","age":30} as JSON bytes. RawView reads those same bytes as raw bytes. TextView reads them as UTF-8 text. JsonView reads them as a dict. All read the SAME underlying blob — just interpreted differently. Zero overhead.
    - test_write_via_different_views: JsonView, RawView, TextView each write different keys. All share the same HEAD. Any View can list all keys and read any key (via get_raw if the decoder doesn't match).
@@ -628,7 +628,7 @@ Task: The Lens Architecture — rename "View" to "Lens", answer the milestone re
    (a) The kernel owns only Bytes, History, Names. Everything above is "a way of interpreting those bytes" — not owning, copying, or converting.
    (b) "View" is the wrong name — conflates with SQL VIEW, Materialized View, etc. The user's preferred rename: "Lens" — different ways of seeing the same data.
    (c) The open research question: can multiple independent domain lenses operate over the same byte graph without metadata duplication? Three options: A (each owns encoding), B (canonical IR), C (intentional overlap). User wants this answered conclusively.
-2. Added "Lens" as an alias for "View" in pond-sdk/lens_sdk.py. Backward compatible: `from lens_sdk import Lens` works, `from lens_sdk import View` still works. Also added KeylessLens, SemanticLens aliases. Documented the rename rationale in a header comment.
+2. Added "Lens" as an alias for "View" in bindings/python/sdk/lens_sdk.py. Backward compatible: `from lens_sdk import Lens` works, `from lens_sdk import View` still works. Also added KeylessLens, SemanticLens aliases. Documented the rename rationale in a header comment.
 3. Wrote RFC-0012: The Lens Architecture (~250 lines). Covers:
    - §1: The clarification (kernel owns Bytes/History/Names; everything else is interpretation)
    - §2: The rename ("View" → "Lens"; implementation via aliases)
@@ -637,7 +637,7 @@ Task: The Lens Architecture — rename "View" to "Lens", answer the milestone re
    - §5: The milestone question answered (YES — proven by test_lens_architecture.py)
    - §6: Relationship to other RFCs
    - §7: What this means for the roadmap
-4. Built pond-sdk/test_lens_architecture.py (~350 LOC, 5 tests):
+4. Built bindings/python/sdk/test_lens_architecture.py (~350 LOC, 5 tests):
    - test_three_lenses_same_byte_graph: THE MILESTONE TEST. SqlLens, GitLens, NotebookLens all share the same byte graph (same Lens name "workspace"). Each writes its own encoding (JSON rows, Git tree format, notebook JSON). All see the same 5 keys. Each reads its own data correctly. Can't read each other's data (different encodings). BUT raw bytes are intact (get_raw works for any lens). Emergent overlap: NotebookLens reads SQL data (both use JSON — not designed, just emergent).
    - test_no_metadata_duplication: 7 blobs total. NO manifest, NO enable_view, NO sidecar. The anti-XTable / anti-Delta-Uniform property.
    - test_shared_history_and_branching: SQL branch visible to Git. Git commit visible to SQL. Same commit DAG.
@@ -649,7 +649,7 @@ Task: The Lens Architecture — rename "View" to "Lens", answer the milestone re
 
 ## Stage Summary
 
-The Lens Architecture is Pond's defining architectural contribution. The kernel owns only Bytes, History, Names — everything above is a Lens (interpretation layer). Multiple domain lenses (SQL, Git, Notebook, FeatureStore) share the same immutable byte graph without metadata duplication, without translation writes, while preserving their own semantics. The milestone question is answered: YES. The proof is in test_lens_architecture.py: 3 lenses, 5 keys, 7 blobs, zero metadata. Emergent overlap: lenses with matching encodings (e.g., both JSON) can read each other's data for free — not designed, just a consequence of encoding choice. This is like Linux: the filesystem stores bytes; applications interpret them. "View" renamed to "Lens" via backward-compatible aliases. RFC-0012 drafted. No kernel changes (pond-core still FROZEN at ~140 LOC, 3 primitives). This is NOT Raft, NOT another adapter, NOT a new feature — it's the architectural clarification that makes Pond fundamentally different from other storage systems.
+The Lens Architecture is Pond's defining architectural contribution. The kernel owns only Bytes, History, Names — everything above is a Lens (interpretation layer). Multiple domain lenses (SQL, Git, Notebook, FeatureStore) share the same immutable byte graph without metadata duplication, without translation writes, while preserving their own semantics. The milestone question is answered: YES. The proof is in test_lens_architecture.py: 3 lenses, 5 keys, 7 blobs, zero metadata. Emergent overlap: lenses with matching encodings (e.g., both JSON) can read each other's data for free — not designed, just a consequence of encoding choice. This is like Linux: the filesystem stores bytes; applications interpret them. "View" renamed to "Lens" via backward-compatible aliases. RFC-0012 drafted. No kernel changes (bindings/python/core still FROZEN at ~140 LOC, 3 primitives). This is NOT Raft, NOT another adapter, NOT a new feature — it's the architectural clarification that makes Pond fundamentally different from other storage systems.
 
 ---
 Task ID: 24
@@ -659,14 +659,14 @@ Task: TypedBlob middle layer — any lens can read any blob, cross-lens indexing
 ## Work Log
 
 1. Read user's ask: (a) any lens should be able to read data from any other lens, even if encoding is "weird" — can consume and transform later; (b) consider how derives (indexes) position in multi-lens env; (c) writes/reads/branching should be fully bidirectional from any lens. "Maybe Option B like thing works. Or some other middle layer between kernel and lens."
-2. Built pond-sdk/typed_blob.py (~350 LOC): the middle layer.
+2. Built bindings/python/sdk/typed_blob.py (~350 LOC): the middle layer.
    - TypedBlob envelope: [1B codec_id][4B payload_len][payload]. 5 bytes overhead per blob. The kernel stores this as raw bytes — the kernel doesn't interpret the envelope.
    - CodecRegistry: global registry mapping codec_id → (encode, decode). Registers 5 built-in codecs at import time: raw(0), json(1), git_tree(2), notebook(3), csv(5). User-defined codecs can be registered for IDs 100-255.
    - TypedLens: a Lens that uses the TypedBlob envelope. Writing: encodes via the lens's codec, wraps in envelope. Reading: unwraps envelope, decodes via the registered codec (ANY registered codec, not just the lens's own). If codec isn't registered, returns raw payload bytes.
    - TypedIndex: a cross-lens index. The extractor receives DECODED payloads regardless of which lens wrote them. The middle layer decodes based on codec_id. Can index across all blobs in the shared byte graph.
    - get_typed(): any lens can inspect any blob's codec metadata (codec_id, codec_name, decoded, value).
 3. KEY RESULT: the behavior is BETTER than what was asked for. The user asked for "read even if weird, can transform later." The TypedBlob envelope actually gives fully decoded values — because the codec_id in the envelope tells the registry which codec to use, and the registry knows ALL registered codecs. So Git lens reading a JSON blob gets the decoded dict, not raw bytes. Any lens gets any blob's decoded value.
-4. Built pond-sdk/test_typed_blob.py (5 tests, all pass):
+4. Built bindings/python/sdk/test_typed_blob.py (5 tests, all pass):
    - test_any_lens_reads_any_blob: SQL writes JSON, Git writes git_tree. All 3 lenses (SQL, Git, Notebook) read ALL blobs and get decoded dicts. Git transforms SQL data into Git tree (consume + transform).
    - test_cross_lens_index: index built across JSON blobs (SQL) and Git blobs. Extractor receives decoded dicts for JSON, skips Git blobs (extractor returns None for non-dict payloads).
    - test_bidirectional_branching: SQL creates branch, Git and Notebook see it. Git commits on branch, SQL sees it. SQL commits on branch, Notebook sees it. All share same commit DAG.
@@ -679,7 +679,7 @@ Task: TypedBlob middle layer — any lens can read any blob, cross-lens indexing
 
 ## Stage Summary
 
-The TypedBlob middle layer is built. Any lens can read any blob in the shared byte graph and get the fully decoded value — because the envelope carries a codec_id and the CodecRegistry knows how to decode all registered codecs. This is better than "get raw bytes and transform later" — the middle layer decodes for you. Cross-lens indexing works (the extractor receives decoded payloads regardless of which lens wrote them). Bidirectional branching works (any lens branches, all see it, shared commit DAG). Minimal overhead (5 bytes per blob envelope). NO manifest, NO enable_view, NO per-lens metadata. The "enablement" is in the codec registry (code), not in the data. This answers the user's ask: Option B-like middle layer, with derives (indexes) positioned as cross-lens materializations, and full bidirectionality. No kernel changes (pond-core still FROZEN).
+The TypedBlob middle layer is built. Any lens can read any blob in the shared byte graph and get the fully decoded value — because the envelope carries a codec_id and the CodecRegistry knows how to decode all registered codecs. This is better than "get raw bytes and transform later" — the middle layer decodes for you. Cross-lens indexing works (the extractor receives decoded payloads regardless of which lens wrote them). Bidirectional branching works (any lens branches, all see it, shared commit DAG). Minimal overhead (5 bytes per blob envelope). NO manifest, NO enable_view, NO per-lens metadata. The "enablement" is in the codec registry (code), not in the data. This answers the user's ask: Option B-like middle layer, with derives (indexes) positioned as cross-lens materializations, and full bidirectionality. No kernel changes (bindings/python/core still FROZEN).
 
 ---
 Task ID: 25
@@ -689,7 +689,7 @@ Task: Resolver comparison — three competing prototypes for the interpretation 
 ## Work Log
 
 1. Read user's STRONG pushback on TypedBlob (scored 4/10). Key concerns: (a) TypedBlob makes the kernel store "typed bytes" not "bytes"; (b) it creates hidden coupling via CodecRegistry; (c) it drifts from "kernel owns only Bytes, History, Names"; (d) the codec belongs to the LENS, not the bytes. User's ask: build three competing prototypes, score them against 6 criteria, let experiments decide. Do NOT merge any into core.
-2. Marked pond-sdk/typed_blob.py as EXPERIMENTAL (not part of core architecture). Added warning header pointing to the comparison document.
+2. Marked bindings/python/sdk/typed_blob.py as EXPERIMENTAL (not part of core architecture). Added warning header pointing to the comparison document.
 3. Built three prototypes in experiments/resolver_comparison/:
    - prototype1_context.py: Context-based interpretation. NO metadata in blobs. The key prefix (sql/, git/, nb/) provides the context. Like Git: Git knows it's asking for a blob/tree/commit from context, not from the object. The resolver uses the key prefix to determine which codec to use. Kernel stores pure bytes.
    - prototype2_envelope.py: Minimal envelope (current TypedBlob approach). 5-byte envelope [codec_id][payload_len][payload]. CodecRegistry decodes via codec_id. Kept for comparison.
@@ -745,8 +745,8 @@ Agent: general-purpose (external implementation challenge)
 Task: Implement LogLens from the Lens Interpretation Contract alone — no access to existing Lens implementations.
 
 Work Log:
-- Read worklog tail (~100 lines) for context. Read the 4 permitted documents: RFC-0013 (Lens Interpretation Contract), RFC-0012 (Lens Architecture), pond-core/pond_minimal.py (the 3-primitive kernel), DESIGN_GOALS.md.
-- Consulted pond-sdk/lens_sdk.py ONLY to locate the `Lens` base class (alias for `View` at line 832). Did NOT read any domain Lens implementation (sql_view.py, arrow_view.py, feature_store.py, pond_git.py, notebook.py, etc.), did NOT read falsification_context.py, did NOT read typed_blob.py, did NOT read any test file.
+- Read worklog tail (~100 lines) for context. Read the 4 permitted documents: RFC-0013 (Lens Interpretation Contract), RFC-0012 (Lens Architecture), bindings/python/core/pond_minimal.py (the 3-primitive kernel), DESIGN_GOALS.md.
+- Consulted bindings/python/sdk/lens_sdk.py ONLY to locate the `Lens` base class (alias for `View` at line 832). Did NOT read any domain Lens implementation (sql_view.py, arrow_view.py, feature_store.py, pond_git.py, notebook.py, etc.), did NOT read falsification_context.py, did NOT read typed_blob.py, did NOT read any test file.
 - Implemented in validation/log_lens_external.py (~336 non-blank LOC including tests):
   - ContextResolver (37 LOC): implements RFC-0013 §8 interface (register, encode_for_key, decode_for_key). Longest-prefix match. Fallback to raw bytes on decode (§5).
   - ContextLens (30 LOC): the generic Resolver-backed Lens. Overrides put/get/get_raw to delegate encode/decode to the resolver, keyed by the FULL key (caller supplies prefix). Inherits branch/checkout/list_branches/undo/commit/history from the Lens base class.
@@ -803,7 +803,7 @@ Task: Phase G Correctness — fix the two scale bugs (data loss + index rebuild 
    - Scale (100K records): count = 100,000 (was 4,080). Point lookup k050000 → user_50000 (was None). ✓
    - Multi-materialization (10K records, 3 indexes): ALL 3 index lookups succeed (was UnicodeDecodeError). ✓
 
-6. Built Architecture Invariants test suite (pond-sdk/test_invariants.py, 7 invariants):
+6. Built Architecture Invariants test suite (bindings/python/sdk/test_invariants.py, 7 invariants):
    - Invariant 1: Every committed key is reachable after restart.
    - Invariant 2: Branch checkout never changes blob hashes.
    - Invariant 3: Lens interpretation never changes stored bytes.
@@ -863,21 +863,21 @@ Task: Full repo reorganization — one-page POND.md, rename view_* to lens_*, mo
 
 2. Full repo audit. Identified:
    - 20 files importing from lens_sdk (needs rename to lens_sdk)
-   - Deprecated typed_blob.py + test_typed_blob.py in pond-sdk/ (should move to experiments/)
+   - Deprecated typed_blob.py + test_typed_blob.py in bindings/python/sdk/ (should move to experiments/)
    - Docs using VIEW_ prefix (should be LENS_)
    - Stale directories (prototype/, libraries/, destruction/, engineering/, applications/)
 
 3. File renames (git mv):
-   - pond-sdk/lens_sdk.py → pond-sdk/lens_sdk.py
-   - pond-sdk/lens_laws.py → pond-sdk/lens_laws.py
-   - pond-sdk/lens_query.py → pond-sdk/lens_query.py
-   - pond-sdk/run_lens_laws_ci.py → pond-sdk/run_lens_laws_ci.py
-   - pond-sdk/test_lens_query.py → pond-sdk/test_lens_query.py
-   - pond-sdk/test_shared_views.py → pond-sdk/test_shared_lenses.py
+   - bindings/python/sdk/lens_sdk.py → bindings/python/sdk/lens_sdk.py
+   - bindings/python/sdk/lens_laws.py → bindings/python/sdk/lens_laws.py
+   - bindings/python/sdk/lens_query.py → bindings/python/sdk/lens_query.py
+   - bindings/python/sdk/run_lens_laws_ci.py → bindings/python/sdk/run_lens_laws_ci.py
+   - bindings/python/sdk/test_lens_query.py → bindings/python/sdk/test_lens_query.py
+   - bindings/python/sdk/test_shared_views.py → bindings/python/sdk/test_shared_lenses.py
 
 4. Moved deprecated files:
-   - pond-sdk/typed_blob.py → experiments/resolver_comparison/typed_blob.py
-   - pond-sdk/test_typed_blob.py → experiments/resolver_comparison/test_typed_blob.py
+   - bindings/python/sdk/typed_blob.py → experiments/resolver_comparison/typed_blob.py
+   - bindings/python/sdk/test_typed_blob.py → experiments/resolver_comparison/test_typed_blob.py
 
 5. Renamed docs:
    - docs/VIEW_AUTHORS_GUIDE.md → docs/LENS_AUTHORS_GUIDE.md
@@ -912,7 +912,7 @@ Task: Dataset layer + differential testing (Phase G).
 
 ## Work Log
 
-1. Built pond-sdk/dataset.py (~350 LOC): the Dataset layer between Kernel and Lens. A Dataset is a named object with metadata (type, source_lens, description, is_materialized, source_dataset, materialization_type). Metadata is ONE small blob per dataset (stored as a kernel Name "{name}__meta"), NOT per record. The blob bytes stay pure.
+1. Built bindings/python/sdk/dataset.py (~350 LOC): the Dataset layer between Kernel and Lens. A Dataset is a named object with metadata (type, source_lens, description, is_materialized, source_dataset, materialization_type). Metadata is ONE small blob per dataset (stored as a kernel Name "{name}__meta"), NOT per record. The blob bytes stay pure.
    - Dataset.create(): create a new dataset with type metadata.
    - Dataset.create_materialized(): create a materialized view (index, aggregate, transform) with lineage to source dataset.
    - Dataset.list(): list all datasets with their types — like listing tables in a database.
@@ -945,7 +945,7 @@ Task: Collection layer (simplified Dataset + namespace) + crash testing (Phase G
 
 ## Work Log
 
-1. Replaced Dataset with Collection (pond-sdk/Collection.py, ~350 LOC). Changes from Dataset:
+1. Replaced Dataset with Collection (bindings/python/sdk/Collection.py, ~350 LOC). Changes from Dataset:
    - Removed source_lens (redundant with type)
    - Simplified materialized views: no separate create_materialized method. Just pass source= when creating a Collection. A materialized view is just a Collection with source metadata. No is_materialized/materialization_type fields — is_materialized is a property that checks if source is not None.
    - Added namespace support: Collection names use "/" as path separator (analytics/orders, ml/features/user_stats). Collection.list_namespaces() shows all namespaces. Collection.list(prefix=) filters by namespace.
@@ -954,7 +954,7 @@ Task: Collection layer (simplified Dataset + namespace) + crash testing (Phase G
 
 2. Updated POND.md: Dataset → Collection, added namespace explanation, simplified materialized view description.
 
-3. Removed old pond-sdk/dataset.py (superseded by Collection.py).
+3. Removed old bindings/python/sdk/dataset.py (superseded by Collection.py).
 
 4. Built experiments/crash_test.py (~330 LOC, 8 crash tests):
    - Test 1: Crash after commit — all committed data survives.
@@ -1056,7 +1056,7 @@ Agent: general-purpose (independent implementation: ConfigLens)
 Task: Build a ConfigLens from the Lens Interpretation Contract (RFC-0013) alone, as a fresh agent who had never seen Pond before.
 
 Work Log:
-- Read the 4 allowed sources: RFC-0013 (Lens Interpretation Contract), RFC-0012 (Lens Architecture), pond-core/pond_minimal.py (the ~140-LOC kernel), and POND.md. Did NOT read any existing Lens implementation, test, or experiment file. Looked at pond-sdk/lens_sdk.py ONLY for the `Lens` import path and `Lens.__init__(self, kernel, name)` constructor signature, per the task constraint.
+- Read the 4 allowed sources: RFC-0013 (Lens Interpretation Contract), RFC-0012 (Lens Architecture), bindings/python/core/pond_minimal.py (the ~140-LOC kernel), and POND.md. Did NOT read any existing Lens implementation, test, or experiment file. Looked at bindings/python/sdk/lens_sdk.py ONLY for the `Lens` import path and `Lens.__init__(self, kernel, name)` constructor signature, per the task constraint.
 - Implemented ContextResolver (RFC-0013 §8): prefix -> (encode, decode) registry with longest-prefix-match dispatch and raw-bytes fallback on unknown prefix or decode failure. 37 LOC incl. docstrings.
 - Implemented ContextLens(Lens): the ~25-LOC override that routes put/get/get_all through the resolver by key prefix; inherits branch/checkout/merge/history/commit/keys/count/get_raw from the base Lens. 39 LOC incl. docstrings.
 - Implemented ConfigLens(ContextLens): registers the `config/` prefix with a JSON codec; stores 5-field entries (key, value, environment, service, last_updated); adds put_config/get_config/get_raw/list_configs/get_by_environment/get_by_service. 52 LOC.
@@ -1075,7 +1075,7 @@ Agent: general-purpose (independent implementation: MetricsLens)
 Task: Build a MetricsLens (time-series metrics storage) from the Lens Interpretation Contract (RFC-0013) alone, as a fresh agent who had never seen Pond before.
 
 Work Log:
-- Read the 4 allowed sources: RFC-0013 (Lens Interpretation Contract), RFC-0012 (Lens Architecture), pond-core/pond_minimal.py (the ~140-LOC kernel), and POND.md. Did NOT read any existing Lens implementation, test, or experiment file (config/log/graph/vector). Consulted pond-sdk/lens_sdk.py ONLY for the Lens class import path and `Lens(kernel, name)` constructor signature, per the task constraint.
+- Read the 4 allowed sources: RFC-0013 (Lens Interpretation Contract), RFC-0012 (Lens Architecture), bindings/python/core/pond_minimal.py (the ~140-LOC kernel), and POND.md. Did NOT read any existing Lens implementation, test, or experiment file (config/log/graph/vector). Consulted bindings/python/sdk/lens_sdk.py ONLY for the Lens class import path and `Lens(kernel, name)` constructor signature, per the task constraint.
 - Implemented ContextResolver (RFC-0013 §8): prefix -> (encode, decode) registry with longest-prefix-match dispatch and raw-bytes fallback on unknown prefix or decode failure. ~37 LOC incl. docstrings and the empty-prefix fallback path.
 - Implemented ContextLens(Lens): the ~30-LOC override that routes put/get/get_all through the resolver by key prefix; inherits branch/checkout/merge/history/commit/keys/count/get_raw from the base Lens. (The override intercepts put/get rather than encode/decode because encode/decode are keyless hooks on the base class — recorded as a contract-clarity gap.)
 - Implemented MetricsLens(ContextLens): registers the `metrics/` prefix with a JSON codec; stores 5-field data points (metric_name, timestamp, value, tags dict, unit); key format `metrics/<metric_name>:<timestamp>:<short_uuid>`. Adds put_metric, get_metric, query_time_range(start, end, metric_name=None), filter_by_tags(tags, metric_name=None), list_metric_names. ~80 LOC.
@@ -1213,14 +1213,14 @@ Task: Falsify the Pond Storage Model paper as a hostile SIGMOD/VLDB reviewer.
    - `docs/POND_STORAGE_MODEL.md` (818 lines, 15 sections) — the paper under review.
    - `POND.md` (159 lines) — the one-page summary.
    - `rfcs/RFC-0013-lens-interpretation-contract.md` (251 lines) — the Lens contract.
-   - `pond-core/pond_minimal.py` (200 lines) — the kernel implementation.
+   - `bindings/python/core/pond_minimal.py` (200 lines) — the kernel implementation.
 
 3. Cross-referenced paper claims against actual code to verify or falsify each:
-   - `pond-sdk/architecture_laws.py` (461 lines) — the 10 executable laws.
-   - `pond-sdk/collection.py` (518 lines) — Collection layer.
-   - `pond-sdk/lens_sdk.py` (~850 lines) — Lens/View SDK.
-   - `pond-sdk/prolly_view.py` (631 lines) — Prolly tree + delta journal.
-   - `pond-sdk/maintenance.py` (316 lines) — tombstone/GC helpers.
+   - `bindings/python/sdk/architecture_laws.py` (461 lines) — the 10 executable laws.
+   - `bindings/python/sdk/collection.py` (518 lines) — Collection layer.
+   - `bindings/python/sdk/lens_sdk.py` (~850 lines) — Lens/View SDK.
+   - `bindings/python/sdk/prolly_view.py` (631 lines) — Prolly tree + delta journal.
+   - `bindings/python/sdk/maintenance.py` (316 lines) — tombstone/GC helpers.
    - `docs/FORMAL_ALGEBRA.md` (531 lines) — formal spec + lower-bound proof.
    - `rfcs/RFC-0005-derived-structures.md` (292 lines) — materialization calculus.
    - `rfcs/RFC-0007-view-algebra.md` (465 lines) — View algebra.
@@ -1228,11 +1228,11 @@ Task: Falsify the Pond Storage Model paper as a hostile SIGMOD/VLDB reviewer.
    - `experiments/performance_benchmark.py` (361 lines) — performance harness.
 
 4. Ran targeted falsification experiments (Python, in-repo):
-   a. **Kernel precondition divergence**: `pond-vector/pond_minimal.py` accepts `reference(name, non_existent_hash)`; `pond-core/pond_minimal.py` raises `ValueError`. Same spec, two implementations, different semantics. CONFIRMED.
+   a. **Kernel precondition divergence**: `pond-vector/pond_minimal.py` accepts `reference(name, non_existent_hash)`; `bindings/python/core/pond_minimal.py` raises `ValueError`. Same spec, two implementations, different semantics. CONFIRMED.
    b. **Read heuristic bug**: A name consisting of exactly 64 lowercase hex chars is misclassified as a hash. `read("a"*64)` returns `ValueError: Blob aaa...aaa not found on disk` instead of resolving the name. CONFIRMED.
    c. **Commit DAG is a linked list**: `prolly_view.py:merge()` (line 478–501) creates a commit with `parent_hash` = current branch HEAD only; the merged branch's commit is read for state but NOT recorded as a second parent. No merge commits exist. CONFIRMED.
    d. **Crash tests don't crash**: `experiments/crash_test.py:45` `crash_and_recover()` just returns `PondMinimal(bench)` — does not kill a process, does not truncate files, does not disable fsync. The "8 crash tests" verify reopen, not crash survival. CONFIRMED.
-   e. **Three kernel copies**: `pond-core/pond_minimal.py` (7677 bytes), `prototype/pond_minimal.py` (7677 bytes, identical), `pond-vector/pond_minimal.py` (1549 bytes, divergent in-memory mock). "Frozen kernel" claim undermined. CONFIRMED.
+   e. **Three kernel copies**: `bindings/python/core/pond_minimal.py` (7677 bytes), `prototype/pond_minimal.py` (7677 bytes, identical), `pond-vector/pond_minimal.py` (1549 bytes, divergent in-memory mock). "Frozen kernel" claim undermined. CONFIRMED.
    f. **Architecture Laws misnumbered**: paper's Law 6 (Branch) and Law 7 (Merge) have NO corresponding executable test; code's `law_6`/`law_7` test Scale/Index (duplicating `law_9`/`law_10`). CONFIRMED.
    g. **Law 8 (Determinism) waived**: `law_8_determinism` docstring admits commit hashes are non-deterministic (include `time.time()`); test only checks blob-hash determinism. CONFIRMED.
    h. **O(log N) contradicted by measurement**: paper §12 admits 0.1ms→14.8ms (148×) for 10K→500K (50×) — two orders of magnitude worse than O(log N) predicts. CONFIRMED.
@@ -1765,7 +1765,7 @@ The model is now operationally complete. Phase K (model falsification) is over. 
 
 Phase L (next, not started): shift from model falsification to model verification — property tests for every law, object-store hazard simulator, differential tests against Git/Dolt/Iceberg/FDB. Phase L produces no new algebras; the model is frozen.
 
-No implementation changes. pond-core still FROZEN at ~140 LOC. No new packages. No new RFCs. This was pure model work, as the user directed.
+No implementation changes. bindings/python/core still FROZEN at ~140 LOC. No new packages. No new RFCs. This was pure model work, as the user directed.
 
 ---
 Task ID: 53
@@ -1775,7 +1775,7 @@ Task: Phase L — Model Verification. Build (1) hazard simulator, (2) property t
 ## Work Log
 
 1. Read user guidance: "Ok continue. go ahead with next steps" — approval to launch Phase L (model verification) per the plan documented in DESIGN_GOALS.md after Phase K.4.
-2. Read pond-core/pond_minimal.py (FROZEN kernel, ~200 LOC, 3 primitives: write/read/reference). Confirmed the kernel implements exactly what the model describes (modulo ReadRange and CAS, which the model says are first-class but the kernel implements only as Read+slice and LWW).
+2. Read bindings/python/core/pond_minimal.py (FROZEN kernel, ~200 LOC, 3 primitives: write/read/reference). Confirmed the kernel implements exactly what the model describes (modulo ReadRange and CAS, which the model says are first-class but the kernel implements only as Read+slice and LWW).
 3. Built Phase L.1: Object-Store Hazard Simulator (scripts/phase_l_hazard_simulator.py, ~375 lines). Wraps PondMinimal with 7 hazard injectors: read-after-write lag, list-after-put lag, replica lag, partial write failure, partial read failure, delete race, clock skew, tombstone barrier (G6). All hazards deterministic via seeded RNG. API matches PondMinimal so property tests can run against either. Self-test passes.
 4. Built Phase L.2: Property Test Suite (scripts/phase_l_property_tests.py, ~600 lines). 39 test functions covering all 10 axioms (A1-A10) and 23 algebra laws (R1-R5, G1/G3/G6, MAN1/MAN2/MAN4, RR1/RR2', ST1/ST3, C0-C3, CC1/CC2, REP1/REP3/REP7, TR3/TR6, SE5/SE6/SE8). 491 checks, all pass. Tests run against both clean kernel and hazard simulator where applicable.
 5. Built Phase L.3: Differential Tests vs Git (scripts/phase_l_differential_git.py, ~480 lines). 9 differential tests vs real Git (using SHA-256 object format for hash parity): content-addressing, commit chain, branch is O(1), time travel, merge commit topology, deterministic tree hash. Plus 6 conceptual differential tests vs Dolt (same rows → same hash), Iceberg (manifest rebuildable), FDB (Pond has no transaction API by A7 design). 45 checks, all pass.
@@ -1882,7 +1882,7 @@ Cumulative across all phases (K + L + N + O + P):
 - 6 substrates, 3 operations, 10 axioms, 17 algebras, 0 open questions
 - 562 property tests + 61 differential tests (45 Git + 16 Dolt/Iceberg) + 23 hazard tests + 53 engineering tests = 683 total checks, all pass
 - 6 TLA+ invariants proven across 56 reachable states
-- 4 production-ready packages: pond-schema, pond-transport (ref + prod), pond-replication, plus the existing pond-sdk/feature-store/arrow
+- 4 production-ready packages: pond-schema, pond-transport (ref + prod), pond-replication, plus the existing bindings/python/sdk/feature-store/arrow
 - Kernel FROZEN at ~140 LOC throughout
 
 The Pond project — across Phases A through P — has answered its research question completely: "Find the smallest storage algebra from which all workload semantics can be composed, and prove that composition is sound." Answer: six substrates, three operations, ten axioms, seventeen algebras. The model is proven (TLA+), tested (683 checks), implemented (4 packages), and honest (all soft spots closed).
@@ -1958,8 +1958,8 @@ Stage Summary:
 - 27/27 tests pass (added 1 new test for column-chunk pruning benchmark)
 - All existing pruning tests still pass (no regressions)
 - Files changed:
-  * pond-sdk/extensions/physical_structures/zone_map_index.py (scan_with_pruning verbose mode)
-  * pond-sdk/extensions/physical_structures/pruning_reader.py (scan() rewritten with column-chunk pruning)
+  * bindings/python/sdk/extensions/physical_structures/zone_map_index.py (scan_with_pruning verbose mode)
+  * bindings/python/sdk/extensions/physical_structures/pruning_reader.py (scan() rewritten with column-chunk pruning)
   * lenses/lakehouse/lakehouse_lens.py (read_with_pruning gains columns/chunk_size params)
   * tests/integration/test_lakehouse_pruning.py (new test_column_chunk_pruning)
   * pond-labs/benchmarks/column_chunk_pruning_benchmark.py (new)
@@ -1980,7 +1980,7 @@ Work Log:
 - Read prior worklog (commit c566ee3 wired column-chunk pruning into PruningReader.scan()).
 - Identified that column-chunk pruning gave only 1.10x speedup because the whole row group is one Parquet blob — pruning skips row_filter work but not I/O.
 - Added blob_hash field to ColumnChunkStats so chunk blob hashes are tracked in the zone map blob.
-- Created pond-sdk/extensions/physical_structures/column_chunk_storage.py with ColumnChunkStorage class:
+- Created bindings/python/sdk/extensions/physical_structures/column_chunk_storage.py with ColumnChunkStorage class:
   * write_row_group_column_chunks(): splits a row group into per-column-chunk Parquet blobs, returns (manifest_blob_hash, cczm_with_blob_hashes)
   * read_column_chunks(): reads only specified column chunks for surviving chunk indices
   * read_full_row_group(): reassembles full row group from chunk blobs (for read_table compatibility)
@@ -2020,8 +2020,8 @@ Stage Summary:
 - Backward compatible: legacy collections fall back to whole-blob read
 - 29/29 tests pass (added 2 new tests: storage + benchmark)
 - Files changed:
-  * pond-sdk/extensions/physical_structures/column_chunk_zone_map.py (blob_hash field)
-  * pond-sdk/extensions/physical_structures/column_chunk_storage.py (NEW)
+  * bindings/python/sdk/extensions/physical_structures/column_chunk_zone_map.py (blob_hash field)
+  * bindings/python/sdk/extensions/physical_structures/column_chunk_storage.py (NEW)
   * lenses/lakehouse/lakehouse_lens.py (range_write_column_chunks + read_with_column_chunk_pruning)
   * tests/integration/test_column_chunk_storage.py (NEW)
   * pond-labs/benchmarks/column_chunk_storage_benchmark.py (NEW)
@@ -2041,7 +2041,7 @@ Task: Implement FastLanes-style encoding-aware compute — skip decode for prune
 Work Log:
 - Read prior worklog (commit b5c9675 added per-column-chunk storage with 9.37x I/O reduction).
 - Identified next bottleneck: column-chunk pruning still decodes Parquet for surviving chunks. For low-cardinality columns, encoded predicate eval (RLE/Dict) can skip decode entirely.
-- Created pond-sdk/extensions/physical_structures/encoding.py:
+- Created bindings/python/sdk/extensions/physical_structures/encoding.py:
   * ColumnEncoding: 4 encodings (RAW, RLE, DICT, BITPACK) with auto-selection heuristics
   * EncodingHeader: 9-byte header prepended to every encoded chunk blob (magic + encoding + n_rows)
   * encode_column(): picks encoding (auto or via hint) and dispatches to encoder
@@ -2052,7 +2052,7 @@ Work Log:
     - BITPACK: prune via min/max in encoding header
     - RAW: return None (caller must decode + filter)
   * decode_column(): fallback decoder for when encoded eval is not possible
-- Created pond-sdk/extensions/physical_structures/encoded_chunk_storage.py:
+- Created bindings/python/sdk/extensions/physical_structures/encoded_chunk_storage.py:
   * EncodedChunkStorage extends ColumnChunkStorage
   * write_row_group_encoded(): splits row group into per-column-chunk ENCODED blobs
   * read_column_chunks_encoded(): reads surviving chunks with encoded predicate eval
@@ -2094,9 +2094,9 @@ Stage Summary:
 - Backward compatible: legacy collections fall back to column-chunk or whole-blob read
 - 31/31 tests pass (added 2 new tests: encoded pruning + benchmark)
 - Files changed:
-  * pond-sdk/extensions/physical_structures/encoding.py (NEW)
-  * pond-sdk/extensions/physical_structures/encoded_chunk_storage.py (NEW)
-  * pond-sdk/extensions/physical_structures/column_chunk_zone_map.py (sidecar preservation)
+  * bindings/python/sdk/extensions/physical_structures/encoding.py (NEW)
+  * bindings/python/sdk/extensions/physical_structures/encoded_chunk_storage.py (NEW)
+  * bindings/python/sdk/extensions/physical_structures/column_chunk_zone_map.py (sidecar preservation)
   * lenses/lakehouse/lakehouse_lens.py (range_write_encoded + read_with_encoded_pruning)
   * tests/integration/test_encoded_pruning.py (NEW)
   * pond-labs/benchmarks/encoded_pruning_benchmark.py (NEW)
@@ -2141,7 +2141,7 @@ Work Log:
   * Fixed _read_all_row_groups to handle manifest blobs (from range_write_column_chunks / range_write_encoded) — was assuming every blob at rg/{key} is Parquet. Now detects manifest blobs by JSON structure and reassembles via ColumnChunkStorage / EncodedChunkStorage. Added _decode_blob_to_table helper.
   * Added test_sql_pushdown_fast_paths.py — verifies all 3 storage modes work end-to-end via SQL
 - Phase E (constants):
-  * Added DEFAULT_CHUNK_SIZE = 1000 to pond-sdk/extensions/physical_structures/__init__.py with documentation about mismatched chunk_size corrupting pruning
+  * Added DEFAULT_CHUNK_SIZE = 1000 to bindings/python/sdk/extensions/physical_structures/__init__.py with documentation about mismatched chunk_size corrupting pruning
 - Registered new files in KNOWLEDGE_GRAPH.md
 
 Stage Summary:
@@ -2154,7 +2154,7 @@ Stage Summary:
 - Remaining review findings deferred to future tasks:
   * C3 (rename duplicate ZoneMap classes) — needs careful coordination across all callers
   * C4 (extensions hard-code PyArrow) — needs callback refactor
-  * C6 (sys.path hacks) — needs pond-sdk to become a real package
+  * C6 (sys.path hacks) — needs bindings/python/sdk to become a real package
   * C9 (extract _range_write_generic + _read_with_pruning_generic) — large refactor
   * C11 (replace except Exception: pass with specific catches) — many sites
   * M1 (split 135-line PruningReader.scan) — extract _compute_surviving_chunks
@@ -2168,15 +2168,15 @@ Stage Summary:
 - See docs/DESIGN_REVIEW_2026_07_26.md for the full prioritized fix plan
 
 Files changed:
-- pond-sdk/extensions/physical_structures/column_chunk_zone_map.py (C1 + delete get_surviving_chunks)
-- pond-sdk/extensions/physical_structures/pruning_reader.py (C2 + delete dead methods + end_key docstring fix)
-- pond-sdk/extensions/physical_structures/pruning.py (delete might_match)
-- pond-sdk/extensions/physical_structures/zone_map_index.py (M3 end_key filtering + LakehouseLens refs removed)
-- pond-sdk/extensions/physical_structures/base.py (delete _ref_name)
-- pond-sdk/extensions/physical_structures/column_chunk_storage.py (C5 + delete _manifest_blob_hash_default)
-- pond-sdk/extensions/physical_structures/encoded_chunk_storage.py (C8 + M12 + delete dead clause)
-- pond-sdk/extensions/physical_structures/encoding.py (added decode_surviving_values)
-- pond-sdk/extensions/physical_structures/__init__.py (DEFAULT_CHUNK_SIZE + better docs)
+- bindings/python/sdk/extensions/physical_structures/column_chunk_zone_map.py (C1 + delete get_surviving_chunks)
+- bindings/python/sdk/extensions/physical_structures/pruning_reader.py (C2 + delete dead methods + end_key docstring fix)
+- bindings/python/sdk/extensions/physical_structures/pruning.py (delete might_match)
+- bindings/python/sdk/extensions/physical_structures/zone_map_index.py (M3 end_key filtering + LakehouseLens refs removed)
+- bindings/python/sdk/extensions/physical_structures/base.py (delete _ref_name)
+- bindings/python/sdk/extensions/physical_structures/column_chunk_storage.py (C5 + delete _manifest_blob_hash_default)
+- bindings/python/sdk/extensions/physical_structures/encoded_chunk_storage.py (C8 + M12 + delete dead clause)
+- bindings/python/sdk/extensions/physical_structures/encoding.py (added decode_surviving_values)
+- bindings/python/sdk/extensions/physical_structures/__init__.py (DEFAULT_CHUNK_SIZE + better docs)
 - lenses/lakehouse/lakehouse_lens.py (C5 caller fix, C10 _read_with_pushdown, _read_all_row_groups manifest handling, _decode_blob_to_table, deleted dead methods M17)
 - tests/integration/test_sql_pushdown_fast_paths.py (NEW)
 - tests/test_all.py (new test entry)
@@ -2231,15 +2231,15 @@ Work Log:
 
 - Phase I (M26 — stale docs):
   * Fixed lenses/vector/README.md — was claiming VectorLens extends
-    KeyValueLens and that KeyValueLens lives in pond-sdk/. Both wrong:
+    KeyValueLens and that KeyValueLens lives in bindings/python/sdk/. Both wrong:
     VectorLens extends PondLens directly; KeyValueLens lives in
     lenses/keyvalue/.
   * Fixed REPO_ORGANIZATION.md §2.2 — removed keyvalue_lens.py from
-    pond-sdk contents; added a note that it lives in lenses/keyvalue/.
-    Also added uuid7.py and collection_metadata.py to the pond-sdk list.
+    bindings/python/sdk contents; added a note that it lives in lenses/keyvalue/.
+    Also added uuid7.py and collection_metadata.py to the bindings/python/sdk list.
   * Fixed REPO_ORGANIZATION.md §2.3 — added lenses/keyvalue/ to the
     production lenses list (was missing entirely).
-  * Fixed pond-sdk/base_lens.py:9 docstring — was mentioning "Lens"
+  * Fixed bindings/python/sdk/base_lens.py:9 docstring — was mentioning "Lens"
     (back-compat alias); now lists KeyValueLens, LakehouseLens,
     VectorLens, FeatureStoreLens by their real names.
 
@@ -2260,12 +2260,12 @@ Stage Summary:
     _read_with_pruning_generic + _compute_surviving_chunks + DEFAULT_CHUNK_SIZE
     + all three write methods reduced to callbacks + all three read methods
     reduced to callbacks)
-  * pond-sdk/extensions/physical_structures/pruning_reader.py
+  * bindings/python/sdk/extensions/physical_structures/pruning_reader.py
     (_INITIAL_STATS + _compute_surviving_chunks + _slice_rows_by_chunks
     + scan() simplified + M2 fix)
   * lenses/vector/README.md (M26 fix)
   * REPO_ORGANIZATION.md §2.2 + §2.3 (M26 fix)
-  * pond-sdk/base_lens.py docstring (M26 fix)
+  * bindings/python/sdk/base_lens.py docstring (M26 fix)
 - Remaining review findings (C3, C4, C6, C11, M13, M14, M16, M21, M22)
   are documented in docs/DESIGN_REVIEW_2026_07_26.md with a fix plan.
   Estimated 3-4 more days of refactoring.
@@ -2353,13 +2353,13 @@ Work Log:
 - Audited all sys.path.insert call sites across the repo (40+ sites in 14 files).
   Two categories identified:
   1. Module-level sys.path.insert (run once at import time) — acceptable as a
-     transitional measure; will be replaced by absolute imports when pond-sdk
+     transitional measure; will be replaced by absolute imports when bindings/python/sdk
      becomes a real pip-installed package.
   2. In-method sys.path.insert (run on every call, grow sys.path unboundedly,
      cause import-order bugs) — the real problem. 8 sites in lakehouse_lens.py.
 - Added physical_structures to the module-level sys.path.insert in
-  lakehouse_lens.py (was only pond-core + pond-sdk; now also includes
-  pond-sdk/extensions/physical_structures).
+  lakehouse_lens.py (was only bindings/python/core + bindings/python/sdk; now also includes
+  bindings/python/sdk/extensions/physical_structures).
 - Added HAVE_PRUNING module-level flag in lakehouse_lens.py:
   * Set once at import time by trying to import all pruning extensions
     (CollectionMetadata, PruningPredicate, ColumnPredicate, ZoneMap,
@@ -2388,7 +2388,7 @@ Stage Summary:
 - SQL pushdown fast-paths test preserved: all 3 storage modes work via SQL.
 - All 8 in-method sys.path.insert calls eliminated. Only 3 module-level
   sys.path.insert calls remain (lines 89, 90, 91) — these run once at import
-  time and are the transitional measure until pond-sdk becomes a real package.
+  time and are the transitional measure until bindings/python/sdk becomes a real package.
 - Methods are now more readable: "if not HAVE_PRUNING: fallback" is clearer
   than "try: sys.path.insert(...); from X import Y; except ImportError: pass".
 - Import-order bugs eliminated: the lens's import behavior no longer depends
@@ -2475,9 +2475,9 @@ Stage Summary:
   ProllyLensBase stores staged changes (e.g., switch from dict to a tree),
   only ProllyLensBase.create_merge_commit needs to update — the lenses don't.
 - Files changed:
-  * pond-sdk/extensions/physical_structures/zone_map_index.py
+  * bindings/python/sdk/extensions/physical_structures/zone_map_index.py
     (+ clear_zone_maps, count_zone_maps, iter_zone_maps; refactored rebuild_zone_maps)
-  * pond-sdk/prolly_tree.py
+  * bindings/python/sdk/prolly_tree.py
     (+ read_state_at_commit, create_merge_commit; kept _read_state_from_commit
     as private alias for backward compat)
   * lenses/lakehouse/lakehouse_lens.py
@@ -2485,7 +2485,7 @@ Stage Summary:
     2 _read_state_from_commit sites → read_state_at_commit; removed unused import)
   * pond-labs/lenses/feature_store_lens.py
     (1 merge commit site → create_merge_commit; 1 _read_state_from_commit → read_state_at_commit)
-  * pond-sdk/extensions/physical_structures/pruning_reader.py
+  * bindings/python/sdk/extensions/physical_structures/pruning_reader.py
     (1 _get_base site → count_zone_maps)
   * pond-labs/benchmarks/overhead_audit.py (1 _get_base site → iter_zone_maps)
   * pond-labs/benchmarks/pruning_benchmark.py (1 _get_base site → count_zone_maps)
@@ -2506,7 +2506,7 @@ Work Log:
 - Audited all `except Exception:` sites in the lens + extension layer (33 sites total).
   The previous pattern silently swallowed real bugs and made "why is my lakehouse slow?"
   impossible to debug.
-- Created pond-sdk/best_effort.py (95 LOC):
+- Created bindings/python/sdk/best_effort.py (95 LOC):
   * best_effort(operation, fn, *args, **kwargs) — runs fn; on recoverable exceptions
     (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError)
     logs a DEBUG warning and returns None. On other exceptions (RuntimeError,
@@ -2559,7 +2559,7 @@ Stage Summary:
 - This fixes the C11 review finding: "the single largest source of 'why is my
   lakehouse slow?' debugging pain (silent best-effort failures)".
 - Files changed:
-  * pond-sdk/best_effort.py (NEW — 95 LOC)
+  * bindings/python/sdk/best_effort.py (NEW — 95 LOC)
   * lenses/lakehouse/lakehouse_lens.py (12 sites replaced with best_effort /
     specific catches + warn_best_effort)
   * lenses/lakehouse/pond_lakehouse.py (2 sites replaced)
@@ -2591,17 +2591,17 @@ Work Log:
   * grep for "from zone_map import" → 0 matches in production/test code
   * grep for "zone_map.ZoneMap" → 0 matches in production/test code
   * Only references were in __init__.py re-exports and docstrings
-- Deleted pond-sdk/extensions/physical_structures/zone_map.py (106 LOC).
-- Updated pond-sdk/extensions/physical_structures/__init__.py:
+- Deleted bindings/python/sdk/extensions/physical_structures/zone_map.py (106 LOC).
+- Updated bindings/python/sdk/extensions/physical_structures/__init__.py:
   * Removed `from extensions.physical_structures.zone_map import ZoneMap`
   * Removed `ZoneMap` from __all__
   * Updated docstring to remove ZoneMap from the "Available types" list
   * Added a NOTE explaining that pruning.ZoneMap is the active class
     (a @dataclass, not a PhysicalStructure) and that the legacy
     zone_map.py:ZoneMap was deleted as dead code (C3)
-- Updated pond-sdk/extensions/__init__.py:
+- Updated bindings/python/sdk/extensions/__init__.py:
   * Removed ZoneMap from the usage example in the docstring
-- Updated pond-sdk/extensions/physical_structures/README.md:
+- Updated bindings/python/sdk/extensions/physical_structures/README.md:
   * Removed ZoneMap from the PhysicalStructure type hierarchy diagram
   * Added ColumnChunkZoneMap, ColumnChunkStorage, EncodedChunkStorage to the
     pruning infrastructure branch (were missing)
@@ -2612,7 +2612,7 @@ Work Log:
     PhysicalStructure type)
   * Removed ZoneMap from the Usage example
   * Added a NOTE explaining the deletion
-- Updated pond-sdk/extensions/README.md:
+- Updated bindings/python/sdk/extensions/README.md:
   * Updated the Zone map row to point to pruning.py (was ambiguous)
   * Added a NOTE explaining the deletion
   * Removed ZoneMap from the Usage example
@@ -2627,13 +2627,13 @@ Stage Summary:
   the caller mean?) is gone.
 - Net code reduction: -106 LOC (zone_map.py deleted).
 - Files changed:
-  * pond-sdk/extensions/physical_structures/zone_map.py (DELETED — 106 LOC)
-  * pond-sdk/extensions/physical_structures/__init__.py (removed ZoneMap
+  * bindings/python/sdk/extensions/physical_structures/zone_map.py (DELETED — 106 LOC)
+  * bindings/python/sdk/extensions/physical_structures/__init__.py (removed ZoneMap
     import + export; updated docstring)
-  * pond-sdk/extensions/__init__.py (removed ZoneMap from usage example)
-  * pond-sdk/extensions/physical_structures/README.md (updated type
+  * bindings/python/sdk/extensions/__init__.py (removed ZoneMap from usage example)
+  * bindings/python/sdk/extensions/physical_structures/README.md (updated type
     hierarchy, files table, naming convention, usage example; added NOTE)
-  * pond-sdk/extensions/README.md (updated zone map row, usage example,
+  * bindings/python/sdk/extensions/README.md (updated zone map row, usage example,
     folder description; added NOTE)
 - Remaining review findings (C4, M13, M14) are documented in
   docs/DESIGN_REVIEW_2026_07_26.md. Estimated 0.5 more day of refactoring.
@@ -2648,7 +2648,7 @@ Agent: main
 Task: Phase C (C4) — make extensions truly format-agnostic via ColumnSource
 
 Work Log:
-- Created pond-sdk/extensions/physical_structures/column_source.py (175 LOC):
+- Created bindings/python/sdk/extensions/physical_structures/column_source.py (175 LOC):
   * ColumnSource Protocol — minimal interface for format-agnostic column
     data access: column_names(), num_rows(), column_slice(name, start, end),
     column_stats(name) → (min, max, null_count)
@@ -2698,13 +2698,13 @@ Stage Summary:
   keep working unchanged (auto-wrapped via as_column_source).
 - The docstrings no longer lie — "format-agnostic" is now true.
 - Files changed:
-  * pond-sdk/extensions/physical_structures/column_source.py (NEW — 175 LOC)
-  * pond-sdk/extensions/physical_structures/pruning.py (ZoneMap.build refactored)
-  * pond-sdk/extensions/physical_structures/column_chunk_zone_map.py
+  * bindings/python/sdk/extensions/physical_structures/column_source.py (NEW — 175 LOC)
+  * bindings/python/sdk/extensions/physical_structures/pruning.py (ZoneMap.build refactored)
+  * bindings/python/sdk/extensions/physical_structures/column_chunk_zone_map.py
     (ColumnChunkZoneMap.build refactored)
-  * pond-sdk/extensions/physical_structures/column_chunk_storage.py
+  * bindings/python/sdk/extensions/physical_structures/column_chunk_storage.py
     (write_row_group_column_chunks refactored)
-  * pond-sdk/extensions/physical_structures/encoded_chunk_storage.py
+  * bindings/python/sdk/extensions/physical_structures/encoded_chunk_storage.py
     (write_row_group_encoded refactored)
   * tests/integration/test_column_source.py (NEW — 180 LOC)
   * tests/test_all.py (1 new test entry)
@@ -2780,13 +2780,13 @@ Stage Summary:
   overhead dominates. On object storage, the I/O savings from 4-8x smaller
   blobs will dominate — that's the design target.
 - Files changed:
-  * pond-sdk/extensions/physical_structures/column_source.py
+  * bindings/python/sdk/extensions/physical_structures/column_source.py
     (compute_list_stats 1-pass + PyArrowColumnSource.column_stats 1-pass)
-  * pond-sdk/extensions/physical_structures/zone_map_index.py
+  * bindings/python/sdk/extensions/physical_structures/zone_map_index.py
     (last_scan_total field populated by scan_with_pruning)
-  * pond-sdk/extensions/physical_structures/pruning_reader.py
+  * bindings/python/sdk/extensions/physical_structures/pruning_reader.py
     (scan() uses last_scan_total instead of count_zone_maps double-walk)
-  * pond-sdk/extensions/physical_structures/encoding.py
+  * bindings/python/sdk/extensions/physical_structures/encoding.py
     (real bitpack: encode_bitpack + _decode_bitpack_packed + _bitpack_min_max
     + _eval_bitpack updated for binary sub-header + decode_column updated)
   * pond-labs/benchmarks/bitpack_compression_benchmark.py (NEW — 130 LOC)
@@ -2847,7 +2847,7 @@ Stage Summary:
 - The "scan without decode" goal is now achieved for bitpack, RLE, and
   DICT encodings. Only RAW (passthrough) falls back to full decode.
 - Files changed:
-  * pond-sdk/extensions/physical_structures/encoding.py
+  * bindings/python/sdk/extensions/physical_structures/encoding.py
     (_eval_bitpack rewritten with vectorized scan; _decode_bitpack_ranges
     added; decode_surviving_values updated for bitpack; docstrings updated)
   * tests/integration/test_encoded_pruning.py (test updated for new behavior)
@@ -2906,9 +2906,9 @@ Stage Summary:
   Video) can now use the FULL pruning + encoding infrastructure with
   different data structures and layouts, on any object store.
 - Files changed:
-  * pond-sdk/extensions/physical_structures/encoded_chunk_storage.py
+  * bindings/python/sdk/extensions/physical_structures/encoded_chunk_storage.py
     (read_column_chunks_encoded rewritten for column alignment)
-  * pond-sdk/extensions/physical_structures/column_chunk_storage.py
+  * bindings/python/sdk/extensions/physical_structures/column_chunk_storage.py
     (encode_fn/decode_fn contracts changed to format-agnostic)
   * lenses/lakehouse/lakehouse_lens.py (all callers updated to provide
     Parquet encode/decode wrappers; read_surviving_rowgroup callbacks
@@ -2935,7 +2935,7 @@ DESIGN DECISION:
   decides whether to decode. No zone-map fetch at all.
 
 Created docs/UNIFIED_STORAGE_DESIGN.md documenting the full design.
-Created pond-sdk/extensions/physical_structures/embedded_stats.py (170 LOC):
+Created bindings/python/sdk/extensions/physical_structures/embedded_stats.py (170 LOC):
 - ColumnStats: per-column min/max/null_count with can_prune() method
 - StatsHeader: build/parse embedded stats header (b"STAT" magic)
 - StatsHeader.can_prune_blob(): evaluate predicate against embedded stats
@@ -3074,11 +3074,11 @@ Stage Summary:
 - The manifest path is the PREFERRED read path. The zone-map path
   remains as a fallback for collections written before manifest support.
 - Files changed:
-  * pond-sdk/extensions/physical_structures/collection_manifest.py (NEW, 830 LOC)
-  * pond-sdk/extensions/physical_structures/stats_tree.py (NEW, 590 LOC)
+  * bindings/python/sdk/extensions/physical_structures/collection_manifest.py (NEW, 830 LOC)
+  * bindings/python/sdk/extensions/physical_structures/stats_tree.py (NEW, 590 LOC)
   * lenses/lakehouse/lakehouse_lens.py (added manifest imports + 6 new methods
     + 2 updated write paths)
-  * pond-sdk/prolly_tree.py (fixed COMPACTION_THRESHOLD bug — literal 16 → constant)
+  * bindings/python/sdk/prolly_tree.py (fixed COMPACTION_THRESHOLD bug — literal 16 → constant)
   * docs/COLLECTION_MANIFEST_DESIGN.md (NEW)
   * docs/ROUND_TRIP_AUDIT.md (NEW)
   * scripts/test_manifest_smoke.py (NEW)
@@ -3229,7 +3229,7 @@ Stage Summary:
   git, feature store) via the same API.
 - Storage-Independent: PND2 is binary; never depends on execution engine.
 - Files changed:
-  * pond-sdk/extensions/physical_structures/unified_storage.py (NEW, ~950 LOC)
+  * bindings/python/sdk/extensions/physical_structures/unified_storage.py (NEW, ~950 LOC)
   * docs/UNIFIED_STORAGE_DESIGN.md (NEW)
   * scripts/test_unified_storage_smoke.py (NEW — 6 tests, all pass)
   * scripts/benchmark_unified_storage.py (NEW — comparison benchmark)
@@ -3265,7 +3265,7 @@ pointer). That works on local disk but is NOT object-store-native:
     reads" because SQLite lookups aren't S3 GETs).
 
 Work Log:
-- Designed ObjectStoreNativeKernel (pond-core/object_store_native_kernel.py):
+- Designed ObjectStoreNativeKernel (bindings/python/core/object_store_native_kernel.py):
   - ALL state (refs + blobs) lives in the object store as content-addressed
     blobs. NO SQLite.
   - Refs stored as a content-addressed "root ref blob" — a small JSON dict
@@ -3368,7 +3368,7 @@ Stage Summary:
 - Real-world S3 timing: 200ms cold, 50ms warm. This is the irreducible
   cost of object storage; SDK caching makes it fast for hot workloads.
 - Files changed:
-  * pond-core/object_store_native_kernel.py (NEW, ~280 LOC)
+  * bindings/python/core/object_store_native_kernel.py (NEW, ~280 LOC)
   * scripts/test_object_store_native_kernel.py (NEW, 6 tests, all pass)
   * scripts/benchmark_cold_round_trips.py (NEW — honest cold-read benchmark)
 
@@ -3619,7 +3619,7 @@ Work Log:
   * test_stats_index.py, test_collection_metadata.py — tests for deleted code
   * Cleaned __init__.py (removed dead imports)
 
-- Created pond-sdk/pond_storage.py (~300 LOC) — the ONE unified storage SDK:
+- Created bindings/python/sdk/pond_storage.py (~300 LOC) — the ONE unified storage SDK:
   * Section 1: Namespace (list_collections, collection_exists, set/get_definition)
   * Section 2: Commit/Branch (commit, branch, checkout, list_branches, merge, undo, history, diff)
   * Section 3: Data I/O (write, append, read, read_as_columns, point_lookup, scan_with_pruning)
@@ -3654,10 +3654,10 @@ Stage Summary:
 
 Files changed:
 - Deleted: 5 source files + 2 test files (Tier 1 dead code)
-- Created: pond-sdk/pond_storage.py (the unified SDK)
+- Created: bindings/python/sdk/pond_storage.py (the unified SDK)
 - Created: scripts/test_pond_storage.py (6 tests)
 - Created: docs/ARCHITECTURE_REDESIGN.md (target architecture + migration path)
-- Updated: pond-sdk/extensions/physical_structures/__init__.py (removed dead imports)
+- Updated: bindings/python/sdk/extensions/physical_structures/__init__.py (removed dead imports)
 - Updated: tests/test_all.py (removed entries for deleted test files)
 
 ---
@@ -4091,7 +4091,7 @@ Agent: main
 Task: Make Pond production-ready for real object stores. The audit revealed the default path was SQLite + local disk (PondMinimal), not object-store-native. Implement a real S3 backend, wire it into the production path, fix PondConfig to not use local FS, and migrate architecture laws to validate the production path.
 
 Work Log:
-- Wrote S3ObjectStore (pond-core/s3_object_store.py, ~280 LOC) — boto3-backed implementation of the 9-primitive object store interface:
+- Wrote S3ObjectStore (bindings/python/core/s3_object_store.py, ~280 LOC) — boto3-backed implementation of the 9-primitive object store interface:
   * put_blob(data) → hash (content-addressed S3 PUT to {prefix}/blobs/{hash})
   * get_blob(hash) → bytes (S3 GET)
   * has_blob(hash) → bool (S3 HEAD)
@@ -4147,14 +4147,14 @@ Agent: main
 Task: Eliminate SQLite entirely — even for local storage. Local FS and S3 should work the same way (pure files/objects, no databases). The switch between local and S3 should be one line.
 
 Work Log:
-- Wrote LocalFSObjectStore (pond-core/local_fs_object_store.py, ~290 LOC) — pure local-filesystem implementation of the same 9-primitive interface as S3ObjectStore/InMemoryObjectStore. No SQLite. No databases. Just files:
+- Wrote LocalFSObjectStore (bindings/python/core/local_fs_object_store.py, ~290 LOC) — pure local-filesystem implementation of the same 9-primitive interface as S3ObjectStore/InMemoryObjectStore. No SQLite. No databases. Just files:
   * Blobs: {base_dir}/blobs/{hash[:2]}/{hash}.bin (content-addressed, 2-char sharded like git)
   * Paths: {base_dir}/paths/{path} (one file per named ref, contains the hash as text)
   * CAS via per-path locking + check-and-set (no database needed)
   * Atomic writes via unique temp files + os.rename (pid + thread id + counter to avoid collisions between concurrent writers)
   * Thread-safe: per-hash locks for blobs, per-path locks for CAS
   * make_local_kernel(base_dir) convenience constructor
-- Wrote make_kernel() unified factory (pond-core/make_kernel.py) — ONE entry point for all backends. Switch between local FS, S3, and in-memory by changing the URL:
+- Wrote make_kernel() unified factory (bindings/python/core/make_kernel.py) — ONE entry point for all backends. Switch between local FS, S3, and in-memory by changing the URL:
   * make_kernel("file:///var/lib/pond") → LocalFSObjectStore
   * make_kernel("s3://my-pond/prod", region="us-east-1") → S3ObjectStore
   * make_kernel("memory://") → InMemoryObjectStore
@@ -4532,7 +4532,7 @@ Agent: main
 Task: Design and implement a simple, generic storage-side optimization that helps ALL execution engines be faster and more efficient. Follow design principles: Simple, Powerful, Performant, Efficient. The kernel stays FROZEN; the optimization lives at Layer 1 (SDK).
 
 Work Log:
-- Created PondPack format (pond-sdk/extensions/physical_structures/pond_pack.py):
+- Created PondPack format (bindings/python/sdk/extensions/physical_structures/pond_pack.py):
   * Combines commit JSON + manifest bytes into ONE blob
   * Format: Magic "PNPK" + version + commit_json_len + commit_json + manifest_len + manifest_bytes
   * Content-addressed (hash = SHA-256 of pack bytes)
@@ -4618,13 +4618,13 @@ Stage Summary:
 - The kernel is FROZEN. The optimization lives at Layer 1 (SDK). Lenses are unchanged.
 - Backward compatible: old collections with separate commit + manifest blobs still work.
 - Multi-process safe: immutable packs, TTL-based cache revalidation.
-- The existing pond-rust/ crate has a PND2 decoder but no Rust toolchain in this environment.
+- The existing  crate has a PND2 decoder but no Rust toolchain in this environment.
   A Rust SDK scaffold (with PyO3 bindings + C ABI) is the next step for CPU-side acceleration.
 
 ---
 Task ID: round-36-rust-sdk-evaluation
 Agent: main
-Task: Evaluate the existing pond-rust/ crate and the Rust SDK strategy.
+Task: Evaluate the existing  crate and the Rust SDK strategy.
 
 Work Log:
 - Installed Rust toolchain (rustup, stable, cargo 1.97.1)
@@ -4687,7 +4687,7 @@ Agent: main
 Task: Rewrite the Rust PND2 decoder from scratch — simple, correct, covering all encodings. Make Rust the canonical format implementation with Python as first-class support via PyO3. Other language SDKs should be full project ports of the Rust crate.
 
 Work Log:
-- Rewrote pond-rust/src/lib.rs from scratch (~600 LOC, clean structure):
+- Rewrote src/lib.rs from scratch (~600 LOC, clean structure):
   * PND2Parser struct with safe read methods (read_u8, read_u16, read_u32, read_i64, read_f64, read_bytes)
   * Handles ALL encodings: RAW, BITPACK, DICT, RLE
   * Handles ALL value types: INT64, FLOAT64, STRING, BINARY, NULL
@@ -4865,11 +4865,11 @@ Work Log:
    - Ran `python3 scripts/verify_knowledge_graph.py` (before): 48 missing files.
    - Added every missing file to the appropriate section with an accurate
      one-line description derived from reading the file. New rows/sections:
-     * §2.1 pond-core/: `local_fs_object_store.py` (443 LOC),
+     * §2.1 bindings/python/core/: `local_fs_object_store.py` (443 LOC),
        `s3_object_store.py` (519 LOC), `make_kernel.py` (112 LOC). Also
        updated `kernel.py` row from 199 LOC → 274 LOC and removed the
        "FROZEN" claim from the section header.
-     * §2.2 pond-sdk/: `hlc.py` (116 LOC — Hybrid Logical Clock).
+     * §2.2 bindings/python/sdk/: `hlc.py` (116 LOC — Hybrid Logical Clock).
        Added new rows for `extensions/indexing/hnsw_index.py` (613 LOC),
        `extensions/indexing/ivf_index.py` (481 LOC, with honesty note
        about IVF not reducing I/O), `extensions/maintenance/vacuum.py`
@@ -4899,7 +4899,7 @@ Work Log:
      * New §2.13 agent-ctx/: created for handoff notes.
        Added `agent-ctx/task-legacy-cleanup-vector-streaming.md`.
      * New §2.14 pond/: created for the installable package shim
-       (re-exports from pond-core/, pond-sdk/, lenses/). Added all 10
+       (re-exports from bindings/python/core/, bindings/python/sdk/, lenses/). Added all 10
        `pond/{__init__.py, core/__init__.py, sdk/__init__.py,
        sdk/extensions/__init__.py, lenses/__init__.py, lenses/*/__init__.py}`
        files with their re-export purpose.
@@ -4928,16 +4928,16 @@ Work Log:
      + `maintenance/vacuum.py`. Added honesty note about the legacy
      files moving to `archive/legacy-extensions/`.
    - §7 dependency rules: rewrote the tree to match reality (kernel.py
-     274 LOC + storage backends; pond-sdk with pond_storage/hlc/etc.;
+     274 LOC + storage backends; bindings/python/sdk with pond_storage/hlc/etc.;
      lenses/ with keyvalue/lakehouse/vector/streaming/oltp; per-lens
      `extends PondLens` vs `NO base class` annotations).
 
 3. PACKAGES.md — drift fixes
-   - Replaced the stale `pond-core/` row (single `kernel.py ~199 LOC`)
+   - Replaced the stale `bindings/python/core/` row (single `kernel.py ~199 LOC`)
      with the actual contents: kernel.py, object_store_native_kernel.py,
      local_fs_object_store.py, s3_object_store.py, s3_mock_backend.py,
      make_kernel.py.
-   - Replaced the stale `pond-sdk/` row (claiming `prolly_tree.py`,
+   - Replaced the stale `bindings/python/sdk/` row (claiming `prolly_tree.py`,
      `binary_encoding.py`, `collection_metadata.py`, `collection.py`)
      with the actual contents: `base_lens.py`, `pond_storage.py`,
      `pond_config.py`, `row_query.py`, `uuid7.py`, `hlc.py`,
@@ -4966,9 +4966,9 @@ Work Log:
      reads go through `HEAD` → PNPK pack → manifest.
    - §3.2 `get()` complexity: replaced the `ProllyLensBase` reference
      with the actual `UnifiedStorage.point_lookup` path. Added an
-     honesty note that `pond-sdk/prolly_tree.py` does NOT exist
+     honesty note that `bindings/python/sdk/prolly_tree.py` does NOT exist
      (it lives in `archive/legacy-sdk/prolly_tree.py`).
-   - §4.4: annotated the `pond-sdk/binary_encoding.py` reference to
+   - §4.4: annotated the `bindings/python/sdk/binary_encoding.py` reference to
      point at `archive/legacy-sdk/binary_encoding.py` and note that
      production indexes use PND2 column encoding.
 
@@ -4990,15 +4990,15 @@ Work Log:
      write_batch and read_blob_batch)." Clarified that the batch
      helpers are same-collection performance primitives, NOT
      cross-collection atomicity. Updated the one-sentence test.
-   - §5.4 code table: updated the `pond-core` row (LOC ~420 → ~1630,
-     file list, NOT FROZEN annotation). Updated the `pond-sdk` row
+   - §5.4 code table: updated the `bindings/python/core` row (LOC ~420 → ~1630,
+     file list, NOT FROZEN annotation). Updated the `bindings/python/sdk` row
      (removed `prolly_tree.py`/`binary_encoding.py`/`collection_metadata.py`;
      added `pond_storage.py`/`hlc.py`/`pond_pack.py`/`ivf_index.py`/
      `hnsw_index.py`/`vacuum.py` and the legacy-file pointer). Added
      a `lenses/oltp` row (184 LOC). Annotated `lakehouse`, `vector`,
      `streaming`, `oltp` with base-class + Known-Gaps pointers.
    - §9 "If you are an AI agent specifically": replaced "The kernel
-     is FROZEN. Do not modify `pond-core/kernel.py`..." with the
+     is FROZEN. Do not modify `bindings/python/core/kernel.py`..." with the
      honest version: "The kernel is NOT FROZEN at the implementation
      level — it has gained `write_batch`/`read_blob_batch`. What IS
      frozen is the substrate/operation count (6 substrates, 3

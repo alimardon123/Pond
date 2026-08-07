@@ -42,11 +42,11 @@ scripts they overlap with.
 ## Architecture
 
 Integration tests are the safety net for cross-component changes. If
-a change to `pond-sdk/` or a lens breaks sharing, query, or pruning,
+a change to `bindings/python/sdk/` or a lens breaks sharing, query, or pruning,
 these tests catch it before the architecture-law scripts do. They
-depend on `pond-core`, `pond-sdk`, and `lenses/`.
+depend on `bindings/python/core`, `bindings/python/sdk`, and `lenses/`.
 
 ## Dependencies
 
-- `pond-core/`, `pond-sdk/`, `lenses/lakehouse/`, `lenses/keyvalue/`
+- `bindings/python/core/`, `bindings/python/sdk/`, `lenses/lakehouse/`, `lenses/keyvalue/`
 - `pyarrow`, `duckdb` (for lakehouse / pruning tests)

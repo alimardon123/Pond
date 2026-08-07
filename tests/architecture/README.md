@@ -59,4 +59,4 @@ purpose, not the code under test.
 
 ## Dependencies
 
-- `pond-core/`, `pond-sdk/`, `lenses/keyvalue/`, `lenses/lakehouse/`
+- `bindings/python/core/`, `bindings/python/sdk/`, `lenses/keyvalue/`, `lenses/lakehouse/`

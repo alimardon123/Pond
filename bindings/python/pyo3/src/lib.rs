@@ -1,16 +1,16 @@
-// Pond Python Bindings — PyO3 wrapper around pond-core
+// Pond Python Bindings — PyO3 wrapper around bindings/python/core
 //
 // This crate compiles to a Python extension module named `pond_rust`.
 // It exposes the full PND2 decode/encode pipeline to Python.
 //
-// All decode/encode LOGIC lives in `pond-core`. This file is the thin
+// All decode/encode LOGIC lives in `bindings/python/core`. This file is the thin
 // PyO3 glue layer that:
 //   1. Accepts Python args (bytes, lists, tuples)
 //   2. Calls into pond-core's pure-Rust functions
 //   3. Converts the Rust result types into Python objects
 //
 // This is the correct architecture: the decoder is implemented ONCE in
-// pure Rust, and both the C ABI (in pond-core) and Python (here) use it.
+// pure Rust, and both the C ABI (in bindings/python/core) and Python (here) use it.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
@@ -137,7 +137,7 @@ fn decode(
     }
 
     // Predicate pushdown: filter rows in Python after decode.
-    // (Real pushdown happens at the zone-map level in pond-sdk; this is
+    // (Real pushdown happens at the zone-map level in bindings/python/sdk; this is
     // a row-level filter applied on the decoded result.)
     if let Some(preds) = predicates {
         return apply_predicates(py, &result, &preds);
@@ -149,7 +149,7 @@ fn decode(
 /// Convert a `pond_core::PondColumn` into a Python list of values.
 ///
 /// Handles all value types: INT64, FLOAT64, STRING, BINARY.
-/// NULL values (which pond-core represents as empty strings/vecs for
+/// NULL values (which bindings/python/core represents as empty strings/vecs for
 /// bitmap-encoded rows) become Python None.
 fn column_to_pylist(py: Python, col: &PondColumn) -> PyResult<PyObject> {
     let list = PyList::empty_bound(py);
@@ -162,7 +162,7 @@ fn column_to_pylist(py: Python, col: &PondColumn) -> PyResult<PyObject> {
         }
         VT_STRING => {
             // CString → &str via to_str (safe — we know the bytes are valid UTF-8
-            // because pond-core built them via bytes_to_cstring which preserves
+            // because bindings/python/core built them via bytes_to_cstring which preserves
             // the input bytes; if the input had invalid UTF-8, the original
             // decode path used String::from_utf8_lossy so the bytes are already
             // valid UTF-8 replacement sequences).

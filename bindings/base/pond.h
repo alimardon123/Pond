@@ -60,6 +60,13 @@ typedef struct PondStorageHandle PondStorageHandle;
 PondStorageHandle* pond_storage_new(const char* base_dir);
 void               pond_storage_free(PondStorageHandle* s);
 
+/* Create a UnifiedStorage backed by S3-compatible storage.
+ * URL format: s3://bucket/prefix?region=us-east-1&endpoint=https://...
+ * Credentials are read from the environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY).
+ * Returns NULL on error.
+ * Link against libpond_s3.a (in addition to libpond_storage.a) to use this. */
+PondStorageHandle* pond_storage_new_s3(const char* s3_url);
+
 const char* pond_storage_get_active_branch(PondStorageHandle* s, const char* collection);
 void        pond_storage_set_active_branch(PondStorageHandle* s, const char* collection, const char* branch);
 

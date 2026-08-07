@@ -64,7 +64,7 @@ Deleted files with ZERO production imports (verified by grep):
 
 ### PondStorage Created — the unified SDK
 
-`pond-sdk/pond_storage.py` (~300 LOC) — the ONE class lens authors see:
+`bindings/python/sdk/pond_storage.py` (~300 LOC) — the ONE class lens authors see:
 - Section 1: Namespace (list_collections, collection_exists, set_definition, get_definition)
 - Section 2: Commit/Branch (commit, branch, checkout, list_branches, merge, undo, history, diff)
 - Section 3: Data I/O (write, append, read, read_as_columns, point_lookup, scan_with_pruning)

@@ -90,7 +90,7 @@ import hashlib
 import string
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "pond-core"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "bindings/python/core"))
 sys.path.insert(0, SCRIPT_DIR)
 from kernel import PondMinimal  # noqa: E402
 from phase_l_hazard_simulator import HazardSimulator, HazardConfig  # noqa: E402
@@ -435,7 +435,7 @@ def test_A10_compress_before_encrypt():
     """A10: Transport pipeline order is compress → encrypt."""
     print("\n=== A10: Compress before encrypt ===")
 
-    # We don't have a real transport layer in pond-core; we test
+    # We don't have a real transport layer in bindings/python/core; we test
     # the principle: compress(encrypt(b)) is larger than
     # encrypt(compress(b)) because encrypted bytes are high-entropy.
     import zlib

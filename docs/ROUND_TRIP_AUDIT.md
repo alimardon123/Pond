@@ -23,7 +23,7 @@ A round trip = one `kernel.read_blob()` call = one S3 GET request.
 `kernel.resolve(name)` is **2 S3 GETs cold** (root pointer + root ref blob).
 Both are content-addressed blobs in the object store. After the first resolve
 in a session, the root ref blob is cached by the SDK → 0 GETs for subsequent
-resolves. See `pond-core/object_store_native_kernel.py`.
+resolves. See `bindings/python/core/object_store_native_kernel.py`.
 
 **Legacy kernel (PondMinimal, SQLite — used by LakehouseLens default path):**
 `kernel.resolve(name)` is a local SQLite lookup — does NOT count as a round

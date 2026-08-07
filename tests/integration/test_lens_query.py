@@ -6,7 +6,7 @@ Demonstrates the "direct, easy, simple and elegant way of reading
 data from other Views" that the architecture review asked for.
 
 Run:
-    python pond-sdk/test_view_query.py
+    python bindings/python/sdk/test_view_query.py
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ import shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-sys.path.insert(0, os.path.join(REPO, "pond-core"))
-sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/core"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk"))
 
 from kernel import PondMinimal
 sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))

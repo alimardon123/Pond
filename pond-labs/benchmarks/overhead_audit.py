@@ -15,11 +15,11 @@ import os, sys, time, json, shutil, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else os.getcwd()
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE))) if '__file__' in dir() else os.getcwd()
-if not os.path.exists(os.path.join(REPO, "pond-core")):
+if not os.path.exists(os.path.join(REPO, "bindings/python/core")):
     REPO = os.getcwd()
-sys.path.insert(0, os.path.join(REPO, "pond-core"))
-sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
-sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_structures"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/core"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk", "extensions", "physical_structures"))
 sys.path.insert(0, os.path.join(REPO, "lenses", "keyvalue"))
 sys.path.insert(0, os.path.join(REPO, "lenses", "lakehouse"))
 

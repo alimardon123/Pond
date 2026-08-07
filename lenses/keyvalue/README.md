@@ -39,7 +39,7 @@ instance operate on any collection.
 
 ## Architecture
 
-`KeyValueLens` extends `PondLens` (from `pond-sdk/base_lens.py`), the
+`KeyValueLens` extends `PondLens` (from `bindings/python/sdk/base_lens.py`), the
 thin shared-namespace base. It owns its read/write API; the base only
 provides ref-namespace operations (`branch`, `list_collections`,
 `set_definition`, `history`).
@@ -50,7 +50,7 @@ NOT inherit from each other — each owns its storage code.
 
 ## Dependencies
 
-- `pond-core/` (kernel)
-- `pond-sdk/` (`base_lens`, `prolly_tree`, `binary_encoding`,
+- `bindings/python/core/` (kernel)
+- `bindings/python/sdk/` (`base_lens`, `prolly_tree`, `binary_encoding`,
   `maintenance`, `row_query`, `collection_metadata`)
 - Python stdlib only

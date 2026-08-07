@@ -29,7 +29,7 @@ code is correct.
 
 1. Run `python3 scripts/verify_knowledge_graph.py` — confirm 100%
    coverage. If any files are missing, add them to `KNOWLEDGE_GRAPH.md`.
-2. Run `PYTHONPATH=pond-rust/target/release python3 -m pytest tests/test_all.py -v`
+2. Run `PYTHONPATH=target/release python3 -m pytest tests/test_all.py -v`
    — confirm 0 failures (skips with documented reasons are OK). If any
    tests fail, either fix the code or skip with a clear reason.
 3. Sweep the top-level docs for stale claims:
@@ -43,7 +43,7 @@ code is correct.
      folder structure?
    - `PACKAGES.md` — does the dependency graph match reality?
 4. Sweep the source for stale comments:
-   - `grep -rn "TODO\|FIXME\|XXX\|HACK" pond-core/ pond-sdk/ lenses/`
+   - `grep -rn "TODO\|FIXME\|XXX\|HACK" bindings/python/core/ bindings/python/sdk/ lenses/`
    - For each TODO that references an issue now fixed, remove or update it.
 5. Commit the doc fixes as a separate commit BEFORE running the review.
    The review commit should be purely additive (the review document
@@ -72,13 +72,13 @@ code organization, dependency graph, and API design.
 
 3. **Performant (3.3):** Are optimizations in the right layer? The kernel
    should not cache, compress, index, or batch (beyond simple I/O
-   batching). Check: is there optimization logic in pond-core/ that
-   belongs in pond-sdk/ or pond-rust/?
+   batching). Check: is there optimization logic in bindings/python/core/ that
+   belongs in bindings/python/sdk/ or ?
 
 4. **Scalable (3.4):** The removability test — if package X is deleted
    entirely, does any lower-layer package break? Check: `grep -r` for
-   imports that cross dependency boundaries (e.g., pond-core importing
-   from pond-sdk).
+   imports that cross dependency boundaries (e.g., bindings/python/core importing
+   from bindings/python/sdk).
 
 5. **Efficient (3.5):** Are derived structures rebuildable from
    snapshots? Check: is there any authoritative metadata that can't
@@ -95,7 +95,7 @@ code organization, dependency graph, and API design.
 
 8. **Storage-Independent (3.8):** Can you switch execution engines
    without rewriting storage? Check: is any execution engine (DuckDB,
-   Spark, Polars) imported in pond-core/ or pond-sdk/ (vs. only in
+   Spark, Polars) imported in bindings/python/core/ or bindings/python/sdk/ (vs. only in
    pond-labs/ or lenses/)?
 
 **Output:** a compliance table with ✅/❌/⚠️ for each principle, plus
@@ -149,9 +149,9 @@ Structure: [see below]
 3. `PACKAGES.md` — package structure
 4. `SDK_SPEC.md` — the authoritative SDK contract
 5. `README.md` — 5-minute intro
-6. `pond-core/kernel.py` — the storage kernel itself
-7. `pond-sdk/base_lens.py` — the shared namespace base
-8. `pond-sdk/extensions/physical_structures/unified_storage.py` — the
+6. `bindings/python/core/kernel.py` — the storage kernel itself
+7. `bindings/python/sdk/base_lens.py` — the shared namespace base
+8. `bindings/python/sdk/extensions/physical_structures/unified_storage.py` — the
    universal storage backend (sample key methods, don't read all 5500 LOC)
 9. `lenses/keyvalue/keyvalue_lens.py` — a production lens
 10. `lenses/lakehouse/lakehouse_lens.py` — another production lens
@@ -171,8 +171,8 @@ Structure: [see below]
 7. Maturity vs. hype — are there current overclaims?
 8. Missing capabilities — what concrete features are missing?
 9. Comparison to existing systems — Iceberg, DuckDB, Git, FAISS, etc.
-10. The "weekly question" — if you deleted everything except pond-core
-    and pond-sdk, would the architecture still make sense?
+10. The "weekly question" — if you deleted everything except bindings/python/core
+    and bindings/python/sdk, would the architecture still make sense?
 
 **Required output structure:**
 

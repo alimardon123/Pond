@@ -38,7 +38,7 @@ Kernel (stores AES-GCM-encrypted, zstd-compressed bytes + block index)
 Lens (sees plaintext, uncompressed bytes)
 ```
 
-Transport depends only on `pond-core` (per `REPO_ORGANIZATION.md` §7).
+Transport depends only on `bindings/python/core` (per `REPO_ORGANIZATION.md` §7).
 It is NOT a kernel extension — it is a library that wraps kernel I/O.
 
 ## Usage
@@ -55,6 +55,6 @@ data = t.read("my_collection", ref)
 
 ## Dependencies
 
-- `pond-core/` (kernel)
+- `bindings/python/core/` (kernel)
 - Reference: stdlib only (`zlib`, `hashlib`)
 - Production: `zstandard`, `cryptography`

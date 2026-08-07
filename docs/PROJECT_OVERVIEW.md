@@ -298,7 +298,7 @@ No ETL. No sync. No duplication. One source of truth.
 
 ### The Weekly Question
 
-> *"If I deleted everything except `pond-core` and `pond-sdk`, would the architecture still make sense?"*
+> *"If I deleted everything except `bindings/python/core` and `bindings/python/sdk`, would the architecture still make sense?"*
 
 Answer: Yes. The kernel provides 3 primitives. The SDK provides UnifiedStorage (PND2 + manifest). Everything else is a lens that composes above. Each lens is removable without breaking the others.
 

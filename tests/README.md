@@ -5,7 +5,7 @@ All Pond tests, organized by purpose.
 ## What it is
 
 Per `REPO_ORGANIZATION.md` §2.6, every test lives in `tests/` or a
-subdirectory. Test files are NOT scattered inside `pond-sdk/` or
+subdirectory. Test files are NOT scattered inside `bindings/python/sdk/` or
 `lenses/` — those directories contain only production code. The
 single entry point is `tests/test_all.py`.
 
@@ -58,6 +58,6 @@ are reported with the offending script's tail output.
 
 ## Dependencies
 
-- `pond-core/`, `pond-sdk/`, `lenses/`, `pond-labs/`
+- `bindings/python/core/`, `bindings/python/sdk/`, `lenses/`, `pond-labs/`
 - `pytest` (only needed for the top-level entry point)
 - `pyarrow`, `duckdb` (for lakehouse / integration tests)

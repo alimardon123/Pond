@@ -2,22 +2,22 @@
 
 `sdk-go` is a Go SDK that lets Go programs encode and decode Pond's PND2
 columnar binary format. It links against `libpond_core.a` (the Rust C ABI
-in `../pond-rust/pond-core/`) via cgo.
+in `../core/codec/`) via cgo.
 
 ## Architectural role
 
-`sdk-go` is a **peer to `pond-sdk/`** (the Python SDK). Both bind to
-`pond-core`'s storage layer:
+`sdk-go` is a **peer to `bindings/python/sdk/`** (the Python SDK). Both bind to
+`bindings/python/core`'s storage layer:
 
 ```
                      Layer 0 (storage kernel)
                      ┌──────────────────────────────────────┐
-                     │  pond-core/kernel.py (Python)         │
-                     │  pond-rust/pond-core/ (Rust C ABI)    │
+                     │  bindings/python/core/kernel.py (Python)         │
+                     │  core/codec/ (Rust C ABI)    │
                      └────────────┬─────────────┬───────────┘
                                   │             │
                   ┌───────────────▼───┐  ┌──────▼──────────┐
-                  │  pond-sdk/        │  │  sdk-go/         │
+                  │  bindings/python/sdk/        │  │  bindings/go/         │
                   │  (Python SDK)     │  │  (Go SDK)        │
                   │                   │  │                  │
                   │  - Lenses         │  │  - PND2 codec    │
@@ -42,7 +42,7 @@ This SDK currently exposes **PND2 codec operations only**:
 | Decode all value types (INT64, FLOAT64, STRING, BINARY, NULL) | ✅ |
 | Storage kernel (Write/Read/Ref) | ❌ (Python-only for now) |
 
-Storage kernel operations require the Python `pond-core/kernel.py`. A
+Storage kernel operations require the Python `bindings/python/core/kernel.py`. A
 future Rust implementation of the storage kernel would enable full Go
 storage support — but that's a much larger project (the kernel's
 ProllyTree, commit graph, ref CAS, etc.).
@@ -110,7 +110,7 @@ Go's GC doesn't track C-allocated memory. The Go SDK handles this in two ways:
 ## Package layout
 
 ```
-sdk-go/
+bindings/go/
 ├── go.mod
 ├── README.md            # this file
 ├── pond/                # public Go API (import this package)
@@ -140,11 +140,11 @@ To run:
 
 ```bash
 # Generate the Python test blobs first (one-time)
-cd pond-rust && PYTHONPATH=../pond-sdk:target/release \
-    python3 tests/generate_test_blobs.py && cd ..
+PYTHONPATH=bindings/python/sdk:target/release \
+    python3 bindings/base/generate_test_blobs.py
 
 # Run the Go tests
-cd sdk-go && go test -v ./...
+cd bindings/go && go test -v ./...
 ```
 
 ## Design principles followed
@@ -153,7 +153,7 @@ cd sdk-go && go test -v ./...
 |-----------|-----|
 | **Simple** (3.1) | One package, one responsibility (PND2 codec). No leaky abstractions. |
 | **Performant** (3.3) | Optimization lives in Rust; Go is a thin wrapper. Zero-copy slice sharing for large INT64/FLOAT64 reads (with copy option for safety). |
-| **Scalable** (3.4) | Removability test: deleting `sdk-go/` breaks no lower layer. The Python SDK, Rust core, and storage kernel are all unaffected. |
-| **Beautiful** (3.6) | Dependencies flow downward only: `sdk-go` → `pond-rust/pond-core` (via C ABI) → no further. |
+| **Scalable** (3.4) | Removability test: deleting `bindings/go/` breaks no lower layer. The Python SDK, Rust core, and storage kernel are all unaffected. |
+| **Beautiful** (3.6) | Dependencies flow downward only: `sdk-go` → `core/codec` (via C ABI) → no further. |
 | **Functional** (3.7) | PND2 codec is the minimum useful capability for Go callers. Storage kernel access is a future addition. |
 | **Storage-Independent** (3.8) | PND2 blobs are language-agnostic. Go-produced blobs are byte-compatible with Python-produced blobs. |

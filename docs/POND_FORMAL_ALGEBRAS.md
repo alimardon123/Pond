@@ -463,7 +463,7 @@ nodes).
 
 **Gap (closed):** OSN7 was the biggest gap. The legacy `PondMinimal` kernel
 uses SQLite for the root namespace. The new `ObjectStoreNativeKernel`
-(`pond-core/object_store_native_kernel.py`) closes this gap — refs are
+(`bindings/python/core/object_store_native_kernel.py`) closes this gap — refs are
 stored as content-addressed blobs in the object store (root pointer →
 root ref blob → name→hash dict). New code should use `ObjectStoreNativeKernel`;
 `PondMinimal` remains for backward compatibility and local-disk testing.

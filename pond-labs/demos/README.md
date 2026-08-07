@@ -44,12 +44,12 @@ python pond-labs/demos/interop_demo.py
 The demo proves Pond's central claim: that one immutable substrate
 can support many specialized systems that interoperate without ETL.
 If the demo stops passing, the architecture is broken — file an issue
-before touching `pond-sdk/` or `lenses/`.
+before touching `bindings/python/sdk/` or `lenses/`.
 
 ## Dependencies
 
-- `pond-core/` (kernel)
-- `pond-sdk/` (base lens, ProllyTreeIndex)
+- `bindings/python/core/` (kernel)
+- `bindings/python/sdk/` (base lens, ProllyTreeIndex)
 - `lenses/lakehouse/` (LakehouseLens)
 - `pond-labs/lenses/` (FeatureStoreLens)
 - `pyarrow`, `duckdb`

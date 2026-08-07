@@ -8,7 +8,7 @@
 //   PND2 stays as the universal container. This crate provides ONE of
 //   several ways to materialize the data:
 //     - Tabular workloads → Arrow (this crate)
-//     - Non-tabular (KV, streaming, git) → raw bytes (pond-core)
+//     - Non-tabular (KV, streaming, git) → raw bytes (bindings/python/core)
 //
 // The conversion is near zero-copy for numeric columns (INT64/FLOAT64):
 //   pond_core::PondColumn.i64_data (Vec<i64>) → arrow::Int64Array

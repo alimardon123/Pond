@@ -208,6 +208,14 @@ pub struct PondStorageHandle {
     storage: UnifiedStorage,
 }
 
+impl PondStorageHandle {
+    /// Create a handle from a UnifiedStorage. Used by C ABI constructors
+    /// in other crates (e.g., pond_s3's `pond_storage_new_s3`).
+    pub fn new(storage: UnifiedStorage) -> Self {
+        Self { storage }
+    }
+}
+
 /// Create a new UnifiedStorage with a local FS backend.
 /// Returns NULL on error.
 #[no_mangle]

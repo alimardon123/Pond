@@ -21,17 +21,17 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _run_script(script_path):
     """Run a Python script as a subprocess and return (success, output).
 
-    Inherits the current PYTHONPATH so scripts that depend on pond-sdk,
-    pond-core, or core modules work correctly when run via pytest.
+    Inherits the current PYTHONPATH so scripts that depend on bindings/python/sdk,
+    bindings/python/core, or core modules work correctly when run via pytest.
     """
     full_path = os.path.join(REPO_ROOT, script_path)
     env = dict(os.environ)
-    # Ensure pond-sdk and pond-sdk/extensions/physical_structures are on
+    # Ensure bindings/python/sdk and bindings/python/sdk/extensions/physical_structures are on
     # PYTHONPATH (many scripts import from there).
     extra_paths = [
-        os.path.join(REPO_ROOT, "pond-sdk"),
-        os.path.join(REPO_ROOT, "pond-sdk", "extensions", "physical_structures"),
-        os.path.join(REPO_ROOT, "pond-core"),
+        os.path.join(REPO_ROOT, "bindings/python/sdk"),
+        os.path.join(REPO_ROOT, "bindings/python/sdk", "extensions", "physical_structures"),
+        os.path.join(REPO_ROOT, "bindings/python/core"),
         os.path.join(REPO_ROOT, "target", "release"),
     ]
     existing = env.get("PYTHONPATH", "")
@@ -76,7 +76,7 @@ def test_architecture_laws():
     assert ok, f"Architecture laws failed:\n{output[-500:]}"
 
 def test_lakehouse():
-    ok, output = _run_script("lenses/lakehouse/lakehouse_lens.py")
+    ok, output = _run_script("lenses/lakehouse/python/lakehouse_lens.py")
     assert ok, f"Lakehouse tests failed:\n{output[-500:]}"
 
 def test_feature_store_lens():
@@ -191,7 +191,7 @@ def test_rust_python_roundtrip():
 
 
 def test_rust_c_abi():
-    """Verify the pond-core C ABI works end-to-end from a C program.
+    """Verify the bindings/python/core C ABI works end-to-end from a C program.
     Skips if cargo or cc is unavailable."""
     import os, shutil, subprocess
     # cargo may be in ~/.cargo/bin (not on PATH in some environments)
@@ -259,7 +259,7 @@ def test_go_sdk():
     if not os.path.isdir(blob_dir) or len(os.listdir(blob_dir)) == 0:
         # Generate them
         env = dict(os.environ)
-        env["PYTHONPATH"] = os.path.join(REPO_ROOT, "pond-sdk") + ":" + \
+        env["PYTHONPATH"] = os.path.join(REPO_ROOT, "bindings/python/sdk") + ":" + \
                             os.path.join(rust_dir, "target", "release")
         subprocess.run(["python3",
                         os.path.join(rust_dir, "tests", "generate_test_blobs.py")],
@@ -290,7 +290,7 @@ def test_decode_benchmark():
     """
     import subprocess
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.path.join(REPO_ROOT, "pond-sdk") + ":" + \
+    env["PYTHONPATH"] = os.path.join(REPO_ROOT, "bindings/python/sdk") + ":" + \
                         os.path.join(REPO_ROOT, "target", "release")
     result = subprocess.run(
         ["python3", os.path.join(REPO_ROOT, "scripts", "benchmark_decode_paths.py")],
@@ -347,3 +347,42 @@ def test_pond_cli():
     binary_size = os.path.getsize(pond_bin)
     assert binary_size < 10 * 1024 * 1024, \
         f"pond binary is {binary_size / 1024 / 1024:.1f}MB — should be < 10MB"
+
+
+def test_rust_s3_backend():
+    """Verify the Rust S3ObjectStore works against a mock S3 server (moto).
+
+    Tests the full SigV4 signing + HTTP + S3 operations pipeline:
+      pond init (S3) → write → read → branch → checkout → merge → history
+
+    Skips if cargo, the pond binary, or moto are unavailable.
+    """
+    import os, shutil, subprocess, sys
+
+    # Check prerequisites
+    pond_bin = os.path.join(REPO_ROOT, "target", "debug", "pond")
+    if not os.path.exists(pond_bin):
+        # Try release build
+        pond_bin = os.path.join(REPO_ROOT, "target", "release", "pond")
+    if not os.path.exists(pond_bin):
+        import pytest
+        pytest.skip("pond binary not built — run `cargo build -p pond_cli`")
+
+    try:
+        import moto  # noqa: F401
+        import boto3  # noqa: F401
+    except ImportError:
+        import pytest
+        pytest.skip("moto/boto3 not available — run `pip install moto boto3`")
+
+    # Run the S3 integration test script
+    result = subprocess.run(
+        [sys.executable, os.path.join(os.path.dirname(REPO_ROOT), "scripts", "test_rust_s3.py")],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=120,
+        env={**os.environ, "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test",
+             "AWS_DEFAULT_REGION": "us-east-1"}
+    )
+    assert result.returncode == 0, \
+        f"S3 test failed:\nSTDOUT:\n{result.stdout[-2000:]}\nSTDERR:\n{result.stderr[-1000:]}"
+    assert "ALL S3 TESTS PASSED" in result.stdout, \
+        f"S3 tests did not complete:\n{result.stdout[-2000:]}"

@@ -1,56 +1,59 @@
 # lenses/
 
-Layer 3: Lens implementations.
+Workload-specific lenses over Pond's unified storage.
 
-A **Lens** is an interpretation layer over immutable bytes — it defines
-`encode` (domain object → bytes) and `decode` (bytes → domain object).
-The kernel stores bytes; the Lens interprets them.
+## Structure
 
-## What's here
+Each lens lives in its own subdirectory with `python/` and `rust/`
+subdirectories for multi-language support:
+
+```
+lenses/
+├── base/                  # Cross-language lens protocol (C ABI header)
+│   ├── pond_lens.h        # PLACEHOLDER — no lens C ABI yet
+│   └── README.md
+├── keyvalue/
+│   ├── python/            # KeyValueLens (production)
+│   │   ├── keyvalue_lens.py
+│   │   └── __init__.py
+│   ├── rust/              # Future Rust port (placeholder)
+│   │   └── README.md
+│   └── README.md
+├── lakehouse/
+│   ├── python/            # LakehouseLens (production)
+│   ├── rust/              # Future Rust port (placeholder)
+│   └── README.md
+├── oltp/
+│   ├── python/            # OLTPLens (production)
+│   └── rust/              # Future Rust port (placeholder)
+├── streaming/
+│   ├── python/            # StreamingLens (production)
+│   ├── rust/              # Future Rust port (placeholder)
+│   └── README.md
+├── vector/
+│   ├── python/            # VectorLens (production)
+│   ├── rust/              # Future Rust port (placeholder)
+│   └── README.md
+└── README.md              # This file
+```
+
+## Migration plan
+
+All lenses today are Python-only. When a lens is ported to Rust:
+1. Implement the lens logic in Rust (in `rust/`), calling `pond_kernel`
+   and `pond_storage` directly.
+2. Expose the lens via `lenses/base/pond_lens.h` C ABI.
+3. The Python wrapper in `python/` becomes a thin PyO3 binding to the
+   Rust implementation.
+
+The first lens to be ported will be **KeyValueLens** (simplest API surface).
+
+## Lens list
 
 | Lens | Purpose | Status |
 |---|---|---|
-| `lakehouse/` | DuckDB-based lakehouse (CREATE TABLE, INSERT, SELECT, time travel, branching, merge, schema evolution) | **Flagship** — 10 tests pass |
-| `vector/` | Vector DB with ANN search | Working — uses mock kernel for testing |
-
-## The flagship: `lakehouse/`
-
-`lenses/lakehouse/lakehouse.py` is the flagship demonstration that the
-Lens algebra covers a real workload. It provides:
-
-- `LakehouseLens` — tabular semantics on Pond via Parquet
-- `PondLakehouse` — full lakehouse = Pond kernel + LakehouseLens + DuckDB
-
-Features (all tested):
-- CREATE TABLE, INSERT, SELECT (WHERE, ORDER BY, GROUP BY, JOIN, aggregation)
-- Time travel (query at old commit hash)
-- Branching (dev/test branches on tables)
-- Merge (2-parent merge commit)
-- Schema evolution (Parquet-native; add column, old rows get NULL)
-
-Benchmark vs native DuckDB+Parquet (10K rows):
-- create: 15% overhead
-- COUNT(*): 260% overhead (re-registering tables each query; production would cache)
-- filter + scan: 127% overhead
-
-## The killer demo: cross-Lens interop
-
-The lakehouse Lens interoperates with the Feature Store Lens
-(`pond-labs/feature_store_lens.py`) without coordination — they share
-the kernel's refs and bytes. See `pond-labs/interop_demo.py` (12/12 pass).
-
-## Adding a new Lens
-
-1. Read `docs/LENS_GUIDE.md` (the Lens author's contract).
-2. Subclass `Lens` from `pond-sdk/lens_sdk.py`.
-3. Implement `encode` and `decode`.
-4. Use `ProllyViewBase` for versioning, branching, time travel.
-5. Add tests.
-6. Verify the 7 design goals (`DESIGN_GOALS.md` §3) are served.
-
-## Dependencies
-
-- `pond-core/` (kernel)
-- `pond-sdk/` (Lens base class, ProllyViewBase)
-- `lakehouse/`: `duckdb`, `pyarrow`
-- `vector/`: stdlib only (uses mock kernel)
+| KeyValueLens | Key-value storage with point lookups | Production (Python) |
+| LakehouseLens | Tabular storage with DuckDB SQL | Production (Python) |
+| OLTPLens | OLTP with memtable + batch flush | Production (Python) |
+| StreamingLens | Kafka-like streaming with partitions | Production (Python) |
+| VectorLens | Vector storage with IVF ANN | Production (Python) |

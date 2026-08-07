@@ -47,10 +47,10 @@ it.
 
 ## Architecture
 
-Depends only on `pond-core` (per `REPO_ORGANIZATION.md` §7). Each
+Depends only on `bindings/python/core` (per `REPO_ORGANIZATION.md` §7). Each
 coordinator is a library, not a kernel feature.
 
 ## Dependencies
 
-- `pond-core/` (kernel)
+- `bindings/python/core/` (kernel)
 - Python stdlib only

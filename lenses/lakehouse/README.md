@@ -37,7 +37,7 @@ Two storage paths coexist inside one lens:
 
 ## Architecture
 
-`LakehouseLens` extends `PondLens` (from `pond-sdk/base_lens.py`).
+`LakehouseLens` extends `PondLens` (from `bindings/python/sdk/base_lens.py`).
 It owns its own read/write API and its own storage code — per
 `REPO_ORGANIZATION.md` §4, production lenses do NOT inherit from each
 other. It is the flagship cross-Lens interop partner: any collection
@@ -46,6 +46,6 @@ it writes is readable by the Feature Store Lens (see
 
 ## Dependencies
 
-- `pond-core/` (kernel)
-- `pond-sdk/` (base lens, ProllyTreeIndex, collection metadata)
+- `bindings/python/core/` (kernel)
+- `bindings/python/sdk/` (base lens, ProllyTreeIndex, collection metadata)
 - `duckdb`, `pyarrow`

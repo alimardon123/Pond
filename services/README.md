@@ -71,7 +71,7 @@ from services.replication.replication_coordinator import PrimarySecondaryCoordin
 
 ## Dependencies
 
-- `pond-core/` (kernel)
+- `bindings/python/core/` (kernel)
 - `transport/`: `zstandard`, `cryptography` (production only)
 - `schema/`: stdlib only
 - `replication/`: stdlib only

@@ -29,7 +29,7 @@ jobs:
           pip install pyarrow duckdb polars pandas
 
       - name: Run view_laws.py CI harness (5 SDK Views)
-        run: python pond-sdk/run_lens_laws_ci.py
+        run: python bindings/python/sdk/run_lens_laws_ci.py
 
       - name: Run view_laws.py on ArrowView (Phase D adapter)
         run: python pond-arrow/run_arrow_view_laws.py
@@ -41,7 +41,7 @@ jobs:
         run: python pond-arrow/arrow_view.py
 
       - name: Run tombstone helper tests (RFC-0008)
-        run: python pond-sdk/maintenance.py
+        run: python bindings/python/sdk/maintenance.py
 
       - name: Run Feature Store production tests (RFC-0011)
         run: python pond-feature-store/feature_store.py
@@ -50,22 +50,22 @@ jobs:
         run: python pond-feature-store/e2e_workflow.py
 
       - name: Run ViewQuery tests (elegant cross-view reading)
-        run: python pond-sdk/test_lens_query.py
+        run: python bindings/python/sdk/test_lens_query.py
 
       - name: Run shared Views test (multiple Views, same bytes, no overhead)
-        run: python pond-sdk/test_shared_lenses.py
+        run: python bindings/python/sdk/test_shared_lenses.py
 
       - name: Run Lens Architecture test (RFC-0012 milestone)
-        run: python pond-sdk/test_lens_architecture.py
+        run: python bindings/python/sdk/test_lens_architecture.py
 
       - name: Run TypedBlob middle layer test (any lens, any blob)
-        run: python pond-sdk/experiments/resolver_comparison/test_typed_blob.py
+        run: python bindings/python/sdk/experiments/resolver_comparison/test_typed_blob.py
 
       - name: Run Architecture Laws (executable specification)
-        run: python pond-sdk/architecture_laws.py
+        run: python bindings/python/sdk/architecture_laws.py
 
       - name: Run Collection layer tests
-        run: python pond-sdk/collection.py
+        run: python bindings/python/sdk/collection.py
 
       - name: Run differential testing (reference vs Pond, 100 scenarios)
         run: python -c "from experiments.differential_test import run_differential_test; r = run_differential_test(100, 30); print(f'Passed: {r[\"passed\"]}/{r[\"scenarios\"]}'); assert r['failed'] == 0"

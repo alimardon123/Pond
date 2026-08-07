@@ -16,7 +16,7 @@ pond_repo/
 ├── KNOWLEDGE_GRAPH.md           # Navigational map of the repo
 ├── worklog.md                   # Append-only research log
 │
-├── pond-core/                   # Layer 0: Storage Kernel + storage backends (NOT FROZEN)
+├── bindings/python/core/                   # Layer 0: Storage Kernel + storage backends (NOT FROZEN)
 │   ├── kernel.py                # PondMinimal — 3 ops + batch I/O helpers (~274 LOC)
 │   ├── object_store_native_kernel.py # ObjectStoreNativeKernel (no SQLite; refs as blobs)
 │   ├── local_fs_object_store.py # LocalFSObjectStore (pure files)
@@ -24,7 +24,7 @@ pond_repo/
 │   ├── s3_mock_backend.py       # Latency-injecting S3 mock
 │   └── make_kernel.py           # make_kernel(url) factory — file:// or s3://
 │
-├── pond-sdk/                    # Layer 1: Storage infrastructure + extensions
+├── bindings/python/sdk/                    # Layer 1: Storage infrastructure + extensions
 │   ├── base_lens.py             # PondLens — shared namespace base (no format awareness)
 │   ├── pond_storage.py          # PondStorage — THE unified SDK class (namespace + commit + data I/O)
 │   ├── pond_config.py           # PondConfig — persistent pruning/encoding settings
@@ -88,17 +88,17 @@ pond_repo/
 │       ├── sql_pushdown_benchmark.py # SQL pushdown end-to-end
 │       └── loc_benchmark.py     # LOC saved vs from-scratch
 │
-├── pond-rust/                   # Cross-language Rust core + Python bindings
-│   ├── pond-core/               # Pure-Rust PND2 codec + C ABI (zero deps)
+├──                    # Cross-language Rust core + Python bindings
+│   ├── bindings/python/core/               # Pure-Rust PND2 codec + C ABI (zero deps)
 │   │   ├── src/lib.rs           # pnd2_decode (all encodings) + pnd2_encode_* + C ABI
 │   │   └── pond_core.h          # C ABI header for Go/Java/Node/C/C++/Zig
 │   ├── pond-python/             # PyO3 wrapper (produces pond_rust.so)
-│   │   └── src/lib.rs           # Thin glue — delegates to pond-core
+│   │   └── src/lib.rs           # Thin glue — delegates to bindings/python/core
 │   └── tests/                   # C ABI test + Python blob generator
 │       ├── test_c_abi.c         # 131-check end-to-end C ABI test
 │       └── test_blobs/          # 7 binary blobs (all encodings × vtypes)
 │
-├── sdk-go/                      # Go SDK (PND2 codec bindings via cgo)
+├── bindings/go/                      # Go SDK (PND2 codec bindings via cgo)
 │   ├── pond/                    # Public Go API (Result, Column, Encoder)
 │   ├── internal/cabi/           # Private cgo layer over libpond_core.a
 │   └── go.mod                   # Module github.com/pond/pond-go
@@ -118,10 +118,10 @@ pond_repo/
 ## Dependency rules
 
 ```
-pond-core (kernel.py 274 LOC + storage backends; NOT FROZEN —
+bindings/python/core (kernel.py 274 LOC + storage backends; NOT FROZEN —
            gained write_batch / read_blob_batch in the thread-safety round)
     ↓
-pond-sdk (base_lens, pond_storage, pond_config, hlc, uuid7,
+bindings/python/sdk (base_lens, pond_storage, pond_config, hlc, uuid7,
           maintenance, row_query, extensions/{indexing, maintenance,
           semantic, physical_structures/unified_storage})
     ↓
@@ -129,12 +129,12 @@ lenses/ (keyvalue, lakehouse, vector, streaming, oltp)
     ↓
 pond-labs/ (experimental code, depends on everything)
 
-pond-rust/pond-core (pure-Rust PND2 codec + C ABI, zero deps)
+core/codec (pure-Rust PND2 codec + C ABI, zero deps)
     ↓                              ↓
-pond-rust/pond-python           sdk-go/ (cgo over libpond_core.a)
+bindings/python/pyo3           bindings/go/ (cgo over libpond_core.a)
 (PyO3 wrapper → pond_rust.so)
     ↓
-(importable by pond-sdk for fast encode/decode)
+(importable by bindings/python/sdk for fast encode/decode)
 ```
 
 **Rules:**
@@ -142,20 +142,20 @@ pond-rust/pond-python           sdk-go/ (cgo over libpond_core.a)
 - KeyValueLens, VectorLens, and StreamingLens extend `PondLens` directly.
 - `LakehouseLens` and `OLTPLens` declare NO base class — documented
   exceptions, NOT bugs (see `SDK_SPEC.md` and `DESIGN_GOALS.md` Known Gaps).
-- pond-sdk depends only on pond-core.
-- Services depend only on pond-core (not on pond-sdk or lenses).
+- bindings/python/sdk depends only on pond-core.
+- Services depend only on bindings/python/core (not on bindings/python/sdk or lenses).
 - Extensions are data-side (collection-level), not lens-side.
 - pond-labs depends on everything (it's experimental).
-- pond-rust/pond-core has ZERO external dependencies (so it can be
+- core/codec has ZERO external dependencies (so it can be
   statically linked from Go/Java/Node without dragging transitive crates).
-- pond-rust/pond-python depends on pond-rust/pond-core + PyO3.
-- sdk-go depends on pond-rust/pond-core (via cgo over libpond_core.a).
+- bindings/python/pyo3 depends on core/codec + PyO3.
+- sdk-go depends on core/codec (via cgo over libpond_core.a).
   It does NOT depend on Python — Go programs can encode/decode PND2
   blobs without any Python runtime.
 
 ## The weekly question
 
-> If I deleted everything except `pond-core` and `pond-sdk`, would the
+> If I deleted everything except `bindings/python/core` and `bindings/python/sdk`, would the
 > architecture still make sense? (DESIGN_GOALS.md §4)
 
 Yes. The kernel and SDK are self-contained. Every lens, service, and

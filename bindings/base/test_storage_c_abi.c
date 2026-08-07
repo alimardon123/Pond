@@ -5,10 +5,10 @@
  * merge, undo, revert, list_branches.
  *
  * Build:
- *   cc pond-rust/tests/test_storage_c_abi.c -Ipond-rust \
- *     pond-rust/target/release/libpond_storage.a \
- *     pond-rust/target/release/libpond_kernel.a \
- *     pond-rust/target/release/libpond_core.a \
+ *   cc tests/test_storage_c_abi.c -Ipond-rust \
+ *     target/release/libpond_storage.a \
+ *     target/release/libpond_kernel.a \
+ *     target/release/libpond_core.a \
  *     -lpthread -ldl -lm -o target/release/test_storage_c_abi
  *
  * Run:

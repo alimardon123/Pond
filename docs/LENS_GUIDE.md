@@ -199,8 +199,8 @@ class ContextResolver:
 ### Verification
 
 This contract is verified by:
-- `pond-sdk/test_shared_lenses.py` — multiple Lenses sharing same byte graph
-- `pond-sdk/test_lens_architecture.py` — multi-Lens architecture proof
+- `bindings/python/sdk/test_shared_lenses.py` — multiple Lenses sharing same byte graph
+- `bindings/python/sdk/test_lens_architecture.py` — multi-Lens architecture proof
 - `pond-labs/interop_demo.py` — bidirectional Feature Store ↔ Lakehouse interop (12/12 pass)
 
 ---

@@ -8,8 +8,8 @@
  *   4. Test error paths (null pointers, empty blob, bad magic)
  *   5. Verify memory cleanup via pond_result_free / pond_blob_free
  *
- * Build (run from pond-rust/):
- *   cc tests/test_c_abi.c -Ipond-core -Ltarget/release \
+ * Build (run from ):
+ *   cc tests/test_c_abi.c -Ibindings/python/core -Ltarget/release \
  *     -lpond_core -lpthread -ldl -lm -o target/test_c_abi && ./target/test_c_abi
  *
  * On success: prints "ALL C ABI TESTS PASSED" and exits 0.
@@ -195,7 +195,7 @@ int main(void) {
         const char *expected_col_name;
     };
 
-    /* Paths are relative to the pond-rust/ directory (where the test
+    /* Paths are relative to the  directory (where the test
      * binary lives in target/test_c_abi). */
     struct blob_test tests[] = {
         {"tests/test_blobs/i64_raw.bin",     1, 8,   "v"},

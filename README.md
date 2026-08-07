@@ -18,108 +18,101 @@ CRDT concurrency (no CAS), and PB-scale performance.
 ## Architecture
 
 ```
-Lenses (KV, Vector, Streaming, Lakehouse)
+Lenses (KV, Vector, Streaming, Lakehouse, OLTP)
   ↓ compose
-PondStorage (ONE unified SDK)
+UnifiedStorage (ONE storage engine — Rust core)
   - write / append / read / point_lookup / iter_rows
   - append_shard / upsert_shard / delete_shard (CRDT, no CAS)
   - read_with_shards (two-level merge: row groups + rows)
   - branch / checkout / merge / revert / history / diff
   - gc / vacuum / optimize (Delta/Iceberg parity)
-  - list_collections / list_namespaces (hierarchical)
   ↓
-UnifiedStorage (ONE storage engine)
+Kernel (3 ops: Write, Read, Ref)
+  - ObjectStore trait (local FS, S3, GCS, in-memory)
   - PND2 format (ONE binary format for ALL workloads)
   - CollectionManifest (ONE index — flat → StatsTree at PB scale)
   - JSON commit blobs (ONE commit format)
   - Shards (CRDT G-Set) + row-level version vectors
-  - Parallel fetch (~1 RTT wall-clock)
   ↓
-Kernel (6 substrates + 3 ops + batch helpers)
-  Write(bytes) → hash  |  Read(hash) → bytes  |  Ref(name, hash) → ()
+Storage Backends
+  - LocalFSObjectStore  (Rust, zero deps)
+  - S3ObjectStore       (Rust, SigV4 — works with AWS S3, R2, MinIO, etc.)
+  - InMemoryObjectStore (Python, for testing)
 ```
 
 ---
 
-## Performance (verified by benchmark)
+## Repository Structure
 
-| Operation | GETs | PUTs | Wall-clock |
-|---|---|---|---|
-| Cold point lookup | 3 | 0 | ~150ms (50ms S3 RTT) |
-| Warm point lookup | 0 | 0 | ~1ms (cached) |
-| Warm append (cached) | 0 | 3 | ~8ms |
-| Shard append (CRDT) | 0 | 2 | ~0.5ms (warm) |
-| Full scan (parallel) | 3+K | 0 | ~1 RTT for fetch phase |
-| GC | O(live) | 0 | fast regardless of total storage |
-
----
-
-## Key Features
-
-### Unified Storage
-- ONE format (PND2) for ALL workloads — lakehouse, KV, vector, streaming
-- ONE commit format (JSON) — simple, debuggable, no binary encoding
-- ONE concurrency model (CRDT shards) — no CAS, no retry, no coordination
-
-### Versioning (git-like)
-- `branch(collection, branch_name)` — O(1) ref copy
-- `checkout(collection, branch_name)` — switch active branch
-- `checkout_new(collection, branch_name)` — branch + checkout in one call
-- `merge(collection, source, target)` — three-level CRDT merge
-- `revert(collection, commit_hash)` — revert to specific commit
-- `history(collection)` — walk commit DAG
-- `diff(collection, commit_a, commit_b)` — compare manifests
-
-### Concurrency (CRDT, no CAS)
-- `append_shard(collection, rows)` — each writer writes its own shard
-- `upsert_shard(collection, rows)` — insert-or-update with _rowid + _version
-- `delete_shard(collection, rowids)` — tombstones with version vectors
-- `read_with_shards(collection)` — merge HEAD + all shards (CRDT union)
-- `compact_shards(collection)` — merge shards into HEAD (idempotent)
-- Works on ANY storage (local FS, S3, GCS) — no conditional PUTs needed
-
-### Streaming (Kafka-like)
-- `create_topic(collection, n_partitions)` — partitions = branches
-- `produce(collection, partition, data)` — append to partition
-- `consume(collection, partition, group, max_messages)` — read from offset
-- `commit_offset(group, collection, partition, offset)` — at-least-once
-- `replay_from(collection, partition, offset)` — time-travel read
-
-### Vector Search (IVF)
-- `build_ann_index(collection, n_clusters)` — k-means clustering
-- `search(collection, query, k, n_probe)` — auto-accelerated ANN
-- ⚠️ **Known limitation:** the current IVF implementation reads ALL vectors
-  per search (no per-cluster blob fetching yet). IVF reduces CPU distance
-  computations but NOT I/O. At PB scale this is a known gap, not a
-  competitive feature. See `docs/HONEST_COMPETITOR_COMPARISON.md` §2.
-
-### Maintenance
-- `gc(collection)` — read-only reachability analysis
-- `vacuum(collections, preserve_days)` — delete dead blobs
-- `optimize(collection)` — compact shards + flatten manifests
-
-### Hierarchical Namespaces (collection naming, not a catalog)
-- Collection names with `/` for organization: `dev/events`, `prod/users`
-- `list_namespaces(parent)` — browse one level at a time
-- ⚠️ This is hierarchical **naming**, not a catalog service (no schema
-  registry, no table discovery, no cross-collection metadata). A real
-  catalog (REST/Glue/Nessie-compatible) is a future milestone. See
-  `docs/HONEST_COMPETITOR_COMPARISON.md` §1.
+```
+pond_repo/
+├── core/                    # Language-AGNOSTIC Rust crates
+│   ├── kernel/              # 3 primitives + ObjectStore trait + CRDT
+│   ├── storage/             # UnifiedStorage (versioning, branching, shards)
+│   ├── codec/               # PND2 encode/decode (all encodings, all vtypes)
+│   ├── arrow/               # PND2 → Arrow direct conversion
+│   └── s3/                  # S3-compatible object store (SigV4, zero AWS SDK deps)
+├── cli/                     # `pond` CLI binary (DuckDB philosophy)
+├── bindings/                # Language-specific bindings
+│   ├── base/                # Shared C ABI: pond.h, C tests, test blobs
+│   ├── python/
+│   │   ├── pyo3/            # PyO3 Rust crate (produces pond_rust.so)
+│   │   ├── sdk/             # Python SDK (PondStorage, lenses, extensions)
+│   │   └── core/            # Python reference kernel (being migrated to Rust)
+│   └── go/                  # Go SDK (cgo wrapper around C ABI)
+├── lenses/                  # Workload-specific lenses
+│   ├── base/                # Lens protocol (C ABI placeholder)
+│   ├── keyvalue/
+│   │   ├── python/          # KeyValueLens (production)
+│   │   └── rust/            # Placeholder for future Rust port
+│   ├── lakehouse/{python,rust}/
+│   ├── oltp/{python,rust}/
+│   ├── streaming/{python,rust}/
+│   └── vector/{python,rust}/
+├── services/                # Cross-cutting services (transport, schema, replication)
+├── pond-labs/               # Experiments and demos
+├── tests/                   # All tests (architecture, integration, lens algebra)
+├── scripts/                 # Verification scripts (property tests, benchmarks)
+├── docs/                    # Documentation
+├── tla/                     # TLA+ formal specification
+└── archive/                 # Historical code (not active)
+```
 
 ---
 
 ## Quick Start
 
-### Unified kernel factory (recommended)
+### Using the Rust CLI (recommended)
 
-One entry point for all storage backends. Switch between local FS and S3
-by changing one line:
+```bash
+# Build the CLI (with S3 support enabled by default)
+cargo build -p pond_cli
+
+# Local filesystem
+pond init /var/lib/pond
+pond --root /var/lib/pond write users --json '[{"id":1,"name":"alice"}]' -m "first"
+pond --root /var/lib/pond read users
+
+# S3-compatible storage (AWS S3, R2, MinIO, etc.)
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+pond --root "s3://my-bucket/prod?region=us-east-1" init
+pond --root "s3://my-bucket/prod?region=us-east-1" write users --json '[{"id":1}]' -m "first"
+pond --root "s3://my-bucket/prod?region=us-east-1" read users
+
+# Cloudflare R2
+pond --root "s3://my-bucket/prod?region=auto&endpoint=https://<account>.r2.cloudflarestorage.com" init
+
+# MinIO
+pond --root "s3://my-bucket/prod?region=us-east-1&endpoint=http://localhost:9000" init
+```
+
+### Using the Python SDK
 
 ```python
 import sys, os
-sys.path.insert(0, "pond-core")
-sys.path.insert(0, "pond-sdk")
-sys.path.insert(0, "pond-sdk/extensions/physical_structures")
+sys.path.insert(0, "bindings/python/core")
+sys.path.insert(0, "bindings/python/sdk")
 
 from make_kernel import make_kernel
 from pond_storage import PondStorage
@@ -149,58 +142,85 @@ storage.merge("users", "dev")
 storage.append_shard("events", [{"id": 1, "event": "click"}], key_col="id")
 rows = storage.read_with_shards("events")
 
-# Atomic publication across collections — commit markers on top of CRDT
-# (NOT full ACID — no isolation, no rollback, no conflict detection.
-#  This provides atomic VISIBILITY: once the commit marker exists, all
-#  tentative shards become visible together. See docs/HONEST_COMPETITOR_COMPARISON.md §3.)
-tx = storage.begin_tx()
-storage.append_shard("users", [{"id": 3, "name": "carol"}], key_col="id", tx_id=tx)
-storage.append_shard("orders", [{"id": 3, "amount": 50.0}], key_col="id", tx_id=tx)
-storage.commit_tx(tx)  # both visible atomically
-
 # Maintenance
 storage.vacuum(preserve_days=7)
 storage.optimize()
 ```
 
-### Direct store construction (advanced)
+### Using the Go SDK
 
-If you need finer control over the store object:
+```go
+import "github.com/pond/pond-go/pond"
 
-```python
-# Local FS (pure files, no SQLite):
-from local_fs_object_store import LocalFSObjectStore
-from object_store_native_kernel import ObjectStoreNativeKernel
-store = LocalFSObjectStore("/var/lib/pond")
+// Open storage (local FS or S3)
+store, _ := pond.OpenStorage("/var/lib/pond")
+defer store.Free()
 
-# S3:
-from s3_object_store import S3ObjectStore
-import boto3
-store = S3ObjectStore(boto3.client("s3"), bucket="my-pond", prefix="prod")
+// Write
+hash, _ := store.Write("users", []byte(`[{"id":1,"name":"alice"}]`), "initial commit")
 
-# Same kernel, same SDK, same everything:
-kernel = ObjectStoreNativeKernel(store)
-storage = PondStorage(kernel)
+// Read
+data, _ := store.Read("users")
+fmt.Println(string(data))
+
+// Branch + merge
+store.Branch("users", "dev")
+store.Checkout("users", "dev")
+store.Merge("users", "dev", "main", "merge dev")
 ```
 
-### Migrating between local FS and S3
+---
 
-The directory layout mirrors S3's key structure, so migrating is a
-straight copy:
+## S3-Compatible Storage
 
+Pond's Rust core includes a **from-scratch S3 client** with SigV4 signing.
+No AWS SDK dependency — just `sha2` + `ureq` (sync HTTP) + `hex`. This
+keeps the binary small and the build fast.
+
+**Supported S3-compatible providers:**
+- AWS S3
+- Cloudflare R2
+- MinIO
+- LocalStack
+- Wasabi
+- DigitalOcean Spaces
+- Any S3-compatible API
+
+**URL format:**
+```
+s3://<bucket>/<prefix>?region=<region>&endpoint=<url>
+```
+
+**Credentials** (read from environment):
+- `AWS_ACCESS_KEY_ID` (or `AWS_ACCESS_KEY`)
+- `AWS_SECRET_ACCESS_KEY` (or `AWS_SECRET_KEY`)
+- `AWS_SESSION_TOKEN` (optional, for STS temporary credentials)
+
+**Migration** between local FS and S3 is a straight copy:
 ```bash
-# Local → S3:
 aws s3 sync /var/lib/pond/ s3://my-pond/prod/
-
-# S3 → local:
 aws s3 sync s3://my-pond/prod/ /var/lib/pond/
 ```
-
 No format conversion needed — blobs and paths use the same layout.
 
-> **Note**: `PondMinimal` (the old SQLite-backed local kernel) is kept for
-> backward compat but should not be used for new code. Use `make_kernel()`
-> or `LocalFSObjectStore` / `S3ObjectStore` directly.
+---
+
+## Cross-Language C ABI
+
+One header (`bindings/base/pond.h`) exposes all three layers:
+
+| Layer | Functions | Purpose |
+|---|---|---|
+| Kernel | `pond_kernel_new/write/read/reference/resolve` | 3 primitives |
+| Storage | `pond_storage_new/new_s3/write/read/branch/merge/undo` | Versioning |
+| Codec | `pond_pnd2_decode/encode_i64/encode_f64/encode_str` | PND2 format |
+
+Any language that can call C gets full Pond access:
+- **Go**: `bindings/go/` (cgo wrapper)
+- **Python**: `bindings/python/pyo3/` (PyO3 — calls Rust directly, not C ABI)
+- **Java**: future (JNI wrapper around C ABI)
+- **Node**: future (N-API wrapper around C ABI)
+- **C/C++**: `#include "pond.h"` (direct)
 
 ---
 
@@ -213,26 +233,27 @@ No format conversion needed — blobs and paths use the same layout.
 5. **Efficient** — immutable blobs (deduped), O(live) GC, parallel fetch
 6. **Beautiful** — shards ARE branches, CRDT = G-Set union, no CAS
 7. **Functional** — lakehouse, KV, vector, streaming, notebook, git
-8. **Storage-Independent** — no CAS, works on local FS / S3 / GCS
+8. **Storage-Independent** — no CAS, works on local FS / S3 / R2 / MinIO / GCS
 
 ---
 
-## Repository Structure
+## Migration Strategy: Python → Rust
 
-```
-pond-core/          Kernel (6 substrates + 3 ops + batch helpers, ~285 LOC)
-pond-sdk/           Unified SDK (PondStorage + UnifiedStorage + extensions)
-  extensions/
-    physical_structures/  PND2, CollectionManifest, StatsTree, Compression
-    indexing/             IVF (vector ANN), CollectionIndexer
-    maintenance/          GC/Vacuum
-    semantic/             Ossie semantic adapter
-lenses/             Workload-specific lenses
-  keyvalue/        KeyValueLens
-  vector/          VectorLens (with IVF)
-  streaming/       StreamingLens (with Kafka-like features)
-  lakehouse/       LakehouseLens (with DuckDB SQL)
-scripts/           Tests + benchmarks + apps
-docs/              Documentation
-tests/             Architecture laws + integration tests
-```
+Pond is migrating from Python to Rust as the core implementation language:
+
+- **Rust core** (done): kernel, storage, codec, arrow, S3, CLI
+- **Python SDK** (current): PyO3 wrapper for codec; Python kernel + lenses still in use
+- **Future**: port lenses to Rust, expose via C ABI, Python becomes thin wrapper
+
+New development happens in Rust. Python is maintained for bug fixes only.
+
+---
+
+## Documentation
+
+- [`DESIGN_GOALS.md`](DESIGN_GOALS.md) — The 8 design principles, in detail
+- [`REPO_ORGANIZATION.md`](REPO_ORGANIZATION.md) — Folder structure rules
+- [`PACKAGES.md`](PACKAGES.md) — Package dependency graph
+- [`KNOWLEDGE_GRAPH.md`](KNOWLEDGE_GRAPH.md) — Every file, its purpose, its exports
+- [`SDK_SPEC.md`](SDK_SPEC.md) — SDK API specification
+- [`docs/`](docs/) — Design documents, whitepaper, formal algebras, TLA+ spec

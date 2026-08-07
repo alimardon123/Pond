@@ -557,7 +557,7 @@ cannot replicate.
 
 **Honest assessment:** Pond's object-store-native design is
 competitive with Iceberg and LakeFS on paper. The `ObjectStoreNativeKernel`
-(`pond-core/object_store_native_kernel.py`) now implements this design —
+(`bindings/python/core/object_store_native_kernel.py`) now implements this design —
 refs are stored as content-addressed blobs in the object store, no SQLite.
 The legacy `PondMinimal` kernel (SQLite) remains for local-disk testing
 and backward compatibility. See `docs/HONEST_COMPETITOR_COMPARISON.md`
@@ -756,7 +756,7 @@ C0-C5 and cannot be served by layering a coordinator.
 ### 8.4 Is the kernel implementation honest?
 
 The legacy `PondMinimal` kernel uses SQLite for the Names substrate.
-The new `ObjectStoreNativeKernel` (`pond-core/object_store_native_kernel.py`)
+The new `ObjectStoreNativeKernel` (`bindings/python/core/object_store_native_kernel.py`)
 stores refs as content-addressed blobs in the object store — no SQLite.
 Both kernels pass the same test suite. The `S3MockKernel` extends
 `ObjectStoreNativeKernel` with simulated S3 latency for honest round-trip
@@ -884,8 +884,8 @@ The architecture is frozen. The validation begins.
 
 | Artifact | Location | LOC |
 |---|---|---|
-| Kernel (FROZEN) | `pond-core/pond_minimal.py` | ~140 |
-| Lens SDK | `pond-sdk/` | ~3000 |
+| Kernel (FROZEN) | `bindings/python/core/pond_minimal.py` | ~140 |
+| Lens SDK | `bindings/python/sdk/` | ~3000 |
 | Feature Store | `pond-feature-store/` | ~1500 |
 | Arrow Lens | `pond-arrow/` | ~500 |
 | Transport (reference) | `services/transport/transport.py` | ~330 |

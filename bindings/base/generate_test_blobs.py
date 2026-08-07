@@ -2,7 +2,7 @@
 """
 Generate PND2 test blobs for the C ABI test.
 
-Produces binary files in pond-rust/tests/test_blobs/:
+Produces binary files in tests/test_blobs/:
   - i64_raw.bin       : single INT64 column, RAW encoding
   - f64_raw.bin       : single FLOAT64 column, RAW encoding
   - str_raw.bin       : single STRING column, RAW encoding
@@ -18,10 +18,10 @@ import os
 import sys
 import struct
 
-# Make pond-sdk importable
+# Make bindings/python/sdk importable
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
-sys.path.insert(0, os.path.join(REPO_ROOT, "pond-sdk"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "bindings/python/sdk"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "pond-rust", "target", "release"))
 
 from extensions.physical_structures.unified_storage import PND2, ColumnSource  # noqa: E402

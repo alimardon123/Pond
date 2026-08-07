@@ -41,6 +41,6 @@ Extends `PondLens` directly (no lens-to-lens inheritance per
 
 ## Dependencies
 
-- `pond-core/` (kernel)
-- `pond-sdk/` (PondLens, ProllyLensBase)
+- `bindings/python/core/` (kernel)
+- `bindings/python/sdk/` (PondLens, ProllyLensBase)
 - Python stdlib only

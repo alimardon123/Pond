@@ -43,8 +43,8 @@ import io
 from typing import Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "lenses/lakehouse"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/core"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "lenses/lakehouse/python"))
 sys.path.insert(0, SCRIPT_DIR)
 
 from kernel import PondMinimal  # noqa: E402
@@ -235,8 +235,8 @@ travel walk. The Lens handles all of it.
 """
 
 import sys, os
-sys.path.insert(0, "pond-core")
-sys.path.insert(0, "lenses/lakehouse")
+sys.path.insert(0, "bindings/python/core")
+sys.path.insert(0, "lenses/lakehouse/python")
 from kernel import PondMinimal
 from lakehouse_lens import PondLakehouse
 

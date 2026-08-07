@@ -64,7 +64,7 @@ sure.
 **Evidence (ran it myself):**
 
 ```
-$ PYTHONPATH=pond-rust/target/release python3 -m pytest tests/test_all.py -v
+$ PYTHONPATH=target/release python3 -m pytest tests/test_all.py -v
 ======================== 20 passed, 2 skipped in 46.81s ========================
 ```
 
@@ -164,7 +164,7 @@ contain stale claims that contradict the current code:
    > The kernel holds an open SQLite connection. Call `kernel.close()`
    > to release it. The kernel is NOT thread-safe by default.
 
-   But `pond-core/kernel.py:93-94` now has:
+   But `bindings/python/core/kernel.py:93-94` now has:
    ```python
    import threading
    self._db_lock = threading.RLock()
@@ -504,7 +504,7 @@ claim.
 
 2. **No real range-read primitive.** Axiom A8 asserts
    "Range reads first-class (RR1 equivalence)" but
-   `pond-core/kernel.py` does not implement `read_range(hash, off,
+   `bindings/python/core/kernel.py` does not implement `read_range(hash, off,
    len)`. The property test simulates it by reading the full blob
    and slicing in Python (`phase_l_property_tests.py:396-397`).
    For a kernel that aspires to serve streaming, time-series, and
@@ -1164,7 +1164,7 @@ expansion. Ship one thing that's competitive. Then expand.
 - `docs/VETERAN_ARCHITECT_REVIEW.md` (822 lines, full re-read for baseline)
 - `scripts/_r2_config.py` (104 lines, full)
 - `scripts/benchmark_r2_quick.py` (147 lines, full)
-- `pond-core/kernel.py` (285 lines, full)
+- `bindings/python/core/kernel.py` (285 lines, full)
 - `scripts/phase_l_property_tests.py` (sampled A7 test, lines 330-377)
 - `tests/test_all.py` (309 lines, full)
 - `lenses/lakehouse/lakehouse_lens.py` (sampled lines 1-120; grep for class declaration)
@@ -1177,16 +1177,16 @@ expansion. Ship one thing that's competitive. Then expand.
 - `DESIGN_GOALS.md` (sampled §1.1, §3.1, §5.3, §6, §10; lines 53-252, 400-499)
 - `SDK_SPEC.md` (sampled §1.3, §1.5; lines 95-224)
 - `docs/NON_GOALS.md` (120 lines, full)
-- `pond-sdk/extensions/indexing/ivf_index.py` (sampled lines 360-410, the TODO section)
-- `pond-sdk/extensions/indexing/collection_index.py` (sampled lines 110-160, the one-blob-per-row loop)
-- `pond-sdk/extensions/physical_structures/unified_storage.py` (sampled lines 3618-3680, the ACID TRANSACTIONS section)
+- `bindings/python/sdk/extensions/indexing/ivf_index.py` (sampled lines 360-410, the TODO section)
+- `bindings/python/sdk/extensions/indexing/collection_index.py` (sampled lines 110-160, the one-blob-per-row loop)
+- `bindings/python/sdk/extensions/physical_structures/unified_storage.py` (sampled lines 3618-3680, the ACID TRANSACTIONS section)
 - `scripts/verify_knowledge_graph.py` (73 lines, full)
 - `worklog.md` (sampled Tier 0 entries, lines 5060-5168)
 
 ## Appendix B — Tests I ran (V2)
 
 ```
-$ PYTHONPATH=pond-rust/target/release python3 -m pytest tests/test_all.py -v
+$ PYTHONPATH=target/release python3 -m pytest tests/test_all.py -v
 ======================== 20 passed, 2 skipped in 46.81s ========================
 
 Both skips are honest and documented:

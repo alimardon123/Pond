@@ -5,6 +5,7 @@ members = [
     "core/storage",
     "core/codec",
     "core/arrow",
+    "core/s3",
     "cli",
     "bindings/python/pyo3",
 ]

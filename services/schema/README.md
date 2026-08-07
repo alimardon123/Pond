@@ -48,11 +48,11 @@ Schemas are JSON-serializable dicts stored as kernel blobs.
 
 ## Architecture
 
-Depends only on `pond-core` (per `REPO_ORGANIZATION.md` §7). Sits
+Depends only on `bindings/python/core` (per `REPO_ORGANIZATION.md` §7). Sits
 between kernel and lenses — lenses query the registry to pick a
 decoder; the kernel never inspects blob contents (Law 3 / Law 6).
 
 ## Dependencies
 
-- `pond-core/` (kernel)
+- `bindings/python/core/` (kernel)
 - Python stdlib only

@@ -22,7 +22,7 @@ to see how the architecture feels.
 
 ```python
 import sys, os
-sys.path.insert(0, "pond-core")
+sys.path.insert(0, "bindings/python/core")
 sys.path.insert(0, "lenses/lakehouse")
 
 import pyarrow as pa

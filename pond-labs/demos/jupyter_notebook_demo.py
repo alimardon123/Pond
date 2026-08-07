@@ -39,9 +39,9 @@ from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-sys.path.insert(0, os.path.join(REPO, "pond-core"))
-sys.path.insert(0, os.path.join(REPO, "pond-sdk"))
-sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_structures"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/core"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk", "extensions", "physical_structures"))
 
 from kernel import PondMinimal
 from column_source import ListColumnSource

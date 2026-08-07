@@ -19,12 +19,12 @@
 
 | Component | Status | Location |
 |---|---|---|
-| Storage kernel (Python) | ✅ Frozen | `pond-core/kernel.py` (~199 LOC) |
-| Python SDK (lenses, prolly tree, extensions) | ✅ Production | `pond-sdk/` (~7300 LOC) |
+| Storage kernel (Python) | ✅ Frozen | `bindings/python/core/kernel.py` (~199 LOC) |
+| Python SDK (lenses, prolly tree, extensions) | ✅ Production | `bindings/python/sdk/` (~7300 LOC) |
 | Production lenses (KeyValue, Lakehouse, Vector, Streaming) | ✅ Production | `lenses/` |
-| Rust PND2 codec + C ABI | ✅ Full decoder parity, 3 encoders | `pond-rust/pond-core/` |
-| Rust PyO3 wrapper | ✅ Thin glue (delegates to pond-core) | `pond-rust/pond-python/` |
-| Go SDK (PND2 codec only) | ✅ Bindings + tests + benchmarks | `sdk-go/` |
+| Rust PND2 codec + C ABI | ✅ Full decoder parity, 3 encoders | `core/codec/` |
+| Rust PyO3 wrapper | ✅ Thin glue (delegates to bindings/python/core) | `bindings/python/pyo3/` |
+| Go SDK (PND2 codec only) | ✅ Bindings + tests + benchmarks | `bindings/go/` |
 | Benchmark (Rust vs Python vs C ABI) | ✅ Run, results captured | `scripts/benchmark_decode_paths.py` |
 
 ### 1.2 Benchmark findings (Round 52)
@@ -137,11 +137,11 @@ pond binary (Rust)
 
 Today, adding a new Rust feature requires:
 
-1. Implement the feature in `pond-rust/pond-core/src/lib.rs`.
+1. Implement the feature in `core/codec/src/lib.rs`.
 2. Add C ABI wrappers (`extern "C"` functions).
 3. Add declarations to `pond_core.h`.
-4. Add bindings in `sdk-go/internal/cabi/cabi.go`.
-5. Add high-level wrappers in `sdk-go/pond/pond.go`.
+4. Add bindings in `bindings/go/internal/cabi/cabi.go`.
+5. Add high-level wrappers in `bindings/go/pond/pond.go`.
 6. (If Python-facing) Add PyO3 wrappers in `pond-python/src/lib.rs`.
 7. Update tests in 3 places (Rust, C, Go).
 8. Update `pond_core.h` documentation.
@@ -202,9 +202,9 @@ language-specific codegens consume. Each language SDK has a small
 template that maps JSON manifest entries to idiomatic code.
 
 ```
-pond-rust/pond-core/src/lib.rs
+core/codec/src/lib.rs
     ↓ (build.rs scans for #[no_mangle] extern "C")
-pond-rust/pond-core/abi_manifest.json
+core/codec/abi_manifest.json
     ↓
 ┌────────────────┬───────────────┬────────────────┐
 │ C header gen   │ Go binding gen│ Node binding   │ ...
@@ -289,7 +289,7 @@ incrementally without touching the core design.
 
 #### 5.1 Extract ABI manifest from Rust source
 
-Write a `build.rs` in `pond-rust/pond-core/` that scans `src/lib.rs`
+Write a `build.rs` in `core/codec/` that scans `src/lib.rs`
 for `#[no_mangle] pub extern "C"` functions and emits
 `abi_manifest.json` with their signatures. This is the foundation for
 the generic codegen approach (Option C above).
@@ -313,7 +313,7 @@ Demonstrates the codegen approach works end-to-end.
 
 #### 5.3 Add the Rust storage kernel skeleton
 
-Create `pond-rust/pond-kernel/` (a new workspace member) with the
+Create `core/kernel/` (a new workspace member) with the
 minimal storage kernel API: `Write`, `Read`, `Ref`, `Resolve`. Initially
 backed by an in-memory `BTreeMap` (no persistence) — just to prove the
 API shape.
@@ -336,7 +336,7 @@ Python implementation is ~1500 LOC) — that's Tier 3.
 
 #### 5.4 Auto-generate Go bindings from the manifest
 
-Replace `sdk-go/internal/cabi/cabi.go` (currently hand-written) with a
+Replace `bindings/go/internal/cabi/cabi.go` (currently hand-written) with a
 generated version. The generator reads `abi_manifest.json` and emits
 cgo wrappers + high-level Go types.
 
@@ -357,7 +357,7 @@ channel. Required for the "small binary package" vision.
 
 #### 5.6 Add a `pond` CLI binary
 
-Create `pond-rust/pond-cli/` (new workspace member) with a minimal CLI:
+Create `cli/` (new workspace member) with a minimal CLI:
 - `pond decode <file>` — decode a PND2 blob, print as JSON
 - `pond encode <file>` — encode JSON to a PND2 blob
 - `pond version` — print version
@@ -371,7 +371,7 @@ binary. Demonstrates the cdylib can be linked into a standalone binary.
 
 #### 5.7 Implement the ProllyTree in Rust
 
-Port `pond-sdk/prolly_tree.py` (~764 LOC) to Rust. This is the
+Port `bindings/python/sdk/prolly_tree.py` (~764 LOC) to Rust. This is the
 persistent storage backend. Once done, the Rust storage kernel can
 persist to disk / S3 / any object store.
 
@@ -470,7 +470,7 @@ For the proposed Tier 1 items:
 ## 8. Summary
 
 The architecture is in good shape. The Round 50-52 work established:
-- A clean Rust workspace (`pond-core` + `pond-python`)
+- A clean Rust workspace (`bindings/python/core` + `pond-python`)
 - A working cross-language C ABI (131 checks passing)
 - A Go SDK proving the cross-language approach works
 - A benchmark validating the performance is real (169M rows/s for

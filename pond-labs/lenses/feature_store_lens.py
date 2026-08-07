@@ -43,10 +43,10 @@ import tempfile
 import shutil
 from typing import Optional, Iterator
 
-# Make pond-core and pond-sdk importable
+# Make bindings/python/core and bindings/python/sdk importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/core"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/sdk"))
 from kernel import PondMinimal  # noqa: E402
 from base_lens import PondLens  # noqa: E402
 # ProllyTree imports removed — use UnifiedStorage instead

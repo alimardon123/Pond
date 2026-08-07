@@ -12,12 +12,12 @@
 
 ### Phase 0 — Current state (now)
 - Python: kernel.py, unified_storage.py (5,540 LOC), pond_storage.py, all lenses, all extensions
-- Rust: pond-kernel (3 primitives + ObjectStore trait), pond-core (PND2 codec), pond-python (PyO3 wrapper), pond-cli
+- Rust: pond-kernel (3 primitives + ObjectStore trait), bindings/python/core (PND2 codec), pond-python (PyO3 wrapper), pond-cli
 - Go: sdk-go (PND2 codec bindings via cgo)
 - Python is the primary implementation. Rust has the kernel + codec + CLI.
 
 ### Phase 1 — Port UnifiedStorage to Rust (next 4-6 weeks)
-- Port `unified_storage.py` (5,540 LOC) to Rust as `pond-rust/pond-storage/`
+- Port `unified_storage.py` (5,540 LOC) to Rust as `core/storage/`
 - This is the big one: manifest management, CRDT shards, commits, branch/merge, read/write paths
 - Python `UnifiedStorage` becomes a PyO3 wrapper (like pond-python already is for the codec)
 - All lenses continue to use Python; they call into Rust UnifiedStorage via PyO3
@@ -69,14 +69,14 @@
 Current structure (transitional):
 ```
 pond_repo/
-├── pond-core/          # Python kernel (will become thin wrapper)
-├── pond-sdk/           # Python SDK (will become thin wrapper)
-├── pond-rust/          # Rust workspace (will become the core)
-│   ├── pond-core/      # PND2 codec
+├── bindings/python/core/          # Python kernel (will become thin wrapper)
+├── bindings/python/sdk/           # Python SDK (will become thin wrapper)
+├──           # Rust workspace (will become the core)
+│   ├── bindings/python/core/      # PND2 codec
 │   ├── pond-kernel/    # Storage kernel (3 primitives)
 │   ├── pond-python/    # PyO3 wrapper
 │   └── pond-cli/       # CLI binary
-├── sdk-go/             # Go SDK
+├── bindings/go/             # Go SDK
 ├── pond/               # Pip shim
 ├── lenses/             # Python lenses (will port to Rust one at a time)
 ├── ...
@@ -85,14 +85,14 @@ pond_repo/
 Future structure (after Phase 3):
 ```
 pond_repo/
-├── core/               # Rust workspace (renamed from pond-rust/)
+├── core/               # Rust workspace (renamed from )
 │   ├── kernel/         # 3 primitives + ObjectStore trait
-│   ├── codec/          # PND2 encode/decode (renamed from pond-core/)
+│   ├── codec/          # PND2 encode/decode (renamed from bindings/python/core/)
 │   ├── storage/        # UnifiedStorage (manifest, shards, commits)
 │   ├── cli/            # pond binary
 │   └── python/         # PyO3 wrapper (thin)
 ├── sdk-python/         # Python SDK (lenses, extensions) — calls into core
-├── sdk-go/             # Go SDK — calls into core via C ABI
+├── bindings/go/             # Go SDK — calls into core via C ABI
 ├── lenses/             # Lens implementations (Rust + Python wrappers)
 ├── services/           # Cross-cutting services
 ├── labs/               # Experiments
@@ -101,16 +101,16 @@ pond_repo/
 └── ...
 ```
 
-The rename (pond-rust/ → core/) happens when Rust is the primary implementation.
-Until then, the current names are fine — just document which `pond-core` is which.
+The rename ( → core/) happens when Rust is the primary implementation.
+Until then, the current names are fine — just document which `bindings/python/core` is which.
 
 ---
 
 ## Duplicate code during transition
 
 Yes, there will be duplicate code during the transition:
-- `pond-core/kernel.py` (Python) and `pond-rust/pond-kernel/src/lib.rs` (Rust)
-- `pond-sdk/extensions/physical_structures/unified_storage.py` (Python) and future `pond-rust/pond-storage/` (Rust)
+- `bindings/python/core/kernel.py` (Python) and `core/kernel/src/lib.rs` (Rust)
+- `bindings/python/sdk/extensions/physical_structures/unified_storage.py` (Python) and future `core/storage/` (Rust)
 
 This is intentional and acceptable:
 - The Python code is the **reference implementation** — it documents the design

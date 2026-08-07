@@ -17,10 +17,10 @@
 ## 1. The problem
 
 Currently:
-- `pond-rust/pond-core/` has a C ABI (`pond_core.h`) for PND2 codec only
-- `pond-rust/pond-kernel/` has a C ABI for the 3 primitives (Write, Read, Ref)
-- `pond-rust/pond-storage/` has NO C ABI — it's Rust-only
-- `sdk-go/` links against `libpond_core.a` (codec only, no storage)
+- `core/codec/` has a C ABI (`pond_core.h`) for PND2 codec only
+- `core/kernel/` has a C ABI for the 3 primitives (Write, Read, Ref)
+- `core/storage/` has NO C ABI — it's Rust-only
+- `bindings/go/` links against `libpond_core.a` (codec only, no storage)
 - Python uses PyO3 for codec, but UnifiedStorage is still Python
 
 **Gap:** a Go/Java/Node program can encode/decode PND2 blobs, but can't
@@ -36,10 +36,10 @@ through one C ABI, with zero per-language logic.
 ### 2.1 One header, one library
 
 ```
-pond-rust/
+
 ├── pond-kernel/     → C ABI for Write/Read/Ref (already exists)
 ├── pond-storage/    → C ABI for write/read/branch/merge/shard (NEW — needed)
-├── pond-core/       → C ABI for PND2 encode/decode (already exists)
+├── bindings/python/core/       → C ABI for PND2 encode/decode (already exists)
 ├── pond-arrow/      → C ABI for PND2→Arrow (NEW — optional, for Arrow users)
 └── pond-cli/        → the `pond` binary (links all crates)
 ```
@@ -111,7 +111,7 @@ Python gets PyO3 because:
 2. **Ergonomics:** `import pond` feels native (no ctypes struct definitions)
 3. **GIL safety:** PyO3 handles the GIL correctly
 
-Python's PyO3 wrapper calls into `pond-storage`, `pond-core`, and `pond-kernel`
+Python's PyO3 wrapper calls into `pond-storage`, `bindings/python/core`, and `pond-kernel`
 directly (Rust-to-Rust, no C ABI overhead). This is the fastest path.
 
 Other languages use the C ABI (Rust → extern "C" → FFI). This adds ~1µs per
@@ -127,10 +127,10 @@ C ABI. Both paths use the same Rust logic.
 There is no separate "Rust SDK." The Rust crates ARE the SDK:
 
 ```
-pond-rust/
+
 ├── pond-kernel/    → PondKernel (Write, Read, Ref)
 ├── pond-storage/   → UnifiedStorage (write, read, branch, merge, shard, transaction)
-├── pond-core/      → PND2 codec (encode, decode, all encodings/vtypes)
+├── bindings/python/core/      → PND2 codec (encode, decode, all encodings/vtypes)
 ├── pond-arrow/     → Arrow bridge (PND2 → RecordBatch)
 ├── pond-cli/       → CLI binary
 └── pond-python/    → PyO3 wrapper (for Python)
@@ -210,16 +210,16 @@ NOT NOW. The plugin protocol is a Phase 3 feature. The priority is:
 
 ```
 pond_repo/
-├── pond-core/          # Python kernel (reference implementation)
-├── pond-sdk/           # Python SDK (reference implementation)
-├── pond-rust/          # Rust workspace (production implementation)
-│   ├── pond-core/      # PND2 codec + C ABI
+├── bindings/python/core/          # Python kernel (reference implementation)
+├── bindings/python/sdk/           # Python SDK (reference implementation)
+├──           # Rust workspace (production implementation)
+│   ├── bindings/python/core/      # PND2 codec + C ABI
 │   ├── pond-kernel/    # Storage kernel + C ABI
 │   ├── pond-storage/   # UnifiedStorage (no C ABI yet)
 │   ├── pond-arrow/     # PND2 → Arrow bridge
 │   ├── pond-python/    # PyO3 wrapper
 │   └── pond-cli/       # CLI binary
-├── sdk-go/             # Go SDK (codec only — needs updating)
+├── bindings/go/             # Go SDK (codec only — needs updating)
 ├── lenses/             # Python lenses (to be ported to Rust)
 ├── services/           # Python services
 ├── pond-labs/          # Experiments
@@ -232,15 +232,15 @@ pond_repo/
 
 ```
 pond/
-├── core/               # Rust workspace (renamed from pond-rust/)
+├── core/               # Rust workspace (renamed from )
 │   ├── kernel/         # 3 primitives + ObjectStore trait + C ABI
 │   ├── storage/        # UnifiedStorage + C ABI
-│   ├── codec/          # PND2 encode/decode + C ABI (renamed from pond-core/)
+│   ├── codec/          # PND2 encode/decode + C ABI (renamed from bindings/python/core/)
 │   ├── arrow/          # PND2 → Arrow bridge
 │   ├── cli/            # CLI binary
 │   └── python/         # PyO3 wrapper
 ├── sdk-python/         # Python SDK (thin wrapper — calls core via PyO3)
-├── sdk-go/             # Go SDK (thin wrapper — calls core via C ABI)
+├── bindings/go/             # Go SDK (thin wrapper — calls core via C ABI)
 ├── sdk-java/           # Java SDK (thin wrapper — calls core via JNI)
 ├── sdk-node/           # Node SDK (thin wrapper — calls core via N-API)
 ├── lenses/             # Lens implementations (Rust + language bindings)
@@ -282,7 +282,7 @@ the current names are fine.
 - This is the big step — Python starts using Rust for storage
 
 ### Step 4: Clean up repo organization (0.5 days)
-- Move `pond-rust/` → `core/` (or keep current names, just document)
+- Move `` → `core/` (or keep current names, just document)
 - Ensure each directory has a clear README
 - Remove dead code and stale references
 

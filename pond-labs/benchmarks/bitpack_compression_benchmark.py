@@ -26,7 +26,7 @@ import struct
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-sys.path.insert(0, os.path.join(REPO, "pond-sdk", "extensions", "physical_structures"))
+sys.path.insert(0, os.path.join(REPO, "bindings/python/sdk", "extensions", "physical_structures"))
 
 from encoding import (
     encode_bitpack, encode_raw, decode_column, eval_predicate_encoded,

@@ -14,7 +14,7 @@ answer three questions:
      (Validates the C ABI design for cross-language SDK consumers.)
 
 Usage:
-    PYTHONPATH=pond-sdk:target/release \
+    PYTHONPATH=bindings/python/sdk:target/release \
         python3 scripts/benchmark_decode_paths.py
 
 Output: tables of (blob_size, column_mix, path) → rows/sec + MB/s.
@@ -26,7 +26,8 @@ import ctypes
 import statistics
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO_ROOT, "pond-sdk"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "bindings/python/sdk"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "bindings/python/core"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "target", "release"))
 
 # ---------------------------------------------------------------------------

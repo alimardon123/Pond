@@ -234,7 +234,7 @@ For a 1% selectivity query on 100 row groups (K=1):
 
 ## Implementation
 
-`pond-sdk/extensions/physical_structures/unified_storage.py`:
+`bindings/python/sdk/extensions/physical_structures/unified_storage.py`:
 - `PND2` class — encode/decode the PND2 format
 - `UnifiedStorage` class — `write()`, `read()`, `point_lookup()`
 

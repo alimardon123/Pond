@@ -31,7 +31,7 @@ back with "competitive" labels that the code does not support.
 
 Concretely, in the state I read it:
 
-- The "FROZEN ~140 LOC kernel" is **261 LOC** (`pond-core/kernel.py`) and
+- The "FROZEN ~140 LOC kernel" is **261 LOC** (`bindings/python/core/kernel.py`) and
   exposes at least **6 public operations** (`write`, `write_batch`,
   `read`, `read_blob`, `read_blob_batch`, `reference` + `resolve` +
   `list_names`). The team's own property test `kernel has no batch /
@@ -39,9 +39,9 @@ Concretely, in the state I read it:
   the model and the implementation have diverged.
 - The "universal storage backend" is named differently in every doc.
   `SDK_SPEC.md`, `REPO_ORGANIZATION.md`, `PACKAGES.md`, and
-  `DESIGN_GOALS.md` all reference `pond-sdk/prolly_tree.py` as the
+  `DESIGN_GOALS.md` all reference `bindings/python/sdk/prolly_tree.py` as the
   universal backend. **That file does not exist.** The actual backend is
-  `pond-sdk/extensions/physical_structures/unified_storage.py`
+  `bindings/python/sdk/extensions/physical_structures/unified_storage.py`
   (5,540 LOC — not exactly "tiny").
 - 5 of 22 tests in `tests/test_all.py` **FAIL** when I run them on a
   clean checkout, including the Feature Store Lens self-test (crashes on
@@ -51,7 +51,7 @@ Concretely, in the state I read it:
 - The IVF vector index, advertised in
   `docs/HONEST_COMPETITOR_COMPARISON.md` as "~100K GETs (IVF, 100×
   reduction) — Competitive", contains this comment in its own source
-  (`pond-sdk/extensions/indexing/ivf_index.py:363-381`):
+  (`bindings/python/sdk/extensions/indexing/ivf_index.py:363-381`):
   > "The current implementation reads ALL vectors via
   > `storage.read(collection)` then filters by target_ids in Python …
   > every search reads the entire collection. At PB scale (10M+ vectors)
@@ -74,7 +74,7 @@ These are real architectural strengths, with evidence:
 
 ### 2.1 The 3-primitive kernel idea is conceptually clean
 
-`pond-core/kernel.py:103-223` — `write(bytes) → hash`,
+`bindings/python/core/kernel.py:103-223` — `write(bytes) → hash`,
 `read(hash_or_name) → bytes`, `reference(name, hash)`. This *is* the
 right minimal algebra for an immutable content-addressed store, and
 the design's willingness to demote concepts (commits, branches, trees,
@@ -89,7 +89,7 @@ a separate question (see §3).
 min/max stats + per-column payloads + optional zstd. Stats computed
 during encode (zero-overhead) is the right design — same as Parquet's
 column indexes / Vortex's layout. The Rust C ABI decoder
-(`pond-rust/pond-core/src/lib.rs`) is a real 1,773-LOC zero-deps
+(`core/codec/src/lib.rs`) is a real 1,773-LOC zero-deps
 crate; the 169M rows/s RAW-numeric decode number is plausible for what
 it measures (single in-memory blob, decode only, no filter/aggregate).
 
@@ -122,8 +122,8 @@ it at all puts Pond ahead of most comparable research projects.
 
 ### 2.6 The cross-language story is concrete and tested
 
-`pond-rust/` (Rust + C ABI) + `sdk-go/` (cgo bindings) + the 131-check
-C ABI end-to-end test (`pond-rust/tests/test_c_abi.c`) is a real,
+`` (Rust + C ABI) + `bindings/go/` (cgo bindings) + the 131-check
+C ABI end-to-end test (`tests/test_c_abi.c`) is a real,
 working cross-language codec layer. Most "universal storage" projects
 never get past a Python-only prototype.
 
@@ -146,12 +146,12 @@ that do not exist or were renamed without updating the docs:
 
 | Doc claim | Reality |
 |---|---|
-| `SDK_SPEC.md:44` "from kernel import PondMinimal" | Works, but the SDK_SPEC then references `pond-sdk/prolly_tree.py` extensively as the "universal storage backend" — **`prolly_tree.py` does not exist** in `pond-sdk/`. |
-| `REPO_ORGANIZATION.md:44-49` lists `prolly_tree.py`, `binary_encoding.py`, `collection.py`, `collection_metadata.py` as pond-sdk files | None of these exist in `pond-sdk/` today. `binary_encoding.py` and `collection_metadata.py` are in `archive/legacy-extensions/`. The pond-sdk directory contains `pond_storage.py`, `base_lens.py`, `hlc.py`, `maintenance.py`, `pond_config.py`, `row_query.py`, `uuid7.py`, and `extensions/`. |
-| `PACKAGES.md:42-46` describes `pond-sdk/extensions/physical_structures/pruning.py`, `zone_map.py`, `bloom_filter.py`, `statistics.py`, `zone_map_index.py`, `pruning_reader.py` | None of these exist in the directory. The actual contents are `unified_storage.py`, `collection_manifest.py`, `stats_tree.py`, `encoding.py`, `compression.py`, `column_source.py`, `pond_pack.py`, `embedded_stats.py`. The doc-described files are all in `archive/legacy-extensions/`. |
+| `SDK_SPEC.md:44` "from kernel import PondMinimal" | Works, but the SDK_SPEC then references `bindings/python/sdk/prolly_tree.py` extensively as the "universal storage backend" — **`prolly_tree.py` does not exist** in `bindings/python/sdk/`. |
+| `REPO_ORGANIZATION.md:44-49` lists `prolly_tree.py`, `binary_encoding.py`, `collection.py`, `collection_metadata.py` as bindings/python/sdk files | None of these exist in `bindings/python/sdk/` today. `binary_encoding.py` and `collection_metadata.py` are in `archive/legacy-extensions/`. The bindings/python/sdk directory contains `pond_storage.py`, `base_lens.py`, `hlc.py`, `maintenance.py`, `pond_config.py`, `row_query.py`, `uuid7.py`, and `extensions/`. |
+| `PACKAGES.md:42-46` describes `bindings/python/sdk/extensions/physical_structures/pruning.py`, `zone_map.py`, `bloom_filter.py`, `statistics.py`, `zone_map_index.py`, `pruning_reader.py` | None of these exist in the directory. The actual contents are `unified_storage.py`, `collection_manifest.py`, `stats_tree.py`, `encoding.py`, `compression.py`, `column_source.py`, `pond_pack.py`, `embedded_stats.py`. The doc-described files are all in `archive/legacy-extensions/`. |
 | `SDK_SPEC.md:93-96, 263-266, 333` and `REPO_ORGANIZATION.md:78-80` claim "All three [KeyValueLens, LakehouseLens, VectorLens] extend PondLens directly" | `lenses/lakehouse/lakehouse_lens.py:81` declares `class LakehouseLens:` (no base). `lenses/oltp/oltp_lens.py:58` declares `class OLTPLens:` (no base). Only `KeyValueLens`, `StreamingLens`, `VectorLens` actually extend `PondLens`. |
-| `SDK_SPEC.md:116-125` shows `CollectionMetadata` as the recommended indexing API and `SDK_SPEC.md:593-600` documents `drop_name` / `is_dropped` / `resolve_active` / `compact_tombstones` from `pond-sdk/maintenance.py` | `CollectionMetadata` is in `archive/legacy-extensions/collection_metadata.py`. `tests/architecture/architecture_laws.py:144-161` provides a *stub* so the import doesn't fail. |
-| `DESIGN_GOALS.md:122, 341` claims "kernel is ~140 LOC, FROZEN" and `kernel.py` is "~140 LOC" | `pond-core/kernel.py` is **261 LOC**. With `object_store_native_kernel.py` (841 LOC) the production kernel is ~1,100 LOC. |
+| `SDK_SPEC.md:116-125` shows `CollectionMetadata` as the recommended indexing API and `SDK_SPEC.md:593-600` documents `drop_name` / `is_dropped` / `resolve_active` / `compact_tombstones` from `bindings/python/sdk/maintenance.py` | `CollectionMetadata` is in `archive/legacy-extensions/collection_metadata.py`. `tests/architecture/architecture_laws.py:144-161` provides a *stub* so the import doesn't fail. |
+| `DESIGN_GOALS.md:122, 341` claims "kernel is ~140 LOC, FROZEN" and `kernel.py` is "~140 LOC" | `bindings/python/core/kernel.py` is **261 LOC**. With `object_store_native_kernel.py` (841 LOC) the production kernel is ~1,100 LOC. |
 
 **Why this matters:** a reviewer (or a new contributor, or a customer
 integration team) cannot trust the docs. Every architectural claim
@@ -164,7 +164,7 @@ hook is "small, legible, frozen kernel," this is fatal to adoption.
 
 > Vector k-NN @ 10M: ~100K GETs (IVF, 100× reduction) — ⚠️ Competitive
 
-`pond-sdk/extensions/indexing/ivf_index.py:363-381` says:
+`bindings/python/sdk/extensions/indexing/ivf_index.py:363-381` says:
 
 > "The current implementation reads ALL vectors via
 > `storage.read(collection)` then filters by target_ids in Python (step
@@ -204,7 +204,7 @@ What these failures mean:
 - **`test_property_tests`** — the Phase L property suite reports
   `490 pass, 1 fail, 0 skip`. The single failure is
   `kernel has no batch/transaction/atomic API`, which fails because
-  `pond-core/kernel.py:117-148` and `:181-208` add `write_batch` and
+  `bindings/python/core/kernel.py:117-148` and `:181-208` add `write_batch` and
   `read_blob_batch`. The team's own model says these shouldn't exist;
   the code has them anyway; the test catches the contradiction; nobody
   fixed either side.
@@ -367,7 +367,7 @@ worst case.
 
 ### 3.9 SEVERITY 7 — `CollectionIndexer` writes one kernel blob per row
 
-`pond-sdk/extensions/indexing/collection_index.py:113-124`:
+`bindings/python/sdk/extensions/indexing/collection_index.py:113-124`:
 
 ```python
 for rowid, row_data in scan_rows():
@@ -393,7 +393,7 @@ demo). But the production `CollectionIndexer` doesn't use packing.
 
 ### 3.10 SEVERITY 7 — No real production backends beyond single-bucket S3
 
-`pond-core/s3_object_store.py` (519 LOC) is a competent boto3 wrapper.
+`bindings/python/core/s3_object_store.py` (519 LOC) is a competent boto3 wrapper.
 It is also the only production backend. There is no:
 
 - multi-region replication,
@@ -772,22 +772,22 @@ docs.
 - `PACKAGES.md` (144 lines, all)
 - `SDK_SPEC.md` (699 lines, all)
 - `README.md` (230 lines, all)
-- `pond-core/kernel.py` (261 lines, all)
-- `pond-sdk/base_lens.py` (447 lines, all)
-- `pond-sdk/pond_storage.py` (1,146 lines, skimmed sections 1-3, full read of sections 2-3)
-- `pond-sdk/extensions/physical_structures/unified_storage.py` (5,540 lines, sampled key methods: encode/decode, append_shard, begin_tx/commit_tx, read_with_shards, point_lookup)
-- `pond-sdk/extensions/indexing/ivf_index.py` (481 lines, all — including the critical comment at lines 363-381)
-- `pond-sdk/extensions/indexing/collection_index.py` (228 lines, all)
-- `pond-sdk/extensions/maintenance/vacuum.py` (477 lines, sampled)
-- `pond-sdk/extensions/physical_structures/collection_manifest.py` (1,062 lines, sampled format spec)
+- `bindings/python/core/kernel.py` (261 lines, all)
+- `bindings/python/sdk/base_lens.py` (447 lines, all)
+- `bindings/python/sdk/pond_storage.py` (1,146 lines, skimmed sections 1-3, full read of sections 2-3)
+- `bindings/python/sdk/extensions/physical_structures/unified_storage.py` (5,540 lines, sampled key methods: encode/decode, append_shard, begin_tx/commit_tx, read_with_shards, point_lookup)
+- `bindings/python/sdk/extensions/indexing/ivf_index.py` (481 lines, all — including the critical comment at lines 363-381)
+- `bindings/python/sdk/extensions/indexing/collection_index.py` (228 lines, all)
+- `bindings/python/sdk/extensions/maintenance/vacuum.py` (477 lines, sampled)
+- `bindings/python/sdk/extensions/physical_structures/collection_manifest.py` (1,062 lines, sampled format spec)
 - `lenses/keyvalue/keyvalue_lens.py` (855 lines, full read of commit/get/put paths)
 - `lenses/lakehouse/lakehouse_lens.py` (779 lines, full read of write/read/query paths)
 - `lenses/streaming/streaming_lens.py` (609 lines, sampled)
 - `lenses/oltp/oltp_lens.py` (184 lines, all)
 - `lenses/vector/vector_lens.py` (747 lines, sampled)
-- `pond-core/s3_object_store.py` (519 lines, sampled)
-- `pond-core/s3_mock_backend.py` (129 lines, all)
-- `pond-core/make_kernel.py` (112 lines, all)
+- `bindings/python/core/s3_object_store.py` (519 lines, sampled)
+- `bindings/python/core/s3_mock_backend.py` (129 lines, all)
+- `bindings/python/core/make_kernel.py` (112 lines, all)
 - `services/transport/transport_production.py` (404 lines, sampled)
 - `services/replication/replication_coordinator.py` (537 lines, sampled)
 - `tests/architecture/architecture_laws.py` (844 lines, all)
@@ -795,7 +795,7 @@ docs.
 - `docs/WHERE_POND_FAILS.md` (388 lines, all)
 - `docs/HONEST_COMPETITOR_COMPARISON.md` (219 lines, all)
 - `docs/NON_GOALS.md` (120 lines, all)
-- `pond-rust/README.md` + `pond-rust/pond-core/src/lib.rs` (1,773 lines, sampled)
+- `README.md` + `core/codec/src/lib.rs` (1,773 lines, sampled)
 
 ## Appendix B — Tests I ran
 

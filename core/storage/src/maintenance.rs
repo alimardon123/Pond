@@ -1,6 +1,6 @@
 // Maintenance module — tombstone operations (RFC-0008: Deletion as Data)
 //
-// FAITHFUL PORT of Python pond-sdk/maintenance.py.
+// FAITHFUL PORT of Python bindings/python/sdk/maintenance.py.
 //
 // Tombstones are a Layer 1 convention — the kernel doesn't know they're
 // special. A tombstone is a name rebound to TOMBSTONE_HASH (SHA-256 of

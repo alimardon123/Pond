@@ -39,8 +39,8 @@ import shutil
 import statistics
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/core"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/sdk"))
 sys.path.insert(0, SCRIPT_DIR)
 
 from kernel import PondMinimal  # noqa: E402
@@ -164,7 +164,7 @@ class PondContender:
         # Build Physical Structures: bloom filter on 'id' + statistics
         full_table = self._get_table()
         from extensions.physical_structures import BloomFilter, Statistics
-        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
+        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/sdk"))
         ids = full_table.column("id").to_pylist()
         BloomFilter.build(self.kernel, "data", [str(i) for i in ids])
         Statistics.build(self.kernel, "data", full_table)
@@ -181,7 +181,7 @@ class PondContender:
     def point_lookup(self, pk_id):
         # Use bloom filter first (Physical Structure)
         from extensions.physical_structures import BloomFilter
-        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
+        sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/sdk"))
         if not BloomFilter.query(self.kernel, "data", str(pk_id)):
             return None  # definitely not present
         table = self._get_table()

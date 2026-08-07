@@ -10,18 +10,18 @@
 
 ```
 pond_repo/
-├── pond-core/          # Python kernel ← NAME COLLISION with pond-rust/pond-core/
-├── pond-sdk/           # Python SDK (reference implementation)
-├── pond-rust/          # Rust workspace
-│   ├── pond-core/      # PND2 codec ← CONFUSING: same name as Python kernel
+├── bindings/python/core/          # Python kernel ← NAME COLLISION with core/codec/
+├── bindings/python/sdk/           # Python SDK (reference implementation)
+├──           # Rust workspace
+│   ├── bindings/python/core/      # PND2 codec ← CONFUSING: same name as Python kernel
 │   ├── pond-kernel/    # Storage kernel (3 primitives + ObjectStore + CRDT)
 │   ├── pond-storage/   # UnifiedStorage (versioning, branching, shards)
 │   ├── pond-arrow/     # Arrow bridge
 │   ├── pond-python/    # PyO3 wrapper
 │   ├── pond-cli/       # CLI binary
-│   ├── pond.h          # Unified C ABI header ← should be shared, not inside pond-rust/
+│   ├── pond.h          # Unified C ABI header ← should be shared, not inside 
 │   └── tests/          # C ABI tests
-├── sdk-go/             # Go SDK ← INCONSISTENT naming (sdk-go vs pond-*)
+├── bindings/go/             # Go SDK ← INCONSISTENT naming (sdk-go vs pond-*)
 ├── pond/               # Pip shim ← UNCLEAR purpose
 ├── lenses/             # Python lenses
 ├── ...
@@ -29,15 +29,15 @@ pond_repo/
 
 ### Problems:
 
-1. **Name collision**: `pond-core/` (Python kernel, ~5 files) and `pond-rust/pond-core/` (Rust PND2 codec, 1 file) share the same name but are completely different things. A developer seeing "pond-core" doesn't know which one is meant.
+1. **Name collision**: `bindings/python/core/` (Python kernel, ~5 files) and `core/codec/` (Rust PND2 codec, 1 file) share the same name but are completely different things. A developer seeing "bindings/python/core" doesn't know which one is meant.
 
-2. **Naming inconsistency**: `pond-core/`, `pond-sdk/`, `pond-rust/`, `sdk-go/`, `pond/` — no consistent convention. Some use `pond-` prefix, some use `sdk-` prefix, one has no prefix.
+2. **Naming inconsistency**: `bindings/python/core/`, `bindings/python/sdk/`, ``, `bindings/go/`, `pond/` — no consistent convention. Some use `pond-` prefix, some use `sdk-` prefix, one has no prefix.
 
-3. **C ABI header buried**: `pond.h` is inside `pond-rust/` but it's the shared contract for ALL language SDKs. It should be in a shared location.
+3. **C ABI header buried**: `pond.h` is inside `` but it's the shared contract for ALL language SDKs. It should be in a shared location.
 
 4. **Kernel 3 primitives not clearly separated**: The `pond-kernel` crate mixes the 3 primitives (Write, Read, Ref) with the ObjectStore trait, LocalFSObjectStore, CRDT utilities, and C ABI wrappers. The 3 primitives ARE the core — everything else is supporting infrastructure.
 
-5. **Go SDK naming**: `sdk-go/` doesn't match the `pond-*` convention and doesn't live under a unified `sdk/` directory.
+5. **Go SDK naming**: `bindings/go/` doesn't match the `pond-*` convention and doesn't live under a unified `sdk/` directory.
 
 6. **`pond/` directory unclear**: It's a pip packaging shim but isn't documented in the top-level structure.
 
@@ -134,19 +134,19 @@ pond_repo/
 
 ### Key decisions:
 
-1. **`pond-rust/` → `core/`**: The Rust workspace IS the core. Renaming eliminates the `pond-` prefix (which is redundant — everything is Pond) and makes it clear this is the production implementation.
+1. **`` → `core/`**: The Rust workspace IS the core. Renaming eliminates the `pond-` prefix (which is redundant — everything is Pond) and makes it clear this is the production implementation.
 
-2. **`pond-rust/pond-core/` → `core/codec/`**: The PND2 codec is NOT "the core" — the kernel is. Renaming to `codec/` is self-describing and eliminates the name collision with Python's `pond-core/`.
+2. **`core/codec/` → `core/codec/`**: The PND2 codec is NOT "the core" — the kernel is. Renaming to `codec/` is self-describing and eliminates the name collision with Python's `bindings/python/core/`.
 
-3. **`pond-rust/pond-kernel/` → `core/kernel/`**: The 3 primitives live here. The name `kernel/` is self-describing. The ObjectStore trait and LocalFSObjectStore are also here because they're the kernel's storage backend abstraction.
+3. **`core/kernel/` → `core/kernel/`**: The 3 primitives live here. The name `kernel/` is self-describing. The ObjectStore trait and LocalFSObjectStore are also here because they're the kernel's storage backend abstraction.
 
-4. **`sdk-go/` → `sdk/go/`**: All language SDKs live under `sdk/`. This is consistent and extensible — adding `sdk/java/` or `sdk/node/` is natural.
+4. **`bindings/go/` → `sdk/go/`**: All language SDKs live under `sdk/`. This is consistent and extensible — adding `sdk/java/` or `sdk/node/` is natural.
 
 5. **`sdk/base/`**: Shared cross-language files. The C ABI header (`pond.h`), C ABI tests, and test blobs live here. All SDKs include from `sdk/base/pond.h`. This is the "generic unified cross-language files" folder the user asked for.
 
-6. **`pond-sdk/` → `sdk/python/`**: The Python SDK is a language SDK. It goes under `sdk/` with the others. The `pond-` prefix is dropped for consistency.
+6. **`bindings/python/sdk/` → `sdk/python/`**: The Python SDK is a language SDK. It goes under `sdk/` with the others. The `pond-` prefix is dropped for consistency.
 
-7. **`pond-core/` (Python kernel) → stays as `pond-core/`**: This is the Python REFERENCE implementation. We keep the name because it's the reference, not the production implementation. It will eventually become a thin wrapper. When it does, it moves to `sdk/python/`.
+7. **`bindings/python/core/` (Python kernel) → stays as `bindings/python/core/`**: This is the Python REFERENCE implementation. We keep the name because it's the reference, not the production implementation. It will eventually become a thin wrapper. When it does, it moves to `sdk/python/`.
 
 8. **`pond/` (pip shim) → deleted or merged into `sdk/python/`**: The pip shim was a packaging artifact. It should be part of the Python SDK, not a separate top-level directory.
 
@@ -170,9 +170,9 @@ The CRDT utilities (`crdt.rs` — UUIDv7 + HLC) are in the kernel crate because 
 ### Migration plan:
 
 This is a big rename. We should do it in phases:
-1. **Phase 1**: Move `pond-rust/` → `core/` and rename internal crates (low risk — just paths)
-2. **Phase 2**: Move `sdk-go/` → `sdk/go/` and create `sdk/base/` (medium risk — cgo paths)
-3. **Phase 3**: Move `pond-sdk/` → `sdk/python/` (high risk — many Python imports)
-4. **Phase 4**: Clean up `pond-core/` (Python reference) and `pond/` (pip shim)
+1. **Phase 1**: Move `` → `core/` and rename internal crates (low risk — just paths)
+2. **Phase 2**: Move `bindings/go/` → `sdk/go/` and create `sdk/base/` (medium risk — cgo paths)
+3. **Phase 3**: Move `bindings/python/sdk/` → `sdk/python/` (high risk — many Python imports)
+4. **Phase 4**: Clean up `bindings/python/core/` (Python reference) and `pond/` (pip shim)
 
 Each phase is a separate commit with tests passing.

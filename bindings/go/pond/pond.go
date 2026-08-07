@@ -8,8 +8,8 @@
 // # Architecture
 //
 // This package links against libpond_core.a (the Rust C ABI in
-// pond-rust/pond-core/). All encode/decode logic lives in Rust; this
-// package is a thin Go wrapper. See sdk-go/internal/cabi for the cgo
+// core/codec/). All encode/decode logic lives in Rust; this
+// package is a thin Go wrapper. See bindings/go/internal/cabi for the cgo
 // layer.
 //
 // # Scope

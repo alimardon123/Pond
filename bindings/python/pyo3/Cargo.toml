@@ -3,7 +3,7 @@ name = "pond_python"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Pond storage — PyO3 bindings to pond-core (Python module name: pond_rust)"
+description = "Pond storage — PyO3 bindings to bindings/python/core (Python module name: pond_rust)"
 
 [lib]
 name = "pond_rust"           # import pond_rust from Python

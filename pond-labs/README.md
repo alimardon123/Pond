@@ -62,6 +62,6 @@ python pond-labs/loc_benchmark.py         # LOC comparison
 
 ## Dependencies
 
-- `pond-core/` (kernel)
+- `bindings/python/core/` (kernel)
 - `lenses/lakehouse/` (for interop demo and LOC benchmark)
 - `pyarrow`, `duckdb`

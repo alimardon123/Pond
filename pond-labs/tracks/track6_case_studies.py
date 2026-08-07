@@ -46,8 +46,8 @@ import shutil
 import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-core"))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "pond-sdk"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/core"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "bindings/python/sdk"))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "..", "lenses", "lakehouse"))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "lenses"))
 sys.path.insert(0, SCRIPT_DIR)

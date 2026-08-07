@@ -30,17 +30,17 @@
 │ Applications (SQL, Git, Feature Store, Notebook, Lakehouse)     │
 ├─────────────────────────────────────────────────────────────────┤
 │ Lenses (encode/decode; interpretation layer)                    │
-│  • lenses/lakehouse/  • lenses/vector/                          │
+│  • lenses/lakehouse/python/  • lenses/vector/python/                          │
 │  • archive/pond-sql/  • archive/pond-git/  (reference impls)    │
 ├─────────────────────────────────────────────────────────────────┤
 │ Services (cross-cutting; between kernel and lenses)             │
 │  • services/transport/  • services/schema/  • services/replication/ │
 ├─────────────────────────────────────────────────────────────────┤
 │ SDK (PondLens base, KeyValueLens, ProllyTreeIndex, indexes, query) │
-│  • pond-sdk/                                                    │
+│  • bindings/python/sdk/                                                    │
 ├─────────────────────────────────────────────────────────────────┤
 │ Kernel (NOT FROZEN; 3 ops + batch I/O helpers; 274 LOC)        │
-│  • pond-core/kernel.py                                    │
+│  • bindings/python/core/kernel.py                                    │
 ├─────────────────────────────────────────────────────────────────┤
 │ Backend (local disk, S3, IPFS, FDB — pluggable)                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -63,10 +63,10 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 
 ## 2. File Map (every active file)
 
-### 2.1 pond-core/ (Kernel + storage backends)
+### 2.1 bindings/python/core/ (Kernel + storage backends)
 
 > **Honesty note (Task 65).** The kernel is no longer "~140 LOC / FROZEN."
-> `pond-core/kernel.py` is 274 LOC and exposes 3 core operations
+> `bindings/python/core/kernel.py` is 274 LOC and exposes 3 core operations
 > (`write`, `read`, `reference`) plus batch I/O helpers (`write_batch`,
 > `read_blob_batch`, `read_blob`) and ref-namespace helpers (`resolve`,
 > `list_names`). The batch helpers are same-collection performance
@@ -75,63 +75,63 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 
 | File | LOC | Purpose |
 |---|---|---|
-| `pond-core/kernel.py` | 274 | The kernel. `PondMinimal` with `write`, `read`, `read_blob`, `write_batch`, `read_blob_batch`, `reference`, `resolve`, `list_names`. SHA-256 content addressing + SQLite-backed root namespace (object-store-native kernel has no SQLite). 6 substrates, 3 operations + batch I/O helpers (not FROZEN). |
-| `pond-core/object_store_native_kernel.py` | — | `ObjectStoreNativeKernel` + `InMemoryObjectStore` + `make_object_store_native_kernel`. No SQLite — refs are content-addressed blobs in the object store. The production kernel backend. |
-| `pond-core/local_fs_object_store.py` | 443 | `LocalFSObjectStore`. Pure local-filesystem content-addressed store (blobs at `{base}/blobs/{hash[:2]}/{hash}.bin`, refs at `{base}/paths/{path}`). Thread-safe (per-hash locks + fcntl/msvcrt CAS). Mirrors the S3 key layout — `rsync` migrates between them. |
-| `pond-core/s3_object_store.py` | 519 | `S3ObjectStore`. Real boto3-backed content-addressed store implementing the same 9-primitive interface as `InMemoryObjectStore` / `LocalFSObjectStore`. S3 conditional PUT (If-Match/If-None-Match) for CAS on small path blobs. |
-| `pond-core/s3_mock_backend.py` | — | S3 mock with simulated latency. Extends `ObjectStoreNativeKernel`. Used by latency-injection benchmarks. |
-| `pond-core/make_kernel.py` | 112 | `make_kernel(url, **kwargs)`. Unified kernel factory — `file://` → `LocalFSObjectStore`, `s3://` → `S3ObjectStore`. Switching backends is one line; everything else (kernel, SDK, lenses) is identical. |
-| `pond-core/__init__.py` | 0 | Package marker. |
-| `pond-core/README.md` | 43 | Folder purpose and usage. |
+| `bindings/python/core/kernel.py` | 274 | The kernel. `PondMinimal` with `write`, `read`, `read_blob`, `write_batch`, `read_blob_batch`, `reference`, `resolve`, `list_names`. SHA-256 content addressing + SQLite-backed root namespace (object-store-native kernel has no SQLite). 6 substrates, 3 operations + batch I/O helpers (not FROZEN). |
+| `bindings/python/core/object_store_native_kernel.py` | — | `ObjectStoreNativeKernel` + `InMemoryObjectStore` + `make_object_store_native_kernel`. No SQLite — refs are content-addressed blobs in the object store. The production kernel backend. |
+| `bindings/python/core/local_fs_object_store.py` | 443 | `LocalFSObjectStore`. Pure local-filesystem content-addressed store (blobs at `{base}/blobs/{hash[:2]}/{hash}.bin`, refs at `{base}/paths/{path}`). Thread-safe (per-hash locks + fcntl/msvcrt CAS). Mirrors the S3 key layout — `rsync` migrates between them. |
+| `bindings/python/core/s3_object_store.py` | 519 | `S3ObjectStore`. Real boto3-backed content-addressed store implementing the same 9-primitive interface as `InMemoryObjectStore` / `LocalFSObjectStore`. S3 conditional PUT (If-Match/If-None-Match) for CAS on small path blobs. |
+| `bindings/python/core/s3_mock_backend.py` | — | S3 mock with simulated latency. Extends `ObjectStoreNativeKernel`. Used by latency-injection benchmarks. |
+| `bindings/python/core/make_kernel.py` | 112 | `make_kernel(url, **kwargs)`. Unified kernel factory — `file://` → `LocalFSObjectStore`, `s3://` → `S3ObjectStore`. Switching backends is one line; everything else (kernel, SDK, lenses) is identical. |
+| `bindings/python/core/__init__.py` | 0 | Package marker. |
+| `bindings/python/core/README.md` | 43 | Folder purpose and usage. |
 
-### 2.2 pond-sdk/ (Lens SDK — 14 files, ~7300 LOC)
+### 2.2 bindings/python/sdk/ (Lens SDK — 14 files, ~7300 LOC)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
-| `pond-sdk/base_lens.py` | 248 | `PondLens` | **Shared namespace base for ALL Lenses.** Provides only ref-namespace operations (branch, list_collections, set_definition, get_definition, history). No format awareness — each app-facing lens owns its own read/write API. |
-| `pond-sdk/prolly_tree.py` *(archived)* | 764 | `ProllyTree`, `ProllyLensBase` | **LEGACY** — ProllyTreeIndex storage + tiered commits. This file does NOT exist in the production SDK; it lives in `archive/legacy-sdk/prolly_tree.py` as historical reference. The actual universal storage backend is `pond-sdk/extensions/physical_structures/unified_storage.py` (5,540 LOC). |
-| `pond-sdk/collection.py` | 517 | `Collection` | Named collection with namespace, type, source metadata. |
+| `bindings/python/sdk/base_lens.py` | 248 | `PondLens` | **Shared namespace base for ALL Lenses.** Provides only ref-namespace operations (branch, list_collections, set_definition, get_definition, history). No format awareness — each app-facing lens owns its own read/write API. |
+| `bindings/python/sdk/prolly_tree.py` *(archived)* | 764 | `ProllyTree`, `ProllyLensBase` | **LEGACY** — ProllyTreeIndex storage + tiered commits. This file does NOT exist in the production SDK; it lives in `archive/legacy-sdk/prolly_tree.py` as historical reference. The actual universal storage backend is `bindings/python/sdk/extensions/physical_structures/unified_storage.py` (5,540 LOC). |
+| `bindings/python/sdk/collection.py` | 517 | `Collection` | Named collection with namespace, type, source metadata. |
 | `tests/lens_algebra/lens_laws.py` | 591 | (test harness) | RFC-0007 Lens algebra property tests (6 laws). |
 | `tests/architecture/architecture_laws.py` | 557 | (12 laws) | Executable architecture laws (Identity, Reachability, History, Lens, Derived, Branch, Merge, Determinism, Scale, Index). |
-| `pond-sdk/binary_encoding.py` | 323 | `BinaryProllyTree` | Binary Prolly tree encoding (metadata optimization). |
+| `bindings/python/sdk/binary_encoding.py` | 323 | `BinaryProllyTree` | Binary Prolly tree encoding (metadata optimization). |
 | `tests/integration/test_shared_lenses.py` | 442 | (tests) | Test: multiple KeyValueLens subclasses sharing same byte graph. |
 | `tests/integration/test_lens_architecture.py` | 449 | (tests) | Test: multi-Lens architecture proof (SQL/Git/Notebook lenses over same byte graph). |
-| `pond-sdk/row_query.py` | 288 | `LensQuery`, `JoinedQuery` | Lazy query API: `.where()`, `.select()`, `.map()`, `.join()`, `.collect()`. |
+| `bindings/python/sdk/row_query.py` | 288 | `LensQuery`, `JoinedQuery` | Lazy query API: `.where()`, `.select()`, `.map()`, `.join()`, `.collect()`. |
 | `tests/integration/test_lens_query.py` | 327 | (tests) | Test: LensQuery. |
 | `tests/integration/test_pruning.py` | 320 | (tests) | Test: Vortex-style pruning. Zone-map-based pruning works for JSON, Parquet, and custom formats. |
 | `tests/integration/test_lakehouse_pruning.py` | 130 | (tests) | Test: End-to-end pruning with LakehouseLens. Zone maps auto-built at write time, read_with_pruning skips row groups. |
 | `tests/integration/test_kv_pruning_and_projection.py` | 130 | (tests) | Test: KV pruning + Lakehouse projection pushdown. Zone maps for KV, column-level access for Parquet. |
 | `tests/integration/test_collection_metadata.py` | 120 | (tests) | Test: Collection integration — unified namespace + labels + zone maps + indexes + pruning + compaction. |
 | `tests/integration/test_index_modes.py` | 220 | (tests) | Test: EAGER/LAZY index modes + O(changed) incremental refresh via commit-diff + is_index_stale. |
-| `pond-sdk/maintenance.py` | 315 | `drop_name`, `is_dropped`, `resolve_active`, `compact_tombstones` | Tombstone helpers (RFC-0008: deletion as data). |
-| `pond-sdk/collection_metadata.py` | 343 | `CollectionMetadata` | Data-side metadata manager. Manages zone maps, indexes, and (future) bloom filters for collections. Lens-agnostic — works through callbacks. |
-| `pond-sdk/best_effort.py` | 95 | `best_effort, warn_best_effort` | Tiny helper for best-effort operations. Catches specific recoverable exceptions (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError) and logs them via the `pond.best_effort` logger. Replaces the `except Exception: pass` anti-pattern. Enable with `POND_DEBUG=1`. |
-| `pond-sdk/pond_config.py` | 195 | `PondConfig` | Persistent pruning + encoding settings via `.pond/config` JSON file. Configures pruning (auto/true/false + force), encoding (auto-select or default), chunk_size, row_group_size, bitpack_max_bitwidth. `should_prune()` decides based on storage type. `load_for_kernel()` finds config in base_dir. |
+| `bindings/python/sdk/maintenance.py` | 315 | `drop_name`, `is_dropped`, `resolve_active`, `compact_tombstones` | Tombstone helpers (RFC-0008: deletion as data). |
+| `bindings/python/sdk/collection_metadata.py` | 343 | `CollectionMetadata` | Data-side metadata manager. Manages zone maps, indexes, and (future) bloom filters for collections. Lens-agnostic — works through callbacks. |
+| `bindings/python/sdk/best_effort.py` | 95 | `best_effort, warn_best_effort` | Tiny helper for best-effort operations. Catches specific recoverable exceptions (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError) and logs them via the `pond.best_effort` logger. Replaces the `except Exception: pass` anti-pattern. Enable with `POND_DEBUG=1`. |
+| `bindings/python/sdk/pond_config.py` | 195 | `PondConfig` | Persistent pruning + encoding settings via `.pond/config` JSON file. Configures pruning (auto/true/false + force), encoding (auto-select or default), chunk_size, row_group_size, bitpack_max_bitwidth. `should_prune()` decides based on storage type. `load_for_kernel()` finds config in base_dir. |
 | `tests/integration/test_pond_config.py` | 130 | (test) | Tests PondConfig: defaults, save/load round-trip, should_prune (auto/true/false/force), encoding hints, validation, load_for_kernel. |
-| `pond-sdk/uuid7.py` | 180 | `uuidv7`, `uuidv7_monotonic`, `uuidv7_timestamp` | UUIDv7 time-ordered UUID generation for distributed row identification (_rowid). |
-| `pond-sdk/hlc.py` | 116 | `HLC` | **Hybrid Logical Clock** — clock-skew-safe versioning for CRDT LWW. Combines physical time + logical counter; monotonic under clock skew. 16-byte (8B physical_ms + 8B logical, big-endian) hex string sorts chronologically. `tick()` advances, `observe()` accounts for remote writes, `compare` / `max` / `is_valid` helpers. Standard CockroachDB/YugabyteDB-style fix for B5 (UUIDv7 wall-clock skew breaks LWW). |
+| `bindings/python/sdk/uuid7.py` | 180 | `uuidv7`, `uuidv7_monotonic`, `uuidv7_timestamp` | UUIDv7 time-ordered UUID generation for distributed row identification (_rowid). |
+| `bindings/python/sdk/hlc.py` | 116 | `HLC` | **Hybrid Logical Clock** — clock-skew-safe versioning for CRDT LWW. Combines physical time + logical counter; monotonic under clock skew. 16-byte (8B physical_ms + 8B logical, big-endian) hex string sorts chronologically. `tick()` advances, `observe()` accounts for remote writes, `compare` / `max` / `is_valid` helpers. Standard CockroachDB/YugabyteDB-style fix for B5 (UUIDv7 wall-clock skew breaks LWW). |
 | `tests/lens_algebra/run_lens_laws_ci.py` | 267 | (CI runner) | CI runner for Lens contracts. |
-| `pond-sdk/__init__.py` | 0 | Package marker. |
-| `pond-sdk/README.md` | 52 | Folder purpose and usage. |
-| `pond-sdk/extensions/__init__.py` | 55 | `register_extension`, `list_extensions` | Extension registry. |
-| `pond-sdk/extensions/indexing/__init__.py` | 27 | `CollectionIndexer`, `AutoIndexMixin`, `AutoIndex` | Indexing extension package. Collection-level indexing + legacy lens-mixin approach. |
-| `pond-sdk/extensions/indexing/collection_index.py` | 200 | `CollectionIndexer` | Collection-level indexer. Operates on kernel + collection name. Any lens can use it. Indexes belong to collections (data-side), not lenses. |
-| `pond-sdk/extensions/indexing/base.py` | 80 | `CollectionIndexerInterface` | Abstract interface for collection-level indexers. |
-| `pond-sdk/extensions/semantic/__init__.py` | 15 | — | Semantic extension package. |
-| `pond-sdk/extensions/semantic/base.py` | 45 | `SemanticModelAdapter` | Abstract interface for semantic adapters. |
-| `pond-sdk/extensions/semantic/ossie.py` | 300 | `SemanticLens`, `OssieAdapter` | Ossie adapter + pluggable SemanticLens. |
-| `pond-sdk/extensions/indexing/hnsw_index.py` | 613 | `HNSWIndex` | **HNSW (Hierarchical Navigable Small World) graph-based ANN for vectors.** Multi-layer graph: O(log N) search vs IVF's O(n_probe × cluster_size). Build reads all vectors, constructs layered adjacency lists, stores as content-addressed blobs. VectorLens.search() checks IVF first, then HNSW, then linear scan. Format: `PHNS` magic + layer/node/edge binary layout. |
-| `pond-sdk/extensions/indexing/ivf_index.py` | 481 | `IVFIndex` | **IVF (Inverted File Index) ANN.** k-means clusters + per-cluster vector ID lists. **Honesty note (Task 65):** the implementation currently reads ALL vectors via `storage.read(collection)` then filters by target IDs in Python — every search reads the entire collection. At PB scale (10M+ vectors) this defeats the purpose of IVF. Admitted in source comments (lines 363-381). Listed as a Known Gap in `DESIGN_GOALS.md`. |
-| `pond-sdk/extensions/maintenance/vacuum.py` | 476 | `GarbageCollector` | **GC + Vacuum** — reclaim space from unreachable blobs. `collect()` builds the live set (read-only) and returns dead set. `vacuum(collections, preserve_days, dry_run)` deletes dead blobs with optional time-travel preservation (Delta/Iceberg-style). PB-scale: O(live) reads (not O(all)); skips dead-blob size reads. |
-| `pond-sdk/extensions/physical_structures/__init__.py` | 52 | — | Physical Structure extension package. |
-| `pond-sdk/extensions/physical_structures/unified_storage.py` | 5540 | `UnifiedStorage`, `PND2` | **The actual universal storage backend** (5,540 LOC — not "tiny"). PND2 format write/read/point_lookup/iter_rows/compact_manifest + shard read/append paths. Read paths: range read, point lookup, manifest-level compaction. Used by every production Lens. **The docs previously named `pond-sdk/prolly_tree.py` here — that file does NOT exist; the prolly tree lives in `archive/legacy-sdk/prolly_tree.py` as a reference impl.** |
-| `pond-sdk/extensions/physical_structures/collection_manifest.py` | — | `CollectionManifest` | ONE manifest blob per commit (PMAN format): row groups + inline stats + delta-manifest support. Delegates stats to `stats_tree.py`. Referenced by `unified_storage.py`. |
-| `pond-sdk/extensions/physical_structures/stats_tree.py` | — | `StatsTreeReader` | PB-scale hierarchical stats index. O(log N) reads for selective predicates by walking a stats tree instead of flat zone maps. |
-| `pond-sdk/extensions/physical_structures/embedded_stats.py` | — | `ColumnStats`, value-type constants | Per-column stats (min/max/null_count) embedded in manifests. |
-| `pond-sdk/extensions/physical_structures/compression.py` | — | zstd / LZ4 helpers | Transparent compression of PND2 payloads. |
-| `pond-sdk/extensions/physical_structures/encoding.py` | 380 | `ColumnEncoding`, `EncodingHeader`, `encode_column`, `eval_predicate_encoded` | FastLanes-style structural encodings (RLE/Dict/Bitpack/Raw). Encoded predicate eval skips decode for pruned chunks. |
-| `pond-sdk/extensions/physical_structures/column_source.py` | 175 | `ColumnSource`, `PyArrowColumnSource`, `ListColumnSource`, `as_column_source`, `compute_list_stats` | Format-agnostic column data access protocol. Lets any lens (KV, Vector, custom) use the pruning infrastructure without PyArrow. PyArrow tables are auto-wrapped for backward compat. |
-| `pond-sdk/extensions/physical_structures/pond_pack.py` | 207 | `PondPack` (helpers) | **PondPack** — ONE blob (PNPK magic) containing commit JSON + manifest bytes (and optionally inline data blobs in v2). Saves 1-2 GETs per cold read (merge, time-travel, branch read) and 1 PUT per write. Layer-1 storage-side optimization above the FROZEN kernel; backward compatible with old separate-commit+manifest layout. |
+| `bindings/python/sdk/__init__.py` | 0 | Package marker. |
+| `bindings/python/sdk/README.md` | 52 | Folder purpose and usage. |
+| `bindings/python/sdk/extensions/__init__.py` | 55 | `register_extension`, `list_extensions` | Extension registry. |
+| `bindings/python/sdk/extensions/indexing/__init__.py` | 27 | `CollectionIndexer`, `AutoIndexMixin`, `AutoIndex` | Indexing extension package. Collection-level indexing + legacy lens-mixin approach. |
+| `bindings/python/sdk/extensions/indexing/collection_index.py` | 200 | `CollectionIndexer` | Collection-level indexer. Operates on kernel + collection name. Any lens can use it. Indexes belong to collections (data-side), not lenses. |
+| `bindings/python/sdk/extensions/indexing/base.py` | 80 | `CollectionIndexerInterface` | Abstract interface for collection-level indexers. |
+| `bindings/python/sdk/extensions/semantic/__init__.py` | 15 | — | Semantic extension package. |
+| `bindings/python/sdk/extensions/semantic/base.py` | 45 | `SemanticModelAdapter` | Abstract interface for semantic adapters. |
+| `bindings/python/sdk/extensions/semantic/ossie.py` | 300 | `SemanticLens`, `OssieAdapter` | Ossie adapter + pluggable SemanticLens. |
+| `bindings/python/sdk/extensions/indexing/hnsw_index.py` | 613 | `HNSWIndex` | **HNSW (Hierarchical Navigable Small World) graph-based ANN for vectors.** Multi-layer graph: O(log N) search vs IVF's O(n_probe × cluster_size). Build reads all vectors, constructs layered adjacency lists, stores as content-addressed blobs. VectorLens.search() checks IVF first, then HNSW, then linear scan. Format: `PHNS` magic + layer/node/edge binary layout. |
+| `bindings/python/sdk/extensions/indexing/ivf_index.py` | 481 | `IVFIndex` | **IVF (Inverted File Index) ANN.** k-means clusters + per-cluster vector ID lists. **Honesty note (Task 65):** the implementation currently reads ALL vectors via `storage.read(collection)` then filters by target IDs in Python — every search reads the entire collection. At PB scale (10M+ vectors) this defeats the purpose of IVF. Admitted in source comments (lines 363-381). Listed as a Known Gap in `DESIGN_GOALS.md`. |
+| `bindings/python/sdk/extensions/maintenance/vacuum.py` | 476 | `GarbageCollector` | **GC + Vacuum** — reclaim space from unreachable blobs. `collect()` builds the live set (read-only) and returns dead set. `vacuum(collections, preserve_days, dry_run)` deletes dead blobs with optional time-travel preservation (Delta/Iceberg-style). PB-scale: O(live) reads (not O(all)); skips dead-blob size reads. |
+| `bindings/python/sdk/extensions/physical_structures/__init__.py` | 52 | — | Physical Structure extension package. |
+| `bindings/python/sdk/extensions/physical_structures/unified_storage.py` | 5540 | `UnifiedStorage`, `PND2` | **The actual universal storage backend** (5,540 LOC — not "tiny"). PND2 format write/read/point_lookup/iter_rows/compact_manifest + shard read/append paths. Read paths: range read, point lookup, manifest-level compaction. Used by every production Lens. **The docs previously named `bindings/python/sdk/prolly_tree.py` here — that file does NOT exist; the prolly tree lives in `archive/legacy-sdk/prolly_tree.py` as a reference impl.** |
+| `bindings/python/sdk/extensions/physical_structures/collection_manifest.py` | — | `CollectionManifest` | ONE manifest blob per commit (PMAN format): row groups + inline stats + delta-manifest support. Delegates stats to `stats_tree.py`. Referenced by `unified_storage.py`. |
+| `bindings/python/sdk/extensions/physical_structures/stats_tree.py` | — | `StatsTreeReader` | PB-scale hierarchical stats index. O(log N) reads for selective predicates by walking a stats tree instead of flat zone maps. |
+| `bindings/python/sdk/extensions/physical_structures/embedded_stats.py` | — | `ColumnStats`, value-type constants | Per-column stats (min/max/null_count) embedded in manifests. |
+| `bindings/python/sdk/extensions/physical_structures/compression.py` | — | zstd / LZ4 helpers | Transparent compression of PND2 payloads. |
+| `bindings/python/sdk/extensions/physical_structures/encoding.py` | 380 | `ColumnEncoding`, `EncodingHeader`, `encode_column`, `eval_predicate_encoded` | FastLanes-style structural encodings (RLE/Dict/Bitpack/Raw). Encoded predicate eval skips decode for pruned chunks. |
+| `bindings/python/sdk/extensions/physical_structures/column_source.py` | 175 | `ColumnSource`, `PyArrowColumnSource`, `ListColumnSource`, `as_column_source`, `compute_list_stats` | Format-agnostic column data access protocol. Lets any lens (KV, Vector, custom) use the pruning infrastructure without PyArrow. PyArrow tables are auto-wrapped for backward compat. |
+| `bindings/python/sdk/extensions/physical_structures/pond_pack.py` | 207 | `PondPack` (helpers) | **PondPack** — ONE blob (PNPK magic) containing commit JSON + manifest bytes (and optionally inline data blobs in v2). Saves 1-2 GETs per cold read (merge, time-travel, branch read) and 1 PUT per write. Layer-1 storage-side optimization above the FROZEN kernel; backward compatible with old separate-commit+manifest layout. |
 
 > **Archived legacy extensions (honesty note, Task 65).** The previous
 > KG rows below this note — `pruning.py`, `zone_map_index.py`,
@@ -140,41 +140,52 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 > `column_chunk_storage.py`, `encoded_chunk_storage.py`,
 > `collection_metadata.py`, `best_effort.py` — have been **moved to
 > `archive/legacy-extensions/`** and are no longer importable from
-> `pond-sdk/extensions/physical_structures/`. They remain listed below
+> `bindings/python/sdk/extensions/physical_structures/`. They remain listed below
 > for historical context. The active physical-structure contents are
 > the rows above this note (unified_storage, collection_manifest,
 > stats_tree, embedded_stats, compression, encoding, column_source,
 > pond_pack, plus the README and `__init__.py`).
 
-| `pond-sdk/extensions/physical_structures/pruning.py` *(archived)* | 180 | `ZoneMap`, `PruningPredicate`, `ColumnPredicate` | Vortex-style predicate pushdown. Zone maps (min/max/null_count per row group) + pruning predicates. Skip row groups without decoding. Now in `archive/legacy-extensions/pruning.py`. |
-| `pond-sdk/extensions/physical_structures/zone_map_index.py` *(archived)* | 280 | `ZoneMapIndex` | ProllyTreeIndex of zone maps. Now in `archive/legacy-extensions/zone_map_index.py`. |
-| `pond-sdk/extensions/physical_structures/pruning_reader.py` *(archived)* | 200 | `PruningReader` | Generic pruning reader. Now in `archive/legacy-extensions/pruning_reader.py`. |
-| `pond-sdk/extensions/physical_structures/column_chunk_zone_map.py` *(archived)* | 180 | `ColumnChunkZoneMap`, `ColumnChunkStats` | Per-column-chunk zone maps. Now in `archive/legacy-extensions/column_chunk_zone_map.py`. |
-| `pond-sdk/extensions/physical_structures/base.py` *(archived)* | 105 | `PhysicalStructure` | Abstract base: build, load, exists, delete, query. |
-| `pond-sdk/extensions/physical_structures/bloom_filter.py` *(archived)* | 120 | `BloomFilter` | Probabilistic membership test (O(1)). |
-| `pond-sdk/extensions/physical_structures/statistics.py` *(archived)* | 100 | `Statistics` | Column min/max/null_count for pruning. |
-| `pond-sdk/extensions/physical_structures/zone_map.py` *(archived)* | 90 | `ZoneMap` | Per-chunk min/max for range pruning. |
+| `bindings/python/sdk/extensions/physical_structures/pruning.py` *(archived)* | 180 | `ZoneMap`, `PruningPredicate`, `ColumnPredicate` | Vortex-style predicate pushdown. Zone maps (min/max/null_count per row group) + pruning predicates. Skip row groups without decoding. Now in `archive/legacy-extensions/pruning.py`. |
+| `bindings/python/sdk/extensions/physical_structures/zone_map_index.py` *(archived)* | 280 | `ZoneMapIndex` | ProllyTreeIndex of zone maps. Now in `archive/legacy-extensions/zone_map_index.py`. |
+| `bindings/python/sdk/extensions/physical_structures/pruning_reader.py` *(archived)* | 200 | `PruningReader` | Generic pruning reader. Now in `archive/legacy-extensions/pruning_reader.py`. |
+| `bindings/python/sdk/extensions/physical_structures/column_chunk_zone_map.py` *(archived)* | 180 | `ColumnChunkZoneMap`, `ColumnChunkStats` | Per-column-chunk zone maps. Now in `archive/legacy-extensions/column_chunk_zone_map.py`. |
+| `bindings/python/sdk/extensions/physical_structures/base.py` *(archived)* | 105 | `PhysicalStructure` | Abstract base: build, load, exists, delete, query. |
+| `bindings/python/sdk/extensions/physical_structures/bloom_filter.py` *(archived)* | 120 | `BloomFilter` | Probabilistic membership test (O(1)). |
+| `bindings/python/sdk/extensions/physical_structures/statistics.py` *(archived)* | 100 | `Statistics` | Column min/max/null_count for pruning. |
+| `bindings/python/sdk/extensions/physical_structures/zone_map.py` *(archived)* | 90 | `ZoneMap` | Per-chunk min/max for range pruning. |
 
 ### 2.3 lenses/ (Active Lens implementations — 4 packages)
 
 | File | LOC | Exports | Purpose |
 |---|---|---|---|
-| `lenses/keyvalue/__init__.py` | 0 | — | Package marker. |
-| `lenses/keyvalue/keyvalue_lens.py` | 694 | `KeyValueLens`, `KeylessLens` | **App-facing KEY-VALUE lens** with ProllyTreeIndex backing. Per-row key→blob storage, O(log N) point lookups, branching, merge, history. `Lens = KeyValueLens` and `View = KeyValueLens` are backward-compat aliases. |
-| `lenses/lakehouse/lakehouse_lens.py` | 1740 | `LakehouseLens` | **Flagship lens.** Tabular semantics on Pond: CREATE TABLE, INSERT, read_table, time travel, branching, merge, schema evolution. Owns its Parquet I/O directly (not inherited). Adds range_read/range_write/range_point_lookup + three pruning read paths (read_with_pruning, read_with_column_chunk_pruning, read_with_encoded_pruning) on top of the shared ProllyTreeIndex. DuckDB-optional — the lens itself only needs PyArrow. |
-| `lenses/lakehouse/pond_lakehouse.py` | 507 | `PondLakehouse` | DuckDB-backed lakehouse façade over LakehouseLens. Provides SQL query with predicate + projection pushdown (cascades: encoded → column-chunk → row-group → full read). Object-store-aware pruning (S3→on, local→off). This is the only place DuckDB is required. |
-| `lenses/lakehouse/sql_pushdown.py` | 170 | `extract_predicates, extract_columns` | Regex SQL parser for predicate + projection extraction. Handles =, !=, <, <=, >, >=, IN, BETWEEN, AND. Does NOT handle OR, joins, subqueries. Returns ["*"] or [] for unparseable queries (caller falls back to full read). |
-| `lenses/lakehouse/duckdb_pond_adapter.py` | 195 | `PondDuckDBAdapter` | **SIMD-ready proof:** reads Pond's PND1 binary encoded chunks directly and converts to PyArrow Table. No JSON in the hot path — INT64/FLOAT64 use struct.unpack (C-speed), DICT uses numpy unpackbits, BITPACK uses numpy-accelerated unpack. DuckDB queries the Arrow Table with full SIMD acceleration. |
-| `lenses/lakehouse/polars_pond_adapter.py` | 60 | `PondPolarsAdapter` | **Second SIMD-ready proof:** extends PondDuckDBAdapter, converts pa.Table → Polars DataFrame (zero-copy Arrow transfer). Proves PND1 format is engine-independent. |
-| `lenses/vector/vector_lens.py` | 460 | `VectorLens` | Vector DB with k-NN search. Extends `PondLens` directly (no lens-to-lens inheritance). Binary packed encoding (struct.pack). Adds build_vector_zone_maps + search_with_pruning — per-dimension bounding-box zone maps enable skipping chunks that can't contain top-k vectors. Uses the SAME ZoneMapIndex infrastructure as tabular lenses. |
-| `lenses/streaming/streaming_lens.py` | 200 | `StreamingLens` | **Streaming/media lens.** Chunked storage for large objects (video, music, logs). Range-read WITHOUT a kernel primitive — composes ProllyTreeIndex + segment blobs. write_stream, read_stream (range), append_stream (structural sharing), time-travel, branching. Resolves architect issue #4. |
-| `lenses/vector/auto_index.py` | 329 | (mock) | Mock auto-index for testing. |
-| `lenses/vector/mock_kernel.py` | 46 | `PondMinimal` (mock) | In-memory mock kernel for tests. |
-| `lenses/vector/view_sdk.py` | 39 | `CrossLens` (mock) | Mock CrossLens helpers. |
-| `lenses/vector/test_vector.py` | 175 | (tests) | VectorView tests. |
-| `lenses/oltp/__init__.py` | 1 | `OLTPLens` | Package marker re-exporting `OLTPLens`. |
-| `lenses/oltp/oltp_lens.py` | 184 | `OLTPLens` | **OLTP lens** — fast KV with in-memory memtable + batch flush to object storage. Per-process memtable (sub-µs writes); flushes as CRDT shards when full or `flush()` is called. Multi-process: each app flushes independently, CRDT merge resolves conflicts. LSM-tree pattern (SST → CRDT shard, compaction → `compact_shards`). **Note:** `class OLTPLens:` declares NO base class — does not extend `PondLens` (documented exception, see `SDK_SPEC.md` + `DESIGN_GOALS.md` Known Gaps). |
-| `lenses/README.md` | — | — | Folder purpose, how to add a Lens. |
+| `lenses/keyvalue/python/__init__.py` | 0 | — | Package marker. |
+| `lenses/keyvalue/python/keyvalue_lens.py` | 694 | `KeyValueLens`, `KeylessLens` | **App-facing KEY-VALUE lens** with ProllyTreeIndex backing. Per-row key→blob storage, O(log N) point lookups, branching, merge, history. `Lens = KeyValueLens` and `View = KeyValueLens` are backward-compat aliases. |
+| `lenses/lakehouse/python/lakehouse_lens.py` | 1740 | `LakehouseLens` | **Flagship lens.** Tabular semantics on Pond: CREATE TABLE, INSERT, read_table, time travel, branching, merge, schema evolution. Owns its Parquet I/O directly (not inherited). Adds range_read/range_write/range_point_lookup + three pruning read paths (read_with_pruning, read_with_column_chunk_pruning, read_with_encoded_pruning) on top of the shared ProllyTreeIndex. DuckDB-optional — the lens itself only needs PyArrow. |
+| `lenses/lakehouse/python/pond_lakehouse.py` | 507 | `PondLakehouse` | DuckDB-backed lakehouse façade over LakehouseLens. Provides SQL query with predicate + projection pushdown (cascades: encoded → column-chunk → row-group → full read). Object-store-aware pruning (S3→on, local→off). This is the only place DuckDB is required. |
+| `lenses/lakehouse/python/sql_pushdown.py` | 170 | `extract_predicates, extract_columns` | Regex SQL parser for predicate + projection extraction. Handles =, !=, <, <=, >, >=, IN, BETWEEN, AND. Does NOT handle OR, joins, subqueries. Returns ["*"] or [] for unparseable queries (caller falls back to full read). |
+| `lenses/lakehouse/python/duckdb_pond_adapter.py` | 195 | `PondDuckDBAdapter` | **SIMD-ready proof:** reads Pond's PND1 binary encoded chunks directly and converts to PyArrow Table. No JSON in the hot path — INT64/FLOAT64 use struct.unpack (C-speed), DICT uses numpy unpackbits, BITPACK uses numpy-accelerated unpack. DuckDB queries the Arrow Table with full SIMD acceleration. |
+| `lenses/lakehouse/python/polars_pond_adapter.py` | 60 | `PondPolarsAdapter` | **Second SIMD-ready proof:** extends PondDuckDBAdapter, converts pa.Table → Polars DataFrame (zero-copy Arrow transfer). Proves PND1 format is engine-independent. |
+| `lenses/vector/python/vector_lens.py` | 460 | `VectorLens` | Vector DB with k-NN search. Extends `PondLens` directly (no lens-to-lens inheritance). Binary packed encoding (struct.pack). Adds build_vector_zone_maps + search_with_pruning — per-dimension bounding-box zone maps enable skipping chunks that can't contain top-k vectors. Uses the SAME ZoneMapIndex infrastructure as tabular lenses. |
+| `lenses/streaming/python/streaming_lens.py` | 200 | `StreamingLens` | **Streaming/media lens.** Chunked storage for large objects (video, music, logs). Range-read WITHOUT a kernel primitive — composes ProllyTreeIndex + segment blobs. write_stream, read_stream (range), append_stream (structural sharing), time-travel, branching. Resolves architect issue #4. |
+| `lenses/vector/python/auto_index.py` | 329 | (mock) | Mock auto-index for testing. |
+| `lenses/vector/python/mock_kernel.py` | 46 | `PondMinimal` (mock) | In-memory mock kernel for tests. |
+| `lenses/vector/python/view_sdk.py` | 39 | `CrossLens` (mock) | Mock CrossLens helpers. |
+| `lenses/vector/python/test_vector.py` | 175 | (tests) | VectorView tests. |
+| `lenses/oltp/python/__init__.py` | 1 | `OLTPLens` | Package marker re-exporting `OLTPLens`. |
+| `lenses/oltp/python/oltp_lens.py` | 184 | `OLTPLens` | **OLTP lens** — fast KV with in-memory memtable + batch flush to object storage. Per-process memtable (sub-µs writes); flushes as CRDT shards when full or `flush()` is called. Multi-process: each app flushes independently, CRDT merge resolves conflicts. LSM-tree pattern (SST → CRDT shard, compaction → `compact_shards`). **Note:** `class OLTPLens:` declares NO base class — does not extend `PondLens` (documented exception, see `SDK_SPEC.md` + `DESIGN_GOALS.md` Known Gaps). |
+| `lenses/base/pond_lens.h` | 12 | — | **PLACEHOLDER** C ABI header for future cross-language lens protocol. No lens functions defined yet — all lenses are Python-only. Will define `pond_lens_new/put/get/delete/scan/free` when the first Rust lens is ported (planned: KeyValueLens). |
+| `lenses/base/README.md` | — | — | Documents the lens protocol placeholder and migration plan. |
+| `lenses/keyvalue/README.md` | — | — | KeyValueLens README. |
+| `lenses/keyvalue/rust/README.md` | — | — | Placeholder for future Rust port of KeyValueLens. |
+| `lenses/lakehouse/README.md` | — | — | LakehouseLens README. |
+| `lenses/lakehouse/rust/README.md` | — | — | Placeholder for future Rust port of LakehouseLens. |
+| `lenses/oltp/rust/README.md` | — | — | Placeholder for future Rust port of OLTPLens. |
+| `lenses/streaming/README.md` | — | — | StreamingLens README. |
+| `lenses/streaming/rust/README.md` | — | — | Placeholder for future Rust port of StreamingLens. |
+| `lenses/vector/README.md` | — | — | VectorLens README. |
+| `lenses/vector/rust/README.md` | — | — | Placeholder for future Rust port of VectorLens. |
+| `lenses/README.md` | — | — | Folder purpose, structure (rust/python subdirs), migration plan. |
 
 ### 2.4 services/ (Cross-cutting services — 3 packages)
 
@@ -202,10 +213,10 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/benchmarks/pruning_benchmark.py` | 200 | (benchmark) | Benchmark: Vortex-style pruning effectiveness. 100K rows, measures blob skip rate and speedup for 1-50% selectivity queries. |
 | `pond-labs/benchmarks/column_chunk_pruning_benchmark.py` | 175 | (benchmark) | Benchmark: column-chunk pruning (3rd level). 50K rows in 1 row group, shows 49/50 chunks pruned for selective predicates. |
 | `pond-labs/benchmarks/column_chunk_storage_benchmark.py` | 175 | (benchmark) | Benchmark: per-column-chunk storage. 50K rows in 1 row group, 9.37x I/O reduction (1090KB → 116KB) for selective predicate; 31.76x with projection. |
-| `pond-sdk/extensions/physical_structures/column_chunk_storage.py` | 280 | `ColumnChunkStorage` | Per-column-chunk storage: splits row groups into single-column Parquet blobs. True I/O savings on object storage (skip 4/5 chunks = skip 4/5 of bytes per column). |
-| `pond-sdk/extensions/physical_structures/encoding.py` | 380 | `ColumnEncoding, EncodingHeader, encode_column, eval_predicate_encoded` | FastLanes-style structural encodings (RLE/Dict/Bitpack/Raw). Encoded predicate eval skips decode for pruned chunks. |
-| `pond-sdk/extensions/physical_structures/encoded_chunk_storage.py` | 220 | `EncodedChunkStorage` | Combines ColumnChunkStorage + encoding.py. Per-column-chunk encoded blobs with encoded predicate eval at read time. |
-| `pond-sdk/extensions/physical_structures/column_source.py` | 175 | `ColumnSource, PyArrowColumnSource, ListColumnSource, as_column_source, compute_list_stats` | Format-agnostic column data access protocol. Lets any lens (KV, Vector, custom) use the pruning infrastructure without PyArrow. PyArrow tables are auto-wrapped for backward compat. |
+| `bindings/python/sdk/extensions/physical_structures/column_chunk_storage.py` | 280 | `ColumnChunkStorage` | Per-column-chunk storage: splits row groups into single-column Parquet blobs. True I/O savings on object storage (skip 4/5 chunks = skip 4/5 of bytes per column). |
+| `bindings/python/sdk/extensions/physical_structures/encoding.py` | 380 | `ColumnEncoding, EncodingHeader, encode_column, eval_predicate_encoded` | FastLanes-style structural encodings (RLE/Dict/Bitpack/Raw). Encoded predicate eval skips decode for pruned chunks. |
+| `bindings/python/sdk/extensions/physical_structures/encoded_chunk_storage.py` | 220 | `EncodedChunkStorage` | Combines ColumnChunkStorage + encoding.py. Per-column-chunk encoded blobs with encoded predicate eval at read time. |
+| `bindings/python/sdk/extensions/physical_structures/column_source.py` | 175 | `ColumnSource, PyArrowColumnSource, ListColumnSource, as_column_source, compute_list_stats` | Format-agnostic column data access protocol. Lets any lens (KV, Vector, custom) use the pruning infrastructure without PyArrow. PyArrow tables are auto-wrapped for backward compat. |
 | `tests/integration/test_column_chunk_storage.py` | 290 | (test) | Tests per-column-chunk storage: basic write/read, I/O savings (bytes), fallback to whole-blob path. 9.37x I/O reduction verified. |
 | `tests/integration/test_encoded_pruning.py` | 380 | (test) | Tests encoding selection, encoded predicate eval, range_write_encoded + read_with_encoded_pruning. 1.86x speedup on low-cardinality queries. |
 | `tests/integration/test_sql_pushdown_fast_paths.py` | 130 | (test) | Tests PondLakehouse.query uses the fastest available read path (encoded → column-chunk → row-group → full). Verifies all 3 storage modes work end-to-end via SQL. |
@@ -239,9 +250,9 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `pond-labs/tracks/track13_honest_benchmarks.py` | 500 | (benchmarks) | **Track 13:** Honest benchmarks with correctness assertions + kernel/query separation. |
 | `pond-labs/tracks/COMPATIBILITY_SUITE.md` | 80 | — | Compatibility Suite: 3 certification levels. |
 | `pond-labs/tracks/README.md` | — | — | Lab tracks overview (12 tracks). |
-| `pond-sdk/extensions/README.md` | 80 | — | Extensions architecture overview. |
-| `pond-sdk/extensions/semantic/README.md` | 60 | — | Semantic adapters overview. |
-| `pond-sdk/extensions/physical_structures/README.md` | 90 | — | Physical Structure type hierarchy. |
+| `bindings/python/sdk/extensions/README.md` | 80 | — | Extensions architecture overview. |
+| `bindings/python/sdk/extensions/semantic/README.md` | 60 | — | Semantic adapters overview. |
+| `bindings/python/sdk/extensions/physical_structures/README.md` | 90 | — | Physical Structure type hierarchy. |
 | `tests/test_all.py` | 110 | (pytest) | Single pytest entry point: 21 test functions covering all suites. |
 
 ### 2.6 scripts/ (Tests and benchmarks — 35 files)
@@ -344,7 +355,7 @@ for Go/Java/Node/C/C++/Zig SDK ports. The CLI is the DuckDB-philosophy binary.
 
 | File | LOC | Purpose |
 |---|---|---|
-| `Cargo.toml` | 23 | Workspace manifest. Members: `pond-core`, `pond-python`, `pond-kernel`, `pond-cli`. |
+| `Cargo.toml` | 23 | Workspace manifest. Members: `bindings/python/core`, `pond-python`, `pond-kernel`, `pond-cli`. |
 | `core/README.md` | 95 | Workspace overview: why split, build/test instructions, C ABI summary. |
 | `core/build.sh` | 41 | Build helper — runs `cargo build --release` + hardlinks `pond_rust.so`. |
 | `core/codec/Cargo.toml` | 14 | Pure-Rust PND2 codec crate (zero external deps). crate-type: `staticlib`, `cdylib`, `rlib`. |
@@ -365,7 +376,7 @@ for Go/Java/Node/C/C++/Zig SDK ports. The CLI is the DuckDB-philosophy binary.
 
 ### 2.11 bindings/go/ (Go SDK — PND2 codec bindings — 1 module, 2 packages)
 
-Go SDK that binds to `libpond_core.a` via cgo. Peer to `pond-sdk/`
+Go SDK that binds to `libpond_core.a` via cgo. Peer to `bindings/python/sdk/`
 (Python SDK) — both bind to pond-core's storage layer. Currently exposes
 PND2 codec operations only (no storage kernel access).
 
@@ -398,7 +409,7 @@ Contains:
 
 **Note:** Archived Lens packages (`pond-sql`, `pond-git`, `pond-notebook`,
 `pond-streaming`, `pond-arrow`, `pond-feature-store`) have been fixed
-to import from `pond-core/` and `pond-sdk/`. They serve as **reference
+to import from `bindings/python/core/` and `bindings/python/sdk/`. They serve as **reference
 implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 
 ### 2.13 agent-ctx/ (Agent task context — handoff notes)
@@ -410,7 +421,7 @@ implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 
 | File | Purpose |
 |---|---|
-| `agent-ctx/task-legacy-cleanup-vector-streaming.md` | Handoff note for the legacy-ProllyLensBase cleanup in `lenses/vector/vector_lens.py` (813→706 LOC) and `lenses/streaming/streaming_lens.py` (642→589 LOC). Removed all `ProllyLensBase`/`BinaryProllyTree` imports and `if self._unified_storage is not None:` fallback branches; the unified path is now the only path. Added `_require_unified()` helper that raises `RuntimeError` loudly when storage is missing. Documented a pre-existing off-by-one in `UnifiedStorage.read` range scans (not introduced by this cleanup). |
+| `agent-ctx/task-legacy-cleanup-vector-streaming.md` | Handoff note for the legacy-ProllyLensBase cleanup in `lenses/vector/python/vector_lens.py` (813→706 LOC) and `lenses/streaming/python/streaming_lens.py` (642→589 LOC). Removed all `ProllyLensBase`/`BinaryProllyTree` imports and `if self._unified_storage is not None:` fallback branches; the unified path is now the only path. Added `_require_unified()` helper that raises `RuntimeError` loudly when storage is missing. Documented a pre-existing off-by-one in `UnifiedStorage.read` range scans (not introduced by this cleanup). |
 
 ### 2.14 pond/ (Installable package shim — re-exports)
 
@@ -418,21 +429,21 @@ implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 > `import pond.core`, `import pond.sdk`, `import pond.lakes.lakehouse`,
 > etc. without manually `sys.path.insert`-ing each source directory.
 > It does NOT contain any implementation — every `__init__.py` simply
-> re-exports from `pond-core/`, `pond-sdk/`, and `lenses/`. This is
+> re-exports from `bindings/python/core/`, `bindings/python/sdk/`, and `lenses/`. This is
 > what `scripts/test_packaging.py` verifies.
 
 | File | Purpose |
 |---|---|
 | `pond/__init__.py` | Top-level package marker (empty). |
-| `pond/core/__init__.py` | Re-exports `PondMinimal`, `hash_bytes`, `ObjectStoreNativeKernel`, `InMemoryObjectStore`, `LocalFSObjectStore`, `S3ObjectStore`, `make_kernel` (and `make_*_kernel` helpers) from `pond-core/`. |
-| `pond/sdk/__init__.py` | Re-exports `PondStorage`, `PondLens`, `PondConfig`, `HLC`, `uuidv7` from `pond-sdk/`. |
+| `pond/core/__init__.py` | Re-exports `PondMinimal`, `hash_bytes`, `ObjectStoreNativeKernel`, `InMemoryObjectStore`, `LocalFSObjectStore`, `S3ObjectStore`, `make_kernel` (and `make_*_kernel` helpers) from `bindings/python/core/`. |
+| `pond/sdk/__init__.py` | Re-exports `PondStorage`, `PondLens`, `PondConfig`, `HLC`, `uuidv7` from `bindings/python/sdk/`. |
 | `pond/sdk/extensions/__init__.py` | Re-exports `UnifiedStorage`, `PND2`, `CollectionManifest`, `StatsTreeReader`, `CollectionIndexer`, `HNSWIndex`, `IVFIndex`, `GarbageCollector` (best-effort — each subsystem is wrapped in try/except ImportError so missing deps don't break the others). |
 | `pond/lenses/__init__.py` | Inserts each `lenses/<name>/` directory onto `sys.path` for `keyvalue`, `lakehouse`, `vector`, `streaming`, `oltp`. |
-| `pond/lenses/keyvalue/__init__.py` | Adds `lenses/keyvalue/`, `pond-core/`, `pond-sdk/`, `pond-sdk/extensions/physical_structures/` to `sys.path`. |
-| `pond/lenses/lakehouse/__init__.py` | Same pattern for `lenses/lakehouse/`. |
-| `pond/lenses/vector/__init__.py` | Same pattern for `lenses/vector/`. |
-| `pond/lenses/streaming/__init__.py` | Same pattern for `lenses/streaming/`. |
-| `pond/lenses/oltp/__init__.py` | Same pattern for `lenses/oltp/`. |
+| `pond/lenses/keyvalue/python/__init__.py` | Adds `lenses/keyvalue/python/`, `bindings/python/core/`, `bindings/python/sdk/`, `bindings/python/sdk/extensions/physical_structures/` to `sys.path`. |
+| `pond/lenses/lakehouse/python/__init__.py` | Same pattern for `lenses/lakehouse/python/`. |
+| `pond/lenses/vector/python/__init__.py` | Same pattern for `lenses/vector/python/`. |
+| `pond/lenses/streaming/python/__init__.py` | Same pattern for `lenses/streaming/python/`. |
+| `pond/lenses/oltp/python/__init__.py` | Same pattern for `lenses/oltp/python/`. |
 
 **Note:** The shim uses `sys.path.insert` rather than proper package
 installation (`pip install -e .`). This is a known limitation — see
@@ -446,18 +457,18 @@ installation (`pip install -e .`). This is a known limitation — see
 
 | Concept | Definition | Where |
 |---|---|---|
-| **Kernel** | 3 core operations (Write, Read, Ref) on 6 substrates + same-collection batch I/O helpers (`write_batch`, `read_blob_batch`). Implementation NOT FROZEN (kernel.py is 274 LOC); substrate/operation count is FROZEN. | `pond-core/kernel.py` |
+| **Kernel** | 3 core operations (Write, Read, Ref) on 6 substrates + same-collection batch I/O helpers (`write_batch`, `read_blob_batch`). Implementation NOT FROZEN (kernel.py is 274 LOC); substrate/operation count is FROZEN. | `bindings/python/core/kernel.py` |
 | **Substrate** | A layer with its own axioms (Bytes, Names, Time, Coordination, Range-Read, Key). | `docs/POND_FORMAL_ALGEBRAS.md` §9 |
-| **Lens** | App-facing interpretation layer over immutable bytes. Each lens owns its own read/write API. | `lenses/keyvalue/keyvalue_lens.py` (KeyValueLens), `lenses/lakehouse/lakehouse_lens.py` (LakehouseLens), `pond-labs/lenses/feature_store_lens.py` (FeatureStoreLens) |
-| **PondLens** | Shared namespace base for all Lenses. Provides only ref-namespace operations (branch, list_collections, set_definition, get_definition, history). No format awareness. | `pond-sdk/base_lens.py` |
+| **Lens** | App-facing interpretation layer over immutable bytes. Each lens owns its own read/write API. | `lenses/keyvalue/python/keyvalue_lens.py` (KeyValueLens), `lenses/lakehouse/python/lakehouse_lens.py` (LakehouseLens), `pond-labs/lenses/feature_store_lens.py` (FeatureStoreLens) |
+| **PondLens** | Shared namespace base for all Lenses. Provides only ref-namespace operations (branch, list_collections, set_definition, get_definition, history). No format awareness. | `bindings/python/sdk/base_lens.py` |
 | **Physical Structure** | `f(snapshot)→artifact`. Deterministic, rebuildable. Indexes, stats, bloom filters. | `docs/POND_FORMAL_ALGEBRAS.md` §14 |
-| **Collection** | Named reference namespace. Not fundamental — just a naming convention. | `pond-sdk/collection.py` |
-| **Prolly Tree** | Probabilistic Merkle tree with content-addressed chunks. O(log N) lookup. **Legacy** — production now uses `UnifiedStorage` (PND2 + manifest); the Prolly tree lives in `archive/legacy-sdk/prolly_tree.py` as historical reference. | `archive/legacy-sdk/prolly_tree.py` (legacy); `pond-sdk/extensions/physical_structures/unified_storage.py` (production) |
-| **Tiered Commit** | Delta commits (O(1) write) + snapshot commits (O(changed_chunks)) + snapshot pointer. **Legacy** — production commits are PNPK packs (commit JSON + manifest bytes in one blob). | `pond-sdk/extensions/physical_structures/pond_pack.py` (production); `archive/legacy-sdk/prolly_tree.py` (legacy) |
-| **Tombstone** | Deletion as data: `Ref(name, TOMBSTONE_HASH)`. RFC-0008. | `pond-sdk/maintenance.py` |
-| `pond-sdk/collection_metadata.py` | 343 | `CollectionMetadata` | Data-side metadata manager. Manages zone maps, indexes, and (future) bloom filters for collections. Lens-agnostic — works through callbacks. |
-| `pond-sdk/best_effort.py` | 95 | `best_effort, warn_best_effort` | Tiny helper for best-effort operations. Catches specific recoverable exceptions (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError) and logs them via the `pond.best_effort` logger. Replaces the `except Exception: pass` anti-pattern. Enable with `POND_DEBUG=1`. |
-| `pond-sdk/pond_config.py` | 195 | `PondConfig` | Persistent pruning + encoding settings via `.pond/config` JSON file. Configures pruning (auto/true/false + force), encoding (auto-select or default), chunk_size, row_group_size, bitpack_max_bitwidth. `should_prune()` decides based on storage type. `load_for_kernel()` finds config in base_dir. |
+| **Collection** | Named reference namespace. Not fundamental — just a naming convention. | `bindings/python/sdk/collection.py` |
+| **Prolly Tree** | Probabilistic Merkle tree with content-addressed chunks. O(log N) lookup. **Legacy** — production now uses `UnifiedStorage` (PND2 + manifest); the Prolly tree lives in `archive/legacy-sdk/prolly_tree.py` as historical reference. | `archive/legacy-sdk/prolly_tree.py` (legacy); `bindings/python/sdk/extensions/physical_structures/unified_storage.py` (production) |
+| **Tiered Commit** | Delta commits (O(1) write) + snapshot commits (O(changed_chunks)) + snapshot pointer. **Legacy** — production commits are PNPK packs (commit JSON + manifest bytes in one blob). | `bindings/python/sdk/extensions/physical_structures/pond_pack.py` (production); `archive/legacy-sdk/prolly_tree.py` (legacy) |
+| **Tombstone** | Deletion as data: `Ref(name, TOMBSTONE_HASH)`. RFC-0008. | `bindings/python/sdk/maintenance.py` |
+| `bindings/python/sdk/collection_metadata.py` | 343 | `CollectionMetadata` | Data-side metadata manager. Manages zone maps, indexes, and (future) bloom filters for collections. Lens-agnostic — works through callbacks. |
+| `bindings/python/sdk/best_effort.py` | 95 | `best_effort, warn_best_effort` | Tiny helper for best-effort operations. Catches specific recoverable exceptions (AttributeError, KeyError, TypeError, ValueError, ImportError, ArithmeticError) and logs them via the `pond.best_effort` logger. Replaces the `except Exception: pass` anti-pattern. Enable with `POND_DEBUG=1`. |
+| `bindings/python/sdk/pond_config.py` | 195 | `PondConfig` | Persistent pruning + encoding settings via `.pond/config` JSON file. Configures pruning (auto/true/false + force), encoding (auto-select or default), chunk_size, row_group_size, bitpack_max_bitwidth. `should_prune()` decides based on storage type. `load_for_kernel()` finds config in base_dir. |
 | `tests/integration/test_pond_config.py` | 130 | (test) | Tests PondConfig: defaults, save/load round-trip, should_prune (auto/true/false/force), encoding hints, validation, load_for_kernel. |
 | **Manifest** | Sidecar listing blob hashes in a pack. Enables physical reachability (1000x GC speedup). | `docs/POND_FORMAL_ALGEBRAS.md` §10 |
 | **Transport Layer** | Compress → encrypt → checksum. Between kernel and Lens. | `services/transport/` |
@@ -468,10 +479,10 @@ installation (`pip install -e .`). This is a known limitation — see
 
 | Axiom | Statement | File |
 |---|---|---|
-| A1 | Immutability: `Read(Write(b)) = b` always | `pond-core/kernel.py` |
-| A2 | Content-addressing: same bytes → same hash | `pond-core/kernel.py` |
-| A3 | Name mutability (LWW): Ref is the only mutation | `pond-core/kernel.py` |
-| A4 | Referential integrity: Ref requires hash exists | `pond-core/kernel.py` |
+| A1 | Immutability: `Read(Write(b)) = b` always | `bindings/python/core/kernel.py` |
+| A2 | Content-addressing: same bytes → same hash | `bindings/python/core/kernel.py` |
+| A3 | Name mutability (LWW): Ref is the only mutation | `bindings/python/core/kernel.py` |
+| A4 | Referential integrity: Ref requires hash exists | `bindings/python/core/kernel.py` |
 | A5 | Monotonic logical clock (Lamport) | `docs/POND_FORMAL_ALGEBRAS.md` §9 |
 | A6 | Atomic commit blob (within-Collection) | `docs/POND_FORMAL_ALGEBRAS.md` §9 |
 | A7 | Coordinator out-of-model (cross-Collection needs coordinator) | `docs/POND_FORMAL_ALGEBRAS.md` §9 |
@@ -498,10 +509,10 @@ installation (`pip install -e .`). This is a known limitation — see
 ## 4. Dependency Graph
 
 ```
-pond-core (NOT FROZEN — kernel.py 274 LOC + storage backends; gained write_batch / read_blob_batch)
+bindings/python/core (NOT FROZEN — kernel.py 274 LOC + storage backends; gained write_batch / read_blob_batch)
     │
-    ├── pond-sdk (depends on pond-core)
-    │   ├── base_lens.py ← pond-core  (shared namespace base, no format awareness)
+    ├── bindings/python/sdk (depends on bindings/python/core)
+    │   ├── base_lens.py ← bindings/python/core  (shared namespace base, no format awareness)
     │   ├── keyvalue_lens.py ← pond_lens, prolly_view, binary_encoding, maintenance, lens_query
     │   ├── lens_sdk.py ← keyvalue_lens  (backward-compat shim, re-exports)
     │   ├── prolly_tree.py ← binary_encoding
@@ -510,28 +521,28 @@ pond-core (NOT FROZEN — kernel.py 274 LOC + storage backends; gained write_bat
     │   ├── query.py
     │   └── maintenance.py
     │
-    ├── lenses/ (depend on pond-core + pond-sdk)
-    │   ├── lakehouse/ ← pond-core, duckdb, pyarrow
-    │   └── vector/ ← pond-sdk (uses mock_kernel for tests)
+    ├── lenses/ (depend on bindings/python/core + bindings/python/sdk)
+    │   ├── lakehouse/ ← bindings/python/core, duckdb, pyarrow
+    │   └── vector/ ← bindings/python/sdk (uses mock_kernel for tests)
     │
-    ├── services/ (depend on pond-core only)
-    │   ├── transport/ ← pond-core, zstandard, cryptography (production)
-    │   ├── schema/ ← pond-core
-    │   └── replication/ ← pond-core
+    ├── services/ (depend on bindings/python/core only)
+    │   ├── transport/ ← bindings/python/core, zstandard, cryptography (production)
+    │   ├── schema/ ← bindings/python/core
+    │   └── replication/ ← bindings/python/core
     │
-    └── pond-labs/ (depend on pond-core + lenses/lakehouse)
-        ├── feature_store_lens.py ← pond-core, pyarrow
-        ├── interop_demo.py ← pond-core, lenses/lakehouse, pond-labs/feature_store_lens
-        └── loc_benchmark.py ← pond-core, lenses/lakehouse
+    └── pond-labs/ (depend on bindings/python/core + lenses/lakehouse)
+        ├── feature_store_lens.py ← bindings/python/core, pyarrow
+        ├── interop_demo.py ← bindings/python/core, lenses/lakehouse, pond-labs/feature_store_lens
+        └── loc_benchmark.py ← bindings/python/core, lenses/lakehouse
 ```
 
 **Rules:**
 - No Lens depends on another Lens.
-- All Lenses depend only on `pond-sdk` (and `pond-core`).
-- `pond-sdk` depends only on `pond-core`.
-- `pond-core` depends on nothing.
-- Services depend only on `pond-core` (not on `pond-sdk`).
-- `pond-labs` depends on `pond-core` + `lenses/lakehouse`.
+- All Lenses depend only on `bindings/python/sdk` (and `bindings/python/core`).
+- `bindings/python/sdk` depends only on `bindings/python/core`.
+- `bindings/python/core` depends on nothing.
+- Services depend only on `bindings/python/core` (not on `bindings/python/sdk`).
+- `pond-labs` depends on `bindings/python/core` + `lenses/lakehouse`.
 
 ---
 
@@ -539,14 +550,14 @@ pond-core (NOT FROZEN — kernel.py 274 LOC + storage backends; gained write_bat
 
 | Workload | Required Lens | Status | Reference Impl |
 |---|---|---|---|
-| Versioned tabular data | Lakehouse Lens | **Shipped** | `lenses/lakehouse/` |
+| Versioned tabular data | Lakehouse Lens | **Shipped** | `lenses/lakehouse/python/` |
 | ML feature stores | Feature Store Lens | **Shipped** | `pond-labs/lenses/feature_store_lens.py` |
 | Code versioning | Git Lens | Reference in archive | `archive/pond-git/` |
 | SQL (native) | SQL Lens | Reference in archive | `archive/pond-sql/` |
 | Streaming | Streaming Lens | Reference in archive | `archive/pond-streaming/` |
 | Notebook versioning | Notebook Lens | Reference in archive | `archive/pond-notebook/` |
 | Arrow interop | Arrow Lens | Reference in archive | `archive/pond-arrow/` |
-| Vector DB | Vector Lens | **Shipped** | `lenses/vector/` |
+| Vector DB | Vector Lens | **Shipped** | `lenses/vector/python/` |
 | High-frequency OLTP | OLTP Lens | Not built | — |
 | Distributed consensus | CRDT Lens + Coordinator | Not built | `services/replication/` (2PC ref) |
 | Random in-place updates | LSM Lens | Not built | — |
@@ -654,10 +665,10 @@ graph TD
 
 ```bash
 # Kernel
-python -c "import sys; sys.path.insert(0,'pond-core'); from pond_minimal import PondMinimal; k=PondMinimal('/tmp/p'); h=k.write(b'hi'); print(k.read(h))"
+python -c "import sys; sys.path.insert(0,'bindings/python/core'); from pond_minimal import PondMinimal; k=PondMinimal('/tmp/p'); h=k.write(b'hi'); print(k.read(h))"
 
 # Flagship (lakehouse)
-python lenses/lakehouse/lakehouse_lens.py
+python lenses/lakehouse/python/lakehouse_lens.py
 
 # Killer demo (interop)
 python pond-labs/demos/interop_demo.py
@@ -706,11 +717,11 @@ python tests/lens_algebra/lens_laws.py
 
 | Looking for... | Go to... |
 |---|---|
-| The kernel | `pond-core/kernel.py` |
-| Lens base class (shared namespace) | `pond-sdk/base_lens.py` → `PondLens` |
-| KeyValueLens (app-facing KV lens) | `lenses/keyvalue/keyvalue_lens.py` → `KeyValueLens` (aliases: `Lens`, `View`) |
-| Prolly tree (legacy ProllyTreeIndex; production uses UnifiedStorage) | `archive/legacy-sdk/prolly_tree.py` → `ProllyTree`, `ProllyLensBase` (legacy); `pond-sdk/extensions/physical_structures/unified_storage.py` → `UnifiedStorage` (production) |
-| Lakehouse (flagship) | `lenses/lakehouse/lakehouse_lens.py` → `LakehouseLens`, `PondLakehouse` |
+| The kernel | `bindings/python/core/kernel.py` |
+| Lens base class (shared namespace) | `bindings/python/sdk/base_lens.py` → `PondLens` |
+| KeyValueLens (app-facing KV lens) | `lenses/keyvalue/python/keyvalue_lens.py` → `KeyValueLens` (aliases: `Lens`, `View`) |
+| Prolly tree (legacy ProllyTreeIndex; production uses UnifiedStorage) | `archive/legacy-sdk/prolly_tree.py` → `ProllyTree`, `ProllyLensBase` (legacy); `bindings/python/sdk/extensions/physical_structures/unified_storage.py` → `UnifiedStorage` (production) |
+| Lakehouse (flagship) | `lenses/lakehouse/python/lakehouse_lens.py` → `LakehouseLens`, `PondLakehouse` |
 | Feature Store | `pond-labs/lenses/feature_store_lens.py` → `FeatureStoreLens` |
 | Compression/encryption | `services/transport/transport_production.py` |
 | Schema evolution | `services/schema/schema_registry.py` |
@@ -750,13 +761,13 @@ $ for f in $(find . -name "*.md" -not -path "./archive/*" -not -path "./.git/*")
 |---|---|
 | `lenses/keyvalue/README.md` | README for KeyValueLens. |
 | `lenses/lakehouse/README.md` | README for LakehouseLens. |
-| `lenses/lakehouse/__init__.py` | Package marker. |
+| `lenses/lakehouse/python/__init__.py` | Package marker. |
 | `lenses/vector/README.md` | README for VectorLens. |
-| `lenses/vector/__init__.py` | Package marker. |
+| `lenses/vector/python/__init__.py` | Package marker. |
 | `pond-labs/benchmarks/README.md` | README for benchmarks. |
 | `pond-labs/demos/README.md` | README for demos. |
 | `pond-labs/lenses/README.md` | README for lab lenses. |
-| `pond-sdk/extensions/indexing/README.md` | README for indexing extensions. |
+| `bindings/python/sdk/extensions/indexing/README.md` | README for indexing extensions. |
 | `services/replication/README.md` | README for replication coordinator. |
 | `services/schema/README.md` | README for schema registry. |
 | `services/transport/README.md` | README for transport layer. |
@@ -769,14 +780,14 @@ $ for f in $(find . -name "*.md" -not -path "./archive/*" -not -path "./.git/*")
 
 ## 7. New Files (Rounds 1-22)
 
-### pond-core/
+### bindings/python/core/
 - `object_store_native_kernel.py` — ObjectStoreNativeKernel (no SQLite, refs as content-addressed blobs) + InMemoryObjectStore + S3MockKernel
 - `s3_mock_backend.py` — S3 mock with simulated latency (extends ObjectStoreNativeKernel)
 
-### pond-sdk/
+### bindings/python/sdk/
 - `pond_storage.py` — PondStorage (the ONE unified SDK class: namespace + commit + data I/O)
 
-### pond-sdk/extensions/physical_structures/
+### bindings/python/sdk/extensions/physical_structures/
 - `unified_storage.py` — UnifiedStorage (PND2 format, write/read/point_lookup/iter_rows/compact_manifest)
 - `collection_manifest.py` — CollectionManifest (ONE index blob per commit, delta-manifest support, stats tree delegation)
 - `stats_tree.py` — StatsTreeReader (PB-scale hierarchical index, O(log N) reads)
@@ -801,7 +812,7 @@ $ for f in $(find . -name "*.md" -not -path "./archive/*" -not -path "./.git/*")
 - `benchmark_unified_storage.py` — Unified storage benchmark
 - `round19_benchmarks.py` — Round 19 comprehensive benchmarks
 
-### lenses/streaming/
+### lenses/streaming/python/
 - `streaming_lens.py` — StreamingLens (chunked segments, range reads)
 - `README.md` — Streaming lens documentation
 - `__init__.py` — Package init
@@ -835,20 +846,20 @@ All active files in the repository (excluding archive/, __pycache__, .git):
 - `docs/ROUND_TRIP_AUDIT.md`
 - `docs/UNIFIED_STORAGE_DESIGN.md`
 - `lenses/streaming/README.md`
-- `lenses/streaming/__init__.py`
-- `pond-core/object_store_native_kernel.py`
-- `pond-core/s3_mock_backend.py`
+- `lenses/streaming/python/__init__.py`
+- `bindings/python/core/object_store_native_kernel.py`
+- `bindings/python/core/s3_mock_backend.py`
 - `pond-labs/benchmarks/s3_mock_benchmark.py`
 - `pond-labs/demos/jupyter_notebook_demo.py`
 - `pond-labs/demos/notebook_lens_demo.py`
 - `pond-labs/demos/polars_adapter_demo.py`
 - `pond-labs/demos/streaming_lens_demo.py`
-- `pond-sdk/extensions/physical_structures/collection_manifest.py`
-- `pond-sdk/extensions/physical_structures/compression.py`
-- `pond-sdk/extensions/physical_structures/embedded_stats.py`
-- `pond-sdk/extensions/physical_structures/stats_tree.py`
-- `pond-sdk/extensions/physical_structures/unified_storage.py`
-- `pond-sdk/pond_storage.py`
+- `bindings/python/sdk/extensions/physical_structures/collection_manifest.py`
+- `bindings/python/sdk/extensions/physical_structures/compression.py`
+- `bindings/python/sdk/extensions/physical_structures/embedded_stats.py`
+- `bindings/python/sdk/extensions/physical_structures/stats_tree.py`
+- `bindings/python/sdk/extensions/physical_structures/unified_storage.py`
+- `bindings/python/sdk/pond_storage.py`
 - `scripts/benchmark_cold_round_trips.py`
 - `scripts/benchmark_final.py`
 - `scripts/benchmark_round_trips.py`

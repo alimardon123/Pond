@@ -45,6 +45,6 @@ own its storage code.
 
 ## Dependencies
 
-- `pond-core/` (kernel)
-- `pond-sdk/` (base lens, ProllyTreeIndex, collection metadata)
+- `bindings/python/core/` (kernel)
+- `bindings/python/sdk/` (base lens, ProllyTreeIndex, collection metadata)
 - `pyarrow`, `duckdb` (Parquet I/O, SQL)

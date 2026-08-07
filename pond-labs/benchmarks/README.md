@@ -31,7 +31,7 @@ regression runs in CI.
 
 ## Architecture
 
-Benchmarks depend on `pond-core`, `pond-sdk`, and `lenses/`. They do
+Benchmarks depend on `bindings/python/core`, `bindings/python/sdk`, and `lenses/`. They do
 NOT depend on each other — each script is independent.
 
 Per the design goals, raw ms-per-op numbers favor in-process systems;
@@ -40,5 +40,5 @@ favors the right abstraction. Use the others to keep overhead honest.
 
 ## Dependencies
 
-- `pond-core/`, `pond-sdk/`, `lenses/lakehouse/`, `lenses/keyvalue/`
+- `bindings/python/core/`, `bindings/python/sdk/`, `lenses/lakehouse/`, `lenses/keyvalue/`
 - `pyarrow`, `duckdb`

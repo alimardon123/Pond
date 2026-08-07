@@ -8,7 +8,7 @@ non-zero if any Lens violates any of the 6 laws.
 Designed for CI: no flakiness, no random data, deterministic output.
 Add to CI with:
 
-    python pond-sdk/run_view_laws_ci.py
+    python bindings/python/sdk/run_view_laws_ci.py
 
 Exit codes:
     0 — all Lenses passed all 6 laws
@@ -25,9 +25,9 @@ import traceback
 
 # Path setup
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "..", "pond-core"))
-sys.path.insert(0, os.path.join(HERE, "..", "..", "pond-core"))
-sys.path.insert(0, os.path.join(HERE, "..", "..", "pond-sdk"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "bindings/python/core"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "bindings/python/core"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "bindings/python/sdk"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "lenses", "keyvalue"))
 
 from kernel import PondMinimal

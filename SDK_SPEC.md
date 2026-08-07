@@ -5,7 +5,7 @@
 > checkable; violations are bugs.
 >
 > **Audience:** Lens authors (both human and AI agents) building
-> Lenses on top of `pond-sdk/`. If you read only one SDK document,
+> Lenses on top of `bindings/python/sdk/`. If you read only one SDK document,
 > read this one.
 >
 > **Source of truth:** This document supersedes informal descriptions
@@ -91,7 +91,7 @@ New code should use `KeyValueLens`. The class lives in
 `lenses/keyvalue/keyvalue_lens.py`.
 
 KeyValueLens is NOT the universal base class — that's `PondLens`
-in `pond-sdk/base_lens.py`. KeyValueLens is a peer of `LakehouseLens`,
+in `bindings/python/sdk/base_lens.py`. KeyValueLens is a peer of `LakehouseLens`,
 `VectorLens`, `StreamingLens`, and `OLTPLens`.
 
 > **Honesty note (updated Task 66).** All 5 production lenses now
@@ -250,7 +250,7 @@ natural primary key (event logs, time-series, append-only streams).
 
 For primary-keyless Lenses (where every entry is append-only and
 looked up by scan, not by key), use `KeylessLens` (in
-`pond-sdk/keyvalue_lens.py`):
+`bindings/python/sdk/keyvalue_lens.py`):
 
 ```python
 from keyvalue_lens import KeylessLens
@@ -283,8 +283,8 @@ the kernel and decoded via `lens.decode(bytes)`.
   `Lens` and `View` are aliases for it.
 - **`UnifiedStorage` (the production storage backend):** the actual
   universal storage backend lives at
-  `pond-sdk/extensions/physical_structures/unified_storage.py`
-  (5,540 LOC). It is NOT `pond-sdk/prolly_tree.py` — that file does
+  `bindings/python/sdk/extensions/physical_structures/unified_storage.py`
+  (5,540 LOC). It is NOT `bindings/python/sdk/prolly_tree.py` — that file does
   NOT exist in the production SDK (it lives in
   `archive/legacy-sdk/prolly_tree.py` as historical reference).
   `UnifiedStorage.point_lookup` reads the manifest, finds the row
@@ -417,7 +417,7 @@ blob itself becomes unreachable and is collected by GC.
 
 **Do NOT** call `kernel.reference(name, TOMBSTONE_HASH)` directly —
 the kernel validates that the hash exists. Use `drop_name` from
-`pond-sdk/maintenance.py`, which pre-writes the tombstone marker.
+`bindings/python/sdk/maintenance.py`, which pre-writes the tombstone marker.
 
 ### 4.6. `refresh_index(name, extractor)`
 
@@ -616,7 +616,7 @@ as kernel blobs with naming conventions (`__stats/{name}`,
 ## 9. Tombstone helpers
 
 Tombstone helpers implement deletion-as-data (RFC-0008). These are
-in `pond-sdk/maintenance.py`:
+in `bindings/python/sdk/maintenance.py`:
 
 | Function | Signature | Purpose |
 |---|---|---|
@@ -650,11 +650,11 @@ Subclasses override these to use a different format. Examples:
 | `LakehouseLens` | PyArrow Table → Parquet | Parquet → PyArrow Table | `lenses/lakehouse/lakehouse.py` |
 | `FeatureStoreLens` | PyArrow Table → Parquet | Parquet → PyArrow Table | `pond-labs/feature_store_lens.py` |
 | `VectorLens` | `struct.pack` floats | `struct.unpack` | `lenses/vector/vector_view.py` |
-| Default `KeyValueLens` | JSON | JSON | `pond-sdk/keyvalue_lens.py` |
+| Default `KeyValueLens` | JSON | JSON | `bindings/python/sdk/keyvalue_lens.py` |
 
 The encode/decode pair MUST satisfy Law 1 (round-trip):
 `decode(encode(d)) == d` for all `d`. This is verified by
-`pond-sdk/lens_laws.py`.
+`bindings/python/sdk/lens_laws.py`.
 
 ---
 
@@ -706,7 +706,7 @@ Before claiming a Lens is SDK-compliant, verify:
 - [ ] The Lens's `drop_index` uses the tombstone pattern from §4.5
       (via `drop_name` from `maintenance.py`).
 - [ ] The Lens passes the `lens_laws.py` property-test harness
-      (see `pond-sdk/lens_laws.py`).
+      (see `bindings/python/sdk/lens_laws.py`).
 - [ ] The Lens passes the bidirectional compatibility matrix
       (see `pond-lab/track1_compat_matrix.py`) when tested against
       at least one other Lens.
@@ -721,7 +721,7 @@ Before claiming a Lens is SDK-compliant, verify:
   (Deletion as Data — the tombstone pattern used by `drop_index`).
 - **Supersedes:** informal descriptions in `docs/LENS_GUIDE.md`.
   Where the two disagree, this document is correct.
-- **Operationalized by:** `pond-sdk/lens_laws.py` (the property-test
+- **Operationalized by:** `bindings/python/sdk/lens_laws.py` (the property-test
   harness that verifies SDK compliance) and `pond-lab/track1_compat_matrix.py`
   (the bidirectional compatibility matrix).
 - **External validation:** the 13 ambiguities settled here were
