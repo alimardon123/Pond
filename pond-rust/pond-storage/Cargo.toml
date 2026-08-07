@@ -1,0 +1,18 @@
+[package]
+name = "pond_storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond UnifiedStorage — manifest management, CRDT shards, commits, branch/merge, read/write paths"
+
+[lib]
+name = "pond_storage"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+pond_kernel = { path = "../pond-kernel" }
+pond_core = { path = "../pond-core" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -949,6 +949,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond_storage"
+version = "0.3.0"
+dependencies = [
+ "pond_core",
+ "pond_kernel",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

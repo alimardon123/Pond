@@ -362,40 +362,26 @@ This lets tools (and humans) answer:
 
 ---
 
-## 4. No implicit coupling between production lenses
+## 4. Lens composition rules
 
-**Rule:** Production lenses (in `lenses/`) MUST NOT have IMPLICIT coupling.
-Each lens either extends `PondLens` directly OR explicitly subclasses
-another lens with a documented reason.
+**Rule:** Main production lenses SHOULD extend `PondLens` directly with no
+dependency on other lenses. However, extending one lens on top of another
+IS allowed when it makes sense (e.g., `KeylessLens` extends `KeyValueLens`
+to auto-generate UUIDv7 keys — a thin, legitimate variant).
 
-**What "implicit coupling" means:**
-- Lens A imports Lens B's internal helpers (not the public API)
-- Lens A depends on Lens B's private ref naming conventions
-- Removing Lens B breaks Lens A in a non-obvious way
-
-**What is ALLOWED (explicit, documented coupling):**
-- `KeylessLens(KeyValueLens)` — a thin variant that auto-generates UUIDv7
-  keys. It overrides `put()` and inherits everything else. This is
-  documented in the class docstring and is a legitimate code-reuse pattern.
-- A lens importing another lens's PUBLIC API (e.g., `from keyvalue_lens
-  import KeyValueLens`) — this is normal composition, not coupling.
-
-**What is NOT allowed:**
-- `FeatureStoreLens(LakehouseLens)` without documentation — this was the
-  old pattern and was removed. FeatureStoreLens now extends PondLens directly.
-
-**Rationale:**
-The original "no lens-to-lens inheritance" rule was too strict — it forbade
-legitimate variants like KeylessLens. The right rule is "no IMPLICIT coupling."
-Explicit, documented inheritance for thin variants is fine. Implicit
-dependency on another lens's internals is not.
-
-**Exception:** Lenses in `pond-labs/` (experimental) may inherit from
-production lenses during prototyping. But before promotion to `lenses/`,
-any implicit coupling must be removed or made explicit.
-- Shared infrastructure lives in `pond-sdk/` (PondLens base, ProllyTreeIndex
-  storage, mixins). Lenses USE this infrastructure; they don't inherit from
-  each other.
+**Principles:**
+1. **No extra dependency for main lenses.** KeyValueLens, LakehouseLens,
+   VectorLens, StreamingLens, OLTPLens — these should each extend PondLens
+   directly and own their storage code. They should NOT import from each
+   other. This keeps each main lens independently removable.
+2. **Extension is allowed for variants.** A lens that extends another lens
+   (like `KeylessLens(KeyValueLens)`) is fine IF:
+   - It's documented in the class docstring
+   - It overrides a small number of methods (thin wrapper)
+   - Removing it doesn't affect any other lens
+3. **Composition via PondLens is preferred.** If two lenses share logic,
+   the shared logic should go in `PondLens` (the base class) or in an
+   extension/mixin — not in a lens-to-lens dependency.
 
 **Exception:** Lenses in `pond-labs/` (experimental) may inherit from
 production lenses during prototyping. But before promotion to `lenses/`,
