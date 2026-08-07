@@ -28,6 +28,7 @@ pub mod shard;
 pub mod read;
 pub mod write;
 pub mod transaction;
+pub mod maintenance;
 
 use pond_kernel::PondKernel;
 use std::sync::Mutex;

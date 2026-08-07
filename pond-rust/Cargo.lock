@@ -956,6 +956,7 @@ dependencies = [
  "pond_core",
  "pond_kernel",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
