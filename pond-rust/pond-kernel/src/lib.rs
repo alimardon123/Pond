@@ -104,6 +104,16 @@ pub trait ObjectStore: Send + Sync {
 
     /// Check if a blob exists (for dedup checks).
     fn blob_exists(&self, hash: &str) -> bool;
+
+    /// Physically delete a blob from the object store (maintenance operation).
+    ///
+    /// This is NOT a kernel primitive — it's a Layer 0.5 maintenance operation
+    /// (like VACUUM in PostgreSQL or git gc). Used by compact_shards and merge
+    /// to reclaim storage space from absorbed/dead shards.
+    ///
+    /// Best-effort: if the store doesn't support deletion, this is a no-op.
+    /// The blob becomes unreachable (orphaned) but the system is still correct.
+    fn delete_blob(&self, hash: &str) -> io::Result<bool>;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +249,18 @@ impl ObjectStore for LocalFSObjectStore {
 
     fn blob_exists(&self, hash: &str) -> bool {
         self.blob_path(hash).exists()
+    }
+
+    fn delete_blob(&self, hash: &str) -> io::Result<bool> {
+        let path = self.blob_path(hash);
+        if path.exists() {
+            fs::remove_file(&path)?;
+            let mut s = self.stats.lock().unwrap();
+            s.gets += 1; // count as a maintenance op
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -383,6 +405,12 @@ impl PondKernel {
 
     pub fn delete_ref(&self, name: &str) -> io::Result<bool> {
         self.store.delete_path(name)
+    }
+
+    /// Physically delete a blob (maintenance operation, NOT a kernel primitive).
+    /// Used by compact_shards and merge to reclaim storage space.
+    pub fn delete_blob(&self, hash: &str) -> io::Result<bool> {
+        self.store.delete_blob(hash)
     }
 
     // ------------------------------------------------------------------
