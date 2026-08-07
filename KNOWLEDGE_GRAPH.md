@@ -358,12 +358,12 @@ for Go/Java/Node/C/C++/Zig SDK ports. The CLI is the DuckDB-philosophy binary.
 |---|---|---|
 | `Cargo.toml` | 23 | Workspace manifest. Members: `bindings/python/core`, `pond-python`, `pond-kernel`, `pond-cli`. |
 | `core/README.md` | 95 | Workspace overview: why split, build/test instructions, C ABI summary. |
-| `core/build.sh` | 41 | Build helper — runs `cargo build --release` + hardlinks `pond_rust.so`. |
+| `core/build.sh` | 41 | Build helper — runs `cargo build --release` + hardlinks `pond.so`. |
 | `core/codec/Cargo.toml` | 14 | Pure-Rust PND2 codec crate (zero external deps). crate-type: `staticlib`, `cdylib`, `rlib`. |
 | `core/codec/pond_core.h` | 200 | C ABI header for PND2 codec. |
 | `core/codec/README.md` | 65 | Pure-Rust crate docs: design principles, Rust API, C ABI, tests. |
 | `core/codec/src/lib.rs` | 1700 | The full PND2 codec + C ABI. Constants, PND2Parser, pnd2_decode (all encodings, all vtypes), pnd2_encode_i64/f64/str/multi, PondResult handle, PondEncoder builder. 9 unit tests. |
-| `bindings/python/pyo3/Cargo.toml` | 11 | PyO3 wrapper crate. crate-type: `cdylib` (produces `pond_rust.so`). |
+| `bindings/python/pyo3/Cargo.toml` | 11 | PyO3 wrapper crate. crate-type: `cdylib` (produces `pond.so`). |
 | `bindings/python/pyo3/README.md` | 50 | PyO3 wrapper docs: Python API, feature comparison vs pond-core. |
 | `bindings/python/pyo3/src/lib.rs` | 415 | Thin PyO3 glue. Delegates all decode logic to pond-core's `decode_column`. Adds zstd decompression (via Python's `zstandard`), projection pushdown, predicate pushdown. |
 | `core/kernel/Cargo.toml` | 22 | Rust storage kernel crate (3 primitives: Write, Read, Ref). crate-type: `rlib`, `staticlib`, `cdylib`. |

@@ -34,9 +34,9 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "target", "release"))
 # Set up the three decode paths
 # ---------------------------------------------------------------------------
 
-# Path 1: PyO3 (pond_rust.decode — Rust + Python object conversion)
-import pond_rust
-PYO3_DECODE = pond_rust.decode
+# Path 1: PyO3 (pond.decode — Rust + Python object conversion)
+import pond
+PYO3_DECODE = pond.decode
 
 # Path 2: Pure Python (PND2.decode — no Rust)
 from extensions.physical_structures.unified_storage import PND2, ColumnSource
@@ -257,7 +257,7 @@ def main():
     print("=" * 90)
     print("PND2 Decode Path Benchmark")
     print("  Paths:")
-    print("    PyO3         — pond_rust.decode (Rust + Python object conversion)")
+    print("    PyO3         — pond.decode (Rust + Python object conversion)")
     print("    Pure-Python  — PND2.decode (no Rust)")
     print("    C ABI (per-row str) — libpond_storage.so via ctypes, per-row str access")
     print("    C ABI (batch str)   — libpond_storage.so via ctypes, batch str_array")

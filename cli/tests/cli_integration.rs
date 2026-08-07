@@ -248,10 +248,17 @@ fn test_auto_discovery_creates_pond_marker() {
     assert!(dir.path().join(".pond").is_dir(),
         ".pond/ marker directory not created");
 
-    // The .pond/config file should exist and contain "storage=local"
+    // The .pond/config file should exist (Pond-level settings)
     let config = dir.path().join(".pond/config");
     assert!(config.exists(), ".pond/config not created");
+    // Config for local FS should NOT have an active storage= line
+    // (only comments mentioning storage=s3:// as documentation).
+    // An active storage= line means S3.
     let config_content = fs::read_to_string(&config).unwrap();
-    assert!(config_content.contains("storage=local"),
-        "expected 'storage=local' in config, got: {}", config_content);
+    let has_active_storage = config_content.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.starts_with('#'))
+        .any(|l| l.starts_with("storage="));
+    assert!(!has_active_storage,
+        "local FS config should NOT have an active 'storage=' line (only comments)");
 }

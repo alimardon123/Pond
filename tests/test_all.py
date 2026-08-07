@@ -159,31 +159,31 @@ def test_knowledge_graph_coverage():
 
 
 def test_rust_python_roundtrip():
-    """Verify the pond_rust PyO3 module (built from core/ workspace)
+    """Verify the pond PyO3 module (built from core/ workspace)
     can encode + decode PND2 blobs end-to-end from Python."""
     import os, sys
     rust_so = os.path.join(REPO_ROOT, "target", "release",
-                           "pond_rust.so")
+                           "pond.so")
     if not os.path.exists(rust_so):
         import pytest
-        pytest.skip(f"pond_rust.so not built — run build.sh")
+        pytest.skip(f"pond.so not built — run build.sh")
     sys.path.insert(0, os.path.dirname(rust_so))
     try:
-        import pond_rust
+        import pond
         cols = [("id", [1, 2, 3, 4, 5]),
                 ("name", ["alice", "bob", "carol", "dave", "eve"]),
                 ("score", [1.5, 2.5, 3.5, 4.5, 5.5])]
-        result = pond_rust.encode(cols, 5)
+        result = pond.encode(cols, 5)
         assert result["blob"][:4] == b"PND2", "encode should produce PND2 magic"
-        decoded = pond_rust.decode(result["blob"])
+        decoded = pond.decode(result["blob"])
         assert decoded["id"] == [1, 2, 3, 4, 5]
         assert decoded["name"] == ["alice", "bob", "carol", "dave", "eve"]
         assert decoded["score"] == [1.5, 2.5, 3.5, 4.5, 5.5]
         # Projection pushdown
-        proj = pond_rust.decode(result["blob"], columns=["id"])
+        proj = pond.decode(result["blob"], columns=["id"])
         assert list(proj.keys()) == ["id"]
         # Predicate pushdown
-        filt = pond_rust.decode(result["blob"], predicates=[("id", ">", 2)])
+        filt = pond.decode(result["blob"], predicates=[("id", ">", 2)])
         assert filt["id"] == [3, 4, 5]
         assert filt["name"] == ["carol", "dave", "eve"]
     finally:

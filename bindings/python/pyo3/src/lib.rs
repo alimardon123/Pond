@@ -1,6 +1,6 @@
 // Pond Python Bindings — PyO3 wrapper around bindings/python/core
 //
-// This crate compiles to a Python extension module named `pond_rust`.
+// This crate compiles to a Python extension module named `pond`.
 // It exposes the full PND2 decode/encode pipeline to Python.
 //
 // All decode/encode LOGIC lives in `bindings/python/core`. This file is the thin
@@ -428,7 +428,7 @@ use {ENC_RAW as _, ENC_RLE as _, ENC_DICT as _, ENC_BITPACK as _};
 //
 // This lets Python call the Rust storage layer directly, without going
 // through the Python reference kernel. This is the migration path: Python
-// code can use `pond_rust.Storage` instead of `PondStorage(PondMinimal(...))`.
+// code can use `pond.Storage` instead of `PondStorage(PondMinimal(...))`.
 //
 // Supported operations:
 //   - Storage(path)          — open local FS storage
@@ -451,6 +451,52 @@ use pond_storage::{write as storage_write, read as storage_read, branch as stora
                     commit as storage_commit};
 use std::sync::Mutex;
 
+/// Build a full S3 URL from a base URL and optional parameters.
+///
+/// If the base URL already has query params (e.g., `?region=us-east-1`),
+/// append the new params. Otherwise, add them.
+///
+/// This lets users pass either:
+///   - A full URL: `s3://bucket/prefix?region=us-east-1&endpoint=https://...`
+///   - A base URL + kwargs: `Storage('s3://bucket/prefix', region='us-east-1', endpoint='...')`
+fn build_s3_url(
+    base: &str,
+    _access_key: Option<&str>,
+    _secret_key: Option<&str>,
+    region: Option<&str>,
+    endpoint: Option<&str>,
+) -> String {
+    let mut url = base.to_string();
+    let mut params: Vec<String> = Vec::new();
+
+    // Check if URL already has query params
+    let has_query = url.contains('?');
+
+    // Add region if provided and not already in URL
+    if let Some(r) = region {
+        if !url.contains("region=") {
+            params.push(format!("region={}", r));
+        }
+    }
+    // Add endpoint if provided and not already in URL
+    if let Some(e) = endpoint {
+        if !url.contains("endpoint=") {
+            params.push(format!("endpoint={}", e));
+        }
+    }
+
+    if !params.is_empty() {
+        if has_query {
+            url.push_str("&");
+        } else {
+            url.push_str("?");
+        }
+        url.push_str(&params.join("&"));
+    }
+
+    url
+}
+
 /// A Pond storage handle backed by the Rust UnifiedStorage.
 ///
 /// This is the Python-facing wrapper around `pond_storage::UnifiedStorage`.
@@ -459,7 +505,7 @@ use std::sync::Mutex;
 ///
 /// # Example (Python)
 /// ```python
-/// from pond_rust import Storage
+/// from pond import Storage
 ///
 /// # Local FS
 /// s = Storage("/var/lib/pond")
@@ -482,24 +528,63 @@ struct Storage {
 
 #[pymethods]
 impl Storage {
-    /// Create a new Storage backed by the local filesystem.
+    /// Create a new Storage backed by a local path or S3 URL.
     ///
-    /// Args:
-    ///   path: The filesystem path (e.g., "/var/lib/pond" or ".")
+    /// Auto-detects the storage type:
+    ///   - `Storage('/var/lib/pond')` → local filesystem
+    ///   - `Storage('s3://bucket/prefix?region=us-east-1&endpoint=...')` → S3
+    ///   - `Storage('.')` → local filesystem (current directory)
+    ///
+    /// For S3, credentials are read from the environment:
+    ///   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional)
+    ///
+    /// For S3, you can also pass credentials as optional kwargs:
+    ///   `Storage('s3://...', access_key='...', secret_key='...')`
     #[new]
-    fn new(path: &str) -> PyResult<Self> {
-        let storage = UnifiedStorage::new_local(path)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(Self { storage: Mutex::new(storage) })
+    #[pyo3(signature = (location, access_key=None, secret_key=None, region=None, endpoint=None))]
+    fn new(
+        location: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        region: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> PyResult<Self> {
+        if location.starts_with("s3://") {
+            // S3-compatible storage
+            #[cfg(feature = "s3")]
+            {
+                let url = build_s3_url(location, access_key, secret_key, region, endpoint);
+                // If credentials are provided via kwargs, set them as env vars
+                // (S3ObjectStore::from_url reads from env)
+                if let (Some(ak), Some(sk)) = (access_key, secret_key) {
+                    std::env::set_var("AWS_ACCESS_KEY_ID", ak);
+                    std::env::set_var("AWS_SECRET_ACCESS_KEY", sk);
+                }
+                let store = pond_s3::S3ObjectStore::from_url(&url)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+                let kernel = PondKernel::new_with_store(Box::new(store));
+                let storage = UnifiedStorage::new(kernel);
+                Ok(Self { storage: Mutex::new(storage) })
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                Err(pyo3::exceptions::PyIOError::new_err(
+                    "S3 support not compiled in. Rebuild with default features."
+                ))
+            }
+        } else {
+            // Local filesystem
+            let path = location.strip_prefix("file://").unwrap_or(location);
+            let storage = UnifiedStorage::new_local(path)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            Ok(Self { storage: Mutex::new(storage) })
+        }
     }
 
     /// Create a new Storage backed by S3-compatible storage.
     ///
-    /// Args:
-    ///   url: S3 URL like "s3://bucket/prefix?region=us-east-1&endpoint=..."
-    ///
-    /// Credentials are read from the environment:
-    ///   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional)
+    /// This is a convenience method — equivalent to `Storage('s3://...')`.
+    /// Kept for explicit clarity, but `Storage()` auto-detects S3 URLs.
     #[cfg(feature = "s3")]
     #[staticmethod]
     fn from_s3(url: &str) -> PyResult<Self> {
@@ -706,7 +791,7 @@ impl Storage {
 // ---------------------------------------------------------------------------
 
 #[pymodule]
-fn pond_rust(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn pond(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_class::<Storage>()?;

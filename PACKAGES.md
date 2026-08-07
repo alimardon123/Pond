@@ -92,7 +92,7 @@ pond_repo/
 │   ├── bindings/python/core/               # Pure-Rust PND2 codec + C ABI (zero deps)
 │   │   ├── src/lib.rs           # pnd2_decode (all encodings) + pnd2_encode_* + C ABI
 │   │   └── pond_core.h          # C ABI header for Go/Java/Node/C/C++/Zig
-│   ├── pond-python/             # PyO3 wrapper (produces pond_rust.so)
+│   ├── pond-python/             # PyO3 wrapper (produces pond.so)
 │   │   └── src/lib.rs           # Thin glue — delegates to bindings/python/core
 │   └── tests/                   # C ABI test + Python blob generator
 │       ├── test_c_abi.c         # 131-check end-to-end C ABI test
@@ -132,7 +132,7 @@ pond-labs/ (experimental code, depends on everything)
 core/codec (pure-Rust PND2 codec + C ABI, zero deps)
     ↓                              ↓
 bindings/python/pyo3           bindings/go/ (cgo over libpond_core.a)
-(PyO3 wrapper → pond_rust.so)
+(PyO3 wrapper → pond.so)
     ↓
 (importable by bindings/python/sdk for fast encode/decode)
 ```

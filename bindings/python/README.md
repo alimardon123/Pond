@@ -4,7 +4,7 @@ This directory contains everything Python-related for Pond:
 
 ```
 bindings/python/
-├── pyo3/      # PyO3 Rust crate (produces pond_rust.so for the codec)
+├── pyo3/      # PyO3 Rust crate (produces pond.so for the codec)
 ├── sdk/       # Python SDK (PondStorage, lenses, extensions)
 └── core/      # Python reference kernel (being migrated to Rust)
 ```
@@ -14,12 +14,12 @@ bindings/python/
 ### `pyo3/` — PyO3 Rust Crate
 
 A thin Rust crate that wraps the PND2 codec (in `core/codec/`) and
-exposes it to Python as `pond_rust.so`. This gives Python access to
+exposes it to Python as `pond.so`. This gives Python access to
 the fast Rust decoder/encoder.
 
 - **Depends on:** `core/codec` (Rust)
-- **Produces:** `pond_rust.so` (Python extension module)
-- **API:** `pond_rust.decode(blob, columns=None, predicates=None)`
+- **Produces:** `pond.so` (Python extension module)
+- **API:** `pond.decode(blob, columns=None, predicates=None)`
 
 See [`pyo3/README.md`](pyo3/README.md) for details.
 
@@ -86,13 +86,13 @@ See [`../../docs/STATUS.md`](../../docs/STATUS.md) for the migration status.
 
 ## Rust Acceleration
 
-Python can use the Rust PND2 codec via `pond_rust.so` (built from `pyo3/`):
+Python can use the Rust PND2 codec via `pond.so` (built from `pyo3/`):
 
 ```python
-import pond_rust  # Rust-accelerated PND2 decode/encode
+import pond  # Rust-accelerated PND2 decode/encode
 
 # Decode a PND2 blob (3-5x faster than pure-Python)
-result = pond_rust.decode(blob_bytes)
+result = pond.decode(blob_bytes)
 ```
 
 The Rust codec is automatically used by the Python SDK when available.

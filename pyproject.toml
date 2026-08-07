@@ -3,12 +3,12 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pond-rust"
-description = "Pond storage system — Rust-accelerated PND2 codec for Python"
+name = "pond"
+description = "Pond — content-addressed storage with branching, CRDT, and versioning"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
-keywords = ["storage", "content-addressed", "columnar", "lakehouse", "pnd2"]
+keywords = ["storage", "content-addressed", "columnar", "lakehouse", "pnd2", "versioning"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -31,6 +31,6 @@ test = ["pytest", "pyarrow"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-module-name = "pond_rust"
+module-name = "pond"
 python-source = "python"
 manifest-path = "bindings/python/pyo3/Cargo.toml"

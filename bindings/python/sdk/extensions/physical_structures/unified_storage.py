@@ -209,7 +209,7 @@ class PND2:
         # single-pass encode — so we don't need to re-compute them in Python.
         if not any(h in ("rle", "dict", "bitpack") for h in encoding_hints.values()):
             try:
-                import pond_rust
+                import pond
                 # Build columns list for the Rust encoder
                 rust_cols = []
                 can_use_rust = True
@@ -222,7 +222,7 @@ class PND2:
                     rust_cols.append((col_name, values))
 
                 if can_use_rust and rust_cols:
-                    result = pond_rust.encode(rust_cols, n_rows)
+                    result = pond.encode(rust_cols, n_rows)
                     if result is not None:
                         # Rust returns {"blob": bytes, "stats": [(name, vtype, min, max, null_count), ...]}
                         rust_blob = result["blob"]
@@ -731,8 +731,8 @@ class UnifiedStorage:
         # To enable: pip install pond-rust (or set POND_RUST=1 env var)
         self._rust_decoder = None
         try:
-            import pond_rust
-            self._rust_decoder = pond_rust
+            import pond
+            self._rust_decoder = pond
         except ImportError:
             pass
 

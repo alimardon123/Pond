@@ -56,7 +56,7 @@ pond_repo/
 ├── bindings/                # Language-specific bindings
 │   ├── base/                # Shared C ABI: pond.h, C tests, test blobs
 │   ├── python/
-│   │   ├── pyo3/            # PyO3 Rust crate (produces pond_rust.so)
+│   │   ├── pyo3/            # PyO3 Rust crate (produces pond.so)
 │   │   ├── sdk/             # Python SDK (PondStorage, lenses, extensions)
 │   │   └── core/            # Python reference kernel (being migrated to Rust)
 │   └── go/                  # Go SDK (cgo wrapper around C ABI)
