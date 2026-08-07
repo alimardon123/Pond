@@ -10,6 +10,7 @@ members = [
     "bindings/python/pyo3",
     "lenses/keyvalue/rust",
     "lenses/streaming/rust",
+    "lenses/oltp/rust",
 ]
 
 [workspace.package]

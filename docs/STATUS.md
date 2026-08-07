@@ -29,6 +29,7 @@ for bug fixes only.
 | Parallel S3 batch operations | `core/s3/` | ✅ Done (32 concurrent threads) |
 | KeyValueLens (Rust port) | `lenses/keyvalue/rust/` | ✅ Done (core API) |
 | StreamingLens (Rust port) | `lenses/streaming/rust/` | ✅ Done (core API) |
+| OLTPLens (Rust port) | `lenses/oltp/rust/` | ✅ Done (core API) |
 
 ### In Progress (Python still in use)
 
@@ -36,7 +37,7 @@ for bug fixes only.
 |---|---|---|
 | Python reference kernel | `bindings/python/core/` | Maintained (bug fixes only) |
 | Python SDK (PondStorage, lenses) | `bindings/python/sdk/` | Maintained (bug fixes only) |
-| Lenses (Lakehouse, OLTP, Vector — Python only) | `lenses/{name}/python/` | Production (Python) |
+| Lenses (Lakehouse, Vector — Python only) | `lenses/{name}/python/` | Production (Python) |
 | base_lens.py (PondLens) | `bindings/python/sdk/base_lens.py` | DEPRECATED — vestigial |
 
 ### Not Started (Future)
@@ -44,11 +45,8 @@ for bug fixes only.
 | Component | Path | Status |
 |---|---|---|
 | LakehouseLens (Rust port) | `lenses/lakehouse/rust/` | Placeholder |
-| OLTPLens (Rust port) | `lenses/oltp/rust/` | Placeholder |
 | VectorLens (Rust port) | `lenses/vector/rust/` | Placeholder |
 | Lens C ABI protocol | `lenses/base/pond_lens.h` | Placeholder only |
-| Java SDK | (future) | Not started |
-| Node.js SDK | (future) | Not started |
 
 ---
 
@@ -87,13 +85,10 @@ for bug fixes only.
 
 | Language | Status | How |
 |---|---|---|
-| Python | ✅ Full | PyO3 (codec) + Python SDK (kernel + lenses) |
+| Python | ✅ Full | PyO3 (codec + storage) + Python SDK (lenses) |
+| Rust | ✅ Full | Direct (it's the core) |
 | Go | ✅ Full | cgo over C ABI (kernel + storage + codec) |
 | C/C++ | ✅ Full | Direct C ABI (`#include "pond.h"`) |
-| Java | Future | JNI wrapper around C ABI |
-| Node.js | Future | N-API wrapper around C ABI |
-| Zig | Future | Direct C ABI |
-| Rust | ✅ Full | Direct (it's the core) |
 
 ---
 
@@ -122,15 +117,11 @@ ObjectStore trait
 3. **PyO3 wrapper for storage** — let Python call Rust storage directly (not just codec)
 
 ### Tier 2 — Do after
-4. Port remaining lenses (Lakehouse, OLTP, Streaming, Vector) to Rust
+4. Port remaining lenses (Lakehouse, Vector) to Rust
 5. Define lens C ABI protocol (`lenses/base/pond_lens.h`)
 6. Build Python wheel with maturin (single `pip install pond`)
 7. Cross-compilation for release binaries (Linux, macOS, Windows)
-
-### Tier 3 — Do when ready
-8. Java SDK (JNI wrapper)
-9. Node.js SDK (N-API wrapper)
-10. GCS native backend (currently works via S3-compatible API)
+8. GCS native backend (currently works via S3-compatible API)
 
 ---
 

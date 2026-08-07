@@ -1,0 +1,19 @@
+[package]
+name = "pond_oltp_lens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OLTPLens — fast KV with in-memory memtable + batch flush (Rust port)"
+
+[lib]
+name = "pond_oltp_lens"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+pond_kernel = { path = "../../../core/kernel" }
+pond_storage = { path = "../../../core/storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

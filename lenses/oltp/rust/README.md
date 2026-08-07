@@ -1,19 +1,89 @@
 # lenses/oltp/rust/
 
-Placeholder for the Rust reference implementation of OltpLens.
+Rust implementation of OLTPLens — fast KV with in-memory memtable + batch flush.
 
 ## Status
 
-**Not yet ported.** The current production implementation is Python-only
-(see `../python/oltp_lens.py`).
+**Implemented (core API).** The following operations are ported:
 
-## Migration plan
+| Operation | Status | Notes |
+|---|---|---|
+| `put(key, value)` | ✅ | Fast write (in-memory memtable) |
+| `delete(key)` | ✅ | Tombstone (in-memory) |
+| `get(key)` | ✅ | Read (memtable first, then storage) |
+| `exists(key)` | ✅ | Check existence |
+| `keys()` | ✅ | List keys (memtable + storage) |
+| `count()` | ✅ | Count entries |
+| `flush()` | ✅ | Flush memtable to storage |
+| `pending_count()` | ✅ | Count unflushed entries |
+| Auto-flush at threshold | ✅ | Triggers when memtable reaches flush_threshold |
 
-When this lens is ported to Rust:
-1. Implement the lens logic in Rust, calling `pond_kernel` and `pond_storage`
-   directly (no Python dependency).
-2. Expose the lens via `lenses/base/pond_lens.h` C ABI.
-3. The Python wrapper in `../python/` becomes a thin PyO3 binding to this
-   Rust implementation.
+The Python implementation (`../python/oltp_lens.py`) is the reference (198 LOC).
+The Rust port covers the full core API.
 
-The first lens to be ported will be KeyValueLens (simplest API surface).
+## Architecture
+
+```
+OLTPLens (this crate)
+  ↓ uses
+pond_storage::UnifiedStorage (Rust core)
+  ↓ calls
+pond_kernel::PondKernel (Rust core)
+  ↓ calls
+ObjectStore trait (LocalFSObjectStore or S3ObjectStore)
+```
+
+## How It Works
+
+Each OLTPLens instance has an in-memory `memtable` (HashMap). Writes go to
+the memtable (sub-µs). When the memtable is full (or `flush()` is called),
+it flushes to storage as a commit — amortizing S3 latency across N writes.
+
+Multiple processes can each have their own OLTPLens instance. They flush
+independently — no coordination, no CAS, no locks. CRDT merge handles
+conflicts deterministically.
+
+This is the SAME pattern as RocksDB's LSM-tree:
+- SST files → commits (concurrent-safe)
+- Compaction → `compact_shards` (already in UnifiedStorage)
+- Multi-process → each flushes independently (CRDT handles conflicts)
+
+## Usage
+
+```rust
+use pond_oltp_lens::OLTPLens;
+use pond_storage::UnifiedStorage;
+use serde_json::json;
+
+let storage = UnifiedStorage::new_local("/var/lib/pond").unwrap();
+let oltp = OLTPLens::new(storage, "kv", 1000);
+
+// Fast writes (in-memory, sub-µs)
+oltp.put("user:1", &json!({"name": "alice", "age": 30}));
+oltp.put("user:2", &json!({"name": "bob", "age": 25}));
+oltp.delete("user:2");
+
+// Reads check memtable first (0 GETs), then storage
+let user = oltp.get("user:1").unwrap();
+assert_eq!(user["name"], "alice");
+
+// Flush to storage (1 PUT, amortized across all writes)
+oltp.flush().unwrap();
+```
+
+## Tests
+
+8 unit tests cover the core operations:
+- `test_put_and_get` — basic put + get
+- `test_get_nonexistent` — get returns None for missing keys
+- `test_delete_in_memtable` — delete in memtable
+- `test_flush_and_cold_read` — flush + read from new instance
+- `test_keys_and_count` — list keys and count
+- `test_overwrite_key` — put overwrites existing keys
+- `test_pending_count` — count unflushed entries
+- `test_auto_flush_at_threshold` — auto-flush triggers at threshold
+
+Run tests:
+```bash
+cargo test -p pond_oltp_lens
+```
