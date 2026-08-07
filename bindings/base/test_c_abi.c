@@ -20,7 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include "pond_core.h"
+#include "pond.h"
 
 static int failures = 0;
 static int passes = 0;

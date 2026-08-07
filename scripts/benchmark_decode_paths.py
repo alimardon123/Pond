@@ -14,7 +14,7 @@ answer three questions:
      (Validates the C ABI design for cross-language SDK consumers.)
 
 Usage:
-    PYTHONPATH=pond-sdk:pond-rust/target/release \
+    PYTHONPATH=pond-sdk:target/release \
         python3 scripts/benchmark_decode_paths.py
 
 Output: tables of (blob_size, column_mix, path) → rows/sec + MB/s.
@@ -27,7 +27,7 @@ import statistics
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "pond-sdk"))
-sys.path.insert(0, os.path.join(REPO_ROOT, "pond-rust", "target", "release"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "target", "release"))
 
 # ---------------------------------------------------------------------------
 # Set up the three decode paths
@@ -41,9 +41,9 @@ PYO3_DECODE = pond_rust.decode
 from extensions.physical_structures.unified_storage import PND2, ColumnSource
 PY_DECODE = PND2.decode
 
-# Path 3: C ABI via ctypes (libpond_core.so — Rust + direct pointer access)
+# Path 3: C ABI via ctypes (libpond_storage.so — Rust + direct pointer access)
 LIBPOND_CORE = ctypes.CDLL(os.path.join(
-    REPO_ROOT, "pond-rust", "target", "release", "libpond_core.so"))
+    REPO_ROOT, "target", "release", "libpond_storage.so"))
 
 # Configure ctypes signatures
 _p = LIBPOND_CORE
@@ -258,8 +258,8 @@ def main():
     print("  Paths:")
     print("    PyO3         — pond_rust.decode (Rust + Python object conversion)")
     print("    Pure-Python  — PND2.decode (no Rust)")
-    print("    C ABI (per-row str) — libpond_core.so via ctypes, per-row str access")
-    print("    C ABI (batch str)   — libpond_core.so via ctypes, batch str_array")
+    print("    C ABI (per-row str) — libpond_storage.so via ctypes, per-row str access")
+    print("    C ABI (batch str)   — libpond_storage.so via ctypes, batch str_array")
     print("=" * 90)
 
     sizes = [1_000, 10_000, 100_000, 1_000_000]

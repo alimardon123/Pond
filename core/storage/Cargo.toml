@@ -10,8 +10,8 @@ name = "pond_storage"
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
-pond_kernel = { path = "../pond-kernel" }
-pond_core = { path = "../pond-core" }
+pond_kernel = { path = "../kernel" }
+pond_core = { path = "../codec" }
 serde_json = "1"
 sha2 = "0.10"
 

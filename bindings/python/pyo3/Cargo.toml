@@ -10,5 +10,5 @@ name = "pond_rust"           # import pond_rust from Python
 crate-type = ["cdylib"]      # produces pond_rust.so / .pyd / .dylib
 
 [dependencies]
-pond_core = { path = "../pond-core" }
+pond_core = { path = "../../../core/codec" }
 pyo3 = { version = "0.22", features = ["extension-module"] }

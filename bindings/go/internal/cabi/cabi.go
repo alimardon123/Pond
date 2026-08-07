@@ -1,15 +1,15 @@
 // Package cabi is the thin cgo layer over Pond's unified C ABI.
 //
 // It links against libpond_storage.a (which pulls in libpond_kernel.a and
-// libpond_core.a automatically). This gives Go full access to all three
+// libpond_storage.a automatically). This gives Go full access to all three
 // layers: kernel (Write/Read/Ref), storage (write/read/branch/merge),
 // and codec (PND2 encode/decode).
 //
 // Users should NOT import this package directly. Use github.com/pond/pond-go/pond.
 package cabi
 
-// #cgo CFLAGS: -I${SRCDIR}/../../../pond-rust
-// #cgo LDFLAGS: ${SRCDIR}/../../../pond-rust/target/release/libpond_storage.a ${SRCDIR}/../../../pond-rust/target/release/libpond_kernel.a -lpthread -ldl -lm
+// #cgo CFLAGS: -I${SRCDIR}/../../../../bindings/base
+// #cgo LDFLAGS: ${SRCDIR}/../../../../target/release/libpond_storage.a ${SRCDIR}/../../../../target/release/libpond_kernel.a -lpthread -ldl -lm
 //
 // #include <stdlib.h>
 // #include "pond.h"

@@ -34,7 +34,7 @@ tla/*.log
 tla/_*.tla
 
 # Rust build artifacts (NEVER commit — ~268MB of compiled output)
-pond-rust/target/
+target/
 
 # Go build artifacts
 sdk-go/pond.test

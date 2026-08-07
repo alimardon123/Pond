@@ -22,7 +22,7 @@ def _run_script(script_path):
     """Run a Python script as a subprocess and return (success, output).
 
     Inherits the current PYTHONPATH so scripts that depend on pond-sdk,
-    pond-core, or pond-rust modules work correctly when run via pytest.
+    pond-core, or core modules work correctly when run via pytest.
     """
     full_path = os.path.join(REPO_ROOT, script_path)
     env = dict(os.environ)
@@ -32,7 +32,7 @@ def _run_script(script_path):
         os.path.join(REPO_ROOT, "pond-sdk"),
         os.path.join(REPO_ROOT, "pond-sdk", "extensions", "physical_structures"),
         os.path.join(REPO_ROOT, "pond-core"),
-        os.path.join(REPO_ROOT, "pond-rust", "target", "release"),
+        os.path.join(REPO_ROOT, "target", "release"),
     ]
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = os.pathsep.join(extra_paths + ([existing] if existing else []))
@@ -159,14 +159,14 @@ def test_knowledge_graph_coverage():
 
 
 def test_rust_python_roundtrip():
-    """Verify the pond_rust PyO3 module (built from pond-rust/ workspace)
+    """Verify the pond_rust PyO3 module (built from core/ workspace)
     can encode + decode PND2 blobs end-to-end from Python."""
     import os, sys
-    rust_so = os.path.join(REPO_ROOT, "pond-rust", "target", "release",
+    rust_so = os.path.join(REPO_ROOT, "target", "release",
                            "pond_rust.so")
     if not os.path.exists(rust_so):
         import pytest
-        pytest.skip(f"pond_rust.so not built — run pond-rust/build.sh")
+        pytest.skip(f"pond_rust.so not built — run build.sh")
     sys.path.insert(0, os.path.dirname(rust_so))
     try:
         import pond_rust
@@ -203,17 +203,17 @@ def test_rust_c_abi():
     if cargo_bin is None or not shutil.which("cc"):
         import pytest
         pytest.skip("cargo or cc not available — skipping C ABI test")
-    rust_dir = os.path.join(REPO_ROOT, "pond-rust")
-    static_lib = os.path.join(rust_dir, "target", "release", "libpond_core.a")
+    rust_dir = os.path.join(REPO_ROOT)
+    static_lib = os.path.join(REPO_ROOT, "target", "release", "libpond_storage.a")
     if not os.path.exists(static_lib):
         # Build it
         subprocess.run([cargo_bin, "build", "--release", "-p", "pond_core"],
                        cwd=rust_dir, check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
     test_bin = os.path.join(rust_dir, "target", "test_c_abi")
-    test_src = os.path.join(rust_dir, "tests", "test_c_abi.c")
+    test_src = os.path.join(REPO_ROOT, "bindings", "base", "test_c_abi.c")
     # Compile: link the static lib directly (avoids pulling libpython via .so)
-    cc_cmd = ["cc", test_src, "-I", os.path.join(rust_dir, "pond-core"),
+    cc_cmd = ["cc", test_src, "-I", os.path.join(REPO_ROOT, "bindings", "base"),
               static_lib, "-lpthread", "-ldl", "-lm", "-o", test_bin]
     result = subprocess.run(cc_cmd, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, f"cc failed:\n{result.stderr}"
@@ -226,7 +226,7 @@ def test_rust_c_abi():
 
 
 def test_go_sdk():
-    """Verify the Go SDK (sdk-go/) builds and its tests pass.
+    """Verify the Go SDK (bindings/go/) builds and its tests pass.
     Skips if Go or cargo is unavailable."""
     import os, shutil, subprocess
     # Locate go binary (may be in ~/.local/go/bin)
@@ -244,18 +244,18 @@ def test_go_sdk():
         import pytest
         pytest.skip("go or cargo not available — skipping Go SDK test")
 
-    rust_dir = os.path.join(REPO_ROOT, "pond-rust")
-    sdk_go_dir = os.path.join(REPO_ROOT, "sdk-go")
+    rust_dir = os.path.join(REPO_ROOT)
+    sdk_go_dir = os.path.join(REPO_ROOT, "bindings", "go")
 
-    # Ensure libpond_core.a is built
-    static_lib = os.path.join(rust_dir, "target", "release", "libpond_core.a")
+    # Ensure libpond_storage.a is built
+    static_lib = os.path.join(REPO_ROOT, "target", "release", "libpond_storage.a")
     if not os.path.exists(static_lib):
         subprocess.run([cargo_bin, "build", "--release", "-p", "pond_core"],
                        cwd=rust_dir, check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
 
     # Ensure Python test blobs exist (the Go test decodes them for cross-lang compat)
-    blob_dir = os.path.join(rust_dir, "tests", "test_blobs")
+    blob_dir = os.path.join(REPO_ROOT, "bindings", "base", "test_blobs")
     if not os.path.isdir(blob_dir) or len(os.listdir(blob_dir)) == 0:
         # Generate them
         env = dict(os.environ)
@@ -266,7 +266,7 @@ def test_go_sdk():
                        cwd=REPO_ROOT, check=True, env=env, timeout=120,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
-    # Run `go test ./...` in sdk-go/
+    # Run `go test ./...` in bindings/go/
     env = dict(os.environ)
     env["PATH"] = os.path.dirname(go_bin) + ":" + env.get("PATH", "")
     result = subprocess.run([go_bin, "test", "-v", "./..."],
@@ -291,7 +291,7 @@ def test_decode_benchmark():
     import subprocess
     env = dict(os.environ)
     env["PYTHONPATH"] = os.path.join(REPO_ROOT, "pond-sdk") + ":" + \
-                        os.path.join(REPO_ROOT, "pond-rust", "target", "release")
+                        os.path.join(REPO_ROOT, "target", "release")
     result = subprocess.run(
         ["python3", os.path.join(REPO_ROOT, "scripts", "benchmark_decode_paths.py")],
         cwd=REPO_ROOT, capture_output=True, text=True, env=env, timeout=600)
@@ -326,7 +326,7 @@ def test_pond_cli():
         import pytest
         pytest.skip("cargo not available — skipping pond CLI test")
 
-    rust_dir = os.path.join(REPO_ROOT, "pond-rust")
+    rust_dir = os.path.join(REPO_ROOT)
 
     # Run `cargo test --release -p pond_cli` (runs the Rust integration tests)
     result = subprocess.run(

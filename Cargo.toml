@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["pond-core", "pond-python", "pond-kernel", "pond-cli", "pond-arrow", "pond-storage"]
+members = [
+    "core/kernel",
+    "core/storage",
+    "core/codec",
+    "core/arrow",
+    "cli",
+    "bindings/python/pyo3",
+]
 
 [workspace.package]
 version = "0.3.0"
@@ -8,7 +15,7 @@ edition = "2021"
 license = "MIT"
 authors = ["Pond Contributors"]
 repository = "https://github.com/alimardon123/Pond"
-description = "Pond storage system — Rust core (kernel + PND2 codec + C ABI), Python bindings, CLI"
+description = "Pond storage system — Rust core (kernel + storage + codec + arrow), CLI, language bindings"
 
 # Workspace-level release profile — fast builds, optimized for FFI hot paths
 [profile.release]

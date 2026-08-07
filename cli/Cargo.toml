@@ -10,8 +10,8 @@ name = "pond"
 path = "src/main.rs"
 
 [dependencies]
-pond_kernel = { path = "../pond-kernel" }
-pond_storage = { path = "../pond-storage" }
+pond_kernel = { path = "../core/kernel" }
+pond_storage = { path = "../core/storage" }
 clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
 

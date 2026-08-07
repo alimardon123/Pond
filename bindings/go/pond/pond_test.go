@@ -196,7 +196,7 @@ func TestMultiColumnEncoder(t *testing.T) {
 func TestDecodePythonBlobs(t *testing.T) {
         blobDir := pythonBlobDir()
         if blobDir == "" {
-                t.Skip("could not locate pond-rust/tests/test_blobs/ — run generate_test_blobs.py first")
+                t.Skip("could not locate bindings/base/test_blobs/ — run generate_test_blobs.py first")
         }
 
         tests := []struct {
@@ -262,7 +262,7 @@ func TestDecodeGarbage(t *testing.T) {
         }
 }
 
-// pythonBlobDir locates the pond-rust/tests/test_blobs/ directory by
+// pythonBlobDir locates the bindings/base/test_blobs/ directory by
 // walking up from the test file's location. Returns "" if not found.
 func pythonBlobDir() string {
         _, thisFile, _, ok := runtime.Caller(0)
