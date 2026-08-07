@@ -1099,7 +1099,11 @@ name = "pond_python"
 version = "0.3.0"
 dependencies = [
  "pond_core",
+ "pond_kernel",
+ "pond_s3",
+ "pond_storage",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]

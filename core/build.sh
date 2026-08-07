@@ -45,4 +45,4 @@ fi
 
 echo
 echo "Build complete. Artifacts in $PROFILE_DIR/:"
-ls -la "$PROFILE_DIR"/libpond_core.* "$PROFILE_DIR"/pond_rust.* "$PROFILE_DIR"/libpond_rust.* 2>/dev/null || true
+ls -la "$PROFILE_DIR"/libpond_*.* "$PROFILE_DIR"/pond_rust.* "$PROFILE_DIR"/pond 2>/dev/null || true

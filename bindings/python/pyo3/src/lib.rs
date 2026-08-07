@@ -422,6 +422,285 @@ fn encode(py: Python, columns: Vec<(String, PyObject)>, n_rows: usize) -> PyResu
 #[allow(unused_imports)]
 use {ENC_RAW as _, ENC_RLE as _, ENC_DICT as _, ENC_BITPACK as _};
 
+// ===========================================================================
+// Storage — PyO3 wrapper around UnifiedStorage (Rust core)
+// ===========================================================================
+//
+// This lets Python call the Rust storage layer directly, without going
+// through the Python reference kernel. This is the migration path: Python
+// code can use `pond_rust.Storage` instead of `PondStorage(PondMinimal(...))`.
+//
+// Supported operations:
+//   - Storage(path)          — open local FS storage
+//   - Storage.from_s3(url)   — open S3-compatible storage
+//   - write(collection, data, message) → commit_hash (str)
+//   - read(collection) → bytes
+//   - branch(collection, branch_name) → commit_hash
+//   - checkout(collection, branch_name)
+//   - checkout_new(collection, branch_name)  — -b equivalent
+//   - merge(collection, source, target, message) → commit_hash
+//   - history(collection, limit) → list of (hash, message, index)
+//   - branches(collection) → list of (name, commit_hash)
+//   - ls() → list of collection names
+//   - undo(collection, steps) → commit_hash
+//   - revert(collection, commit_hash)
+
+use pond_kernel::PondKernel;
+use pond_storage::UnifiedStorage;
+use pond_storage::{write as storage_write, read as storage_read, branch as storage_branch,
+                    commit as storage_commit};
+use std::sync::Mutex;
+
+/// A Pond storage handle backed by the Rust UnifiedStorage.
+///
+/// This is the Python-facing wrapper around `pond_storage::UnifiedStorage`.
+/// It provides the same operations as the Python `PondStorage` class, but
+/// all logic runs in Rust (no Python reference kernel needed).
+///
+/// # Example (Python)
+/// ```python
+/// from pond_rust import Storage
+///
+/// # Local FS
+/// s = Storage("/var/lib/pond")
+///
+/// # S3
+/// # s = Storage.from_s3("s3://bucket/prefix?region=us-east-1&endpoint=...")
+///
+/// s.write("users", b'[{"id":1,"name":"alice"}]', "init")
+/// data = s.read("users")
+/// s.branch("users", "dev")
+/// s.checkout_new("users", "dev")
+/// s.write("users", b'[{"id":2,"name":"bob"}]', "add bob")
+/// s.checkout("users", "main")
+/// s.merge("users", "dev", "main", "merge dev")
+/// ```
+#[pyclass]
+struct Storage {
+    storage: Mutex<UnifiedStorage>,
+}
+
+#[pymethods]
+impl Storage {
+    /// Create a new Storage backed by the local filesystem.
+    ///
+    /// Args:
+    ///   path: The filesystem path (e.g., "/var/lib/pond" or ".")
+    #[new]
+    fn new(path: &str) -> PyResult<Self> {
+        let storage = UnifiedStorage::new_local(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        Ok(Self { storage: Mutex::new(storage) })
+    }
+
+    /// Create a new Storage backed by S3-compatible storage.
+    ///
+    /// Args:
+    ///   url: S3 URL like "s3://bucket/prefix?region=us-east-1&endpoint=..."
+    ///
+    /// Credentials are read from the environment:
+    ///   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional)
+    #[cfg(feature = "s3")]
+    #[staticmethod]
+    fn from_s3(url: &str) -> PyResult<Self> {
+        let store = pond_s3::S3ObjectStore::from_url(url)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let kernel = PondKernel::new_with_store(Box::new(store));
+        let storage = UnifiedStorage::new(kernel);
+        Ok(Self { storage: Mutex::new(storage) })
+    }
+
+    /// Write data to a collection on the active branch.
+    ///
+    /// Args:
+    ///   collection: The collection name
+    ///   data: The data to write (bytes)
+    ///   message: The commit message
+    ///
+    /// Returns:
+    ///   The commit hash (hex string)
+    fn write(&self, collection: &str, data: &[u8], message: &str) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
+        let active = storage.get_active_branch(collection);
+        storage_write::write(storage.kernel(), collection, &active, data, message)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Read data from a collection's active branch.
+    ///
+    /// Args:
+    ///   collection: The collection name
+    ///
+    /// Returns:
+    ///   The data as bytes
+    fn read<'py>(&self, py: Python<'py>, collection: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let storage = self.storage.lock().unwrap();
+        let active = storage.get_active_branch(collection);
+        let data = storage_read::read(storage.kernel(), collection, &active)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        Ok(PyBytes::new_bound(py, &data))
+    }
+
+    /// Create a new branch from the active branch.
+    ///
+    /// Args:
+    ///   collection: The collection name
+    ///   branch_name: The new branch name
+    ///
+    /// Returns:
+    ///   The commit hash the branch was created at
+    fn branch(&self, collection: &str, branch_name: &str) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
+        let active = storage.get_active_branch(collection);
+        storage_branch::branch(storage.kernel(), collection, branch_name, &active)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Switch the active branch.
+    ///
+    /// Args:
+    ///   collection: The collection name
+    ///   branch_name: The branch to switch to (must exist)
+    fn checkout(&self, collection: &str, branch_name: &str) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        storage.set_active_branch(collection, branch_name);
+        Ok(())
+    }
+
+    /// Create a new branch and switch to it (like `git checkout -b`).
+    ///
+    /// Args:
+    ///   collection: The collection name
+    ///   branch_name: The new branch name
+    fn checkout_new(&self, collection: &str, branch_name: &str) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        let active = storage.get_active_branch(collection);
+        storage_branch::branch(storage.kernel(), collection, branch_name, &active)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        storage.set_active_branch(collection, branch_name);
+        Ok(())
+    }
+
+    /// Merge a source branch into a target branch.
+    ///
+    /// Args:
+    ///   collection: The collection name
+    ///   source: The source branch name
+    ///   target: The target branch name (None = active branch)
+    ///   message: The merge commit message
+    ///
+    /// Returns:
+    ///   The merge commit hash
+    #[pyo3(signature = (collection, source, target=None, message="merge"))]
+    fn merge(&self, collection: &str, source: &str, target: Option<&str>, message: &str) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
+        let target = target.map(|t| t.to_string())
+            .unwrap_or_else(|| storage.get_active_branch(collection));
+        storage_branch::merge(storage.kernel(), collection, source, &target, message)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Show commit history for a collection.
+    ///
+    /// Args:
+    ///   collection: The collection name
+    ///   limit: Max number of commits to show (default 20)
+    ///
+    /// Returns:
+    ///   List of (commit_hash, message, index) tuples, newest first
+    #[pyo3(signature = (collection, limit=20))]
+    fn history(&self, py: Python<'_>, collection: &str, limit: usize) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let active = storage.get_active_branch(collection);
+
+        // Get the current commit hash
+        let commit_ref = format!("collections/{}/_branches/{}/commit", collection, active);
+        let commit_hash = storage.kernel().resolve(&commit_ref)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!(
+                "no commit found for collection '{}' on branch '{}'", collection, active
+            )))?;
+
+        // Walk the commit history
+        let history = storage_commit::history(storage.kernel(), &commit_hash, limit);
+
+        let list = PyList::new_bound(py, history.iter().map(|(hash, commit)| {
+            PyTuple::new_bound(py, [
+                hash.to_object(py),
+                commit.message.to_object(py),
+                commit.index.to_object(py),
+            ]).into_any()
+        }));
+        Ok(list.into())
+    }
+
+    /// List all collections.
+    ///
+    /// Returns:
+    ///   List of collection names (strings)
+    fn ls(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        // List all refs, then extract collection names from "collections/{name}/..."
+        let names = storage.kernel().list_names_prefix("collections/");
+        let mut collections: Vec<String> = names.iter()
+            .filter_map(|n| {
+                // n looks like "collections/users/_branches/main/commit"
+                let parts: Vec<&str> = n.split('/').collect();
+                if parts.len() >= 2 && parts[0] == "collections" {
+                    Some(parts[1].to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        collections.sort();
+        collections.dedup();
+        let list = PyList::new_bound(py, collections.iter().map(|n| n.to_object(py)));
+        Ok(list.into())
+    }
+
+    /// Undo the last N commits.
+    ///
+    /// Args:
+    ///   collection: The collection name
+    ///   steps: Number of commits to undo (default 1)
+    ///
+    /// Returns:
+    ///   The new HEAD commit hash
+    #[pyo3(signature = (collection, steps=1))]
+    fn undo(&self, collection: &str, steps: usize) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
+        let active = storage.get_active_branch(collection);
+        storage_branch::undo(storage.kernel(), collection, &active, steps)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Revert to a specific commit.
+    ///
+    /// Args:
+    ///   collection: The collection name
+    ///   commit_hash: The commit hash to revert to
+    fn revert(&self, collection: &str, commit_hash: &str) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        let active = storage.get_active_branch(collection);
+        storage_branch::revert(storage.kernel(), collection, &active, commit_hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Get the active branch name for a collection.
+    ///
+    /// Returns "main" if no active branch has been set.
+    fn get_active_branch(&self, collection: &str) -> String {
+        let storage = self.storage.lock().unwrap();
+        storage.get_active_branch(collection)
+    }
+
+    /// Set the active branch for a collection.
+    fn set_active_branch(&self, collection: &str, branch_name: &str) {
+        let storage = self.storage.lock().unwrap();
+        storage.set_active_branch(collection, branch_name);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Python module definition
 // ---------------------------------------------------------------------------
@@ -430,5 +709,6 @@ use {ENC_RAW as _, ENC_RLE as _, ENC_DICT as _, ENC_BITPACK as _};
 fn pond_rust(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
+    m.add_class::<Storage>()?;
     Ok(())
 }
