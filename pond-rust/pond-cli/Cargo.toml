@@ -11,9 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 pond_kernel = { path = "../pond-kernel" }
-# clap for argument parsing — a mature, widely-used crate
+pond_storage = { path = "../pond-storage" }
 clap = { version = "4", features = ["derive", "env"] }
-# serde_json for reading/writing JSON data (the CLI accepts JSON input)
 serde_json = "1"
 
 [dev-dependencies]
