@@ -22,10 +22,13 @@ for bug fixes only.
 | UnifiedStorage (versioning, branching, shards) | `core/storage/` | ✅ Done |
 | PND2 codec (all encodings, all vtypes) | `core/codec/` | ✅ Done |
 | PND2 → Arrow bridge | `core/arrow/` | ✅ Done |
-| CLI (`pond` command, local + S3) | `cli/` | ✅ Done |
+| CLI (`pond` command, local + S3 + auto-discovery) | `cli/` | ✅ Done |
 | C ABI (pond.h — kernel + storage + codec + S3) | `bindings/base/pond.h` | ✅ Done |
 | Go SDK (full storage access via cgo) | `bindings/go/` | ✅ Done |
-| Python PyO3 wrapper (codec only) | `bindings/python/pyo3/` | ✅ Done |
+| Python PyO3 wrapper (codec + storage) | `bindings/python/pyo3/` | ✅ Done |
+| Parallel S3 batch operations | `core/s3/` | ✅ Done (32 concurrent threads) |
+| KeyValueLens (Rust port) | `lenses/keyvalue/rust/` | ✅ Done (core API) |
+| StreamingLens (Rust port) | `lenses/streaming/rust/` | ✅ Done (core API) |
 
 ### In Progress (Python still in use)
 
@@ -33,17 +36,19 @@ for bug fixes only.
 |---|---|---|
 | Python reference kernel | `bindings/python/core/` | Maintained (bug fixes only) |
 | Python SDK (PondStorage, lenses) | `bindings/python/sdk/` | Maintained (bug fixes only) |
-| Lenses (KeyValue, Lakehouse, OLTP, Streaming, Vector) | `lenses/{name}/python/` | Production (Python) |
+| Lenses (Lakehouse, OLTP, Vector — Python only) | `lenses/{name}/python/` | Production (Python) |
+| base_lens.py (PondLens) | `bindings/python/sdk/base_lens.py` | DEPRECATED — vestigial |
 
 ### Not Started (Future)
 
 | Component | Path | Status |
 |---|---|---|
-| Rust lens implementations | `lenses/{name}/rust/` | Placeholder only |
+| LakehouseLens (Rust port) | `lenses/lakehouse/rust/` | Placeholder |
+| OLTPLens (Rust port) | `lenses/oltp/rust/` | Placeholder |
+| VectorLens (Rust port) | `lenses/vector/rust/` | Placeholder |
 | Lens C ABI protocol | `lenses/base/pond_lens.h` | Placeholder only |
 | Java SDK | (future) | Not started |
 | Node.js SDK | (future) | Not started |
-| Parallel S3 batch operations | `core/s3/` | Sequential (TODO: thread pool) |
 
 ---
 
