@@ -43,107 +43,154 @@ fn decode(
     columns: Option<Vec<String>>,
     predicates: Option<Vec<(String, String, PyObject)>>,
 ) -> PyResult<PyObject> {
-    // Validate header
-    if blob_bytes.len() < 13 || &blob_bytes[0..4] != PND2_MAGIC {
-        return Ok(py.None());
-    }
-
-    let version = blob_bytes[4];
-    if version != PND2_VERSION {
-        return Ok(py.None());
-    }
-    let flags = blob_bytes[5];
-    let has_stats = (flags & FLAG_HAS_STATS) != 0;
-    let _is_compressed = (flags & FLAG_COMPRESSED) != 0;
-
-    let n_rows = u32::from_le_bytes([
-        blob_bytes[6], blob_bytes[7], blob_bytes[8], blob_bytes[9]
-    ]) as usize;
-    let n_columns = u16::from_le_bytes([blob_bytes[10], blob_bytes[11]]) as usize;
-
-    let compression_tag = blob_bytes[12];
-
-    // Get the inner data (decompress if needed)
-    let inner_owned: Vec<u8>;
-    let inner: &[u8] = if compression_tag == COMPRESSION_ZSTD {
-        match zstd_decompress(&blob_bytes[13..]) {
-            Ok(d) => { inner_owned = d; &inner_owned[..] }
-            Err(_) => return Ok(py.None()),
-        }
-    } else {
-        &blob_bytes[13..]
+    // Use pond_core's decoder directly — it handles zstd decompression
+    // (when the "zstd" feature is enabled) and all encodings/vtypes.
+    let pond_columns = match pond_core::pnd2_decode(blob_bytes) {
+        Ok(cols) => cols,
+        Err(_) => return Ok(py.None()),
     };
 
-    let mut parser = PND2Parser::new(inner);
+    let n_columns = pond_columns.len();
+    let n_rows = pond_columns.first().map(|c| c.n_values).unwrap_or(0);
 
-    // Parse schema: per col: name_len(1B) + name + vtype(1B) + enc(1B)
-    let mut schema: Vec<(String, u8, u8)> = Vec::with_capacity(n_columns);
-    for _ in 0..n_columns {
-        let name_len = match parser.read_u8() { Some(v) => v as usize, None => break };
-        let name_bytes = match parser.read_bytes(name_len) { Some(v) => v, None => break };
-        let name = String::from_utf8_lossy(name_bytes).to_string();
-        let vtype = match parser.read_u8() { Some(v) => v, None => break };
-        let enc = match parser.read_u8() { Some(v) => v, None => break };
-        schema.push((name, vtype, enc));
-    }
+    // Apply column projection if requested
+    let projection: Option<std::collections::HashSet<String>> = columns.map(|cols| {
+        cols.into_iter().collect()
+    });
 
-    // Skip stats section
-    if has_stats {
-        for (_, vtype, _) in &schema {
-            let has_min = match parser.read_u8() { Some(v) => v, None => break };
-            if has_min != 0 {
-                parser.skip_stat_value(*vtype);
-                parser.skip_stat_value(*vtype);
-            }
-            let _null_count = parser.read_u32();
-        }
-    }
+    // Apply predicate pushdown: determine which rows pass ALL predicates
+    let mask: Vec<bool> = if let Some(ref preds) = predicates {
+        compute_predicate_mask(py, &pond_columns, preds)?
+    } else {
+        vec![true; n_rows]
+    };
 
-    // Record payload positions (don't read yet — projection pushdown)
-    let mut payloads: Vec<(String, u8, u8, usize, usize)> = Vec::with_capacity(n_columns);
-    for (name, vtype, enc) in &schema {
-        let plen = match parser.read_u32() { Some(v) => v as usize, None => break };
-        let pstart = parser.pos;
-        if pstart + plen > inner.len() { break; }
-        parser.pos += plen;
-        payloads.push((name.clone(), *vtype, *enc, pstart, plen));
-    }
-
-    // Build the result dict
+    // Build the result dict: column_name -> list of values (filtered by mask)
     let result = PyDict::new_bound(py);
-
-    // Determine which columns to decode
-    let requested_cols: Option<std::collections::HashSet<String>> =
-        columns.map(|c| c.into_iter().collect());
-
-    for (name, vtype, enc, pstart, plen) in &payloads {
-        // Skip if not requested (projection pushdown)
-        if let Some(ref req) = requested_cols {
-            if !req.contains(name) {
+    for col in &pond_columns {
+        let name = col.name.to_string_lossy().to_string();
+        // Skip if projection requested and this column is not in it
+        if let Some(ref proj) = projection {
+            if !proj.contains(&name) {
                 continue;
             }
         }
-
-        let payload = &inner[*pstart..*pstart + *plen];
-        if payload.is_empty() {
-            result.set_item(name, PyList::empty_bound(py))?;
-            continue;
-        }
-
-        // Delegate to pond-core's pure-Rust decoder
-        let col = pond_core::decode_column(payload, *vtype, *enc, n_rows);
-        let py_values = column_to_pylist(py, &col)?;
-        result.set_item(name, py_values)?;
+        let py_values = column_to_pylist_filtered(py, col, &mask)?;
+        result.set_item(&name, py_values)?;
     }
 
-    // Predicate pushdown: filter rows in Python after decode.
-    // (Real pushdown happens at the zone-map level in bindings/python/sdk; this is
-    // a row-level filter applied on the decoded result.)
-    if let Some(preds) = predicates {
-        return apply_predicates(py, &result, &preds);
-    }
+    // Add metadata
+    let filtered_rows = mask.iter().filter(|&&m| m).count();
+    result.set_item("_n_rows", filtered_rows.to_object(py))?;
+    result.set_item("_n_columns", n_columns.to_object(py))?;
 
     Ok(result.into())
+}
+
+/// Compute a row mask (which rows pass ALL predicates).
+fn compute_predicate_mask(
+    py: Python,
+    columns: &[pond_core::PondColumn],
+    predicates: &[(String, String, PyObject)],
+) -> PyResult<Vec<bool>> {
+    use pond_core::{VT_INT64, VT_FLOAT64};
+    let n_rows = columns.first().map(|c| c.n_values).unwrap_or(0);
+    let mut mask = vec![true; n_rows];
+
+    for (col_name, op, value) in predicates {
+        // Find the column
+        let col = match columns.iter().find(|c| c.name.to_string_lossy() == col_name.as_str()) {
+            Some(c) => c,
+            None => continue, // Column not found — skip this predicate
+        };
+
+        for (i, m) in mask.iter_mut().enumerate() {
+            if !*m { continue; }
+            let passes = match col.vtype {
+                VT_INT64 => {
+                    let cell_val = col.i64_data.get(i).copied().unwrap_or(0);
+                    let target: i64 = value.extract(py).unwrap_or(0);
+                    apply_op_i64(cell_val, op, target)
+                }
+                VT_FLOAT64 => {
+                    let cell_val = col.f64_data.get(i).copied().unwrap_or(0.0);
+                    let target: f64 = value.extract(py).unwrap_or(0.0);
+                    apply_op_f64(cell_val, op, target)
+                }
+                _ => true, // Unsupported vtype — don't filter
+            };
+            *m = passes;
+        }
+    }
+    Ok(mask)
+}
+
+fn apply_op_i64(cell: i64, op: &str, target: i64) -> bool {
+    match op {
+        "=" | "==" => cell == target,
+        "!=" | "<>" => cell != target,
+        "<" => cell < target,
+        "<=" => cell <= target,
+        ">" => cell > target,
+        ">=" => cell >= target,
+        _ => true,
+    }
+}
+
+fn apply_op_f64(cell: f64, op: &str, target: f64) -> bool {
+    match op {
+        "=" | "==" => cell == target,
+        "!=" | "<>" => cell != target,
+        "<" => cell < target,
+        "<=" => cell <= target,
+        ">" => cell > target,
+        ">=" => cell >= target,
+        _ => true,
+    }
+}
+
+/// Convert a PondColumn to a Python list, filtered by the mask.
+fn column_to_pylist_filtered(py: Python, col: &pond_core::PondColumn, mask: &[bool]) -> PyResult<PyObject> {
+    use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY, VT_NULL};
+    let list = PyList::empty_bound(py);
+    match col.vtype {
+        VT_INT64 => {
+            for (i, v) in col.i64_data.iter().enumerate() {
+                if mask.get(i).copied().unwrap_or(false) {
+                    list.append(*v)?;
+                }
+            }
+        }
+        VT_FLOAT64 => {
+            for (i, v) in col.f64_data.iter().enumerate() {
+                if mask.get(i).copied().unwrap_or(false) {
+                    list.append(*v)?;
+                }
+            }
+        }
+        VT_STRING => {
+            for (i, s) in col.str_data.iter().enumerate() {
+                if mask.get(i).copied().unwrap_or(false) {
+                    list.append(s.to_string_lossy().to_string())?;
+                }
+            }
+        }
+        VT_BINARY => {
+            for (i, b) in col.bin_data.iter().enumerate() {
+                if mask.get(i).copied().unwrap_or(false) {
+                    list.append(PyBytes::new_bound(py, b))?;
+                }
+            }
+        }
+        VT_NULL | _ => {
+            for i in 0..col.n_values {
+                if mask.get(i).copied().unwrap_or(false) {
+                    list.append(py.None())?;
+                }
+            }
+        }
+    }
+    Ok(list.into())
 }
 
 /// Convert a `pond_core::PondColumn` into a Python list of values.

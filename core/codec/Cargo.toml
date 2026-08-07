@@ -12,7 +12,15 @@ name = "pond_core"
 # cdylib:    shared library (.so/.dylib/.dll) for dynamic FFI loading
 crate-type = ["staticlib", "rlib", "cdylib"]
 
+[features]
+default = []
+# Enable zstd decompression support (for reading production PND2 blobs).
+# Uses ruzstd (pure-Rust, no C deps). Off by default to preserve zero-dep
+# for cross-language linking. Enable with: cargo build -p pond_core --features zstd
+zstd = ["dep:ruzstd"]
+
 [dependencies]
-# NONE — bindings/python/core is pure Rust with no external deps. This is critical for
-# cross-language linking: consumers (Go, Java, Node) must not have to satisfy
-# transitive Rust crate dependencies.
+# NONE by default — pond_core stays pure-Rust with zero external deps.
+# This is critical for cross-language linking: consumers (Go, Java, Node)
+# must not have to satisfy transitive Rust crate dependencies.
+ruzstd = { version = "0.9", optional = true }

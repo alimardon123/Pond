@@ -41,10 +41,18 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
     let compression_tag = blob[12];
 
     if compression_tag == COMPRESSION_ZSTD {
-        // The C ABI expects uncompressed input — callers decompress first.
-        // (Python bindings handle zstd internally via the `zstandard` module.)
-        return Err("zstd-compressed blobs are not supported by pond_core::pnd2_decode; \
-                    decompress before calling".into());
+        // zstd-compressed blob — decompress if the "zstd" feature is enabled.
+        #[cfg(feature = "zstd")]
+        {
+            let decompressed = decompress_zstd(&blob[13..])?;
+            let mut parser = PND2Parser::new(&decompressed);
+            return decode_inner(&decompressed, &mut parser, n_rows, n_columns, has_stats);
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            return Err("zstd-compressed blobs require the 'zstd' feature. \
+                        Rebuild with: cargo build -p pond_core --features zstd".into());
+        }
     }
     if compression_tag != COMPRESSION_NONE {
         return Err(format!("unknown compression tag: {}", compression_tag));
@@ -52,6 +60,31 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
 
     let inner = &blob[13..];
     let mut parser = PND2Parser::new(inner);
+    decode_inner(inner, &mut parser, n_rows, n_columns, has_stats)
+}
+
+/// Decompress zstd data using ruzstd (pure-Rust, no C deps).
+#[cfg(feature = "zstd")]
+fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, String> {
+    use ruzstd::decoding::StreamingDecoder;
+    use std::io::Cursor;
+    let mut decoder = StreamingDecoder::new(Cursor::new(data))
+        .map_err(|e| format!("zstd: failed to create decoder: {}", e))?;
+    let mut output = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut output)
+        .map_err(|e| format!("zstd: failed to decompress: {}", e))?;
+    Ok(output)
+}
+
+/// Inner decoder that works on already-decompressed bytes.
+/// Called by pnd2_decode for both uncompressed and zstd-decompressed data.
+fn decode_inner(
+    inner: &[u8],
+    parser: &mut PND2Parser,
+    n_rows: usize,
+    n_columns: usize,
+    has_stats: bool,
+) -> Result<Vec<PondColumn>, String> {
 
     // Parse schema
     let mut schema: Vec<(CString, u8, u8)> = Vec::with_capacity(n_columns);

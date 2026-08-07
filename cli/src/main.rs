@@ -19,10 +19,10 @@
 //   4. . (current directory)  (fallback)
 //
 // The .pond/ marker directory contains a `config` file:
-//   - For local FS: Pond-level settings only (no storage= line —
-//     location is implicit: the .pond/ marker's parent directory)
-//   - For S3: `storage=s3://bucket/prefix?region=...&endpoint=...`
-//     (so auto-discovery knows which S3 URL to use)
+//   - Lives at the storage root (local path or S3 prefix)
+//   - For local FS: location is implicit (.pond/'s parent directory)
+//   - For S3: .pond/config is a key in the S3 prefix
+//   - Config holds Pond-level settings (NOT storage URL — that's passed via --root)
 
 use clap::{Parser, Subcommand};
 use pond_kernel::PondKernel;
@@ -173,38 +173,24 @@ fn persist_active_branch(storage: &UnifiedStorage, collection: &str, branch: &st
 // ---------------------------------------------------------------------------
 
 /// Resolve the storage URL using the discovery chain:
-///   1. --root <url>           (explicit override)
-///   2. POND_ROOT env var      (already in cli.root via clap's env=)
-///   3. .pond/config file      (auto-discovery — walks up from CWD)
+///   1. --root <url>           (explicit override — required for S3)
+///   2. POND_ROOT env var      (explicit override — required for S3)
+///   3. .pond/ marker in CWD   (auto-discovery — local FS only, walks up from CWD)
 ///   4. . (current directory)  (fallback)
+///
+/// Note: S3 storage requires --root or POND_ROOT (no auto-discovery for remote).
+/// This is intentional — you can't "walk up" to find an S3 URL.
 fn resolve_storage_url(explicit_root: Option<&str>) -> String {
     // 1. Explicit --root or POND_ROOT env var
     if let Some(root) = explicit_root {
         return root.to_string();
     }
 
-    // 3. Auto-discover .pond/ by walking up from CWD
+    // 3. Auto-discover .pond/ by walking up from CWD (local FS only)
     if let Some(pond_dir) = find_pond_marker() {
         let repo_root = pond_dir.parent().unwrap_or(std::path::Path::new("."));
-        let config_path = pond_dir.join("config");
-        if let Ok(config) = std::fs::read_to_string(&config_path) {
-            // Check for storage= line (used for S3 URLs — local FS doesn't need it)
-            for line in config.lines() {
-                let line = line.trim();
-                if let Some(url) = line.strip_prefix("storage=") {
-                    if url.starts_with("s3://") {
-                        // S3 URL saved in config — use it
-                        return url.to_string();
-                    }
-                    // "storage=local" or empty → use repo root (local FS)
-                    // (storage=local is legacy; new configs don't write it)
-                    return repo_root.to_string_lossy().to_string();
-                }
-            }
-            // Config exists but no storage= line → local FS, use repo root
-            return repo_root.to_string_lossy().to_string();
-        }
-        // .pond/ exists but no config → local FS, use repo root
+        // For local FS, the .pond/ marker's parent IS the storage root.
+        // (No need to read .pond/config — location is implicit.)
         return repo_root.to_string_lossy().to_string();
     }
 
@@ -296,10 +282,13 @@ fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>
 ///
 /// Behavior:
 ///   - `pond init` (no path) → create `.pond/` in CWD (local FS)
-///   - `pond init /path` → connect to /path; create `.pond/` there if missing
-///   - `pond init "s3://..."` → connect to S3; save URL to local `.pond/config`
+///   - `pond init /path` → create `.pond/` at /path (local FS); just connect if exists
+///   - `pond init "s3://..."` → create `.pond/config` IN S3; just connect if exists
 ///
-/// If the target already has `.pond/`, just connect (no re-initialization).
+/// The `.pond/config` ALWAYS lives at the storage root (not in CWD for remote).
+/// For local FS: `.pond/` is a directory in the storage path.
+/// For S3: `.pond/config` is a key in the S3 prefix.
+///
 /// If `--root` is provided, it overrides the location argument.
 fn cmd_init(location: &str, explicit_root: Option<&str>) {
     let location = explicit_root.unwrap_or(location);
@@ -312,6 +301,7 @@ fn cmd_init(location: &str, explicit_root: Option<&str>) {
 }
 
 /// Initialize/connect to a local FS storage.
+/// `.pond/` lives in the storage path (not CWD).
 fn cmd_init_local(location: &str) {
     let path_stripped = location.strip_prefix("file://").unwrap_or(location);
     let base_path = std::path::Path::new(path_stripped);
@@ -333,8 +323,7 @@ fn cmd_init_local(location: &str) {
         }
         // Config holds Pond-level settings (NOT storage= — location is implicit)
         let config = "# Pond repository configuration\n\
-            # Storage location is implicit: the .pond/ marker's parent directory.\n\
-            # For S3, use: storage=s3://bucket/prefix?region=...&endpoint=...\n";
+            # Storage location: this directory (local filesystem)\n";
         if let Err(e) = std::fs::write(pond_dir.join("config"), config) {
             eprintln!("Error: failed to write .pond/config: {}", e);
             std::process::exit(1);
@@ -358,45 +347,47 @@ fn cmd_init_local(location: &str) {
 }
 
 /// Initialize/connect to S3-compatible storage.
+/// `.pond/config` lives IN S3 (not in local CWD).
 fn cmd_init_s3(url: &str) {
     #[cfg(feature = "s3")]
     {
         match pond_s3::S3ObjectStore::from_url(url) {
             Ok(store) => {
                 use pond_kernel::ObjectStore;
+                // Check if .pond/config already exists in S3
+                let existing_config = store.get_path(".pond/config");
+                let already_initialized = existing_config.is_some();
+
+                // Write .pond/config to S3 (create or update)
+                let config = format!(
+                    "# Pond repository configuration\n\
+                     # Storage: S3-compatible ({})\n",
+                    url
+                );
+                // Store the config as a blob, then reference it at .pond/config
+                if let Err(e) = store.put_path(".pond/config", &pond_kernel::hash_bytes(config.as_bytes())) {
+                    eprintln!("Error: failed to write .pond/config to S3: {}", e);
+                    std::process::exit(1);
+                }
+                // Also need to write the actual config content as a blob
+                let config_hash = pond_kernel::hash_bytes(config.as_bytes());
+                let _ = store.put_blob(config.as_bytes());
+                let _ = store.put_path(".pond/config", &config_hash);
+
+                // Verify connectivity
                 match store.list_paths("") {
                     Ok(_) => {
-                        // S3 is reachable. Save the URL to a local .pond/config
-                        // so subsequent commands auto-discover it.
-                        let pond_dir = std::path::Path::new(".pond");
-                        let already_initialized = pond_dir.is_dir();
-
-                        if !already_initialized {
-                            if let Err(e) = std::fs::create_dir_all(pond_dir) {
-                                eprintln!("Error: failed to create .pond/ marker: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                        let config = format!(
-                            "# Pond repository configuration\n\
-                             # Connected to S3-compatible storage.\n\
-                             storage={}\n",
-                            url
-                        );
-                        if let Err(e) = std::fs::write(pond_dir.join("config"), config) {
-                            eprintln!("Error: failed to write .pond/config: {}", e);
-                            std::process::exit(1);
-                        }
-
                         // Display connection info
                         println!("Connected to: {}", describe_storage(url));
                         if already_initialized {
-                            println!("(updated .pond/config with S3 connection)");
+                            println!("(already initialized — .pond/config exists in S3)");
                         } else {
-                            println!("Created .pond/config (auto-discovery enabled).");
+                            println!("Created .pond/config in S3.");
                         }
-                        println!("\nNow you can run:");
-                        println!("  pond write users --json '[{{\"id\":1}}]' -m \"first commit\"");
+                        println!("\nTo use this storage in future commands:");
+                        println!("  pond --root \"{}\" write users --json '[{{\"id\":1}}]' -m \"first\"", url);
+                        println!("\nOr set POND_ROOT:");
+                        println!("  export POND_ROOT=\"{}\"", url);
                     }
                     Err(e) => {
                         eprintln!("Error: cannot access S3 storage: {}", e);

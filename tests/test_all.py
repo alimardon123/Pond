@@ -181,7 +181,9 @@ def test_rust_python_roundtrip():
         assert decoded["score"] == [1.5, 2.5, 3.5, 4.5, 5.5]
         # Projection pushdown
         proj = pond.decode(result["blob"], columns=["id"])
-        assert list(proj.keys()) == ["id"]
+        # Metadata keys (_n_rows, _n_columns) are always present
+        proj_cols = [k for k in proj.keys() if not k.startswith("_")]
+        assert proj_cols == ["id"], f"expected only 'id' column, got {proj_cols}"
         # Predicate pushdown
         filt = pond.decode(result["blob"], predicates=[("id", ">", 2)])
         assert filt["id"] == [3, 4, 5]
