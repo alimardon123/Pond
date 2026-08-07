@@ -268,3 +268,85 @@ func (e *Encoder) Free() {
                 e.handle = nil
         }
 }
+
+// ===========================================================================
+// Storage — UnifiedStorage (write, read, branch, merge, history, undo)
+// ===========================================================================
+
+// Storage provides full Pond storage access (write, read, branch, merge,
+// history, undo, revert) via the unified C ABI. It wraps the Rust
+// UnifiedStorage, which is the same code path used by the pond CLI.
+//
+// Usage:
+//
+//      store, _ := pond.NewStorage("/path/to/.pond")
+//      defer store.Free()
+//      store.Write("users", []byte(`{"name":"alice"}`), "initial")
+//      data, _ := store.Read("users")
+//      store.Branch("users", "experiment")
+//      store.Checkout("users", "experiment")
+//      store.Write("users", []byte(`{"name":"bob"}`), "experiment")
+//      store.Checkout("users", "main")
+//      store.Merge("users", "experiment", "", "merge experiment")
+type Storage struct {
+        handle *cabi.PondStorage
+}
+
+// NewStorage creates a new Storage with a local FS backend.
+func NewStorage(baseDir string) (*Storage, error) {
+        h, err := cabi.StorageNew(baseDir)
+        if err != nil {
+                return nil, err
+        }
+        return &Storage{handle: h}, nil
+}
+
+// Free releases the storage handle. Must be called when done.
+func (s *Storage) Free() {
+        if s != nil && s.handle != nil {
+                cabi.StorageFree(s.handle)
+                s.handle = nil
+        }
+}
+
+// Write writes data to a collection on the active branch.
+// Returns the commit hash.
+func (s *Storage) Write(collection string, data []byte, message string) (string, error) {
+        return cabi.StorageWrite(s.handle, collection, data, message)
+}
+
+// Read reads data from a collection's active branch.
+func (s *Storage) Read(collection string) ([]byte, error) {
+        return cabi.StorageRead(s.handle, collection)
+}
+
+// Branch creates a new branch from the active branch.
+func (s *Storage) Branch(collection, branchName string) (string, error) {
+        return cabi.StorageBranch(s.handle, collection, branchName)
+}
+
+// Checkout switches the active branch.
+func (s *Storage) Checkout(collection, branchName string) error {
+        return cabi.StorageCheckout(s.handle, collection, branchName)
+}
+
+// Merge merges a source branch into a target branch.
+// If targetBranch is empty, uses the active branch.
+func (s *Storage) Merge(collection, sourceBranch, targetBranch, message string) (string, error) {
+        return cabi.StorageMerge(s.handle, collection, sourceBranch, targetBranch, message)
+}
+
+// Undo undoes the last N commits on the active branch.
+func (s *Storage) Undo(collection string, steps int) (string, error) {
+        return cabi.StorageUndo(s.handle, collection, steps)
+}
+
+// Revert reverts the active branch to a specific commit.
+func (s *Storage) Revert(collection, commitHash string) error {
+        return cabi.StorageRevert(s.handle, collection, commitHash)
+}
+
+// ListBranches lists all branches for a collection.
+func (s *Storage) ListBranches(collection string) ([]string, error) {
+        return cabi.StorageListBranches(s.handle, collection)
+}

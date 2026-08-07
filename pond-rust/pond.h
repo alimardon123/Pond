@@ -94,6 +94,8 @@ size_t      pond_result_column_len(const PondResult* result, size_t index);
 const int64_t* pond_result_column_i64(const PondResult* result, size_t index);
 const double*  pond_result_column_f64(const PondResult* result, size_t index);
 const char* pond_result_column_str(const PondResult* result, size_t col, size_t row);
+const char* const* pond_result_column_str_array(const PondResult* result, size_t col_index);
+void pond_str_array_free(const char* const* arr);
 int32_t     pond_result_column_bin(const PondResult* result, size_t col, size_t row,
                                     const uint8_t** out, size_t* out_len);
 void        pond_result_free(PondResult* result);

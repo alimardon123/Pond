@@ -1,20 +1,24 @@
-// Package cabi is the thin cgo layer over libpond_core's C ABI.
+// Package cabi is the thin cgo layer over Pond's unified C ABI.
 //
-// It is intentionally minimal — just #cgo directives to link the static
-// library and re-export the C function declarations. Higher-level Go
-// types (Column, Result, Encoder) live in package pond.
+// It links against libpond_storage.a (which pulls in libpond_kernel.a and
+// libpond_core.a automatically). This gives Go full access to all three
+// layers: kernel (Write/Read/Ref), storage (write/read/branch/merge),
+// and codec (PND2 encode/decode).
 //
 // Users should NOT import this package directly. Use github.com/pond/pond-go/pond.
 package cabi
 
-// #cgo CFLAGS: -I${SRCDIR}/../../../pond-rust/pond-core
-// #cgo LDFLAGS: ${SRCDIR}/../../../pond-rust/target/release/libpond_core.a -lpthread -ldl -lm
+// #cgo CFLAGS: -I${SRCDIR}/../../../pond-rust
+// #cgo LDFLAGS: ${SRCDIR}/../../../pond-rust/target/release/libpond_storage.a ${SRCDIR}/../../../pond-rust/target/release/libpond_kernel.a -lpthread -ldl -lm
 //
 // #include <stdlib.h>
-// #include "pond_core.h"
+// #include "pond.h"
 import "C"
 
-import "unsafe"
+import (
+        "strings"
+        "unsafe"
+)
 
 // Re-export the C constants as Go constants for type-safe usage.
 const (
@@ -389,3 +393,156 @@ type Error struct {
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Msg }
+
+// ===========================================================================
+// Storage C ABI — UnifiedStorage (write, read, branch, merge, etc.)
+// ===========================================================================
+
+// PondStorage is the opaque C handle for UnifiedStorage.
+type PondStorage = C.PondStorageHandle
+
+// StorageNew creates a new UnifiedStorage with a local FS backend.
+func StorageNew(baseDir string) (*PondStorage, error) {
+        cDir := C.CString(baseDir)
+        defer C.free(unsafe.Pointer(cDir))
+        h := C.pond_storage_new(cDir)
+        if h == nil {
+                return nil, &Error{Code: "storage_new_failed", Msg: "failed to create storage"}
+        }
+        return h, nil
+}
+
+// StorageFree frees a storage handle. Safe on nil.
+func StorageFree(s *PondStorage) {
+        if s != nil {
+                C.pond_storage_free(s)
+        }
+}
+
+// StorageWrite writes data to a collection on the active branch.
+// Returns the commit hash.
+func StorageWrite(s *PondStorage, collection string, data []byte, message string) (string, error) {
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+        cMsg := C.CString(message)
+        defer C.free(unsafe.Pointer(cMsg))
+        hash := C.pond_storage_write(s, cColl,
+                (*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)), cMsg)
+        if hash == nil {
+                return "", &Error{Code: "storage_write_failed", Msg: "write failed"}
+        }
+        result := C.GoString(hash)
+        C.pond_storage_string_free(hash)
+        return result, nil
+}
+
+// StorageRead reads data from a collection's active branch.
+func StorageRead(s *PondStorage, collection string) ([]byte, error) {
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+        var outData *C.uint8_t
+        var outLen C.size_t
+        rc := C.pond_storage_read(s, cColl, &outData, &outLen)
+        if rc != 0 {
+                return nil, &Error{Code: "storage_read_failed", Msg: "read failed"}
+        }
+        if outData == nil || outLen == 0 {
+                return []byte{}, nil
+        }
+        result := C.GoBytes(unsafe.Pointer(outData), C.int(outLen))
+        C.pond_storage_data_free((*C.uint8_t)(unsafe.Pointer(outData)), outLen)
+        return result, nil
+}
+
+// StorageBranch creates a branch from the active branch.
+func StorageBranch(s *PondStorage, collection, branchName string) (string, error) {
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+        cBranch := C.CString(branchName)
+        defer C.free(unsafe.Pointer(cBranch))
+        hash := C.pond_storage_branch(s, cColl, cBranch)
+        if hash == nil {
+                return "", &Error{Code: "storage_branch_failed", Msg: "branch failed"}
+        }
+        result := C.GoString(hash)
+        C.pond_storage_string_free(hash)
+        return result, nil
+}
+
+// StorageCheckout switches the active branch.
+func StorageCheckout(s *PondStorage, collection, branchName string) error {
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+        cBranch := C.CString(branchName)
+        defer C.free(unsafe.Pointer(cBranch))
+        rc := C.pond_storage_checkout(s, cColl, cBranch)
+        if rc != 0 {
+                return &Error{Code: "storage_checkout_failed", Msg: "checkout failed"}
+        }
+        return nil
+}
+
+// StorageMerge merges a source branch into a target branch.
+// If target is empty, uses the active branch.
+func StorageMerge(s *PondStorage, collection, sourceBranch, targetBranch, message string) (string, error) {
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+        cSrc := C.CString(sourceBranch)
+        defer C.free(unsafe.Pointer(cSrc))
+        var cTgt *C.char
+        if targetBranch != "" {
+                cTgt = C.CString(targetBranch)
+                defer C.free(unsafe.Pointer(cTgt))
+        }
+        cMsg := C.CString(message)
+        defer C.free(unsafe.Pointer(cMsg))
+        hash := C.pond_storage_merge(s, cColl, cSrc, cTgt, cMsg)
+        if hash == nil {
+                return "", &Error{Code: "storage_merge_failed", Msg: "merge failed"}
+        }
+        result := C.GoString(hash)
+        C.pond_storage_string_free(hash)
+        return result, nil
+}
+
+// StorageUndo undoes the last N commits.
+func StorageUndo(s *PondStorage, collection string, steps int) (string, error) {
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+        hash := C.pond_storage_undo(s, cColl, C.size_t(steps))
+        if hash == nil {
+                return "", &Error{Code: "storage_undo_failed", Msg: "undo failed"}
+        }
+        result := C.GoString(hash)
+        C.pond_storage_string_free(hash)
+        return result, nil
+}
+
+// StorageRevert reverts to a specific commit.
+func StorageRevert(s *PondStorage, collection, commitHash string) error {
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+        cHash := C.CString(commitHash)
+        defer C.free(unsafe.Pointer(cHash))
+        rc := C.pond_storage_revert(s, cColl, cHash)
+        if rc != 0 {
+                return &Error{Code: "storage_revert_failed", Msg: "revert failed"}
+        }
+        return nil
+}
+
+// StorageListBranches lists branches for a collection.
+func StorageListBranches(s *PondStorage, collection string) ([]string, error) {
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+        result := C.pond_storage_list_branches(s, cColl)
+        if result == nil {
+                return nil, &Error{Code: "storage_list_branches_failed", Msg: "list_branches failed"}
+        }
+        joined := C.GoString(result)
+        C.pond_storage_string_free(result)
+        if joined == "" {
+                return []string{}, nil
+        }
+        return strings.Split(joined, "\n"), nil
+}
