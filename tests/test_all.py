@@ -386,3 +386,36 @@ def test_rust_s3_backend():
         f"S3 test failed:\nSTDOUT:\n{result.stdout[-2000:]}\nSTDERR:\n{result.stderr[-1000:]}"
     assert "ALL S3 TESTS PASSED" in result.stdout, \
         f"S3 tests did not complete:\n{result.stdout[-2000:]}"
+
+
+def test_rust_s3_r2_backend():
+    """Verify the Rust S3ObjectStore works against REAL Cloudflare R2.
+
+    Requires a .env file with R2 credentials (POND_S3_URL, AWS_ACCESS_KEY_ID,
+    AWS_SECRET_ACCESS_KEY). See .env.example.
+
+    Skips if .env doesn't exist or the pond binary isn't built.
+    """
+    import os, sys, subprocess
+
+    env_path = os.path.join(REPO_ROOT, ".env")
+    if not os.path.exists(env_path):
+        import pytest
+        pytest.skip(".env not found — create it with R2 credentials (see .env.example)")
+
+    pond_bin = os.path.join(REPO_ROOT, "target", "debug", "pond")
+    if not os.path.exists(pond_bin):
+        pond_bin = os.path.join(REPO_ROOT, "target", "release", "pond")
+    if not os.path.exists(pond_bin):
+        import pytest
+        pytest.skip("pond binary not built — run `cargo build -p pond_cli`")
+
+    # Run the R2 integration test script
+    result = subprocess.run(
+        [sys.executable, os.path.join(os.path.dirname(REPO_ROOT), "scripts", "test_rust_s3_r2.py")],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, \
+        f"R2 test failed:\nSTDOUT:\n{result.stdout[-2000:]}\nSTDERR:\n{result.stderr[-1000:]}"
+    assert "ALL R2 TESTS PASSED" in result.stdout, \
+        f"R2 tests did not complete:\n{result.stdout[-2000:]}"

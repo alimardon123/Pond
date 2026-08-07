@@ -174,6 +174,47 @@ fn build_canonical_request(
     )
 }
 
+/// Canonicalize a query string for SigV4.
+///
+/// Per AWS spec, the canonical query string is:
+/// 1. Split into (key, value) pairs
+/// 2. URL-encode each key and value (RFC 3986 — `/` becomes `%2F`)
+/// 3. Sort by key name (then by value if keys are equal)
+/// 4. Join with `&` and separate key from value with `=`
+///
+/// Input: `"list-type=2&prefix=pond/"`
+/// Output: `"list-type=2&prefix=pond%2F"`
+fn canonicalize_query(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some(eq_pos) = pair.find('=') {
+            let key = &pair[..eq_pos];
+            let value = &pair[eq_pos + 1..];
+            pairs.push((
+                urlencoding::encode_query(key),
+                urlencoding::encode_query(value),
+            ));
+        } else {
+            // Key with no value
+            pairs.push((
+                urlencoding::encode_query(pair),
+                String::new(),
+            ));
+        }
+    }
+    pairs.sort();
+    pairs.iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// Build the string-to-sign for SigV4.
 fn build_string_to_sign(
     timestamp: &str,
@@ -345,7 +386,8 @@ impl S3ObjectStore {
         // Canonical URI is the path (URL-encoded, but for S3 keys we keep them as-is
         // since S3 expects the un-encoded form in the canonical request)
         let canonical_uri = format!("/{}/{}", self.bucket, key);
-        let canonical_query = query.unwrap_or("").to_string();
+        // Canonicalize the query string for SigV4 (URL-encode values, sort by key)
+        let canonical_query = canonicalize_query(query.unwrap_or(""));
 
         // Build headers (must include host, x-amz-content-sha256, x-amz-date)
         let host = url::Url::parse(&url)
@@ -657,9 +699,11 @@ fn extract_hash_from_json(json: &str) -> Option<String> {
     None
 }
 
-// Minimal URL-encoding helper (avoids pulling in the `urlencoding` crate)
+// Minimal URL-encoding helpers (avoid pulling in the `urlencoding` crate)
 mod urlencoding {
-    pub fn encode(s: &str) -> String {
+    /// Encode a string for use in a URL PATH component.
+    /// Forward slashes are kept literal (S3 keys contain slashes).
+    pub fn encode_path(s: &str) -> String {
         let mut out = String::with_capacity(s.len() * 3);
         for b in s.bytes() {
             match b {
@@ -675,6 +719,31 @@ mod urlencoding {
             }
         }
         out
+    }
+
+    /// Encode a string for use in a URL QUERY parameter value.
+    /// Forward slashes ARE encoded as %2F (required by SigV4 canonical query).
+    /// This is also used for query parameter VALUES (not the key=value separator).
+    pub fn encode_query(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for b in s.bytes() {
+            match b {
+                // Unreserved characters (RFC 3986)
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char);
+                }
+                _ => {
+                    out.push_str(&format!("%{:02X}", b));
+                }
+            }
+        }
+        out
+    }
+
+    /// Backward-compat alias: `encode` = `encode_path`.
+    /// (Most callers encode path components, not query values.)
+    pub fn encode(s: &str) -> String {
+        encode_path(s)
     }
 }
 
