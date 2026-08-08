@@ -492,6 +492,156 @@ fn encode_raw_i64_payload(values: &[i64]) -> Vec<u8> {
     payload
 }
 
+/// Encode FLOAT64 values as RAW payload (value_type + raw bytes).
+fn encode_raw_f64_payload(values: &[f64]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + values.len() * 8);
+    payload.push(VT_FLOAT64);
+    for v in values {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    payload
+}
+
+/// Encode STRING values as RAW payload (value_type + [len + bytes]*N).
+fn encode_raw_str_payload(values: &[&str]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(VT_STRING);
+    for v in values {
+        let vb = v.as_bytes();
+        payload.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+        payload.extend_from_slice(vb);
+    }
+    payload
+}
+
+// ===========================================================================
+// TypedColumn — typed column data for multi-type PND2 encoding
+// ===========================================================================
+
+/// A typed column for multi-type PND2 encoding.
+///
+/// Supports INT64, FLOAT64, and STRING value types.
+#[derive(Clone, Debug)]
+pub enum TypedColumn {
+    Int64(Vec<i64>),
+    Float64(Vec<f64>),
+    String(Vec<String>),
+}
+
+impl TypedColumn {
+    pub fn vtype(&self) -> u8 {
+        match self {
+            TypedColumn::Int64(_) => VT_INT64,
+            TypedColumn::Float64(_) => VT_FLOAT64,
+            TypedColumn::String(_) => VT_STRING,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            TypedColumn::Int64(v) => v.len(),
+            TypedColumn::Float64(v) => v.len(),
+            TypedColumn::String(v) => v.len(),
+        }
+    }
+
+    pub fn encode_payload(&self) -> Vec<u8> {
+        match self {
+            TypedColumn::Int64(v) => {
+                let (enc, payload) = encode_i64_auto(v);
+                payload
+            }
+            TypedColumn::Float64(v) => encode_raw_f64_payload(v),
+            TypedColumn::String(v) => {
+                let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+                encode_raw_str_payload(&refs)
+            }
+        }
+    }
+
+    pub fn encode_encoding(&self) -> u8 {
+        match self {
+            TypedColumn::Int64(v) => encode_i64_auto(v).0,
+            TypedColumn::Float64(_) => ENC_RAW,
+            TypedColumn::String(_) => ENC_RAW,
+        }
+    }
+
+    pub fn min_max_bytes(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        match self {
+            TypedColumn::Int64(v) if !v.is_empty() => {
+                let min = *v.iter().min().unwrap();
+                let max = *v.iter().max().unwrap();
+                Some((min.to_le_bytes().to_vec(), max.to_le_bytes().to_vec()))
+            }
+            TypedColumn::Float64(v) if !v.is_empty() => {
+                let min = v.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                Some((min.to_le_bytes().to_vec(), max.to_le_bytes().to_vec()))
+            }
+            _ => None, // No stats for strings or empty columns
+        }
+    }
+}
+
+/// Encode a multi-type PND2 blob from typed columns.
+///
+/// This is the high-level API: pass column names + typed values, get a PND2 blob
+/// with per-column encoding selection and stats.
+///
+/// Example:
+/// ```ignore
+/// use pond_core::TypedColumn;
+/// let blob = pnd2_encode_multi_typed(&[
+///     ("id", TypedColumn::Int64(vec![1, 2, 3])),
+///     ("score", TypedColumn::Float64(vec![1.5, 2.5, 3.5])),
+///     ("name", TypedColumn::String(vec!["a".into(), "b".into(), "c".into()])),
+/// ]);
+/// ```
+pub fn pnd2_encode_multi_typed(columns: &[(&str, TypedColumn)]) -> Vec<u8> {
+    let n_rows = columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+    let mut inner = Vec::new();
+
+    // Phase 1: Write ALL schemas
+    for (name, col) in columns {
+        let name_bytes = name.as_bytes();
+        inner.push(name_bytes.len() as u8);
+        inner.extend_from_slice(name_bytes);
+        inner.push(col.vtype());
+        inner.push(col.encode_encoding());
+    }
+
+    // Phase 2: Write ALL stats
+    for (_, col) in columns {
+        if let Some((min, max)) = col.min_max_bytes() {
+            inner.push(1); // has_min
+            inner.extend_from_slice(&min);
+            inner.extend_from_slice(&max);
+        } else {
+            inner.push(0); // no stats
+        }
+        inner.extend_from_slice(&0u32.to_le_bytes()); // null_count
+    }
+
+    // Phase 3: Write ALL payloads
+    for (_, col) in columns {
+        let payload = col.encode_payload();
+        inner.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        inner.extend_from_slice(&payload);
+    }
+
+    // Final PND2 blob
+    let mut blob = Vec::with_capacity(13 + inner.len());
+    blob.extend_from_slice(PND2_MAGIC);
+    blob.push(PND2_VERSION);
+    blob.push(FLAG_HAS_STATS);
+    blob.extend_from_slice(&(n_rows as u32).to_le_bytes());
+    blob.extend_from_slice(&(columns.len() as u16).to_le_bytes());
+    blob.push(COMPRESSION_NONE);
+    blob.extend_from_slice(&inner);
+    blob
+}
+
 /// Encode a PND2 blob with automatic encoding selection for INT64 columns.
 ///
 /// This is the high-level API: pass column names + i64 values, get a PND2 blob

@@ -22,7 +22,7 @@ use pond_core::{
     COMPRESSION_NONE, COMPRESSION_ZSTD,
     VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY,
     ENC_RAW, ENC_RLE, ENC_DICT, ENC_BITPACK,
-    PND2Parser, PondColumn,
+    PND2Parser, PondColumn, TypedColumn,
 };
 
 // ---------------------------------------------------------------------------
@@ -677,39 +677,54 @@ impl Storage {
         Ok(PyBytes::new_bound(py, &data))
     }
 
-    /// Write structured INT64 columns as a PND2 blob with column stats.
+    /// Write structured columns as a PND2 blob with column stats.
     ///
-    /// This is the PRODUCTION write path — encodes data as PND2 with
-    /// auto-encoding (RLE/DICT/BITPACK/RAW per column), per-column stats
-    /// in manifest for predicate pruning.
+    /// Supports INT64, FLOAT64, and STRING column types (auto-detected from
+    /// Python values). Each column's encoding is chosen automatically:
+    ///   - INT64: RLE/DICT/BITPACK/RAW (based on data characteristics)
+    ///   - FLOAT64: RAW
+    ///   - STRING: RAW
     ///
     /// Args:
     ///   - collection: Collection name
-    ///   - columns: List of (name, list_of_int64_values) tuples
+    ///   - columns: List of (name, list_of_values) tuples
     ///   - message: Commit message
     ///
     /// Returns:
     ///   The commit hash
     ///
     /// Example:
-    ///   s.write_rows('metrics', [('id', [1, 2, 3]), ('val', [10, 20, 30])], 'init')
-    fn write_rows(&self, collection: &str, columns: Vec<(String, Vec<i64>)>, message: &str) -> PyResult<String> {
+    ///   s.write_rows('users', [
+    ///       ('id', [1, 2, 3]),
+    ///       ('score', [1.5, 2.5, 3.5]),
+    ///       ('name', ['alice', 'bob', 'carol']),
+    ///   ], 'init')
+    fn write_rows(&self, collection: &str, columns: Vec<(String, Vec<PyObject>)>, message: &str) -> PyResult<String> {
         let storage = self.storage.lock().unwrap();
         let active = storage.get_active_branch(collection);
 
-        // Convert Vec<(String, Vec<i64>)> to &[(&str, &[i64])]
-        let col_refs: Vec<(&str, &[i64])> = columns.iter()
-            .map(|(name, vals)| (name.as_str(), vals.as_slice()))
+        // Convert Python (name, values) to Rust (name, TypedColumn)
+        let typed_cols: Vec<(String, TypedColumn)> = columns.into_iter()
+            .map(|(name, values)| {
+                let typed = python_values_to_typed_column(&values);
+                (name, typed)
+            })
             .collect();
 
-        storage_write::write_rows_i64(storage.kernel(), collection, &active, &col_refs, message)
+        let col_refs: Vec<(&str, TypedColumn)> = typed_cols.iter()
+            .map(|(name, col)| (name.as_str(), col.clone()))
+            .collect();
+
+        storage_write::write_rows(storage.kernel(), collection, &active, &col_refs, message)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 
-    /// Read structured INT64 columns from a collection with optional pruning.
+    /// Read structured columns from a collection with optional pruning.
     ///
     /// Decodes PND2 blobs with predicate pruning (skip row groups whose
     /// stats don't match) and column projection (only decode requested columns).
+    ///
+    /// Returns typed Python values: int for INT64, float for FLOAT64, str for STRING.
     ///
     /// Args:
     ///   - collection: Collection name
@@ -717,17 +732,11 @@ impl Storage {
     ///   - predicates: Optional list of (column, op, value) for row-group pruning
     ///
     /// Returns:
-    ///   Dict of {column_name: list_of_int64_values}
+    ///   Dict of {column_name: list_of_values}
     ///
     /// Example:
-    ///   data = s.read_rows('metrics')
-    ///   # → {'id': [1, 2, 3], 'val': [10, 20, 30]}
-    ///
-    ///   data = s.read_rows('metrics', columns=['val'])
-    ///   # → {'val': [10, 20, 30]}
-    ///
-    ///   data = s.read_rows('metrics', predicates=[('id', '>', 1)])
-    ///   # → {'id': [1, 2, 3], 'val': [10, 20, 30]} (all — single RG can't prune)
+    ///   data = s.read_rows('users')
+    ///   # → {'id': [1, 2, 3], 'score': [1.5, 2.5, 3.5], 'name': ['a', 'b', 'c']}
     #[pyo3(signature = (collection, columns=None, predicates=None))]
     fn read_rows(
         &self,
@@ -739,25 +748,104 @@ impl Storage {
         let storage = self.storage.lock().unwrap();
         let active = storage.get_active_branch(collection);
 
-        // Convert predicates to the format read_rows_i64 expects
-        let pred_refs: Option<Vec<(&str, &str, i64)>> = predicates.as_ref().map(|preds| {
-            preds.iter().map(|(col, op, val)| (col.as_str(), op.as_str(), *val)).collect()
+        // Resolve HEAD and get manifest (handles PondPack + old format)
+        let head = storage.kernel().resolve(&pond_storage::branch_ref(collection, &active))
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!(
+                "no commits for '{}'", collection)))?;
+
+        let head_data = storage.kernel().read_blob(&head)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
+            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
+                .ok_or_else(|| pyo3::exceptions::PyIOError::new_err("Failed to decode PondPack"))?;
+            manifest_bytes
+        } else {
+            let commit = pond_storage::commit::read_commit(storage.kernel(), &head)
+                .ok_or_else(|| pyo3::exceptions::PyIOError::new_err("Failed to read commit"))?;
+            storage.kernel().read_blob(&commit.manifest)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+        };
+
+        let manifest = pond_storage::manifest::CollectionManifest::decode(&manifest_bytes)
+            .ok_or_else(|| pyo3::exceptions::PyIOError::new_err("Failed to decode manifest"))?;
+
+        // Build projection set
+        let projection: Option<std::collections::HashSet<String>> = columns.map(|cols| {
+            cols.into_iter().collect()
         });
 
-        let col_refs = columns.as_ref().map(|c| c.clone());
+        // Collect results
+        let mut result_cols: std::collections::HashMap<String, Vec<PyObject>> = std::collections::HashMap::new();
 
-        let result = storage_read::read_rows_i64(
-            storage.kernel(),
-            collection,
-            &active,
-            col_refs.as_deref(),
-            pred_refs.as_deref(),
-        ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        for rg in &manifest.row_groups {
+            // Predicate pruning
+            if let Some(ref preds) = predicates {
+                let mut skip = false;
+                for (col_name, op, value) in preds {
+                    let col_stats = rg.columns.iter().find(|c| c.name == *col_name);
+                    if let Some(stats) = col_stats {
+                        if can_prune_row_group_py(stats, op, *value) {
+                            skip = true;
+                            break;
+                        }
+                    }
+                }
+                if skip { continue; }
+            }
+
+            // Read and decode PND2 blob
+            let blob_data = storage.kernel().read_blob(&rg.blob_hash)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+            let cols = pond_core::pnd2_decode(&blob_data)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+            for col in &cols {
+                let name = col.name.to_string_lossy().to_string();
+
+                if let Some(ref proj) = projection {
+                    if !proj.contains(&name) { continue; }
+                }
+
+                let entry = result_cols.entry(name.clone()).or_insert_with(Vec::new);
+
+                // Convert to Python objects based on vtype
+                use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY, VT_NULL};
+                match col.vtype {
+                    VT_INT64 => {
+                        for v in &col.i64_data {
+                            entry.push(v.to_object(py));
+                        }
+                    }
+                    VT_FLOAT64 => {
+                        for v in &col.f64_data {
+                            entry.push(v.to_object(py));
+                        }
+                    }
+                    VT_STRING => {
+                        for s in &col.str_data {
+                            entry.push(s.to_string_lossy().to_string().to_object(py));
+                        }
+                    }
+                    VT_BINARY => {
+                        for b in &col.bin_data {
+                            entry.push(PyBytes::new_bound(py, b).into());
+                        }
+                    }
+                    VT_NULL | _ => {
+                        for _ in 0..col.n_values {
+                            entry.push(py.None());
+                        }
+                    }
+                }
+            }
+        }
 
         // Convert to Python dict
         let dict = PyDict::new_bound(py);
-        for (name, values) in result {
-            let list = PyList::new_bound(py, values.iter().map(|v| v.to_object(py)));
+        for (name, values) in result_cols {
+            let list = PyList::new_bound(py, values.iter());
             dict.set_item(&name, list)?;
         }
         Ok(dict.into())
@@ -1153,6 +1241,37 @@ impl Storage {
     }
 }
 
+/// Check if a row group can be pruned based on column stats + predicate.
+/// Returns true if the row group CANNOT match the predicate (should be skipped).
+fn can_prune_row_group_py(
+    stats: &pond_storage::manifest::ColumnStatsEntry,
+    op: &str,
+    value: i64,
+) -> bool {
+    let (min, max) = match (&stats.min, &stats.max) {
+        (Some(m), Some(x)) if m.len() >= 8 && x.len() >= 8 => {
+            let min_val = i64::from_le_bytes([
+                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]
+            ]);
+            let max_val = i64::from_le_bytes([
+                x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]
+            ]);
+            (min_val, max_val)
+        }
+        _ => return false,
+    };
+
+    match op {
+        "=" | "==" => value < min || value > max,
+        "<" => min >= value,
+        "<=" => min > value,
+        ">" => max <= value,
+        ">=" => max < value,
+        "!=" | "<>" => false,
+        _ => false,
+    }
+}
+
 /// Convert a Python object to a serde_json::Value.
 fn python_to_json(obj: &PyObject) -> JsonValue {
     Python::with_gil(|py| {
@@ -1174,6 +1293,41 @@ fn python_to_json(obj: &PyObject) -> JsonValue {
         } else {
             JsonValue::Null
         }
+    })
+}
+
+/// Convert a Vec<PyObject> (Python list of values) to a TypedColumn.
+///
+/// Auto-detects the type from the first non-None element:
+///   - int → TypedColumn::Int64
+///   - float → TypedColumn::Float64
+///   - str → TypedColumn::String
+///   - empty → TypedColumn::Int64 (default)
+fn python_values_to_typed_column(values: &[PyObject]) -> TypedColumn {
+    Python::with_gil(|py| {
+        // Detect type from first element
+        for v in values.iter() {
+            if let Ok(_) = v.extract::<i64>(py) {
+                let vals: Vec<i64> = values.iter()
+                    .map(|v| v.extract::<i64>(py).unwrap_or(0))
+                    .collect();
+                return TypedColumn::Int64(vals);
+            }
+            if let Ok(_) = v.extract::<f64>(py) {
+                let vals: Vec<f64> = values.iter()
+                    .map(|v| v.extract::<f64>(py).unwrap_or(0.0))
+                    .collect();
+                return TypedColumn::Float64(vals);
+            }
+            if let Ok(_) = v.extract::<String>(py) {
+                let vals: Vec<String> = values.iter()
+                    .map(|v| v.extract::<String>(py).unwrap_or_default())
+                    .collect();
+                return TypedColumn::String(vals);
+            }
+        }
+        // Empty or unknown → default to empty Int64
+        TypedColumn::Int64(Vec::new())
     })
 }
 

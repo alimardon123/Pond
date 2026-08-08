@@ -11,7 +11,7 @@
 use crate::commit;
 use crate::manifest::{CollectionManifest, ColumnStatsEntry, RowGroupEntry};
 use crate::{branch_ref, manifest_ref};
-use pond_core::{pnd2_encode_multi, pnd2_encode_i64_auto, EncodeMultiColumn, VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY};
+use pond_core::{pnd2_encode_multi, pnd2_encode_i64_auto, pnd2_encode_multi_typed, EncodeMultiColumn, TypedColumn, VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY};
 use pond_kernel::PondKernel;
 
 /// Write raw bytes to a collection. Creates a new commit on the active branch.
@@ -257,6 +257,91 @@ pub fn write_rows_i64_packed(
     let _ = kernel.reference(collection, &pack_hash);
 
     Ok(pack_hash)
+}
+
+/// Write typed columns (INT64, FLOAT64, STRING) as a PND2 blob.
+///
+/// This is the GENERIC write path — supports mixed column types.
+/// Each column's encoding is chosen automatically (INT64: RLE/DICT/BITPACK/RAW,
+/// FLOAT64: RAW, STRING: RAW).
+///
+/// Args:
+///   - kernel: The PondKernel handle
+///   - collection: Collection name
+///   - active_branch: Branch to write to
+///   - columns: Column specs (name, TypedColumn)
+///   - message: Commit message
+///
+/// Returns: commit hash
+pub fn write_rows(
+    kernel: &PondKernel,
+    collection: &str,
+    active_branch: &str,
+    columns: &[(&str, TypedColumn)],
+    message: &str,
+) -> Result<String, String> {
+    let n_rows = columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+
+    // Encode as PND2 with per-type encoding
+    let blob = pnd2_encode_multi_typed(columns);
+    let data_hash = kernel.write(&blob)
+        .map_err(|e| format!("Failed to write PND2 blob: {}", e))?;
+
+    // Get parent commit
+    let parent = kernel.resolve(&branch_ref(collection, active_branch));
+    let parent_index = parent.as_ref()
+        .and_then(|p| commit::read_commit(kernel, p))
+        .map(|c| c.index + 1)
+        .unwrap_or(0);
+
+    // Build manifest with schema + column stats
+    let schema: Vec<(String, u8)> = columns.iter()
+        .map(|(name, col)| (name.to_string(), col.vtype()))
+        .collect();
+    let key_col = columns.first().map(|(name, _)| name.to_string()).unwrap_or_default();
+    let mut manifest = CollectionManifest::new(schema, key_col);
+
+    // Build column stats entries
+    let col_stats: Vec<ColumnStatsEntry> = columns.iter()
+        .map(|(name, col)| {
+            let (min, max) = col.min_max_bytes()
+                .map(|(mn, mx)| (Some(mn), Some(mx)))
+                .unwrap_or((None, None));
+            ColumnStatsEntry {
+                name: name.to_string(),
+                value_type: col.vtype(),
+                min,
+                max,
+                null_count: 0,
+            }
+        })
+        .collect();
+
+    manifest.add_row_group(RowGroupEntry {
+        key: "rg_0000000000".to_string(),
+        blob_hash: data_hash.clone(),
+        n_rows: n_rows as u32,
+        columns: col_stats,
+    });
+
+    let manifest_bytes = manifest.encode();
+    let manifest_hash = kernel.write(&manifest_bytes)
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+    // Write the commit
+    let commit_hash = commit::write_commit(
+        kernel, collection, &manifest_hash, parent.as_deref(), None,
+        if message.is_empty() { "write_rows" } else { message }, parent_index,
+    ).map_err(|e| format!("Failed to write commit: {}", e))?;
+
+    // Update branch refs
+    kernel.reference(&branch_ref(collection, active_branch), &commit_hash)
+        .map_err(|e| format!("Failed to update branch ref: {}", e))?;
+    kernel.reference(&manifest_ref(collection, active_branch), &manifest_hash)
+        .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
+    let _ = kernel.reference(collection, &commit_hash);
+
+    Ok(commit_hash)
 }
 
 #[cfg(test)]
