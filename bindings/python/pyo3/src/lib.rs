@@ -496,6 +496,10 @@ use pond_kernel::PondKernel;
 use pond_storage::UnifiedStorage;
 use pond_storage::{write as storage_write, read as storage_read, branch as storage_branch,
                     commit as storage_commit};
+use pond_vector_index::IVFIndex as RustIVFIndex;
+use pond_hnsw_index::HNSWIndex as RustHNSWIndex;
+use pond_collection_index::CollectionIndexer as RustCollectionIndexer;
+use serde_json::Value as JsonValue;
 use std::sync::Mutex;
 
 /// Build a full S3 URL from a base URL and optional parameters.
@@ -831,68 +835,40 @@ impl Storage {
         let storage = self.storage.lock().unwrap();
         storage.set_active_branch(collection, branch_name);
     }
-}
 
-// ===========================================================================
-// IVFIndex — PyO3 wrapper for Rust IVF index (Bug 10 fixed)
-// ===========================================================================
+    // ===================================================================
+    // Index operations — operate ON collections via this Storage
+    // ===================================================================
 
-use pond_vector_index::IVFIndex as RustIVFIndex;
-use serde_json::Value as JsonValue;
-
-/// IVF (Inverted File) index for approximate nearest neighbor search.
-///
-/// This is the Rust implementation with Bug 10 fixed — stores per-cluster
-/// blob references so n_probe actually reduces I/O.
-///
-/// # Example (Python)
-/// ```python
-/// from pond import Storage, IVFIndex
-///
-/// ivf = IVFIndex("/var/lib/pond")
-/// ivf.build("vectors", n_clusters=10, metric="euclidean")
-/// results = ivf.search("vectors", [0.1, 0.2, ...], k=10, n_probe=5)
-/// ```
-#[pyclass]
-struct IVFIndex {
-    storage: Storage,
-}
-
-#[pymethods]
-impl IVFIndex {
-    /// Create a new IVFIndex bound to a storage path or S3 URL.
+    /// Build an IVF (Inverted File) index on a collection.
+    ///
+    /// The index enables approximate nearest neighbor (ANN) search.
+    /// Bug 10 fixed: per-cluster blob references for true I/O reduction.
     ///
     /// Args:
-    ///   - location: Local path or S3 URL (same as Storage constructor)
-    ///   - access_key: Optional S3 access key
-    ///   - secret_key: Optional S3 secret key
-    ///   - region: Optional S3 region
-    ///   - endpoint: Optional S3 endpoint
-    #[new]
-    #[pyo3(signature = (location, access_key=None, secret_key=None, region=None, endpoint=None))]
-    fn new(
-        location: &str,
-        access_key: Option<&str>,
-        secret_key: Option<&str>,
-        region: Option<&str>,
-        endpoint: Option<&str>,
-    ) -> PyResult<Self> {
-        let storage = Storage::new(location, access_key, secret_key, region, endpoint)?;
-        Ok(Self { storage })
-    }
-
-    /// Build an IVF index for a collection.
-    fn build(&self, collection: &str, n_clusters: usize, metric: &str) -> PyResult<String> {
-        let storage = self.storage.storage.lock().unwrap();
+    ///   - collection: Collection name
+    ///   - n_clusters: Number of clusters for k-means
+    ///   - metric: "euclidean" or "cosine"
+    fn build_ivf(&self, collection: &str, n_clusters: usize, metric: &str) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let ivf = RustIVFIndex::new(kernel);
         ivf.build(collection, n_clusters, metric)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
     }
 
-    /// Search for k nearest neighbors using the IVF index.
-    fn search(&self, py: Python<'_>, collection: &str, query: Vec<f64>, k: usize, n_probe: usize) -> PyResult<PyObject> {
-        let storage = self.storage.storage.lock().unwrap();
+    /// Search for k nearest neighbors using IVF index.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - query: Query vector (list of floats)
+    ///   - k: Number of nearest neighbors to return
+    ///   - n_probe: Number of clusters to search (higher = more accurate)
+    ///
+    /// Returns:
+    ///   List of (distance, vector_id) tuples, sorted by distance.
+    fn search_ivf(&self, py: Python<'_>, collection: &str, query: Vec<f64>, k: usize, n_probe: usize) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let ivf = RustIVFIndex::new(kernel);
         let results = ivf.search(collection, &query, k, n_probe)
@@ -904,9 +880,9 @@ impl IVFIndex {
         Ok(list.into())
     }
 
-    /// Get index statistics. Returns None if no index exists.
-    fn stats(&self, py: Python<'_>, collection: &str) -> PyResult<PyObject> {
-        let storage = self.storage.storage.lock().unwrap();
+    /// Get IVF index statistics. Returns None if no index exists.
+    fn ivf_stats(&self, py: Python<'_>, collection: &str) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let ivf = RustIVFIndex::new(kernel);
         match ivf.stats(collection) {
@@ -922,60 +898,35 @@ impl IVFIndex {
             None => Ok(py.None()),
         }
     }
-}
 
-// ===========================================================================
-// HNSWIndex — PyO3 wrapper for Rust HNSW index
-// ===========================================================================
-
-use pond_hnsw_index::HNSWIndex as RustHNSWIndex;
-
-/// HNSW (Hierarchical Navigable Small World) index for ANN search.
-///
-/// O(log N) search — better than IVF for high-recall at low latency.
-///
-/// # Example (Python)
-/// ```python
-/// from pond import HNSWIndex
-///
-/// hnsw = HNSWIndex("/var/lib/pond")
-/// hnsw.build("vectors", m=16, ef_construction=200, metric="l2")
-/// results = hnsw.search("vectors", [0.1, 0.2, ...], k=10, ef=50)
-/// ```
-#[pyclass]
-struct HNSWIndex {
-    storage: Storage,
-}
-
-#[pymethods]
-impl HNSWIndex {
-    #[new]
-    #[pyo3(signature = (location, access_key=None, secret_key=None, region=None, endpoint=None))]
-    fn new(
-        location: &str,
-        access_key: Option<&str>,
-        secret_key: Option<&str>,
-        region: Option<&str>,
-        endpoint: Option<&str>,
-    ) -> PyResult<Self> {
-        let storage = Storage::new(location, access_key, secret_key, region, endpoint)?;
-        Ok(Self { storage })
-    }
-
-    /// Build the HNSW index for a collection.
+    /// Build an HNSW (Hierarchical Navigable Small World) index on a collection.
+    ///
+    /// O(log N) search — better than IVF for high-recall at low latency.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - m: Max connections per node per layer (default 16)
+    ///   - ef_construction: Search beam width during construction (default 200)
+    ///   - metric: "l2" or "cosine"
     #[pyo3(signature = (collection, m=16, ef_construction=200, metric="l2"))]
-    fn build(&self, collection: &str, m: usize, ef_construction: usize, metric: &str) -> PyResult<String> {
-        let storage = self.storage.storage.lock().unwrap();
+    fn build_hnsw(&self, collection: &str, m: usize, ef_construction: usize, metric: &str) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let hnsw = RustHNSWIndex::new(kernel);
         hnsw.build(collection, m, ef_construction, None, metric)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
     }
 
-    /// Search for k nearest neighbors using HNSW.
+    /// Search for k nearest neighbors using HNSW index.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - query: Query vector (list of floats)
+    ///   - k: Number of nearest neighbors to return
+    ///   - ef: Beam width for layer 0 search (default 50)
     #[pyo3(signature = (collection, query, k=10, ef=50))]
-    fn search(&self, py: Python<'_>, collection: &str, query: Vec<f64>, k: usize, ef: usize) -> PyResult<PyObject> {
-        let storage = self.storage.storage.lock().unwrap();
+    fn search_hnsw(&self, py: Python<'_>, collection: &str, query: Vec<f64>, k: usize, ef: usize) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let hnsw = RustHNSWIndex::new(kernel);
         let results = hnsw.search(collection, &query, k, ef)
@@ -987,9 +938,9 @@ impl HNSWIndex {
         Ok(list.into())
     }
 
-    /// Get index statistics. Returns None if no index exists.
-    fn stats(&self, py: Python<'_>, collection: &str) -> PyResult<PyObject> {
-        let storage = self.storage.storage.lock().unwrap();
+    /// Get HNSW index statistics. Returns None if no index exists.
+    fn hnsw_stats(&self, py: Python<'_>, collection: &str) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let hnsw = RustHNSWIndex::new(kernel);
         match hnsw.stats(collection) {
@@ -1004,49 +955,12 @@ impl HNSWIndex {
             None => Ok(py.None()),
         }
     }
-}
 
-// ===========================================================================
-// CollectionIndexer — PyO3 wrapper for Rust secondary index
-// ===========================================================================
-
-use pond_collection_index::CollectionIndexer as RustCollectionIndexer;
-
-/// Collection-level secondary indexes.
-///
-/// # Example (Python)
-/// ```python
-/// from pond import CollectionIndexer
-///
-/// idx = CollectionIndexer("/var/lib/pond")
-/// idx.build_index("users", "by_name", [("user:1", {"name": "alice"})], "name")
-/// rowid = idx.lookup("users", "by_name", "alice")  # → "user:1"
-/// ```
-#[pyclass]
-struct CollectionIndexer {
-    storage: Storage,
-}
-
-#[pymethods]
-impl CollectionIndexer {
-    #[new]
-    #[pyo3(signature = (location, access_key=None, secret_key=None, region=None, endpoint=None))]
-    fn new(
-        location: &str,
-        access_key: Option<&str>,
-        secret_key: Option<&str>,
-        region: Option<&str>,
-        endpoint: Option<&str>,
-    ) -> PyResult<Self> {
-        let storage = Storage::new(location, access_key, secret_key, region, endpoint)?;
-        Ok(Self { storage })
-    }
-
-    /// Build an index on a collection.
+    /// Build a secondary index on a collection.
     ///
     /// Args:
     ///   - collection: Collection name
-    ///   - index_name: Name for this index
+    ///   - index_name: Name for this index (e.g., "by_name", "by_email")
     ///   - rows: List of (rowid, row_dict) tuples
     ///   - key_field: The field in row_dict to index
     ///
@@ -1059,7 +973,7 @@ impl CollectionIndexer {
         rows: Vec<(String, PyObject)>,
         key_field: &str,
     ) -> PyResult<String> {
-        let storage = self.storage.storage.lock().unwrap();
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let indexer = RustCollectionIndexer::new(kernel);
 
@@ -1086,17 +1000,17 @@ impl CollectionIndexer {
         }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
     }
 
-    /// Look up a single rowid by index key. Returns None if not found.
-    fn lookup(&self, collection: &str, index_name: &str, index_key: &str) -> Option<String> {
-        let storage = self.storage.storage.lock().unwrap();
+    /// Look up a rowid by index key. Returns None if not found.
+    fn lookup_index(&self, collection: &str, index_name: &str, index_key: &str) -> Option<String> {
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let indexer = RustCollectionIndexer::new(kernel);
         indexer.lookup(collection, index_name, index_key)
     }
 
-    /// Drop an index. Returns True if the index existed and was dropped.
+    /// Drop a secondary index. Returns True if the index existed and was dropped.
     fn drop_index(&self, collection: &str, index_name: &str) -> bool {
-        let storage = self.storage.storage.lock().unwrap();
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let indexer = RustCollectionIndexer::new(kernel);
         indexer.drop_index(collection, index_name)
@@ -1104,18 +1018,52 @@ impl CollectionIndexer {
 
     /// List all active indexes for a collection.
     fn list_indexes(&self, collection: &str) -> Vec<String> {
-        let storage = self.storage.storage.lock().unwrap();
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let indexer = RustCollectionIndexer::new(kernel);
         indexer.list_indexes(collection)
     }
 
-    /// Check if an index exists and is active.
-    fn index_exists(&self, collection: &str, index_name: &str) -> bool {
-        let storage = self.storage.storage.lock().unwrap();
+    // ===================================================================
+    // GC / Vacuum — maintenance operations
+    // ===================================================================
+
+    /// Analyze reachability and return GC stats (read-only).
+    ///
+    /// Returns a dict with: live, dead, dead_size_bytes (-1 if compute_size=False)
+    #[pyo3(signature = (compute_size=false))]
+    fn gc_stats(&self, py: Python<'_>, compute_size: bool) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let indexer = RustCollectionIndexer::new(kernel);
-        indexer.index_exists(collection, index_name)
+        let gc = pond_storage::maintenance::GarbageCollector::new(kernel);
+        let stats = gc.collect(None, compute_size);
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("live", stats.live)?;
+        dict.set_item("dead", stats.dead)?;
+        dict.set_item("dead_size_bytes", stats.dead_size_bytes)?;
+        Ok(dict.into())
+    }
+
+    /// Vacuum — delete unreachable blobs with time-travel safety.
+    ///
+    /// Args:
+    ///   - preserve_days: Keep commits younger than N days (default 0)
+    ///   - dry_run: If True, report what would be deleted without deleting
+    ///
+    /// Returns a dict with: deleted, preserved, dry_run
+    #[pyo3(signature = (preserve_days=0, dry_run=false))]
+    fn vacuum(&self, py: Python<'_>, preserve_days: u32, dry_run: bool) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let gc = pond_storage::maintenance::GarbageCollector::new(kernel);
+        let result = gc.vacuum(None, preserve_days, dry_run);
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("deleted", result.deleted)?;
+        dict.set_item("preserved", result.preserved)?;
+        dict.set_item("dry_run", result.dry_run)?;
+        Ok(dict.into())
     }
 }
 
@@ -1152,8 +1100,5 @@ fn pond(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_class::<Storage>()?;
-    m.add_class::<IVFIndex>()?;
-    m.add_class::<HNSWIndex>()?;
-    m.add_class::<CollectionIndexer>()?;
     Ok(())
 }
