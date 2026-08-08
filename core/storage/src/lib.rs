@@ -29,6 +29,7 @@ pub mod read;
 pub mod write;
 pub mod transaction;
 pub mod maintenance;
+pub mod pond_pack;
 
 use pond_kernel::PondKernel;
 use std::sync::Mutex;
