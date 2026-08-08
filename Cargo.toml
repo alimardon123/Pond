@@ -13,6 +13,7 @@ members = [
     "lenses/oltp/rust",
     "extensions/indexing/rust",
     "extensions/indexing/collection_index",
+    "extensions/indexing/hnsw_index",
 ]
 
 [workspace.package]
