@@ -677,6 +677,92 @@ impl Storage {
         Ok(PyBytes::new_bound(py, &data))
     }
 
+    /// Write structured INT64 columns as a PND2 blob with column stats.
+    ///
+    /// This is the PRODUCTION write path — encodes data as PND2 with
+    /// auto-encoding (RLE/DICT/BITPACK/RAW per column), per-column stats
+    /// in manifest for predicate pruning.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - columns: List of (name, list_of_int64_values) tuples
+    ///   - message: Commit message
+    ///
+    /// Returns:
+    ///   The commit hash
+    ///
+    /// Example:
+    ///   s.write_rows('metrics', [('id', [1, 2, 3]), ('val', [10, 20, 30])], 'init')
+    fn write_rows(&self, collection: &str, columns: Vec<(String, Vec<i64>)>, message: &str) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
+        let active = storage.get_active_branch(collection);
+
+        // Convert Vec<(String, Vec<i64>)> to &[(&str, &[i64])]
+        let col_refs: Vec<(&str, &[i64])> = columns.iter()
+            .map(|(name, vals)| (name.as_str(), vals.as_slice()))
+            .collect();
+
+        storage_write::write_rows_i64(storage.kernel(), collection, &active, &col_refs, message)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Read structured INT64 columns from a collection with optional pruning.
+    ///
+    /// Decodes PND2 blobs with predicate pruning (skip row groups whose
+    /// stats don't match) and column projection (only decode requested columns).
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - columns: Optional list of column names to project (None = all)
+    ///   - predicates: Optional list of (column, op, value) for row-group pruning
+    ///
+    /// Returns:
+    ///   Dict of {column_name: list_of_int64_values}
+    ///
+    /// Example:
+    ///   data = s.read_rows('metrics')
+    ///   # → {'id': [1, 2, 3], 'val': [10, 20, 30]}
+    ///
+    ///   data = s.read_rows('metrics', columns=['val'])
+    ///   # → {'val': [10, 20, 30]}
+    ///
+    ///   data = s.read_rows('metrics', predicates=[('id', '>', 1)])
+    ///   # → {'id': [1, 2, 3], 'val': [10, 20, 30]} (all — single RG can't prune)
+    #[pyo3(signature = (collection, columns=None, predicates=None))]
+    fn read_rows(
+        &self,
+        py: Python<'_>,
+        collection: &str,
+        columns: Option<Vec<String>>,
+        predicates: Option<Vec<(String, String, i64)>>,
+    ) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let active = storage.get_active_branch(collection);
+
+        // Convert predicates to the format read_rows_i64 expects
+        let pred_refs: Option<Vec<(&str, &str, i64)>> = predicates.as_ref().map(|preds| {
+            preds.iter().map(|(col, op, val)| (col.as_str(), op.as_str(), *val)).collect()
+        });
+
+        let col_refs = columns.as_ref().map(|c| c.clone());
+
+        let result = storage_read::read_rows_i64(
+            storage.kernel(),
+            collection,
+            &active,
+            col_refs.as_deref(),
+            pred_refs.as_deref(),
+        ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+        // Convert to Python dict
+        let dict = PyDict::new_bound(py);
+        for (name, values) in result {
+            let list = PyList::new_bound(py, values.iter().map(|v| v.to_object(py)));
+            dict.set_item(&name, list)?;
+        }
+        Ok(dict.into())
+    }
+
     /// Create a new branch from the active branch.
     ///
     /// Args:
