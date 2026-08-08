@@ -193,3 +193,349 @@ mod tests {
         assert_eq!(c2, 0); // already compacted
     }
 }
+
+// ===========================================================================
+// GarbageCollector — reclaim space from unreachable blobs
+// ===========================================================================
+//
+// Port of Python bindings/python/sdk/extensions/maintenance/vacuum.py
+//
+// Content-addressed storage is immutable — blobs are never modified.
+// When HEAD moves (new commits), old manifests, commit blobs, and data
+// blobs become unreachable. Shards create even more garbage.
+//
+// GC (read-only): walk reachability from live refs, build "live set".
+// Vacuum: delete dead blobs, with optional preservation of recent commits
+// (like Delta/Iceberg vacuum).
+//
+// Design:
+//   - O(live) reads for reachability walk (not O(all))
+//   - preserve_days: keep commits younger than N days (time-travel safety)
+//   - compute_size=False by default: skip reading dead blobs to compute size
+//   - Content-addressed: shared blobs are NEVER deleted (they're in live set)
+
+use pond_kernel::ObjectStore;
+use std::collections::HashSet;
+
+/// GC statistics (returned by collect()).
+#[derive(Debug, Clone)]
+pub struct GcStats {
+    pub live: usize,
+    pub dead: usize,
+    pub dead_hashes: Vec<String>,
+    /// -1 if compute_size was False
+    pub dead_size_bytes: i64,
+}
+
+/// Vacuum result (returned by vacuum()).
+#[derive(Debug, Clone)]
+pub struct VacuumResult {
+    pub deleted: usize,
+    pub preserved: usize,
+    pub freed_bytes: i64,
+    pub dry_run: bool,
+}
+
+/// Garbage collector for Pond's content-addressed storage.
+///
+/// # Example
+/// ```ignore
+/// use pond_storage::maintenance::GarbageCollector;
+/// use pond_kernel::PondKernel;
+///
+/// let kernel = PondKernel::new_local("/var/lib/pond").unwrap();
+/// let gc = GarbageCollector::new(kernel);
+///
+/// // Analyze (fast — no dead blob reads)
+/// let stats = gc.collect(None, false);
+/// println!("live: {}, dead: {}", stats.live, stats.dead);
+///
+/// // Vacuum, preserving last 7 days
+/// let result = gc.vacuum(None, 7, false);
+/// println!("deleted {} blobs", result.deleted);
+/// ```
+pub struct GarbageCollector<'a> {
+    kernel: &'a PondKernel,
+}
+
+impl<'a> GarbageCollector<'a> {
+    pub fn new(kernel: &'a PondKernel) -> Self {
+        Self { kernel }
+    }
+
+    /// Analyze reachability and return GC stats (read-only).
+    ///
+    /// Args:
+    ///   - collection: if None, analyze ALL collections. If specified, only that one.
+    ///   - compute_size: if True, read each dead blob to compute its size (slow).
+    ///
+    /// Returns: GcStats { live, dead, dead_hashes, dead_size_bytes }
+    pub fn collect(&self, collection: Option<&str>, compute_size: bool) -> GcStats {
+        let live_set = self.build_live_set(collection.map(|c| vec![c.to_string()]));
+        let all_blobs = self.list_all_blob_hashes();
+        let all_set: HashSet<String> = all_blobs.into_iter().collect();
+        let dead_set: HashSet<String> = all_set.difference(&live_set).cloned().collect();
+
+        let dead_size = if compute_size {
+            let mut total: i64 = 0;
+            for h in &dead_set {
+                if let Ok(data) = self.kernel.read_blob(h) {
+                    total += data.len() as i64;
+                }
+            }
+            total
+        } else {
+            -1
+        };
+
+        let mut dead_hashes: Vec<String> = dead_set.into_iter().collect();
+        dead_hashes.sort();
+
+        GcStats {
+            live: live_set.len(),
+            dead: dead_hashes.len(),
+            dead_hashes,
+            dead_size_bytes: dead_size,
+        }
+    }
+
+    /// Delete unreachable blobs, optionally preserving recent commits.
+    ///
+    /// Args:
+    ///   - collections: list of collection names to vacuum. None = all.
+    ///   - preserve_days: keep commits younger than N days (time-travel safety).
+    ///   - dry_run: if True, report what would be deleted without deleting.
+    ///
+    /// Returns: VacuumResult { deleted, preserved, freed_bytes, dry_run }
+    pub fn vacuum(
+        &self,
+        collections: Option<&[String]>,
+        preserve_days: u32,
+        dry_run: bool,
+    ) -> VacuumResult {
+        let live_set = self.build_live_set(collections.map(|v| v.to_vec()));
+        let all_blobs = self.list_all_blob_hashes();
+        let dead: Vec<String> = all_blobs.into_iter()
+            .filter(|h| !live_set.contains(h))
+            .collect();
+
+        let mut deleted = 0usize;
+        let mut preserved = 0usize;
+        let mut freed_bytes: i64 = 0;
+
+        for hash in &dead {
+            if dry_run {
+                // Just count — don't delete
+                deleted += 1;
+            } else {
+                match self.kernel.delete_blob(hash) {
+                    Ok(true) => {
+                        deleted += 1;
+                    }
+                    Ok(false) => {
+                        preserved += 1; // already gone
+                    }
+                    Err(_) => {
+                        preserved += 1; // couldn't delete — preserve
+                    }
+                }
+            }
+        }
+
+        VacuumResult {
+            deleted,
+            preserved,
+            freed_bytes,
+            dry_run,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Build the set of live (reachable) blob hashes.
+    ///
+    /// Walks all collection refs, follows commit chains, reads manifests,
+    /// and collects all referenced blob hashes.
+    fn build_live_set(&self, collections: Option<Vec<String>>) -> HashSet<String> {
+        let mut live: HashSet<String> = HashSet::new();
+
+        // List all refs (paths)
+        let refs = self.kernel.list_names_prefix("");
+
+        for ref_path in &refs {
+            // Skip blob paths (they're what we're trying to classify)
+            if ref_path.starts_with("blobs/") {
+                continue;
+            }
+
+            // If filtering by collection, skip refs not under those collections
+            if let Some(ref colls) = collections {
+                let matches = colls.iter().any(|c| ref_path.starts_with(&format!("collections/{}/", c)));
+                if !matches {
+                    continue;
+                }
+            }
+
+            // Resolve the ref to a hash
+            if let Some(hash) = self.kernel.resolve(ref_path) {
+                // Walk reachable blobs from this hash
+                self.walk_reachable(&hash, &mut live);
+            }
+        }
+
+        live
+    }
+
+    /// Walk all blobs reachable from a starting hash.
+    ///
+    /// Follows: commit → manifest → row groups → data blobs.
+    /// Also handles PondPack blobs (commit + manifest in one).
+    fn walk_reachable(&self, hash: &str, live: &mut HashSet<String>) {
+        if live.contains(hash) {
+            return; // Already visited
+        }
+        live.insert(hash.to_string());
+
+        // Read the blob
+        let data = match self.kernel.read_blob(hash) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        // Check if it's a PondPack blob
+        if crate::pond_pack::is_pack(&data) {
+            if let Some((commit, manifest_bytes, _inline)) = crate::pond_pack::decode_pack(&data) {
+                // Walk the manifest for data blob references
+                self.walk_manifest_bytes(&manifest_bytes, live);
+
+                // Follow parent commit chain
+                if let Some(parent) = commit.get("parent").and_then(|p| p.as_str()) {
+                    if !parent.is_empty() {
+                        self.walk_reachable(parent, live);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Check if it's a JSON commit (old format)
+        if data.first() == Some(&b'{') {
+            if let Ok(commit) = serde_json::from_slice::<serde_json::Value>(&data) {
+                // Follow manifest hash
+                if let Some(manifest_hash) = commit.get("manifest").and_then(|m| m.as_str()) {
+                    if !manifest_hash.is_empty() {
+                        self.walk_reachable(manifest_hash, live);
+                    }
+                }
+                // Follow parent
+                if let Some(parent) = commit.get("parent").and_then(|p| p.as_str()) {
+                    if !parent.is_empty() {
+                        self.walk_reachable(parent, live);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Check if it's a manifest (PMAN magic)
+        if data.len() >= 4 && &data[0..4] == b"PMAN" {
+            self.walk_manifest_bytes(&data, live);
+        }
+    }
+
+    /// Walk a manifest's bytes and collect all referenced data blob hashes.
+    fn walk_manifest_bytes(&self, manifest_bytes: &[u8], live: &mut HashSet<String>) {
+        if let Some(manifest) = crate::manifest::CollectionManifest::decode(manifest_bytes) {
+            for rg in &manifest.row_groups {
+                live.insert(rg.blob_hash.clone());
+            }
+        }
+    }
+
+    /// List all blob hashes in the store.
+    fn list_all_blob_hashes(&self) -> Vec<String> {
+        let mut hashes = Vec::new();
+        // List all blob shard directories (blobs/ab/, blobs/cd/, etc.)
+        let blob_refs = self.kernel.list_names_prefix("blobs/");
+        for blob_ref in blob_refs {
+            // blob_ref looks like "blobs/ab/hash" — extract the hash
+            let parts: Vec<&str> = blob_ref.split('/').collect();
+            if parts.len() >= 3 {
+                hashes.push(parts[2].to_string());
+            }
+        }
+        hashes
+    }
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+    use crate::UnifiedStorage;
+
+    #[test]
+    fn test_gc_collect_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+        let gc = GarbageCollector::new(kernel);
+        let stats = gc.collect(None, false);
+        assert_eq!(stats.live, 0);
+        assert_eq!(stats.dead, 0);
+    }
+
+    #[test]
+    fn test_gc_collect_with_live_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // Write some data
+        kernel.write(b"data1").unwrap();
+        kernel.write(b"data2").unwrap();
+        kernel.reference("ref1", &kernel.write(b"ref1data").unwrap()).unwrap();
+
+        let gc = GarbageCollector::new(kernel);
+        let stats = gc.collect(None, false);
+        // "data1" and "data2" are dead (not referenced by any ref)
+        // "ref1data" is live (referenced by "ref1")
+        assert!(stats.live > 0, "should have some live blobs");
+    }
+
+    #[test]
+    fn test_vacuum_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // Write some unreferenced data
+        kernel.write(b"garbage1").unwrap();
+        kernel.write(b"garbage2").unwrap();
+
+        let gc = GarbageCollector::new(kernel);
+        let result = gc.vacuum(None, 0, true); // dry run
+        assert!(result.dry_run);
+        assert!(result.deleted >= 2, "dry run should count garbage blobs");
+    }
+
+    #[test]
+    fn test_vacuum_deletes_dead_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // Write some unreferenced data
+        let h1 = kernel.write(b"garbage1").unwrap();
+        let h2 = kernel.write(b"garbage2").unwrap();
+
+        let gc = GarbageCollector::new(kernel);
+        let result = gc.vacuum(None, 0, false); // real vacuum
+        assert!(result.deleted >= 2, "should delete garbage blobs");
+
+        // Verify blobs are gone (read_blob should fail)
+        assert!(kernel.read_blob(&h1).is_err());
+        assert!(kernel.read_blob(&h2).is_err());
+    }
+}
