@@ -123,7 +123,46 @@ pond init "s3://bucket/prefix?region=us-east-1&endpoint=http://localhost:9000"
 
 `--root` and `POND_ROOT` env var still work as overrides (for scripts/CI).
 
-### Using the Python SDK
+### Using the Rust Python SDK (recommended)
+
+```python
+from pond import Storage
+
+# ONE storage connection — local or S3 (auto-detected)
+s = Storage('/var/lib/pond')
+# OR: s = Storage('s3://bucket/prefix?region=us-east-1&endpoint=...')
+
+# Raw bytes (JSON or any format)
+s.write('users', b'[{"id":1,"name":"alice"}]', 'init')
+data = s.read('users')
+
+# Structured PND2 columns (auto-encoding: RLE/DICT/BITPACK/RAW + pruning)
+s.write_rows('metrics', [('id', [1, 2, 3]), ('val', [10, 20, 30])], 'init')
+cols = s.read_rows('metrics')           # → {'id': [1,2,3], 'val': [10,20,30]}
+cols = s.read_rows('metrics', columns=['val'])  # projection
+cols = s.read_rows('metrics', predicates=[('id', '>', 1)])  # pruning
+
+# Version control (git-like)
+s.branch('users', 'dev')
+s.checkout_new('users', 'dev')
+s.write('users', b'[{"id":2,"name":"bob"}]', 'add bob')
+s.checkout('users', 'main')
+s.merge('users', 'dev', 'main', 'merge dev')
+
+# Secondary indexes
+s.build_index('users', 'by_name', [('user:1', {'name': 'alice'})], 'name')
+rowid = s.lookup_index('users', 'by_name', 'alice')  # → 'user:1'
+
+# Vector ANN (IVF — Bug 10 fixed, HNSW — O(log N))
+s.build_ivf('vectors', n_clusters=10, metric='euclidean')
+results = s.search_ivf('vectors', [0.1, 0.2], k=10, n_probe=5)
+
+# Maintenance
+s.gc_stats()                    # → {'live': N, 'dead': M, ...}
+s.vacuum(preserve_days=7, dry_run=True)
+```
+
+### Using the Python reference SDK (legacy)
 
 ```python
 import sys, os
@@ -133,34 +172,13 @@ sys.path.insert(0, "bindings/python/sdk")
 from make_kernel import make_kernel
 from pond_storage import PondStorage
 
-# Local filesystem (pure files, no SQLite):
 kernel = make_kernel("file:///var/lib/pond")
-
-# OR — S3 (boto3, credentials from env):
-kernel = make_kernel("s3://my-pond/prod", region="us-east-1")
-
 storage = PondStorage(kernel)
 
-# Write any workload — same API regardless of backend
 storage.write("users", [{"id": 1, "name": "alice"}], key_col="id")
-
-# Read any workload — same API
 rows = storage.read("users")
-row = storage.point_lookup("users", key="1")
-
-# Version control — same API
 storage.branch("users", "dev")
-storage.checkout("users", "dev")
-storage.append("users", [{"id": 2, "name": "bob"}], key_col="id")
 storage.merge("users", "dev")
-
-# Concurrent multi-writer — CRDT, no CAS
-storage.append_shard("events", [{"id": 1, "event": "click"}], key_col="id")
-rows = storage.read_with_shards("events")
-
-# Maintenance
-storage.vacuum(preserve_days=7)
-storage.optimize()
 ```
 
 ### Using the Go SDK
