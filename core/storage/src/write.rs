@@ -161,9 +161,103 @@ pub fn write_rows_i64(
     Ok(commit_hash)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// Write structured rows as PND2 + PondPack (commit+manifest in ONE blob).
+///
+/// This is the OPTIMIZED write path — uses PondPack to combine the commit
+/// JSON and manifest bytes into a single blob, saving 1 PUT per write and
+/// 1-2 GETs per cold read.
+///
+/// Args:
+///   - kernel: The PondKernel handle
+///   - collection: Collection name
+///   - active_branch: Branch to write to
+///   - columns: Column specs (name, i64 values)
+///   - message: Commit message
+///
+/// Returns: pack hash (HEAD ref points to pack — contains both commit + manifest)
+pub fn write_rows_i64_packed(
+    kernel: &PondKernel,
+    collection: &str,
+    active_branch: &str,
+    columns: &[(&str, &[i64])],
+    message: &str,
+) -> Result<String, String> {
+    let n_rows = columns.first().map(|(_, v)| v.len()).unwrap_or(0);
+
+    // 1. Encode data as PND2 blob
+    let blob = pnd2_encode_i64_auto(columns);
+    let data_hash = kernel.write(&blob)
+        .map_err(|e| format!("Failed to write PND2 blob: {}", e))?;
+
+    // 2. Get parent commit
+    let parent = kernel.resolve(&branch_ref(collection, active_branch));
+    let parent_index = parent.as_ref()
+        .and_then(|p| commit::read_commit(kernel, p))
+        .map(|c| c.index + 1)
+        .unwrap_or(0);
+
+    // 3. Build manifest with schema + column stats
+    let schema: Vec<(String, u8)> = columns.iter()
+        .map(|(name, _)| (name.to_string(), VT_INT64))
+        .collect();
+    let key_col = columns.first().map(|(name, _)| name.to_string()).unwrap_or_default();
+    let mut manifest = CollectionManifest::new(schema, key_col);
+
+    let mut col_stats: Vec<ColumnStatsEntry> = Vec::new();
+    for (name, values) in columns {
+        if values.is_empty() {
+            col_stats.push(ColumnStatsEntry {
+                name: name.to_string(),
+                value_type: VT_INT64,
+                min: None,
+                max: None,
+                null_count: 0,
+            });
+        } else {
+            let min = *values.iter().min().unwrap();
+            let max = *values.iter().max().unwrap();
+            col_stats.push(ColumnStatsEntry {
+                name: name.to_string(),
+                value_type: VT_INT64,
+                min: Some(min.to_le_bytes().to_vec()),
+                max: Some(max.to_le_bytes().to_vec()),
+                null_count: 0,
+            });
+        }
+    }
+
+    manifest.add_row_group(RowGroupEntry {
+        key: "rg_0000000000".to_string(),
+        blob_hash: data_hash.clone(),
+        n_rows: n_rows as u32,
+        columns: col_stats,
+    });
+
+    let manifest_bytes = manifest.encode();
+
+    // 4. Build commit object
+    let commit_obj = serde_json::json!({
+        "parent": parent,
+        "manifest": "",
+        "message": if message.is_empty() { "write_rows_packed" } else { message },
+        "timestamp": 0,
+        "index": parent_index,
+    });
+
+    // 5. Encode as PondPack (commit JSON + manifest bytes in ONE blob)
+    let pack_bytes = crate::pond_pack::encode_pack(&commit_obj, &manifest_bytes, None);
+    let pack_hash = kernel.write(&pack_bytes)
+        .map_err(|e| format!("Failed to write pack blob: {}", e))?;
+
+    // 6. Update branch refs — both point to the pack hash
+    kernel.reference(&branch_ref(collection, active_branch), &pack_hash)
+        .map_err(|e| format!("Failed to update branch ref: {}", e))?;
+    kernel.reference(&manifest_ref(collection, active_branch), &pack_hash)
+        .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
+    let _ = kernel.reference(collection, &pack_hash);
+
+    Ok(pack_hash)
+}
 
 #[cfg(test)]
 mod tests {
@@ -251,5 +345,48 @@ mod tests {
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].i64_data, ids);
         assert_eq!(cols[1].i64_data, ages);
+    }
+
+    #[test]
+    fn test_write_rows_i64_packed_uses_pondpack() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let ids = vec![1i64, 2, 3];
+        let scores = vec![10i64, 20, 30];
+
+        let hash = write_rows_i64_packed(
+            kernel, "metrics", "main",
+            &[("id", &ids), ("score", &scores)],
+            "packed write test",
+        ).unwrap();
+
+        // The hash should be a pack (PNPK magic)
+        let pack_data = kernel.read_blob(&hash).unwrap();
+        assert!(crate::pond_pack::is_pack(&pack_data),
+            "HEAD should point to a PondPack blob");
+
+        // Decode the pack
+        let (commit, manifest_bytes, _inline) = crate::pond_pack::decode_pack(&pack_data).unwrap();
+        assert_eq!(commit["message"], "packed write test");
+        assert_eq!(commit["index"], 0);
+
+        // Verify manifest is decodable
+        let manifest = CollectionManifest::decode(&manifest_bytes).expect("manifest should decode");
+        assert_eq!(manifest.row_groups.len(), 1);
+        assert_eq!(manifest.row_groups[0].n_rows, 3);
+
+        // Verify the PND2 data blob is decodable
+        let blob_hash = &manifest.row_groups[0].blob_hash;
+        let blob_data = kernel.read_blob(blob_hash).unwrap();
+        let cols = pond_core::pnd2_decode(&blob_data).unwrap();
+        assert_eq!(cols[0].i64_data, ids);
+        assert_eq!(cols[1].i64_data, scores);
+
+        // Verify only 2 blobs were written (1 pack + 1 data) — NOT 3 (commit + manifest + data)
+        // The pack replaces both commit and manifest with ONE blob
+        let all_blobs = kernel.list_names_prefix("blobs/");
+        assert_eq!(all_blobs.len(), 2, "packed write should create 2 blobs (pack + data), got {}", all_blobs.len());
     }
 }
