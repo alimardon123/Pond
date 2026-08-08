@@ -1,109 +1,62 @@
 # extensions/physical_structures/
 
-Acceleration structures — each is `f(snapshot) → artifact`.
+The universal storage backend + derived structures.
 
 ## Purpose
 
-Physical Structures accelerate access to data. They are deterministic
-functions of a snapshot: same snapshot → same structure. They can be
-lost without data loss (rebuildable). They can be shared across Lenses
-(Track 2 proved this).
-
-Think of them as **LLVM optimization passes**: each pass transforms
-intermediate representation for a specific purpose, but the IR stays
-the same. Here, the "IR" is the immutable byte graph; Physical
-Structures are derived artifacts that accelerate specific access
-patterns.
-
-## Type hierarchy
-
-```
-PhysicalStructure (abstract base — base.py)
-├── BloomFilter     — O(1) probabilistic membership test
-├── Statistics      — column min/max/null_count for range pruning
-│
-├── (pruning infrastructure — standalone, not PhysicalStructure subclasses)
-│   ├── ZoneMap (pruning.py)     — per-row-group {min, max, null_count} data class
-│   ├── ColumnPredicate           — single-column filter (=, !=, <, >, IN, BETWEEN)
-│   ├── PruningPredicate          — combines ColumnPredicates (AND/OR)
-│   ├── ZoneMapIndex              — ProllyTreeIndex of zone maps
-│   ├── PruningReader             — generic reader with zone-map pruning
-│   ├── ColumnChunkZoneMap        — per-column-chunk zone maps (finer pruning)
-│   ├── ColumnChunkStorage        — per-column-chunk blob storage (true I/O savings)
-│   └── EncodedChunkStorage       — FastLanes-style encoded chunk storage
-│
-└── (built into SDK core, not here)
-    └── ProllyTree Index — O(log N) point lookup (collection_index.py)
-        This is the "default" Physical Structure, used by every Lens.
-```
-
-Note: an earlier `ZoneMap` PhysicalStructure (in `zone_map.py`) was
-deleted as dead code — see `docs/DESIGN_REVIEW_2026_07_26.md` (C3).
-The active `ZoneMap` is the `@dataclass` in `pruning.py`.
-
-## Common interface
-
-Every Physical Structure implements (from `base.py`):
-
-| Method | Purpose |
-|---|---|
-| `build(kernel, collection, source_data)` | Create from data, store as kernel blob |
-| `load(kernel, collection)` | Read from kernel (returns dict or None) |
-| `exists(kernel, collection)` | Check if it exists (tombstone-aware) |
-| `delete(kernel, collection)` | Tombstone the ref (RFC-0008) |
-| `query(kernel, collection, *args)` | Type-specific query |
-| `verify(kernel, collection)` | Check validity |
-
-## Naming convention
-
-All structures use: `__{type_name}/{collection}`
-
-| Type | `type_name` | Ref example |
-|---|---|---|
-| BloomFilter | `bloom` | `__bloom/users` |
-| Statistics | `stats` | `__stats/users` |
-| ProllyTree Index | `index` (in auto_index.py) | `{name}__index__{index_name}` |
-
-Any Lens can resolve any of these refs. This is the cross-Lens sharing
-contract (Track 2 proved it works).
+Physical Structures are the storage layer that all lenses use. The main
+component is `UnifiedStorage` — the production storage engine that encodes
+data as PND2 blobs with CollectionManifest for pruning.
 
 ## Files
 
-| File | Class | Purpose |
-|---|---|---|
-| `base.py` | `PhysicalStructure` | Abstract base class. Defines the common interface. |
-| `bloom_filter.py` | `BloomFilter` | Probabilistic membership test. O(1) query. |
-| `statistics.py` | `Statistics` | Column-level min/max/null_count. |
-| `pruning.py` | `ZoneMap`, `ColumnPredicate`, `PruningPredicate` | Vortex-style pruning data structures. `ZoneMap` here is a `@dataclass` (min/max/null_count/row_count/column_chunks). |
-| `zone_map_index.py` | `ZoneMapIndex` | ProllyTreeIndex of zone maps. Stores min/max per data blob. |
-| `pruning_reader.py` | `PruningReader` | Generic reader with zone-map pruning. Skips blobs without decoding. |
-| `column_chunk_zone_map.py` | `ColumnChunkZoneMap`, `ColumnChunkStats` | Per-column-chunk zone maps for finer-grained pruning within surviving row groups. |
-| `column_chunk_storage.py` | `ColumnChunkStorage` | Per-column-chunk blob storage (true I/O savings on object storage). |
-| `encoding.py` | `ColumnEncoding`, `EncodingHeader`, `encode_column`, `eval_predicate_encoded`, `decode_surviving_values` | FastLanes-style structural encodings (RLE/Dict/Bitpack/Raw). |
-| `encoded_chunk_storage.py` | `EncodedChunkStorage` | Combines ColumnChunkStorage + encoding.py. Per-column-chunk encoded blobs with encoded predicate eval at read time. |
+| File | Purpose |
+|---|---|
+| `unified_storage.py` | **UnifiedStorage** — the production storage backend (PND2 + CollectionManifest + CRDT shards) |
+| `collection_manifest.py` | **CollectionManifest** — one manifest blob per commit (PMAN format) with per-column stats |
+| `stats_tree.py` | **StatsTreeReader** — PB-scale hierarchical stats index |
+| `embedded_stats.py` | **ColumnStats** + value-type constants |
+| `compression.py` | zstd / LZ4 transparent compression |
+| `encoding.py` | **ColumnEncoding** — RLE/Dict/Bitpack/Raw encoding with auto-selection |
+| `column_source.py` | **ColumnSource** — format-agnostic column access protocol |
+| `pond_pack.py` | **PondPack** — commit+manifest in ONE blob (saves 1-2 GETs per cold read) |
 
-## Usage
+## Architecture
 
-```python
-from extensions.physical_structures import BloomFilter, Statistics
-
-# Build (any Lens can build)
-BloomFilter.build(kernel, "users", ["user_1", "user_2", "user_3"])
-Statistics.build(kernel, "users", table_data)
-
-# Query (any Lens can query — Track 2 proved cross-Lens sharing)
-BloomFilter.query(kernel, "users", "user_2")     # → True
-Statistics.can_prune(stats, "age", 999)           # → True (skip chunk)
-
-# Delete (tombstone — doesn't affect other structures)
-BloomFilter.delete(kernel, "users")
+```
+Lens (KeyValue, Lakehouse, etc.)
+  ↓ uses
+UnifiedStorage (this directory)
+  ├── PND2 format (encoding.py + compression.py)
+  ├── CollectionManifest (collection_manifest.py)
+  ├── StatsTree (stats_tree.py — PB scale)
+  ├── PondPack (pond_pack.py — commit+manifest in one blob)
+  └── CRDT shards (upsert_shard, delete_shard, read_with_shards)
+  ↓ calls
+Kernel (Write, Read, Ref)
 ```
 
-## Adding a new Physical Structure type
+## Rust port status
 
-1. Create a new file in this directory (e.g., `histogram.py`).
-2. Subclass `PhysicalStructure` from `base.py`.
-3. Set `type_name` (used in the naming convention).
-4. Implement `build()`, `load()`, and `query()`.
-5. Add to `__init__.py` re-exports.
-6. No existing code needs to change.
+The Rust core (`core/`) has partial ports of these structures:
+- ✅ `CollectionManifest` — in `core/storage/src/manifest.rs`
+- ✅ `PondPack` — in `core/storage/src/pond_pack.rs`
+- ✅ `encoding` — in `core/codec/src/encode.rs` (RLE, DICT, BITPACK, RAW)
+- ✅ `compression` — zstd feature flag in `core/codec/`
+- ⚠️ `UnifiedStorage` — in `core/storage/` (partial — JSON storage, PND2 via write_rows_i64)
+- ❌ `StatsTree` — not ported (defer until PB-scale workloads)
+- ❌ `column_source` — not needed in Rust (uses concrete types)
+
+## Historical note
+
+The following files previously existed in this directory but have been
+**deleted** (moved to `archive/legacy-extensions/`):
+- `BloomFilter` — removed (stats in manifest provide sufficient pruning)
+- `Statistics` — consolidated into `CollectionManifest`
+- `ZoneMapIndex` — replaced by `CollectionManifest`
+- `PruningReader` — pruning now happens inside `UnifiedStorage.read()`
+- `column_chunk_storage.py` — replaced by PND2 row groups
+- `encoded_chunk_storage.py` — replaced by PND2 encodings
+- `base.py` — removed (PhysicalStructure abstract base is gone)
+
+These are kept in `archive/legacy-extensions/` for historical reference.

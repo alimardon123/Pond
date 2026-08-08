@@ -33,7 +33,13 @@ Usage:
     from extensions.semantic.ossie import SemanticLens, OssieAdapter
 
     # Physical Structure extensions
-    from extensions.physical_structures import BloomFilter, Statistics
+    from extensions.physical_structures.unified_storage import UnifiedStorage, PND2
+    from extensions.physical_structures.collection_manifest import CollectionManifest
+    from extensions.physical_structures.stats_tree import StatsTreeReader
+
+    # Indexing extensions
+    from extensions.indexing.collection_index import CollectionIndexer
+    from extensions.indexing.ivf_index import IVFIndex
 
     # Extension registry
     from extensions import list_extensions, load_extension
