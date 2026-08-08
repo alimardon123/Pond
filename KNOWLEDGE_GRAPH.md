@@ -385,6 +385,14 @@ for Go/Java/Node/C/C++/Zig SDK ports. The CLI is the DuckDB-philosophy binary.
 | `core/storage/src/maintenance.rs` | — | Maintenance: drop_name, is_dropped, resolve_active, compact_tombstones. |
 | `core/arrow/Cargo.toml` | — | PND2 → Arrow bridge crate. Deps: pond_codec, arrow. |
 | `core/arrow/src/lib.rs` | — | PND2 → Arrow direct conversion (near-zero copy). |
+| `extensions/indexing/rust/Cargo.toml` | — | IVF index crate (pond_vector_index). Deps: pond_kernel, pond_storage, pond_core. |
+| `extensions/indexing/rust/src/lib.rs` | — | **IVFIndex** — Inverted File index for ANN search. Bug 10 FIXED: per-cluster blob references so n_probe reduces I/O. K-means clustering + euclidean/cosine distance. 5 tests. |
+| `extensions/indexing/collection_index/Cargo.toml` | — | CollectionIndexer crate (pond_collection_index). Deps: pond_kernel, pond_storage. |
+| `extensions/indexing/collection_index/src/lib.rs` | — | **CollectionIndexer** — secondary indexes (JSON blob format). Multi-key support. build_index, lookup, drop_index, list_indexes, index_stats. 6 tests. |
+| `extensions/indexing/hnsw_index/Cargo.toml` | — | HNSW index crate (pond_hnsw_index). Deps: pond_kernel, pond_storage, pond_core. |
+| `extensions/indexing/hnsw_index/src/lib.rs` | — | **HNSWIndex** — Hierarchical Navigable Small World for O(log N) ANN. Multi-layer graph with geometric distribution, greedy search at upper layers, beam search at layer 0. Chunked storage (one blob per layer). L2 + cosine distance. 9 tests. |
+| `extensions/README.md` | — | Documents extensions directory: indexing (IVF, HNSW, CollectionIndexer), maintenance (GC). |
+| `extensions/indexing/README.md` | — | Documents indexing extensions: Rust crates + Python files. |
 | `cli/Cargo.toml` | 20 | CLI binary crate. Produces the `pond` executable. |
 | `cli/src/main.rs` | 480 | The `pond` CLI: init, write (JSON/file/stdin), read, branch, merge, history, ls, cat (with prefix matching), version. Uses clap for arg parsing. Single binary, ~1MB, DuckDB philosophy. |
 | `cli/tests/cli_integration.rs` | 170 | 10 integration tests: init, write/read JSON, write from file, write from stdin, dedup, ls, branch+merge, cat by prefix, version, persistence. All pass. |
