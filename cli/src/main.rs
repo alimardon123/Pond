@@ -76,6 +76,26 @@ enum Commands {
     Revert { collection: String, commit_hash: String },
     Ls,
     Cat { hash: String },
+    /// Garbage collect unreachable blobs.
+    /// Analyzes reachability and optionally deletes dead blobs.
+    Gc {
+        /// Compute dead blob sizes (slower — reads each dead blob)
+        #[arg(long)]
+        compute_size: bool,
+        /// Dry run — report what would be deleted without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Vacuum — delete unreachable blobs with time-travel safety.
+    /// Preserves commits younger than preserve_days.
+    Vacuum {
+        /// Keep commits younger than N days (default 0 = only current HEAD)
+        #[arg(short, long, default_value = "0")]
+        preserve_days: u32,
+        /// Dry run — report what would be deleted without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
     Version,
 }
 
@@ -134,6 +154,12 @@ fn main() {
                 }
                 Commands::Ls => { cmd_ls(&storage); }
                 Commands::Cat { hash } => { cmd_cat(&storage, &hash); }
+                Commands::Gc { compute_size, dry_run } => {
+                    cmd_gc(&storage, compute_size, dry_run);
+                }
+                Commands::Vacuum { preserve_days, dry_run } => {
+                    cmd_vacuum(&storage, preserve_days, dry_run);
+                }
                 _ => unreachable!(),
             }
         }
@@ -608,3 +634,61 @@ fn cmd_cat(storage: &UnifiedStorage, hash: &str) {
 }
 
 use std::fs;
+
+/// Garbage collect — analyze reachability and optionally delete dead blobs.
+fn cmd_gc(storage: &UnifiedStorage, compute_size: bool, dry_run: bool) {
+    let kernel = storage.kernel();
+    let gc = pond_storage::maintenance::GarbageCollector::new(kernel);
+
+    let stats = gc.collect(None, compute_size);
+
+    println!("GC Analysis:");
+    println!("  Live blobs:     {}", stats.live);
+    println!("  Dead blobs:     {}", stats.dead);
+
+    if stats.dead_size_bytes >= 0 {
+        println!("  Dead size:      {} bytes", stats.dead_size_bytes);
+    } else {
+        println!("  Dead size:      (use --compute-size to calculate)");
+    }
+
+    if dry_run && stats.dead > 0 {
+        println!("\n  (dry run — no blobs deleted)");
+        println!("  Would delete {} blobs:", stats.dead);
+        for hash in stats.dead_hashes.iter().take(20) {
+            println!("    {}", hash);
+        }
+        if stats.dead > 20 {
+            println!("    ... and {} more", stats.dead - 20);
+        }
+    } else if stats.dead > 0 {
+        let result = gc.vacuum(None, 0, false);
+        println!("\nVacuumed: deleted {} blobs, preserved {}", result.deleted, result.preserved);
+    } else {
+        println!("\nNo dead blobs to clean up.");
+    }
+}
+
+/// Vacuum — delete dead blobs with time-travel safety.
+fn cmd_vacuum(storage: &UnifiedStorage, preserve_days: u32, dry_run: bool) {
+    let kernel = storage.kernel();
+    let gc = pond_storage::maintenance::GarbageCollector::new(kernel);
+
+    // First analyze
+    let stats = gc.collect(None, false);
+    println!("Before vacuum:");
+    println!("  Live blobs: {}", stats.live);
+    println!("  Dead blobs: {}", stats.dead);
+
+    if dry_run {
+        println!("\n  (dry run — no blobs deleted)");
+        println!("  Would delete {} blobs (preserving last {} days)", stats.dead, preserve_days);
+    } else if stats.dead > 0 {
+        let result = gc.vacuum(None, preserve_days, false);
+        println!("\nVacuum complete:");
+        println!("  Deleted:   {} blobs", result.deleted);
+        println!("  Preserved: {} blobs", result.preserved);
+    } else {
+        println!("\nNo dead blobs to vacuum.");
+    }
+}
