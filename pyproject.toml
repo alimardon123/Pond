@@ -32,5 +32,4 @@ test = ["pytest", "pyarrow"]
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "pond"
-python-source = "python"
 manifest-path = "bindings/python/pyo3/Cargo.toml"
