@@ -19,5 +19,8 @@ pond_core = { path = "../../../core/codec", features = ["zstd"] }
 pond_kernel = { path = "../../../core/kernel" }
 pond_storage = { path = "../../../core/storage" }
 pond_s3 = { path = "../../../core/s3", optional = true }
+pond_vector_index = { path = "../../../extensions/indexing/rust" }
+pond_collection_index = { path = "../../../extensions/indexing/collection_index" }
+pond_hnsw_index = { path = "../../../extensions/indexing/hnsw_index" }
 pyo3 = { version = "0.22", features = ["extension-module"] }
 serde_json = "1"

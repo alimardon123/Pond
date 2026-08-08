@@ -833,6 +833,316 @@ impl Storage {
     }
 }
 
+// ===========================================================================
+// IVFIndex — PyO3 wrapper for Rust IVF index (Bug 10 fixed)
+// ===========================================================================
+
+use pond_vector_index::IVFIndex as RustIVFIndex;
+use serde_json::Value as JsonValue;
+
+/// IVF (Inverted File) index for approximate nearest neighbor search.
+///
+/// This is the Rust implementation with Bug 10 fixed — stores per-cluster
+/// blob references so n_probe actually reduces I/O.
+///
+/// # Example (Python)
+/// ```python
+/// from pond import Storage, IVFIndex
+///
+/// ivf = IVFIndex("/var/lib/pond")
+/// ivf.build("vectors", n_clusters=10, metric="euclidean")
+/// results = ivf.search("vectors", [0.1, 0.2, ...], k=10, n_probe=5)
+/// ```
+#[pyclass]
+struct IVFIndex {
+    storage: Storage,
+}
+
+#[pymethods]
+impl IVFIndex {
+    /// Create a new IVFIndex bound to a storage path or S3 URL.
+    ///
+    /// Args:
+    ///   - location: Local path or S3 URL (same as Storage constructor)
+    ///   - access_key: Optional S3 access key
+    ///   - secret_key: Optional S3 secret key
+    ///   - region: Optional S3 region
+    ///   - endpoint: Optional S3 endpoint
+    #[new]
+    #[pyo3(signature = (location, access_key=None, secret_key=None, region=None, endpoint=None))]
+    fn new(
+        location: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        region: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> PyResult<Self> {
+        let storage = Storage::new(location, access_key, secret_key, region, endpoint)?;
+        Ok(Self { storage })
+    }
+
+    /// Build an IVF index for a collection.
+    fn build(&self, collection: &str, n_clusters: usize, metric: &str) -> PyResult<String> {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let ivf = RustIVFIndex::new(kernel);
+        ivf.build(collection, n_clusters, metric)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+    }
+
+    /// Search for k nearest neighbors using the IVF index.
+    fn search(&self, py: Python<'_>, collection: &str, query: Vec<f64>, k: usize, n_probe: usize) -> PyResult<PyObject> {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let ivf = RustIVFIndex::new(kernel);
+        let results = ivf.search(collection, &query, k, n_probe)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+        let list = PyList::new_bound(py, results.iter().map(|(dist, id)| {
+            PyTuple::new_bound(py, [dist.to_object(py), id.to_object(py)]).into_any()
+        }));
+        Ok(list.into())
+    }
+
+    /// Get index statistics. Returns None if no index exists.
+    fn stats(&self, py: Python<'_>, collection: &str) -> PyResult<PyObject> {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let ivf = RustIVFIndex::new(kernel);
+        match ivf.stats(collection) {
+            Some(stats) => {
+                let dict = PyDict::new_bound(py);
+                dict.set_item("n_dims", stats.n_dims)?;
+                dict.set_item("n_clusters", stats.n_clusters)?;
+                dict.set_item("metric", &stats.metric)?;
+                dict.set_item("total_vectors", stats.total_vectors)?;
+                dict.set_item("total_blob_refs", stats.total_blob_refs)?;
+                Ok(dict.into())
+            }
+            None => Ok(py.None()),
+        }
+    }
+}
+
+// ===========================================================================
+// HNSWIndex — PyO3 wrapper for Rust HNSW index
+// ===========================================================================
+
+use pond_hnsw_index::HNSWIndex as RustHNSWIndex;
+
+/// HNSW (Hierarchical Navigable Small World) index for ANN search.
+///
+/// O(log N) search — better than IVF for high-recall at low latency.
+///
+/// # Example (Python)
+/// ```python
+/// from pond import HNSWIndex
+///
+/// hnsw = HNSWIndex("/var/lib/pond")
+/// hnsw.build("vectors", m=16, ef_construction=200, metric="l2")
+/// results = hnsw.search("vectors", [0.1, 0.2, ...], k=10, ef=50)
+/// ```
+#[pyclass]
+struct HNSWIndex {
+    storage: Storage,
+}
+
+#[pymethods]
+impl HNSWIndex {
+    #[new]
+    #[pyo3(signature = (location, access_key=None, secret_key=None, region=None, endpoint=None))]
+    fn new(
+        location: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        region: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> PyResult<Self> {
+        let storage = Storage::new(location, access_key, secret_key, region, endpoint)?;
+        Ok(Self { storage })
+    }
+
+    /// Build the HNSW index for a collection.
+    #[pyo3(signature = (collection, m=16, ef_construction=200, metric="l2"))]
+    fn build(&self, collection: &str, m: usize, ef_construction: usize, metric: &str) -> PyResult<String> {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let hnsw = RustHNSWIndex::new(kernel);
+        hnsw.build(collection, m, ef_construction, None, metric)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+    }
+
+    /// Search for k nearest neighbors using HNSW.
+    #[pyo3(signature = (collection, query, k=10, ef=50))]
+    fn search(&self, py: Python<'_>, collection: &str, query: Vec<f64>, k: usize, ef: usize) -> PyResult<PyObject> {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let hnsw = RustHNSWIndex::new(kernel);
+        let results = hnsw.search(collection, &query, k, ef)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+        let list = PyList::new_bound(py, results.iter().map(|(dist, id)| {
+            PyTuple::new_bound(py, [dist.to_object(py), id.to_object(py)]).into_any()
+        }));
+        Ok(list.into())
+    }
+
+    /// Get index statistics. Returns None if no index exists.
+    fn stats(&self, py: Python<'_>, collection: &str) -> PyResult<PyObject> {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let hnsw = RustHNSWIndex::new(kernel);
+        match hnsw.stats(collection) {
+            Some(stats) => {
+                let dict = PyDict::new_bound(py);
+                dict.set_item("n_vectors", stats.n_vectors)?;
+                dict.set_item("max_layer", stats.max_layer)?;
+                dict.set_item("m", stats.m)?;
+                dict.set_item("metric", &stats.metric)?;
+                Ok(dict.into())
+            }
+            None => Ok(py.None()),
+        }
+    }
+}
+
+// ===========================================================================
+// CollectionIndexer — PyO3 wrapper for Rust secondary index
+// ===========================================================================
+
+use pond_collection_index::CollectionIndexer as RustCollectionIndexer;
+
+/// Collection-level secondary indexes.
+///
+/// # Example (Python)
+/// ```python
+/// from pond import CollectionIndexer
+///
+/// idx = CollectionIndexer("/var/lib/pond")
+/// idx.build_index("users", "by_name", [("user:1", {"name": "alice"})], "name")
+/// rowid = idx.lookup("users", "by_name", "alice")  # → "user:1"
+/// ```
+#[pyclass]
+struct CollectionIndexer {
+    storage: Storage,
+}
+
+#[pymethods]
+impl CollectionIndexer {
+    #[new]
+    #[pyo3(signature = (location, access_key=None, secret_key=None, region=None, endpoint=None))]
+    fn new(
+        location: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        region: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> PyResult<Self> {
+        let storage = Storage::new(location, access_key, secret_key, region, endpoint)?;
+        Ok(Self { storage })
+    }
+
+    /// Build an index on a collection.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - index_name: Name for this index
+    ///   - rows: List of (rowid, row_dict) tuples
+    ///   - key_field: The field in row_dict to index
+    ///
+    /// Returns:
+    ///   The index blob hash.
+    fn build_index(
+        &self,
+        collection: &str,
+        index_name: &str,
+        rows: Vec<(String, PyObject)>,
+        key_field: &str,
+    ) -> PyResult<String> {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let indexer = RustCollectionIndexer::new(kernel);
+
+        let rust_rows: Vec<(String, JsonValue)> = rows.into_iter()
+            .map(|(rowid, obj)| {
+                let val: JsonValue = python_to_json(&obj);
+                (rowid, val)
+            })
+            .collect();
+
+        indexer.build_index(collection, index_name, &rust_rows, |row| {
+            match row.get(key_field) {
+                Some(JsonValue::String(s)) => vec![s.clone()],
+                Some(JsonValue::Number(n)) => vec![n.to_string()],
+                Some(JsonValue::Array(arr)) => arr.iter()
+                    .filter_map(|v| match v {
+                        JsonValue::String(s) => Some(s.clone()),
+                        JsonValue::Number(n) => Some(n.to_string()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => vec![],
+            }
+        }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+    }
+
+    /// Look up a single rowid by index key. Returns None if not found.
+    fn lookup(&self, collection: &str, index_name: &str, index_key: &str) -> Option<String> {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let indexer = RustCollectionIndexer::new(kernel);
+        indexer.lookup(collection, index_name, index_key)
+    }
+
+    /// Drop an index. Returns True if the index existed and was dropped.
+    fn drop_index(&self, collection: &str, index_name: &str) -> bool {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let indexer = RustCollectionIndexer::new(kernel);
+        indexer.drop_index(collection, index_name)
+    }
+
+    /// List all active indexes for a collection.
+    fn list_indexes(&self, collection: &str) -> Vec<String> {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let indexer = RustCollectionIndexer::new(kernel);
+        indexer.list_indexes(collection)
+    }
+
+    /// Check if an index exists and is active.
+    fn index_exists(&self, collection: &str, index_name: &str) -> bool {
+        let storage = self.storage.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let indexer = RustCollectionIndexer::new(kernel);
+        indexer.index_exists(collection, index_name)
+    }
+}
+
+/// Convert a Python object to a serde_json::Value.
+fn python_to_json(obj: &PyObject) -> JsonValue {
+    Python::with_gil(|py| {
+        if let Ok(s) = obj.extract::<String>(py) {
+            JsonValue::String(s)
+        } else if let Ok(i) = obj.extract::<i64>(py) {
+            JsonValue::Number(serde_json::Number::from(i))
+        } else if let Ok(f) = obj.extract::<f64>(py) {
+            serde_json::Number::from_f64(f).map(JsonValue::Number).unwrap_or(JsonValue::Null)
+        } else if let Ok(b) = obj.extract::<bool>(py) {
+            JsonValue::Bool(b)
+        } else if let Ok(dict) = obj.extract::<std::collections::HashMap<String, PyObject>>(py) {
+            let map: serde_json::Map<String, JsonValue> = dict.into_iter()
+                .map(|(k, v)| (k, python_to_json(&v)))
+                .collect();
+            JsonValue::Object(map)
+        } else if let Ok(list) = obj.extract::<Vec<PyObject>>(py) {
+            JsonValue::Array(list.into_iter().map(|item| python_to_json(&item)).collect())
+        } else {
+            JsonValue::Null
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Python module definition
 // ---------------------------------------------------------------------------
@@ -842,5 +1152,8 @@ fn pond(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_class::<Storage>()?;
+    m.add_class::<IVFIndex>()?;
+    m.add_class::<HNSWIndex>()?;
+    m.add_class::<CollectionIndexer>()?;
     Ok(())
 }

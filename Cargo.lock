@@ -1135,10 +1135,13 @@ dependencies = [
 name = "pond_python"
 version = "0.3.0"
 dependencies = [
+ "pond_collection_index",
  "pond_core",
+ "pond_hnsw_index",
  "pond_kernel",
  "pond_s3",
  "pond_storage",
+ "pond_vector_index",
  "pyo3",
  "serde_json",
 ]
