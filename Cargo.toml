@@ -12,6 +12,7 @@ members = [
     "lenses/streaming/rust",
     "lenses/oltp/rust",
     "lenses/lakehouse/rust",
+    "lenses/vector/rust",
     "extensions/indexing/rust",
     "extensions/indexing/collection_index",
     "extensions/indexing/hnsw_index",
