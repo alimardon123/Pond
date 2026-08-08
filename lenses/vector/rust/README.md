@@ -1,19 +1,15 @@
 # lenses/vector/rust/
 
-Placeholder for the Rust reference implementation of VectorLens.
+Placeholder for a future Rust port of VectorLens.
+
+The IVF index implementation lives in `extensions/indexing/rust/` (not here)
+because it's an extension, not a lens. VectorLens would use the IVF index
+extension, just like the Python VectorLens uses the Python IVF extension.
 
 ## Status
 
-**Not yet ported.** The current production implementation is Python-only
-(see `../python/vector_lens.py`).
+**Not yet ported.** The Python implementation (`../python/vector_lens.py`)
+is the production reference.
 
-## Migration plan
-
-When this lens is ported to Rust:
-1. Implement the lens logic in Rust, calling `pond_kernel` and `pond_storage`
-   directly (no Python dependency).
-2. Expose the lens via `lenses/base/pond_lens.h` C ABI.
-3. The Python wrapper in `../python/` becomes a thin PyO3 binding to this
-   Rust implementation.
-
-The first lens to be ported will be KeyValueLens (simplest API surface).
+The IVF index (with Bug 10 fixed) is available at:
+`extensions/indexing/rust/` — `IVFIndex` with per-cluster blob references.
