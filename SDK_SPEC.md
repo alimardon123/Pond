@@ -1,728 +1,393 @@
 # Pond SDK Specification
 
-> **Status:** Authoritative contract for the Pond SDK. Every method
-> signature, return shape, and behavior in this document is
-> checkable; violations are bugs.
+> **Status:** This document describes the CURRENT state of the Pond SDK
+> (August 2026). It replaces the previous version which described APIs
+> that no longer exist.
 >
-> **Audience:** Lens authors (both human and AI agents) building
-> Lenses on top of `bindings/python/sdk/`. If you read only one SDK document,
-> read this one.
->
-> **Source of truth:** This document supersedes informal descriptions
-> in `docs/LENS_GUIDE.md`. Where the two disagree, this document is
-> correct.
+> For migration status, see [`docs/STATUS.md`](docs/STATUS.md).
 
 ---
 
-## 0. What this document settles
+## 1. Architecture
 
-This document settles 13 ambiguities (A–M) that caused friction when
-external validators tried to build Lenses from the SDK spec alone.
+```
+Lenses (KV, Vector, Streaming, Lakehouse, OLTP)
+  ↓ compose
+UnifiedStorage (Rust core or Python reference)
+  ↓
+Kernel (3 ops: Write, Read, Ref)
+  ↓
+ObjectStore trait
+  ├── LocalFSObjectStore (Rust)
+  ├── S3ObjectStore (Rust, SigV4 from scratch)
+  └── InMemoryObjectStore (Python, testing)
+```
 
-| ID | Ambiguity | Settled in section |
+### Two implementations
+
+| Implementation | Path | Status |
 |---|---|---|
-| A | How is a kernel obtained? | §1.1 |
-| B | Index extractor call signature | §4.2 |
-| C | `get()` complexity | §3.2 |
-| D | Merge semantics | §6.1 |
-| E | Index persistence and naming | §4.4 |
-| F | `drop_index` / `unregister_index` | §4.5 |
-| G | `diff(a, b)` parameter types | §6.3 |
-| H | `history()` return shape | §6.2 |
-| I | `put_raw` semantics | §2.3 |
-| J | Commit object format | §7 |
-| K | Multi-key (multi-valued) indexes | §4.2.1 |
-| L | Auto-key mode and primary-keyless Lenses | §2.6 |
-| M | Cross-Lens read/write semantics | §8.1 |
+| **Rust core** (canonical) | `core/` | Production for storage, CLI, C ABI |
+| **Python reference** | `bindings/python/` | Production for lenses, maintained for bugs |
+
+The Rust core handles: kernel, storage (versioning, branching, shards),
+PND2 codec, S3, CLI, C ABI. The Python SDK handles: lenses (KeyValue,
+Lakehouse, Streaming, Vector, OLTP), extensions (indexing, semantic).
+
+Python calls Rust via PyO3 (`pond.Storage`, `pond.decode`, `pond.encode`).
+Other languages call Rust via the C ABI (`pond.h`).
 
 ---
 
-## 1. Obtaining a kernel (Ambiguity A)
-
-### 1.1. Constructor contract
-
-```python
-from kernel import PondMinimal
-
-kernel = PondMinimal(base_dir: str)
-```
-
-`PondMinimal(base_dir)` constructs and returns a kernel instance. It
-is NOT a factory; it IS the kernel. The `base_dir` is the filesystem
-path where the kernel stores its object store and root namespace
-SQLite database. The kernel creates `base_dir/.pond/` if it does not
-exist.
-
-### 1.2. What the kernel provides
-
-The kernel exposes exactly 3 core primitives plus 3 supporting
-operations:
-
-| Method | Signature | Purpose |
-|---|---|---|
-| `write(data: bytes) -> str` | core | Create an immutable content-addressed blob. Returns its 64-char hex SHA-256 hash. |
-| `read(hash_or_name: str) -> bytes` | core | Read a blob by hash, or resolve a name then read. |
-| `reference(name: str, hash: str) -> None` | core | Set a mutable name→hash mapping. The ONLY mutable operation. **Validates that `hash` refers to an existing blob** — raises `ValueError` if not. |
-| `resolve(name: str) -> str \| None` | supporting | Resolve a name to its current hash. Returns `None` if unbound. |
-| `list_names() -> list[str]` | supporting | List all names in the root namespace. |
-| `read_blob(hash: str) -> bytes` | supporting | Read a blob by hash directly (no name resolution). Performance shortcut. |
-
-The 3 supporting operations are pure derivations of the 3 core
-primitives. They do not extend the kernel's algebra. See
-`docs/POND_FORMAL_ALGEBRAS.md` §9 for the formal substrate specification.
-
-> **⚠ Important consequence of `reference()` validation:** you cannot
-> bind a name to a hash whose blob does not exist on disk. This
-> matters for tombstones (see §4.5, §8): `drop_name` handles this
-> for you by pre-writing the tombstone marker blob before rebinding.
-> Do NOT call `kernel.reference(name, TOMBSTONE_HASH)` directly
-> without first writing the marker blob — it will raise
-> `ValueError`.
-
-### 1.3. Terminology
-
-The preferred term is **KeyValueLens** (the app-facing KEY-VALUE
-lens). Two legacy aliases are kept for backward compatibility:
-  - `Lens`  = `KeyValueLens`  (old class name)
-  - `View`  = `KeyValueLens`  (older class name)
-
-All three names refer to the same class and are interchangeable.
-New code should use `KeyValueLens`. The class lives in
-`lenses/keyvalue/keyvalue_lens.py`.
-
-KeyValueLens is NOT the universal base class — that's `PondLens`
-in `bindings/python/sdk/base_lens.py`. KeyValueLens is a peer of `LakehouseLens`,
-`VectorLens`, `StreamingLens`, and `OLTPLens`.
-
-> **Honesty note (updated Task 66).** All 5 production lenses now
-> extend `PondLens` directly:
->
-> | Lens | Class declaration | Extends `PondLens`? |
-> |---|---|---|
-> | `KeyValueLens` | `class KeyValueLens(PondLens):` | ✅ Yes |
-> | `VectorLens`   | `class VectorLens(PondLens):`   | ✅ Yes |
-> | `StreamingLens`| `class StreamingLens(PondLens):`| ✅ Yes |
-> | `LakehouseLens`| `class LakehouseLens(PondLens):` | ✅ Yes (fixed in Tier 0 — Task 66) |
-> | `OLTPLens`     | `class OLTPLens(PondLens):`     | ✅ Yes (fixed in Tier 0 — Task 66) |
->
-> All 5 production lenses now extend `PondLens` directly. `KeylessLens`
-> in `lenses/keyvalue/keyvalue_lens.py` is a documented exception — it
-> subclasses `KeyValueLens` to auto-generate UUIDv7 keys, which is a
-> legitimate variant pattern (same file, thin override of `put()`).
-
-No production lens inherits from another lens.
-
-### 1.4. Constructing a Lens
-
-KeyValueLens is collection-agnostic (like all Pond lenses). Pass the
-collection name to each operation:
-
-```python
-from keyvalue_lens import KeyValueLens
-
-lens = KeyValueLens(kernel)  # NOT bound to a collection
-lens.put("users", "user:1", {"name": "alice"})
-lens.get("users", "user:1")
-lens.commit("users", "insert alice")
-```
-
-Backward compat: `KeyValueLens(kernel, "users")` still works — the
-name binds to a default collection. Old code using `lens.put(key, data)`
-continues to work via this compat layer.
-
-For indexing, use CollectionMetadata (data-side, not lens-side):
-```python
-from collection_metadata import CollectionMetadata
-meta = CollectionMetadata(kernel)
-meta.build_index("users", "by_name",
-                 extractor=lambda r: r["name"],
-                 scan_fn=lambda: ((k, lens.get("users", k)) for k in lens.keys("users")))
-rowid = meta.lookup_index("users", "by_name", "alice")
-row = lens.get("users", rowid)
-```
-
-The collection name appears in:
-- The HEAD reference: `collections/{name}/HEAD` → latest commit hash.
-- Branch references: `collections/{name}/branches/{branch}`.
-- Index references: `collections/{name}/indexes/{index_name}`.
-- Zone map references: `collections/{name}/zone_maps`.
-- Definition reference: `collections/{name}/definition` (optional metadata).
-
-### 1.5. Lifetime
-
-The kernel holds an open SQLite connection. Call `kernel.close()` to
-release it. The kernel IS thread-safe as of Tier 0 (Task 66) — the
-SQLite connection uses `check_same_thread=False` and all mutations are
-guarded by a `threading.RLock`. This allows `UnifiedStorage`'s
-`ThreadPoolExecutor` to call the kernel from worker threads.
-
----
-
-## 2. Writing data (Ambiguity I: `put_raw`)
-
-### 2.1. `put(key, data) -> str`
-
-```python
-lens.put(key: str, data: Any) -> str
-```
-
-Stages a key→blob mapping for the next commit. The data is encoded
-via `lens.encode(data)` (default: JSON), written to the kernel as a
-blob, and the resulting hash is staged under `key`. Returns the
-blob hash.
-
-This is the standard write path. The data passes through `encode`;
-the Lens does NOT see the raw bytes.
-
-### 2.2. `delete(key) -> None`
-
-```python
-lens.delete(key: str) -> None
-```
-
-Stages a deletion for `key`. The deletion is NOT immediate; it
-takes effect on the next `commit()`. Internally, this stages a
-tombstone (see §8 and RFC-0008 in `docs/archive/rfcs/`).
-
-### 2.3. `put_raw(key, blob_hash) -> None` (Ambiguity I)
-
-```python
-lens.put_raw(key: str, blob_hash: str) -> None
-```
-
-Stages a key→blob mapping **without encoding**. The `blob_hash` must
-refer to an already-written blob. This is the "raw bytes" write
-path — the Lens does NOT call `encode`; it stages a pre-existing
-blob hash directly.
-
-Use cases:
-- **Cross-Lens blob sharing:** Lens A writes a blob; Lens B wants
-  to reference the same blob under a different key without copying.
-- **Pre-computed blobs:** the application has already encoded the
-  data (e.g., Parquet bytes) and wants to stage the hash directly.
-
-### 2.4. `commit(message) -> str`
-
-```python
-commit_hash = lens.commit(message: str = "") -> str
-```
-
-Atomically commits all staged puts and deletes. Returns the new
-commit hash. The commit is atomic: either all staged changes are
-applied, or none are. After commit, the staging area is cleared.
-
-The commit creates a new commit blob in the kernel containing:
-- `parent`: the previous HEAD commit hash (or `None` for the first commit)
-- `second_parent`: the second parent for merge commits (or `None`)
-- `snapshot`: the Prolly tree root hash (for snapshot commits)
-- `delta`: the staged changes (for delta commits)
-- `message`: the commit message
-- `timestamp`: wall-clock time
-- `index`: commit sequence number
-
-See §7 for the full commit object format.
-
-### 2.5. Naming conventions
-
-The kernel's root namespace is flat. The following naming conventions
-are used by the SDK:
-
-| Pattern | Purpose | Example |
-|---|---|---|
-| `collections/{name}/HEAD` | HEAD commit reference (shared namespace) | `collections/analytics/orders/HEAD` |
-| `collections/{name}/branches/{branch}` | Branch reference | `collections/analytics/orders/branches/dev` |
-| `collections/{name}/definition` | Optional lens-specific metadata | `collections/analytics/orders/definition` |
-| `collections/{name}/snapshot` | Latest snapshot pointer (legacy `ProllyLensBase`; production reads use `collections/{name}/HEAD` → PNPK pack → manifest) | `collections/analytics/orders/snapshot` |
-| `{name}__index__{index}` | Index reference (legacy convention) | `analytics/orders__index__by_region` |
-| `__schema/{name}/v{version}` | Schema version (Schema Registry) | `__schema/user_features/v1` |
-| `__stats/{name}` | Statistics (Physical Structure) | `__stats/users` |
-| `__bloom/{name}` | Bloom filter (Physical Structure) | `__bloom/user_features` |
-
-### 2.6. Auto-key mode and primary-keyless Lenses (Ambiguity L)
-
-```python
-key = lens.put_auto(data: Any) -> str
-```
-
-Stages data with an auto-generated primary key (UUID4 hex, 32 chars).
-Returns the generated key. Use this when your data does not have a
-natural primary key (event logs, time-series, append-only streams).
-
-For primary-keyless Lenses (where every entry is append-only and
-looked up by scan, not by key), use `KeylessLens` (in
-`bindings/python/sdk/keyvalue_lens.py`):
-
-```python
-from keyvalue_lens import KeylessLens
-
-lens = KeylessLens(kernel, "events")
-lens.put(None, {"event": "click", "user": "u1", "ts": 1721500000})
-```
-
----
-
-## 3. Reading data
-
-### 3.1. `get(key) -> Any`
-
-```python
-data = lens.get(key: str) -> Any
-```
-
-Reads the value for `key` from the current HEAD. Returns `None` if
-the key does not exist or has been deleted. The blob is read from
-the kernel and decoded via `lens.decode(bytes)`.
-
-### 3.2. `get()` complexity (Ambiguity C)
-
-- **`KeyValueLens` (the app-facing KV lens):** O(log N) point lookup
-  in the legacy Prolly-tree path; the production path uses
-  `UnifiedStorage.point_lookup` which reads the collection manifest
-  (PMAN / PNPK pack) and fetches a single data blob — O(1) GETs for
-  the warm path, O(2-3) GETs cold. This is the only KV lens class;
-  `Lens` and `View` are aliases for it.
-- **`UnifiedStorage` (the production storage backend):** the actual
-  universal storage backend lives at
-  `bindings/python/sdk/extensions/physical_structures/unified_storage.py`
-  (5,540 LOC). It is NOT `bindings/python/sdk/prolly_tree.py` — that file does
-  NOT exist in the production SDK (it lives in
-  `archive/legacy-sdk/prolly_tree.py` as historical reference).
-  `UnifiedStorage.point_lookup` reads the manifest, finds the row
-  group containing the key, and fetches only that row group.
-
-**Recommendation:** extend `KeyValueLens` for production KV lenses.
-For auto-indexing, extend `IndexedLens` (in `auto_index.py`), which
-adds eager/lazy auto-index management on top of the same Prolly
-tree storage.
-
-### 3.3. `get_all() -> dict`
-
-```python
-all_data = lens.get_all() -> dict[str, Any]
-```
-
-Returns all key→value pairs in the current HEAD. O(N) — reads the
-entire snapshot.
-
-### 3.4. `find_by(index_name, value) -> list`
-
-```python
-results = lens.find_by(index_name: str, value: Any) -> list
-```
-
-Finds all keys whose indexed value matches `value`. Requires that
-index `index_name` has been created (see §4). O(log N) lookup via
-the index's Prolly tree, then O(K) to fetch K matching blobs.
-
----
-
-## 4. Index management
-
-### 4.1. `create_index(name, extractor) -> str`
-
-```python
-index_hash = lens.create_index(
-    name: str,
-    extractor: Callable[[str, bytes], Any]
-) -> str
-```
-
-Builds a secondary index. The `extractor` is called for each
-(key, blob_bytes) pair in the current snapshot and returns the
-indexed value. The index is stored as a Prolly tree mapping
-`indexed_value → blob_hash`.
-
-**Important:** `create_index` works on METADATA ONLY. It does NOT
-touch data blobs. It scans the snapshot once, builds the index tree,
-and stores it as a new blob. Data blobs are immutable and never
-rewritten.
-
-### 4.2. Index extractor signature (Ambiguity B)
-
-```python
-def extractor(key: str, blob_bytes: bytes) -> Any:
-    # key: the key under which the blob is stored
-    # blob_bytes: the raw blob bytes (NOT decoded)
-    # returns: the value to index on
-    ...
-```
-
-The extractor receives RAW bytes, not decoded data. This is because
-the index is a Physical Structure (kernel-level), not a Lens-level
-construct. The extractor must parse the bytes itself if it needs
-structured data.
-
-**Example:**
-```python
-def extract_region(key: str, blob_bytes: bytes) -> str:
-    row = json.loads(blob_bytes)  # parse JSON
-    return row.get("region", "")
-
-lens.create_index("by_region", extract_region)
-```
-
-### 4.2.1. Multi-key indexes (Ambiguity K)
-
-For multi-valued indexes (where one row maps to multiple index
-values), the extractor returns a `list`:
-
-```python
-def extract_tags(key: str, blob_bytes: bytes) -> list:
-    row = json.loads(blob_bytes)
-    return row.get("tags", [])  # multiple values per row
-
-lens.create_index("by_tag", extract_tags)
-```
-
-The index stores each (value, key) pair separately. `find_by("by_tag",
-"python")` returns all keys whose `tags` list contains `"python"`.
-
-### 4.3. `find_by_index(name, value)` — alias for `find_by`
-
-```python
-results = lens.find_by_index(name: str, value: Any) -> list
-```
-
-Alias for `find_by(name, value)` (see §3.4).
-
-### 4.4. Index persistence and naming (Ambiguity E)
-
-Indexes are persisted as kernel blobs, referenced by:
-```
-{name}__index__{index_name}
-```
-
-For example, if the Lens name is `analytics/orders` and the index
-name is `by_region`, the index reference is:
-```
-analytics/orders__index__by_region
-```
-
-The index blob is a serialized Prolly tree (binary format, see
-`archive/legacy-sdk/binary_encoding.py` for the historical reference
-encoding; production indexes use `UnifiedStorage`'s PND2 column
-encoding). The tree maps `indexed_value → blob_hash`.
-
-### 4.5. `drop_index` / `unregister_index` (Ambiguity F)
-
-```python
-from maintenance import drop_name
-
-drop_name(kernel, f"{name}__index__{index_name}")
-```
-
-Dropping an index uses the **tombstone pattern** (RFC-0008): the
-index reference is rebound to a tombstone marker blob. The index
-blob itself becomes unreachable and is collected by GC.
-
-**Do NOT** call `kernel.reference(name, TOMBSTONE_HASH)` directly —
-the kernel validates that the hash exists. Use `drop_name` from
-`bindings/python/sdk/maintenance.py`, which pre-writes the tombstone marker.
-
-### 4.6. `refresh_index(name, extractor)`
-
-```python
-lens.refresh_index(name: str, extractor: Callable) -> str
-```
-
-Rebuilds an existing index from the current snapshot. METADATA ONLY
-— data blobs are not touched. The old index blob becomes unreachable;
-the new index blob is stored and referenced.
-
-### 4.7. `list_indexes() -> list`
-
-```python
-index_names = lens.list_indexes() -> list[str]
-```
-
-Returns the names of all indexes for this Lens. Scans the kernel's
-root namespace for `{name}__index__*` references.
-
----
-
-## 5. Branching and merging
-
-### 5.1. `branch(name) -> str`
-
-```python
-head_hash = lens.branch(name: str) -> str
-```
-
-Creates a new branch pointing at the current HEAD. O(1) — no data
-is copied. The branch is stored as a kernel reference:
-`{lens_name}__branch__{name}`.
-
-### 5.2. `checkout(name) -> None`
-
-```python
-lens.checkout(name: str) -> None
-```
-
-Switches the Lens's HEAD to point at the named branch. Subsequent
-commits go to the branch, not the main HEAD.
-
-### 5.3. `merge(branch_name) -> str` (Ambiguity D)
-
-```python
-merge_hash = lens.merge(branch_name: str) -> str
-```
-
-Merges a branch into the current HEAD. Creates a merge commit with
-TWO parents (`parent` = current HEAD, `second_parent` = branch HEAD).
-
-**Merge semantics:** the default merge is **union, last-writer-wins**.
-The merged state is the union of both branches' key→value mappings;
-where both branches modified the same key, the branch's value wins.
-
-**Custom merge:** subclasses can override `merge()` to implement
-3-way merge, CRDT merge, or domain-specific merge. The kernel only
-records the topology (2-parent commit); the Lens defines the
-semantics.
-
-### 5.4. `list_branches() -> list`
-
-```python
-branches = lens.list_branches() -> list[str]
-```
-
-Returns the names of all branches for this Lens.
-
----
-
-## 6. History and diff
-
-### 6.1. `history(limit) -> list` (Ambiguity H)
-
-```python
-commits = lens.history(limit: int = 20) -> list[dict]
-```
-
-Returns a list of commit dictionaries, most recent first. Each
-dictionary contains:
-
-```python
-{
-    "hash": str,           # commit hash (64-char hex)
-    "parent": str | None,  # parent commit hash
-    "second_parent": str | None,  # second parent (merge commits)
-    "message": str,        # commit message
-    "timestamp": float,    # wall-clock time
-    "index": int,          # commit sequence number
+## 2. Kernel (Layer 0)
+
+### 2.1 Three primitives
+
+```rust
+// Rust (core/kernel/)
+pub trait ObjectStore: Send + Sync {
+    fn put_blob(&self, data: &[u8]) -> io::Result<String>;
+    fn get_blob(&self, hash: &str) -> io::Result<Vec<u8>>;
+    fn put_path(&self, path: &str, hash: &str) -> io::Result<()>;
+    fn get_path(&self, path: &str) -> Option<String>;
+    fn delete_path(&self, path: &str) -> io::Result<bool>;
+    fn list_paths(&self, prefix: &str) -> io::Result<Vec<String>>;
+    fn blob_exists(&self, hash: &str) -> bool;
+    fn delete_blob(&self, hash: &str) -> io::Result<bool>;
+}
+
+pub struct PondKernel { /* ... */ }
+impl PondKernel {
+    pub fn write(&self, data: &[u8]) -> io::Result<String>;  // → hash
+    pub fn read(&self, name_or_hash: &str) -> io::Result<Vec<u8>>;
+    pub fn reference(&self, name: &str, hash: &str) -> io::Result<()>;
+    pub fn resolve(&self, name: &str) -> Option<String>;
+    pub fn list_names_prefix(&self, prefix: &str) -> Vec<String>;
 }
 ```
 
-### 6.2. `diff(a, b) -> dict` (Ambiguity G)
+### 2.2 Path layout (same on ALL backends)
 
-```python
-changes = lens.diff(a: str, b: str) -> dict
+```
+blobs/{hash[:2]}/{hash}                          — content-addressed blobs
+collections/{name}/_branches/{branch}/commit      — branch commit refs
+collections/{name}/_branches/{branch}/manifest    — branch manifest refs
+collections/{name}/_branches/{branch}/shards/{id} — CRDT shards
+collections/{name}/_active_branch                 — active branch name
+transactions/{tx_id}                              — transaction markers
 ```
 
-Computes the difference between two commits. Parameters `a` and `b`
-are commit hashes (strings). Returns:
+### 2.3 Storage backends
 
-```python
-{
-    "added": dict,     # keys in b but not in a: {key: value}
-    "removed": dict,   # keys in a but not in b: {key: value}
-    "modified": dict,  # keys in both with different values: {key: (old, new)}
-}
-```
-
-### 6.3. `undo(steps) -> str`
-
-```python
-new_head = lens.undo(steps: int = 1) -> str
-```
-
-Moves HEAD back `steps` commits. Creates a new commit that is a
-copy of the target commit's snapshot. Does NOT delete history; the
-old commits remain reachable for time travel.
-
----
-
-## 7. Commit object format (Ambiguity J)
-
-A commit is a JSON blob stored in the kernel:
-
-```json
-{
-    "type": "commit",
-    "parent": "abc123...",       // parent commit hash (or null)
-    "second_parent": "def456...", // second parent (merge commits, or null)
-    "snapshot": "ghi789...",     // Prolly tree root hash (snapshot commits)
-    "delta": {                   // staged changes (delta commits, or null)
-        "additions": {"key1": "hash1", ...},
-        "deletions": ["key2", ...]
-    },
-    "message": "commit message",
-    "timestamp": 1721500000.0,
-    "index": 42
-}
-```
-
-A commit is either:
-- **Snapshot commit:** `snapshot` is set, `delta` is null. Contains
-  a full Prolly tree root.
-- **Delta commit:** `delta` is set, `snapshot` is null. Contains
-  only the changed keys.
-- **Merge commit:** `second_parent` is set. Always a snapshot commit
-  (contains the full merged state).
-
-The Tiered Commit Model (delta + snapshot + snapshot pointer) is a
-Lens-level strategy, not a kernel concept. The kernel stores
-commits; the Lens decides the tiering policy.
-
----
-
-## 8. Cross-Lens semantics (Ambiguity M)
-
-### 8.1. Cross-Lens read/write
-
-Multiple Lenses can share the same kernel namespace. If two Lenses
-use the same `name`, they share:
-- The same Prolly tree (same snapshot)
-- The same commit DAG (same history)
-- The same branches
-- The same indexes
-
-**One write → all Lenses see it immediately.** No ETL, no sync, no
-manifest. This is the core architectural insight (see
-`pond-lab/track1_compat_matrix.py` for the formal compatibility
-contract).
-
-### 8.2. Cross-Lens blob sharing
-
-Lenses with different names can still share blobs via `put_raw`:
-
-```python
-# Lens A writes a blob
-blob_hash = lens_a.put("key1", data)
-
-# Lens B references the same blob under a different key
-lens_b.put_raw("key2", blob_hash)
-```
-
-Both Lenses now point at the same immutable bytes. No copying.
-
-### 8.3. Cross-Lens Physical Structure sharing
-
-Physical Structures (indexes, statistics, bloom filters) are stored
-as kernel blobs with naming conventions (`__stats/{name}`,
-`__bloom/{name}`). Any Lens can read them. See
-`pond-lab/track2_index_portability.py` for the proof.
-
----
-
-## 9. Tombstone helpers
-
-Tombstone helpers implement deletion-as-data (RFC-0008). These are
-in `bindings/python/sdk/maintenance.py`:
-
-| Function | Signature | Purpose |
-|---|---|---|
-| `drop_name(kernel, name)` | `(kernel, name: str) -> None` | Rebind a name to a tombstone marker. Pre-writes the marker blob. |
-| `is_dropped(kernel, name)` | `(kernel, name: str) -> bool` | Check if a name is tombstoned. |
-| `resolve_active(kernel, name)` | `(kernel, name: str) -> str \| None` | Resolve a name, returning None if tombstoned. |
-| `compact_tombstones(kernel)` | `(kernel) -> dict` | Remove tombstone markers and their targets. Returns stats. |
-
-**Do NOT** call `kernel.reference(name, TOMBSTONE_HASH)` directly —
-the kernel validates that the hash exists. Use `drop_name`, which
-pre-writes the marker blob.
-
----
-
-## 10. Encoding (override in subclasses)
-
-The default `View` class uses JSON for encoding:
-
-```python
-def encode(self, data: Any) -> bytes:
-    return json.dumps(data, sort_keys=True).encode()
-
-def decode(self, data: bytes) -> Any:
-    return json.loads(data)
-```
-
-Subclasses override these to use a different format. Examples:
-
-| Lens | Encode | Decode | Location |
+| Backend | Rust | Python | Notes |
 |---|---|---|---|
-| `LakehouseLens` | PyArrow Table → Parquet | Parquet → PyArrow Table | `lenses/lakehouse/lakehouse.py` |
-| `FeatureStoreLens` | PyArrow Table → Parquet | Parquet → PyArrow Table | `pond-labs/feature_store_lens.py` |
-| `VectorLens` | `struct.pack` floats | `struct.unpack` | `lenses/vector/vector_view.py` |
-| Default `KeyValueLens` | JSON | JSON | `bindings/python/sdk/keyvalue_lens.py` |
+| Local FS | ✅ | ✅ | `LocalFSObjectStore` |
+| S3-compatible | ✅ | ✅ (boto3) | AWS S3, R2, MinIO, LocalStack, Wasabi |
+| In-memory | ❌ | ✅ | Testing only |
 
-The encode/decode pair MUST satisfy Law 1 (round-trip):
-`decode(encode(d)) == d` for all `d`. This is verified by
-`bindings/python/sdk/lens_laws.py`.
+S3 credentials from environment: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_SESSION_TOKEN` (optional).
 
 ---
 
-## 11. What is deliberately NOT in the SDK
+## 3. UnifiedStorage (Layer 1)
 
-- **No query planner.** Lenses expose `get`, `find_by`, `get_all`.
-  There is no SQL parser, no optimizer, no cost model. The Lakehouse
-  Lens adds SQL via DuckDB on top of the SDK; the SDK itself is
-  query-language-agnostic.
-- **No transactions.** `commit` is atomic for a single Lens. There
-  is no cross-Lens atomic commit, no 2PC, no isolation levels. The
-  `TwoPhaseCommitCoordinator` in `services/replication/` provides
-  cross-Collection atomicity as an application-level service (per
-  A7: coordinator out-of-model).
-- **No schema in the SDK.** The SDK stores bytes; the Lens tracks
-  its own schema. The Schema Registry (`services/schema/`) provides
-  versioned schemas as a cross-cutting service, not an SDK feature.
-- **No compression in the SDK.** The Transport Layer
-  (`services/transport/`) handles compression + encryption as a
-  cross-cutting service. The SDK does not compress automatically.
-- **No cache.** The SDK reads from the kernel on every `get()`.
-  Lenses cache if they want to (e.g., `IndexedLens`'s
-  `_cached_entries`).
-- **No concurrency control.** The SDK is single-threaded.
+### 3.1 Write paths
 
-These omissions are deliberate. Each is a Layer 3 or cross-cutting
-concern; adding it to the SDK would violate the design goal of
-keeping the SDK minimal. See `docs/NON_GOALS.md` for the full list.
+```rust
+// Raw bytes (JSON or any format) — simple, used by CLI
+pub fn write(kernel, collection, branch, data: &[u8], message) -> Result<String, String>;
+
+// Structured INT64 columns as PND2 — production with stats + pruning
+pub fn write_rows_i64(kernel, collection, branch, columns: &[(&str, &[i64])], message) -> Result<String, String>;
+```
+
+`write_rows_i64` encodes columns as a PND2 blob with:
+- Auto-encoding per column (RLE/DICT/BITPACK/RAW based on heuristics)
+- Per-column stats in manifest (min/max/null_count for pruning)
+- Schema in manifest (column names + types)
+
+### 3.2 Read paths
+
+```rust
+// Read HEAD (raw bytes)
+pub fn read(kernel, collection, branch) -> Result<Vec<u8>, String>;
+
+// Read at specific commit (time-travel)
+pub fn read_at_snapshot(kernel, commit_hash) -> Result<Vec<u8>, String>;
+
+// Read HEAD + all shards (CRDT merge)
+pub fn read_full(kernel, collection, branch) -> Vec<Vec<u8>>;
+```
+
+### 3.3 Versioning (git-like)
+
+```rust
+pub fn branch(kernel, collection, source_branch, new_branch) -> Result<String, String>;
+pub fn checkout(storage, collection, branch_name);
+pub fn merge(kernel, collection, source, target, message) -> Result<String, String>;
+pub fn undo(kernel, collection, branch, steps) -> Result<String, String>;
+pub fn revert(kernel, collection, branch, commit_hash) -> Result<(), String>;
+pub fn history(kernel, commit_hash, limit) -> Vec<(String, Commit)>;
+```
+
+### 3.4 CRDT shards (concurrent multi-writer)
+
+```rust
+pub fn append_shard(kernel, collection, branch, shard_id, data) -> Result<String, String>;
+pub fn upsert_shard(kernel, collection, branch, shard_id, rows, key_col, hlc) -> Result<String, String>;
+pub fn delete_shard(kernel, collection, branch, shard_id, rowids, hlc) -> Result<String, String>;
+pub fn read_with_shards(kernel, collection, branch) -> (Option<Vec<u8>>, Vec<Vec<u8>>);
+pub fn compact_shards(kernel, collection, branch) -> Result<usize, String>;
+```
+
+CRDT merge uses HLC (Hybrid Logical Clock) for clock-skew-safe LWW.
+Each row gets `_rowid` (UUIDv7) and `_version` (HLC) columns.
+
+### 3.5 Transactions (atomic visibility)
+
+```rust
+pub fn begin_tx() -> String;  // → tx_id
+pub fn commit_tx(kernel, tx_id, message) -> Result<String, String>;
+pub fn abort_tx(kernel, tx_id);
+pub fn is_tx_committed(kernel, tx_id) -> bool;
+```
+
+**Note:** This is atomic VISIBILITY (not full ACID — no isolation, no rollback).
+Once the commit marker exists, all tentative shards become visible together.
+
+### 3.6 PondPack (PNPK format)
+
+```rust
+// core/storage/src/pond_pack.rs
+pub fn encode_pack(commit: &Value, manifest_bytes: &[u8], inline_data: Option<&[Vec<u8>]>) -> Vec<u8>;
+pub fn decode_pack(blob: &[u8]) -> Option<(Value, Vec<u8>, Option<Vec<Vec<u8>>>)>;
+```
+
+PondPack combines commit JSON + manifest bytes into ONE blob, saving
+1-2 GETs per cold read and 1 PUT per write. Backward compatible with
+old separate commit (JSON) + manifest (PMAN) format.
 
 ---
 
-## 12. Compliance checklist for new Lenses
+## 4. PND2 Codec (Layer 2)
 
-Before claiming a Lens is SDK-compliant, verify:
+### 4.1 Format
 
-- [ ] The Lens extends `KeyValueLens` (for KV-style lenses) or
-      `PondLens` directly (for lenses with custom storage like
-      `LakehouseLens`), OR is built directly on the kernel following
-      §7's commit format.
-- [ ] The Lens's `encode`/`decode` pair satisfies round-trip
-      (Law 1 of the Lens algebra).
-- [ ] The Lens's operations are deterministic (Law 2).
-- [ ] The Lens does not call `kernel.reference` inside `get` or
-      `find_by` (read paths are pure).
-- [ ] The Lens does not reach past the SDK (no direct SQL on the
-      kernel's `root_db`, except via `maintenance.compact_tombstones`).
-- [ ] The Lens's indexes (if any) are stored as kernel blobs
-      following the naming convention in §4.4.
-- [ ] The Lens's `drop_index` uses the tombstone pattern from §4.5
-      (via `drop_name` from `maintenance.py`).
-- [ ] The Lens passes the `lens_laws.py` property-test harness
-      (see `bindings/python/sdk/lens_laws.py`).
-- [ ] The Lens passes the bidirectional compatibility matrix
-      (see `pond-lab/track1_compat_matrix.py`) when tested against
-      at least one other Lens.
+```
+Header (13 bytes):
+  magic "PND2" (4B) + version 1 (1B) + flags (1B)
+  + n_rows (4B) + n_columns (2B) + compression_tag (1B)
+
+Inner (after header):
+  Phase 1: ALL schemas — per column: name_len(1B) + name + vtype(1B) + enc(1B)
+  Phase 2: ALL stats — per column: has_min(1B) + min(8B) + max(8B) + null_count(4B)
+  Phase 3: ALL payloads — per column: payload_len(4B) + payload
+
+Compression: 0=none, 2=zstd (feature flag in Rust)
+```
+
+### 4.2 Encodings
+
+| Encoding | Code | Best for | Rust decode | Rust encode |
+|---|---|---|---|---|
+| RAW | 0 | General purpose | ✅ | ✅ |
+| RLE | 1 | Consecutive repeats | ✅ | ✅ |
+| DICT | 2 | Low cardinality | ✅ | ✅ |
+| BITPACK | 3 | Small-range integers | ✅ | ✅ |
+
+Auto-selection (`encode_i64_auto`):
+1. Low cardinality (<10% unique, <1000 unique) → DICT
+2. Run-heavy (<50% runs in sample) → RLE
+3. Small range (<2^16) → BITPACK
+4. Default → RAW
+
+### 4.3 Value types
+
+| Type | Code | Rust |
+|---|---|---|
+| INT64 | 1 | ✅ |
+| FLOAT64 | 2 | ✅ |
+| STRING | 3 | ✅ |
+| NULL | 4 | ✅ |
+| BINARY | 5 | ✅ |
+
+### 4.4 zstd decompression
+
+Enabled via `zstd` feature flag (uses `ruzstd`, pure-Rust, no C deps):
+```toml
+pond_core = { path = "core/codec", features = ["zstd"] }
+```
 
 ---
 
-## 13. Relationship to other documents
+## 5. Lenses (Layer 3)
 
-- **Depends on:** `docs/POND_FORMAL_ALGEBRAS.md` §9 (Substrate
-  Algebra — the 6 substrates and 10 axioms the SDK is built on),
-  the Lens algebra (L1-L7 laws the SDK implements), RFC-0008
-  (Deletion as Data — the tombstone pattern used by `drop_index`).
-- **Supersedes:** informal descriptions in `docs/LENS_GUIDE.md`.
-  Where the two disagree, this document is correct.
-- **Operationalized by:** `bindings/python/sdk/lens_laws.py` (the property-test
-  harness that verifies SDK compliance) and `pond-lab/track1_compat_matrix.py`
-  (the bidirectional compatibility matrix).
-- **External validation:** the 13 ambiguities settled here were
-  identified by external validators (reports in `archive/validation/`).
+### 5.1 Lens design
+
+Each lens owns a `UnifiedStorage` and adds workload-specific semantics.
+**No base class needed** — the `PondLens` base class in Python is deprecated.
+
+```rust
+pub struct KeyValueLens {
+    storage: UnifiedStorage,
+    staged: Mutex<HashMap<String, HashMap<String, Option<Value>>>>,
+}
+```
+
+### 5.2 Available lenses
+
+| Lens | Rust | Python | Notes |
+|---|---|---|---|
+| KeyValueLens | ✅ core API | ✅ full | KV with staging + commit |
+| StreamingLens | ✅ core API | ✅ full | Chunked storage, range read |
+| OLTPLens | ✅ core API | ✅ full | Memtable + batch flush |
+| LakehouseLens | ❌ | ✅ | Tabular + DuckDB SQL |
+| VectorLens | ❌ | ✅ | IVF + HNSW ANN |
+
+### 5.3 Lens structure
+
+```
+lenses/{name}/
+├── python/     # Python implementation
+├── rust/       # Rust implementation (if ported)
+└── README.md
+```
+
+---
+
+## 6. Extensions (Layer 2.5)
+
+### 6.1 Physical structures
+
+| Extension | Python | Rust | Notes |
+|---|---|---|---|
+| UnifiedStorage (PND2) | ✅ 5767 LOC | ⚠️ partial | Python has full PND2 + caching + pruning |
+| CollectionManifest | ✅ | ✅ | PMAN format |
+| StatsTree | ✅ | ❌ | PB-scale hierarchical stats (defer) |
+| Encoding (RLE/DICT/BITPACK) | ✅ | ✅ | Auto-selection |
+| Compression (zstd) | ✅ | ✅ | Feature flag |
+| PondPack (PNPK) | ✅ | ✅ | Commit+manifest in one blob |
+
+### 6.2 Indexing
+
+| Extension | Python | Rust | Notes |
+|---|---|---|---|
+| CollectionIndexer | ✅ | ❌ | Secondary indexes (JSON blob format) |
+| IVFIndex | ✅ | ❌ | Vector ANN (known Bug 10: reads ALL vectors) |
+| HNSWIndex | ✅ | ❌ | Graph ANN (pure-Python, 10-100x slower than Rust) |
+
+**Known gap:** IVF search reads ALL vectors then filters — `n_probe` has no
+effect on I/O. Fix: store per-cluster blob references in index format.
+
+### 6.3 Maintenance
+
+| Extension | Python | Rust | Notes |
+|---|---|---|---|
+| GarbageCollector | ✅ 476 LOC | ❌ | GC + vacuum with preserve_days |
+| Tombstone helpers | ✅ | ✅ | drop_name, is_dropped, resolve_active |
+
+### 6.4 Semantic
+
+| Extension | Python | Rust | Notes |
+|---|---|---|---|
+| SemanticMixin | ✅ | ❌ | Defer (Ossie is a placeholder name) |
+
+---
+
+## 7. C ABI (`pond.h`)
+
+One header for all languages:
+
+```c
+// Kernel
+PondKernel* pond_kernel_new(const char* base_dir);
+const char* pond_kernel_write(PondKernel* k, const uint8_t* data, size_t len);
+int         pond_kernel_read(PondKernel* k, const char* hash_or_name, ...);
+
+// Storage
+PondStorageHandle* pond_storage_new(const char* base_dir);
+PondStorageHandle* pond_storage_new_s3(const char* s3_url);
+const char* pond_storage_write(PondStorageHandle* s, const char* collection, ...);
+int         pond_storage_read(PondStorageHandle* s, const char* collection, ...);
+const char* pond_storage_branch(PondStorageHandle* s, ...);
+const char* pond_storage_merge(PondStorageHandle* s, ...);
+
+// Codec
+PondResult* pond_pnd2_decode(const uint8_t* blob, size_t blob_len);
+int32_t     pond_pnd2_encode_i64(const int64_t* values, size_t n, ...);
+```
+
+### 7.1 Language bindings
+
+| Language | Status | How |
+|---|---|---|
+| Python | ✅ Full | PyO3 (`import pond`) |
+| Rust | ✅ Full | Direct (it's the core) |
+| Go | ✅ Full | cgo over C ABI |
+| C/C++ | ✅ Full | Direct `#include "pond.h"` |
+
+---
+
+## 8. CLI (`pond` command)
+
+### 8.1 Storage discovery
+
+Priority order:
+1. `--root <url>` (explicit override)
+2. `POND_ROOT` env var
+3. `.pond/` marker (walk up from CWD — local FS only)
+4. `.` (current directory)
+
+### 8.2 Commands
+
+```
+pond init [location]           # Initialize/connect (local path or s3:// URL)
+pond write <collection> --json '...' -m "msg"
+pond read <collection>
+pond branch <collection> <name>
+pond checkout <collection> <name> [-b]
+pond merge <collection> <source> [-i <target>] -m "msg"
+pond branches <collection>
+pond history <collection> [-l <limit>]
+pond undo <collection> [steps]
+pond revert <collection> <commit_hash>
+pond ls
+pond cat <hash>
+pond version
+```
+
+### 8.3 S3 support
+
+S3 is a cargo feature (`default = ["s3"]`):
+```bash
+pond init "s3://bucket/prefix?region=us-east-1&endpoint=https://..."
+pond write users --json '[{"id":1}]' -m "first"  # uses POND_ROOT or --root
+```
+
+---
+
+## 9. Design Principles
+
+1. **Simple** — ONE format (PND2), ONE commit format (PNPK), ONE concurrency model (CRDT)
+2. **Powerful** — branch/merge + CRDT + IVF + streaming + GC + optimize
+3. **Performant** — O(1) point lookup, O(1) warm writes, PND2 columnar encoding
+4. **Scalable** — linear PUTs, flat GETs, PB-scale via StatsTree
+5. **Efficient** — immutable blobs (deduped), O(live) GC, parallel fetch
+6. **Beautiful** — shards ARE branches, CRDT = G-Set union, no CAS
+7. **Functional** — lakehouse, KV, vector, streaming, notebook, git
+8. **Storage-Independent** — no CAS, works on local FS / S3 / R2 / MinIO / GCS
+
+---
+
+## 10. Non-Goals (what Pond deliberately doesn't do)
+
+- **Distributed consensus** — single-writer per collection (CRDT handles multi-writer)
+- **Online schema evolution** — collections are schema-less at the kernel level
+- **Materialized views** — lenses compute on read (no pre-computation)
+- **Cross-collection joins** — each lens operates on one collection
+- **Full-text search** — not a search engine (use a lens on top)
+- **Streaming ingestion pipelines** — StreamingLens provides storage, not pipelines
+
+These are intentionally out of scope. Pond is a storage substrate, not an
+application framework.
