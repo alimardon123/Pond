@@ -31,6 +31,12 @@ collection can be read by Python (as JSON) and vice versa (if Python writes JSON
 parity. Until then, Rust storage is correct but slower than Python for large
 datasets (no pruning, no compression).
 
+**UPDATE (August 2026):** PND2 is now wired into the Rust storage layer!
+- `write_rows_i64()` — PND2 encode with auto-encoding (RLE/DICT/BITPACK/RAW)
+- `write_rows_i64_packed()` — PND2 + PondPack (commit+manifest in ONE blob)
+- `read_rows_i64()` — PND2 decode with predicate pruning + column projection
+- IVF Bug 10 FIXED — per-cluster blob references for true I/O reduction
+
 ### Done (Rust core)
 
 | Component | Path | Status |
@@ -42,8 +48,13 @@ datasets (no pruning, no compression).
 | UnifiedStorage (versioning, branching, shards) | `core/storage/` | ✅ Done |
 | PND2 codec — decode (all encodings, all vtypes) | `core/codec/` | ✅ Done |
 | PND2 codec — zstd decompression | `core/codec/` | ✅ Done (feature flag) |
-| PND2 codec — encode (RAW only) | `core/codec/` | ⚠️ Partial (RLE/DICT/BITPACK TODO) |
+| PND2 codec — encode (RLE, DICT, BITPACK, RAW + auto-select) | `core/codec/` | ✅ Done |
 | PND2 → Arrow bridge | `core/arrow/` | ✅ Done |
+| PND2 storage write path (write_rows_i64) | `core/storage/src/write.rs` | ✅ Done |
+| PND2 storage read path (read_rows_i64) | `core/storage/src/read.rs` | ✅ Done (pruning + projection) |
+| PondPack (PNPK) format | `core/storage/src/pond_pack.rs` | ✅ Done |
+| GarbageCollector / vacuum | `core/storage/src/maintenance.rs` | ✅ Done |
+| IVF Index (Bug 10 fixed) | `lenses/vector/rust/` | ✅ Done (per-cluster blob refs) |
 | CLI (`pond` command, local + S3 + auto-discovery) | `cli/` | ✅ Done |
 | C ABI (pond.h — kernel + storage + codec + S3) | `bindings/base/pond.h` | ✅ Done |
 | Go SDK (full storage access via cgo) | `bindings/go/` | ✅ Done |
