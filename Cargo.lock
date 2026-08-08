@@ -1072,6 +1072,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond_collection_index"
+version = "0.3.0"
+dependencies = [
+ "pond_kernel",
+ "pond_storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pond_core"
 version = "0.3.0"
 dependencies = [
