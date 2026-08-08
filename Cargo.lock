@@ -1121,6 +1121,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond_lakehouse_lens"
+version = "0.3.0"
+dependencies = [
+ "pond_core",
+ "pond_kernel",
+ "pond_storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pond_oltp_lens"
 version = "0.3.0"
 dependencies = [

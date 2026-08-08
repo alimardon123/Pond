@@ -11,6 +11,7 @@ members = [
     "lenses/keyvalue/rust",
     "lenses/streaming/rust",
     "lenses/oltp/rust",
+    "lenses/lakehouse/rust",
     "extensions/indexing/rust",
     "extensions/indexing/collection_index",
     "extensions/indexing/hnsw_index",
