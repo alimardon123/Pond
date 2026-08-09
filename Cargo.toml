@@ -16,7 +16,8 @@ members = [
     "extensions/indexes/ivf/rust",
     "extensions/indexes/hnsw/rust",
     "extensions/indexes/simple/rust",
-    "extensions/semantic/rust",
+    "extensions/semantic/base/rust",
+    "extensions/semantic/ossie/rust",
 ]
 
 [workspace.package]

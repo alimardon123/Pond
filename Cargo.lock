@@ -1145,6 +1145,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond_ossie_adapter"
+version = "0.3.0"
+dependencies = [
+ "pond_semantic",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pond_python"
 version = "0.3.0"
 dependencies = [

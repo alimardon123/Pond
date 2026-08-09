@@ -3,36 +3,54 @@
 Semantic model adapters — translate between Pond's internal definitions
 and external semantic model formats.
 
-## Status
+## Structure
 
-**Basic trait + definitions ported.** The `SemanticModelAdapter` trait
-and `SemanticDefinitions` struct are implemented. Concrete adapters
-(Cube, dbt, Malloy) are future work.
+```
+extensions/semantic/
+├── base/rust/       # SemanticModelAdapter trait + SemanticDefinitions
+├── ossie/rust/      # OssieAdapter — Apache Ossie format
+└── README.md        # This file
+```
 
-## What's here
+## Base
 
 | File | Purpose |
 |---|---|
-| `rust/src/lib.rs` | `SemanticModelAdapter` trait, `SemanticDefinitions`, `Metric`, `Dimension`, `Relationship` |
+| `base/rust/src/lib.rs` | `SemanticModelAdapter` trait, `SemanticDefinitions`, `Metric`, `Dimension`, `Relationship` |
 
-## Architecture
+The base crate defines:
+- `SemanticModelAdapter` trait: `export_model`, `import_model`, `validate_model`, `name`
+- `SemanticDefinitions`: internal representation (metrics, dimensions, relationships)
+- JSON serialization/deserialization
 
+## Ossie Adapter
+
+| File | Purpose |
+|---|---|
+| `ossie/rust/src/lib.rs` | `OssieAdapter` — translates between Pond definitions and Ossie format |
+
+The Ossie format:
+```json
+{
+  "name": "model_name",
+  "metrics": [{"name": "revenue", "expression": {"dialects": {"ANSI_SQL": "SUM(amount)"}}}],
+  "dimensions": [{"name": "country", "type": "string"}],
+  "relationships": [{"name": "user_orders", "from": {"dataset": "users"}, "to": {"dataset": "orders"}}]
+}
 ```
-SemanticModelAdapter (trait)
-  ├── export_model(definitions) → JSON
-  ├── import_model(JSON) → definitions
-  └── validate_model(JSON) → bool
 
-SemanticDefinitions (internal representation)
-  ├── metrics: Vec<Metric>
-  ├── dimensions: Vec<Dimension>
-  └── relationships: Vec<Relationship>
-```
+## Adding New Adapters
 
-Future adapters:
-- `CubeAdapter` — Cube.js semantic model format
-- `DbtAdapter` — dbt metrics format
-- `MalloyAdapter` — Malloy model format
+To add a new semantic standard (e.g., Cube.js):
+1. Create `extensions/semantic/cube/rust/` with a new crate
+2. Implement `SemanticModelAdapter` trait
+3. Add to this README
 
-Note: "Ossie" was a placeholder name in the Python code, not a real
-semantic model spec. It has been replaced with this clean trait.
+Each adapter is independent — adding a new one doesn't modify existing code.
+
+## Design Principles
+
+- **Simple**: One trait, one struct, one adapter per format
+- **Independent**: Adapters don't depend on each other
+- **Generic**: Works with any collection via SemanticDefinitions
+- **Orthogonal**: Semantic models are orthogonal to storage — data can live in any lens

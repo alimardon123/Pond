@@ -1,0 +1,18 @@
+[package]
+name = "pond_ossie_adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ossie semantic adapter — one implementation of the semantic model interface"
+
+[lib]
+name = "pond_ossie_adapter"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+pond_semantic = { path = "../../base/rust" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

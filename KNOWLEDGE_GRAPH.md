@@ -114,9 +114,9 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `bindings/python/sdk/__init__.py` | 0 | Package marker. |
 | `bindings/python/sdk/README.md` | 52 | Folder purpose and usage. |
 | `bindings/python/sdk/extensions/__init__.py` | 55 | `register_extension`, `list_extensions` | Extension registry. |
-| `bindings/python/sdk/extensions/indexing/__init__.py` | 27 | `CollectionIndexer`, `AutoIndexMixin`, `AutoIndex` | Indexing extension package. Collection-level indexing + legacy lens-mixin approach. |
-| `bindings/python/sdk/extensions/indexing/collection_index.py` | 200 | `CollectionIndexer` | Collection-level indexer. Operates on kernel + collection name. Any lens can use it. Indexes belong to collections (data-side), not lenses. |
-| `bindings/python/sdk/extensions/indexing/base.py` | 80 | `CollectionIndexerInterface` | Abstract interface for collection-level indexers. |
+| `bindings/python/sdk/extensions/indexing/__init__.py` | 27 | `SimpleIndex`, `AutoIndexMixin`, `AutoIndex` | Indexing extension package. Collection-level indexing + legacy lens-mixin approach. |
+| `bindings/python/sdk/extensions/indexing/collection_index.py` | 200 | `SimpleIndex` | Collection-level indexer. Operates on kernel + collection name. Any lens can use it. Indexes belong to collections (data-side), not lenses. |
+| `bindings/python/sdk/extensions/indexing/base.py` | 80 | `SimpleIndexInterface` | Abstract interface for collection-level indexers. |
 | `bindings/python/sdk/extensions/semantic/__init__.py` | 15 | — | Semantic extension package. |
 | `bindings/python/sdk/extensions/semantic/base.py` | 45 | `SemanticModelAdapter` | Abstract interface for semantic adapters. |
 | `bindings/python/sdk/extensions/semantic/ossie.py` | 300 | `SemanticLens`, `OssieAdapter` | Ossie adapter + pluggable SemanticLens. |
@@ -385,14 +385,19 @@ for Go/Java/Node/C/C++/Zig SDK ports. The CLI is the DuckDB-philosophy binary.
 | `core/storage/src/maintenance.rs` | — | Maintenance: drop_name, is_dropped, resolve_active, compact_tombstones. |
 | `core/arrow/Cargo.toml` | — | PND2 → Arrow bridge crate. Deps: pond_codec, arrow. |
 | `core/arrow/src/lib.rs` | — | PND2 → Arrow direct conversion (near-zero copy). |
-| `extensions/indexing/rust/Cargo.toml` | — | IVF index crate (pond_vector_index). Deps: pond_kernel, pond_storage, pond_core. |
-| `extensions/indexing/rust/src/lib.rs` | — | **IVFIndex** — Inverted File index for ANN search. Bug 10 FIXED: per-cluster blob references so n_probe reduces I/O. K-means clustering + euclidean/cosine distance. 5 tests. |
-| `extensions/indexing/collection_index/Cargo.toml` | — | CollectionIndexer crate (pond_collection_index). Deps: pond_kernel, pond_storage. |
-| `extensions/indexing/collection_index/src/lib.rs` | — | **CollectionIndexer** — secondary indexes (JSON blob format). Multi-key support. build_index, lookup, drop_index, list_indexes, index_stats. 6 tests. |
-| `extensions/indexing/hnsw_index/Cargo.toml` | — | HNSW index crate (pond_hnsw_index). Deps: pond_kernel, pond_storage, pond_core. |
-| `extensions/indexing/hnsw_index/src/lib.rs` | — | **HNSWIndex** — Hierarchical Navigable Small World for O(log N) ANN. Multi-layer graph with geometric distribution, greedy search at upper layers, beam search at layer 0. Chunked storage (one blob per layer). L2 + cosine distance. 9 tests. |
-| `extensions/README.md` | — | Documents extensions directory: indexing (IVF, HNSW, CollectionIndexer), maintenance (GC). |
-| `extensions/indexing/README.md` | — | Documents indexing extensions: Rust crates + Python files. |
+| `extensions/indexes/ivf/rust/Cargo.toml` | — | IVF index crate (pond_ivf_index). Deps: pond_kernel, pond_storage, pond_core. |
+| `extensions/indexes/ivf/rust/src/lib.rs` | — | **IVFIndex** — Inverted File index for ANN search. Bug 10 FIXED: per-cluster blob references so n_probe reduces I/O. K-means clustering + euclidean/cosine distance. 5 tests. |
+| `extensions/indexes/simple/rust/Cargo.toml` | — | SimpleIndex crate (pond_simple_index). Deps: pond_kernel, pond_storage. |
+| `extensions/indexes/simple/rust/src/lib.rs` | — | **SimpleIndex** — secondary indexes (JSON blob format). Multi-key support. build_index, lookup, drop_index, list_indexes, index_stats. 6 tests. |
+| `extensions/indexes/hnsw/rust/Cargo.toml` | — | HNSW index crate (pond_hnsw_index). Deps: pond_kernel, pond_storage, pond_core. |
+| `extensions/indexes/hnsw/rust/src/lib.rs` | — | **HNSWIndex** — Hierarchical Navigable Small World for O(log N) ANN. Multi-layer graph with geometric distribution, greedy search at upper layers, beam search at layer 0. Chunked storage (one blob per layer). L2 + cosine distance. 9 tests. |
+| `extensions/README.md` | — | Documents extensions directory: indexing (IVF, HNSW, SimpleIndex), maintenance (GC). |
+| `extensions/indexes/README.md` | — | Documents index extensions: unified API for simple, ivf, hnsw. |
+| `extensions/semantic/base/rust/Cargo.toml` | — | Semantic base crate (pond_semantic). SemanticModelAdapter trait + SemanticDefinitions. |
+| `extensions/semantic/base/rust/src/lib.rs` | — | **SemanticModelAdapter** trait (export/import/validate) + SemanticDefinitions (metrics, dimensions, relationships). JSON roundtrip. 3 tests. |
+| `extensions/semantic/ossie/rust/Cargo.toml` | — | Ossie adapter crate (pond_ossie_adapter). Deps: pond_semantic. |
+| `extensions/semantic/ossie/rust/src/lib.rs` | — | **OssieAdapter** — translates between Pond definitions and Ossie format. Export/import/validate. 6 tests. |
+| `extensions/semantic/README.md` | — | Documents semantic extensions: base trait + ossie adapter. |
 | `cli/Cargo.toml` | 20 | CLI binary crate. Produces the `pond` executable. |
 | `cli/src/main.rs` | 480 | The `pond` CLI: init, write (JSON/file/stdin), read, branch, merge, history, ls, cat (with prefix matching), version. Uses clap for arg parsing. Single binary, ~1MB, DuckDB philosophy. |
 | `cli/tests/cli_integration.rs` | 170 | 10 integration tests: init, write/read JSON, write from file, write from stdin, dedup, ls, branch+merge, cat by prefix, version, persistence. All pass. |
@@ -467,7 +472,7 @@ implementations** for the Lens roadmap in `WHERE_POND_FAILS.md`.
 | `pond/__init__.py` | Top-level package marker (empty). |
 | `pond/core/__init__.py` | Re-exports `PondMinimal`, `hash_bytes`, `ObjectStoreNativeKernel`, `InMemoryObjectStore`, `LocalFSObjectStore`, `S3ObjectStore`, `make_kernel` (and `make_*_kernel` helpers) from `bindings/python/core/`. |
 | `pond/sdk/__init__.py` | Re-exports `PondStorage`, `PondLens`, `PondConfig`, `HLC`, `uuidv7` from `bindings/python/sdk/`. |
-| `pond/sdk/extensions/__init__.py` | Re-exports `UnifiedStorage`, `PND2`, `CollectionManifest`, `StatsTreeReader`, `CollectionIndexer`, `HNSWIndex`, `IVFIndex`, `GarbageCollector` (best-effort — each subsystem is wrapped in try/except ImportError so missing deps don't break the others). |
+| `pond/sdk/extensions/__init__.py` | Re-exports `UnifiedStorage`, `PND2`, `CollectionManifest`, `StatsTreeReader`, `SimpleIndex`, `HNSWIndex`, `IVFIndex`, `GarbageCollector` (best-effort — each subsystem is wrapped in try/except ImportError so missing deps don't break the others). |
 | `pond/lenses/__init__.py` | Inserts each `lenses/<name>/` directory onto `sys.path` for `keyvalue`, `lakehouse`, `vector`, `streaming`, `oltp`. |
 | `pond/lenses/keyvalue/python/__init__.py` | Adds `lenses/keyvalue/python/`, `bindings/python/core/`, `bindings/python/sdk/`, `bindings/python/sdk/extensions/physical_structures/` to `sys.path`. |
 | `pond/lenses/lakehouse/python/__init__.py` | Same pattern for `lenses/lakehouse/python/`. |
