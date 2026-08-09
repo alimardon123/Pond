@@ -1,0 +1,14 @@
+[package]
+name = "pond_semantic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Semantic model adapter — translate between Pond and external semantic formats"
+
+[lib]
+name = "pond_semantic"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

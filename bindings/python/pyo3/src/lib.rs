@@ -496,9 +496,9 @@ use pond_kernel::PondKernel;
 use pond_storage::UnifiedStorage;
 use pond_storage::{write as storage_write, read as storage_read, branch as storage_branch,
                     commit as storage_commit};
-use pond_vector_index::IVFIndex as RustIVFIndex;
+use pond_ivf_index::IVFIndex as RustIVFIndex;
 use pond_hnsw_index::HNSWIndex as RustHNSWIndex;
-use pond_collection_index::CollectionIndexer as RustCollectionIndexer;
+use pond_simple_index::SimpleIndex as RustSimpleIndex;
 use serde_json::Value as JsonValue;
 use std::sync::Mutex;
 
@@ -1011,182 +1011,179 @@ impl Storage {
     }
 
     // ===================================================================
-    // Index operations — operate ON collections via this Storage
+    // Index operations — UNIFIED API for ALL index types
     // ===================================================================
 
-    /// Build an IVF (Inverted File) index on a collection.
-    ///
-    /// The index enables approximate nearest neighbor (ANN) search.
-    /// Bug 10 fixed: per-cluster blob references for true I/O reduction.
+    /// Build an index on a collection. Works for ALL index types.
     ///
     /// Args:
     ///   - collection: Collection name
-    ///   - n_clusters: Number of clusters for k-means
-    ///   - metric: "euclidean" or "cosine"
-    fn build_ivf(&self, collection: &str, n_clusters: usize, metric: &str) -> PyResult<String> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-        let ivf = RustIVFIndex::new(kernel);
-        ivf.build(collection, n_clusters, metric)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
-    }
-
-    /// Search for k nearest neighbors using IVF index.
-    ///
-    /// Args:
-    ///   - collection: Collection name
-    ///   - query: Query vector (list of floats)
-    ///   - k: Number of nearest neighbors to return
-    ///   - n_probe: Number of clusters to search (higher = more accurate)
-    ///
-    /// Returns:
-    ///   List of (distance, vector_id) tuples, sorted by distance.
-    fn search_ivf(&self, py: Python<'_>, collection: &str, query: Vec<f64>, k: usize, n_probe: usize) -> PyResult<PyObject> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-        let ivf = RustIVFIndex::new(kernel);
-        let results = ivf.search(collection, &query, k, n_probe)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
-
-        let list = PyList::new_bound(py, results.iter().map(|(dist, id)| {
-            PyTuple::new_bound(py, [dist.to_object(py), id.to_object(py)]).into_any()
-        }));
-        Ok(list.into())
-    }
-
-    /// Get IVF index statistics. Returns None if no index exists.
-    fn ivf_stats(&self, py: Python<'_>, collection: &str) -> PyResult<PyObject> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-        let ivf = RustIVFIndex::new(kernel);
-        match ivf.stats(collection) {
-            Some(stats) => {
-                let dict = PyDict::new_bound(py);
-                dict.set_item("n_dims", stats.n_dims)?;
-                dict.set_item("n_clusters", stats.n_clusters)?;
-                dict.set_item("metric", &stats.metric)?;
-                dict.set_item("total_vectors", stats.total_vectors)?;
-                dict.set_item("total_blob_refs", stats.total_blob_refs)?;
-                Ok(dict.into())
-            }
-            None => Ok(py.None()),
-        }
-    }
-
-    /// Build an HNSW (Hierarchical Navigable Small World) index on a collection.
-    ///
-    /// O(log N) search — better than IVF for high-recall at low latency.
-    ///
-    /// Args:
-    ///   - collection: Collection name
-    ///   - m: Max connections per node per layer (default 16)
-    ///   - ef_construction: Search beam width during construction (default 200)
-    ///   - metric: "l2" or "cosine"
-    #[pyo3(signature = (collection, m=16, ef_construction=200, metric="l2"))]
-    fn build_hnsw(&self, collection: &str, m: usize, ef_construction: usize, metric: &str) -> PyResult<String> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-        let hnsw = RustHNSWIndex::new(kernel);
-        hnsw.build(collection, m, ef_construction, None, metric)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
-    }
-
-    /// Search for k nearest neighbors using HNSW index.
-    ///
-    /// Args:
-    ///   - collection: Collection name
-    ///   - query: Query vector (list of floats)
-    ///   - k: Number of nearest neighbors to return
-    ///   - ef: Beam width for layer 0 search (default 50)
-    #[pyo3(signature = (collection, query, k=10, ef=50))]
-    fn search_hnsw(&self, py: Python<'_>, collection: &str, query: Vec<f64>, k: usize, ef: usize) -> PyResult<PyObject> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-        let hnsw = RustHNSWIndex::new(kernel);
-        let results = hnsw.search(collection, &query, k, ef)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
-
-        let list = PyList::new_bound(py, results.iter().map(|(dist, id)| {
-            PyTuple::new_bound(py, [dist.to_object(py), id.to_object(py)]).into_any()
-        }));
-        Ok(list.into())
-    }
-
-    /// Get HNSW index statistics. Returns None if no index exists.
-    fn hnsw_stats(&self, py: Python<'_>, collection: &str) -> PyResult<PyObject> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-        let hnsw = RustHNSWIndex::new(kernel);
-        match hnsw.stats(collection) {
-            Some(stats) => {
-                let dict = PyDict::new_bound(py);
-                dict.set_item("n_vectors", stats.n_vectors)?;
-                dict.set_item("max_layer", stats.max_layer)?;
-                dict.set_item("m", stats.m)?;
-                dict.set_item("metric", &stats.metric)?;
-                Ok(dict.into())
-            }
-            None => Ok(py.None()),
-        }
-    }
-
-    /// Build a secondary index on a collection.
-    ///
-    /// Args:
-    ///   - collection: Collection name
-    ///   - index_name: Name for this index (e.g., "by_name", "by_email")
-    ///   - rows: List of (rowid, row_dict) tuples
-    ///   - key_field: The field in row_dict to index
+    ///   - index_name: Name for this index
+    ///   - index_type: Type of index ("simple", "ivf", "hnsw")
+    ///   - config: Dict of index-specific config:
+    ///       "simple": {"key_field": "name"}
+    ///       "ivf":    {"n_clusters": 10, "metric": "euclidean"}
+    ///       "hnsw":   {"m": 16, "ef_construction": 200, "metric": "l2"}
+    ///   - rows: For "simple" index — list of (rowid, row_dict) tuples.
+    ///           For "ivf"/"hnsw" — not needed (reads from collection).
     ///
     /// Returns:
     ///   The index blob hash.
+    ///
+    /// Examples:
+    ///   # Simple secondary index
+    ///   s.build_index('users', 'by_name', 'simple',
+    ///       config={'key_field': 'name'},
+    ///       rows=[('user:1', {'name': 'alice'})])
+    ///
+    ///   # IVF vector index
+    ///   s.build_index('vectors', 'ann', 'ivf',
+    ///       config={'n_clusters': 10, 'metric': 'euclidean'})
+    ///
+    ///   # HNSW vector index
+    ///   s.build_index('vectors', 'ann', 'hnsw',
+    ///       config={'m': 16, 'metric': 'l2'})
+    #[pyo3(signature = (collection, index_name, index_type, config=None, rows=None))]
     fn build_index(
         &self,
         collection: &str,
         index_name: &str,
-        rows: Vec<(String, PyObject)>,
-        key_field: &str,
+        index_type: &str,
+        config: Option<PyObject>,
+        rows: Option<Vec<(String, PyObject)>>,
     ) -> PyResult<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let indexer = RustCollectionIndexer::new(kernel);
 
-        let rust_rows: Vec<(String, JsonValue)> = rows.into_iter()
-            .map(|(rowid, obj)| {
-                let val: JsonValue = python_to_json(&obj);
-                (rowid, val)
-            })
-            .collect();
+        match index_type {
+            "simple" => {
+                let indexer = RustSimpleIndex::new(kernel);
+                let cfg = config.as_ref().map(|c| python_to_json(c));
+                let key_field = cfg.as_ref()
+                    .and_then(|c| c.get("key_field"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("id")
+                    .to_string();
 
-        indexer.build_index(collection, index_name, &rust_rows, |row| {
-            match row.get(key_field) {
-                Some(JsonValue::String(s)) => vec![s.clone()],
-                Some(JsonValue::Number(n)) => vec![n.to_string()],
-                Some(JsonValue::Array(arr)) => arr.iter()
-                    .filter_map(|v| match v {
-                        JsonValue::String(s) => Some(s.clone()),
-                        JsonValue::Number(n) => Some(n.to_string()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
+                let rust_rows: Vec<(String, JsonValue)> = rows.unwrap_or_default()
+                    .into_iter()
+                    .map(|(rowid, obj)| (rowid, python_to_json(&obj)))
+                    .collect();
+
+                let kf = key_field.clone();
+                indexer.build_index(collection, index_name, &rust_rows, |row| {
+                    match row.get(&kf) {
+                        Some(JsonValue::String(s)) => vec![s.clone()],
+                        Some(JsonValue::Number(n)) => vec![n.to_string()],
+                        Some(JsonValue::Array(arr)) => arr.iter()
+                            .filter_map(|v| match v {
+                                JsonValue::String(s) => Some(s.clone()),
+                                JsonValue::Number(n) => Some(n.to_string()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => vec![],
+                    }
+                }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
             }
-        }).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+            "ivf" => {
+                let cfg = config.as_ref().map(|c| python_to_json(c));
+                let n_clusters = cfg.as_ref()
+                    .and_then(|c| c.get("n_clusters"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10) as usize;
+                let metric = cfg.as_ref()
+                    .and_then(|c| c.get("metric"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("euclidean");
+
+                // IVF uses the index_name as the ref name
+                // Currently IVF hardcodes "ivf" as the ref — we need to support custom names
+                let ivf = RustIVFIndex::new(kernel);
+                ivf.build(collection, n_clusters, metric)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+            }
+            "hnsw" => {
+                let cfg = config.as_ref().map(|c| python_to_json(c));
+                let m = cfg.as_ref()
+                    .and_then(|c| c.get("m"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(16) as usize;
+                let ef_construction = cfg.as_ref()
+                    .and_then(|c| c.get("ef_construction"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200) as usize;
+                let metric = cfg.as_ref()
+                    .and_then(|c| c.get("metric"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("l2");
+
+                let hnsw = RustHNSWIndex::new(kernel);
+                hnsw.build(collection, m, ef_construction, None, metric)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+            }
+            _ => Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Unknown index type: '{}'. Supported: simple, ivf, hnsw", index_type)
+            )),
+        }
     }
 
-    /// Look up a rowid by index key. Returns None if not found.
+    /// Look up a rowid by index key (exact lookup — for simple indexes).
+    ///
+    /// Returns None if the key is not found.
     fn lookup_index(&self, collection: &str, index_name: &str, index_key: &str) -> Option<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let indexer = RustCollectionIndexer::new(kernel);
+        let indexer = RustSimpleIndex::new(kernel);
         indexer.lookup(collection, index_name, index_key)
     }
 
-    /// Drop a secondary index. Returns True if the index existed and was dropped.
+    /// Search an index (approximate search — for vector indexes: IVF, HNSW).
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - index_type: "ivf" or "hnsw"
+    ///   - query: Query vector (list of floats)
+    ///   - k: Number of nearest neighbors to return
+    ///   - n_probe: IVF clusters to search (default 10)
+    ///   - ef: HNSW beam width (default 50)
+    ///
+    /// Returns:
+    ///   List of (distance, vector_id) tuples, sorted by distance.
+    #[pyo3(signature = (collection, index_type, query, k=10, n_probe=10, ef=50))]
+    fn search_index(&self, py: Python<'_>, collection: &str, index_type: &str, query: Vec<f64>, k: usize, n_probe: usize, ef: usize) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+
+        let results = match index_type {
+            "ivf" => {
+                let ivf = RustIVFIndex::new(kernel);
+                ivf.search(collection, &query, k, n_probe)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?
+            }
+            "hnsw" => {
+                let hnsw = RustHNSWIndex::new(kernel);
+                hnsw.search(collection, &query, k, ef)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?
+            }
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Unknown index type: '{}'. Supported: ivf, hnsw", index_type)
+            )),
+        };
+
+        let list = PyList::new_bound(py, results.iter().map(|(dist, id)| {
+            PyTuple::new_bound(py, [dist.to_object(py), id.to_object(py)]).into_any()
+        }));
+        Ok(list.into())
+    }
+
+    /// Drop an index. Works for ALL index types.
+    ///
+    /// Returns True if the index existed and was dropped.
     fn drop_index(&self, collection: &str, index_name: &str) -> bool {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let indexer = RustCollectionIndexer::new(kernel);
+        let indexer = RustSimpleIndex::new(kernel);
         indexer.drop_index(collection, index_name)
     }
 
@@ -1194,7 +1191,7 @@ impl Storage {
     fn list_indexes(&self, collection: &str) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let indexer = RustCollectionIndexer::new(kernel);
+        let indexer = RustSimpleIndex::new(kernel);
         indexer.list_indexes(collection)
     }
 

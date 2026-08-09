@@ -1072,17 +1072,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pond_collection_index"
-version = "0.3.0"
-dependencies = [
- "pond_kernel",
- "pond_storage",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "pond_core"
 version = "0.3.0"
 dependencies = [
@@ -1091,6 +1080,18 @@ dependencies = [
 
 [[package]]
 name = "pond_hnsw_index"
+version = "0.3.0"
+dependencies = [
+ "pond_core",
+ "pond_kernel",
+ "pond_storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "pond_ivf_index"
 version = "0.3.0"
 dependencies = [
  "pond_core",
@@ -1147,13 +1148,13 @@ dependencies = [
 name = "pond_python"
 version = "0.3.0"
 dependencies = [
- "pond_collection_index",
  "pond_core",
  "pond_hnsw_index",
+ "pond_ivf_index",
  "pond_kernel",
  "pond_s3",
+ "pond_simple_index",
  "pond_storage",
- "pond_vector_index",
  "pyo3",
  "serde_json",
 ]
@@ -1171,6 +1172,25 @@ dependencies = [
  "tempfile",
  "ureq",
  "url",
+]
+
+[[package]]
+name = "pond_semantic"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "pond_simple_index"
+version = "0.3.0"
+dependencies = [
+ "pond_kernel",
+ "pond_storage",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1196,26 +1216,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "pond_vector_index"
-version = "0.3.0"
-dependencies = [
- "pond_core",
- "pond_kernel",
- "pond_storage",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "pond_vector_lens"
 version = "0.3.0"
 dependencies = [
  "pond_core",
  "pond_hnsw_index",
+ "pond_ivf_index",
  "pond_kernel",
  "pond_storage",
- "pond_vector_index",
  "serde",
  "serde_json",
  "tempfile",

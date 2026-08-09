@@ -1,4 +1,4 @@
-// CollectionIndexer — collection-level secondary indexes.
+// SimpleIndex — simple secondary indexes.
 //
 // Port of Python bindings/python/sdk/extensions/indexing/collection_index.py
 //
@@ -9,7 +9,7 @@
 // from collections/{name}/indexes/{index_name}.
 //
 // API:
-//   let indexer = CollectionIndexer::new(kernel);
+//   let indexer = SimpleIndex::new(kernel);
 //   indexer.build_index("users", "by_name", &rows, |row| row["name"].as_str().unwrap().to_string());
 //   let rowid = indexer.lookup("users", "by_name", "alice"); // → Some("user:1")
 //
@@ -27,11 +27,11 @@ use std::collections::HashMap;
 ///
 /// Indexes are stored as JSON blobs (index_key → rowid mappings).
 /// O(1) PUT for the entire index (one blob). O(1) GET on lookup.
-pub struct CollectionIndexer<'a> {
+pub struct SimpleIndex<'a> {
     kernel: &'a PondKernel,
 }
 
-impl<'a> CollectionIndexer<'a> {
+impl<'a> SimpleIndex<'a> {
     pub fn new(kernel: &'a PondKernel) -> Self {
         Self { kernel }
     }
@@ -187,7 +187,7 @@ mod tests {
     fn test_build_and_lookup_index() {
         let (storage, _dir) = make_test_storage();
         let kernel = storage.kernel();
-        let indexer = CollectionIndexer::new(kernel);
+        let indexer = SimpleIndex::new(kernel);
 
         let rows = vec![
             ("user:1".to_string(), json!({"name": "alice", "age": 30})),
@@ -210,7 +210,7 @@ mod tests {
     fn test_multi_key_index() {
         let (storage, _dir) = make_test_storage();
         let kernel = storage.kernel();
-        let indexer = CollectionIndexer::new(kernel);
+        let indexer = SimpleIndex::new(kernel);
 
         let rows = vec![
             ("doc:1".to_string(), json!({"tags": ["rust", "db", "storage"]})),
@@ -236,7 +236,7 @@ mod tests {
     fn test_drop_index() {
         let (storage, _dir) = make_test_storage();
         let kernel = storage.kernel();
-        let indexer = CollectionIndexer::new(kernel);
+        let indexer = SimpleIndex::new(kernel);
 
         let rows = vec![("k1".to_string(), json!({"name": "test"}))];
         indexer.build_index("coll", "idx", &rows, |row| {
@@ -253,7 +253,7 @@ mod tests {
     fn test_list_indexes() {
         let (storage, _dir) = make_test_storage();
         let kernel = storage.kernel();
-        let indexer = CollectionIndexer::new(kernel);
+        let indexer = SimpleIndex::new(kernel);
 
         let rows = vec![("k1".to_string(), json!({"name": "a", "email": "a@b.com"}))];
 
@@ -269,7 +269,7 @@ mod tests {
     fn test_index_stats() {
         let (storage, _dir) = make_test_storage();
         let kernel = storage.kernel();
-        let indexer = CollectionIndexer::new(kernel);
+        let indexer = SimpleIndex::new(kernel);
 
         let rows = vec![
             ("k1".to_string(), json!({"name": "a"})),
@@ -291,7 +291,7 @@ mod tests {
     fn test_rebuild_index() {
         let (storage, _dir) = make_test_storage();
         let kernel = storage.kernel();
-        let indexer = CollectionIndexer::new(kernel);
+        let indexer = SimpleIndex::new(kernel);
 
         // Build with 2 rows
         let rows = vec![

@@ -176,7 +176,7 @@ impl VectorLens {
         }
 
         // 2. Try IVF index (O(n_probe × cluster_size))
-        let ivf = pond_vector_index::IVFIndex::new(kernel);
+        let ivf = pond_ivf_index::IVFIndex::new(kernel);
         if ivf.stats(collection).is_some() {
             return ivf.search(collection, query, k, n_probe);
         }
@@ -187,7 +187,7 @@ impl VectorLens {
 
     /// Build an IVF index on a collection (uses the IVF extension).
     pub fn build_ivf_index(&self, collection: &str, n_clusters: usize, metric: &str) -> Result<String, String> {
-        let ivf = pond_vector_index::IVFIndex::new(self.storage.kernel());
+        let ivf = pond_ivf_index::IVFIndex::new(self.storage.kernel());
         ivf.build(collection, n_clusters, metric)
     }
 

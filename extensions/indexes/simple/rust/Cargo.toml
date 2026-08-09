@@ -1,17 +1,17 @@
 [package]
-name = "pond_collection_index"
+name = "pond_simple_index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "CollectionIndexer — secondary indexes for Pond collections"
 
 [lib]
-name = "pond_collection_index"
+name = "pond_simple_index"
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
-pond_kernel = { path = "../../../core/kernel" }
-pond_storage = { path = "../../../core/storage" }
+pond_kernel = { path = "../../../../core/kernel" }
+pond_storage = { path = "../../../../core/storage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -13,9 +13,10 @@ members = [
     "lenses/oltp/rust",
     "lenses/lakehouse/rust",
     "lenses/vector/rust",
-    "extensions/indexing/rust",
-    "extensions/indexing/collection_index",
-    "extensions/indexing/hnsw_index",
+    "extensions/indexes/ivf/rust",
+    "extensions/indexes/hnsw/rust",
+    "extensions/indexes/simple/rust",
+    "extensions/semantic/rust",
 ]
 
 [workspace.package]
