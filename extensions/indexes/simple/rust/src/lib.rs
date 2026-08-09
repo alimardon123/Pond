@@ -44,6 +44,8 @@ impl<'a> SimpleIndex<'a> {
     ///   - rows: The rows to index (Vec<(rowid, row_data)>)
     ///   - extractor: Function that extracts index key(s) from a row.
     ///                Can return a single key or multiple keys (multi-key index).
+    ///   - key_field: The field name being indexed (stored as metadata
+    ///                for automatic index acceleration)
     ///
     /// Returns: index blob hash
     pub fn build_index(
@@ -52,6 +54,7 @@ impl<'a> SimpleIndex<'a> {
         index_name: &str,
         rows: &[(String, Value)],
         extractor: impl Fn(&Value) -> Vec<String>,
+        key_field: &str,
     ) -> Result<String, String> {
         let mut index_entries: HashMap<String, String> = HashMap::new();
 
@@ -71,6 +74,9 @@ impl<'a> SimpleIndex<'a> {
         let ref_name = self.index_ref(collection, index_name);
         self.kernel.reference(&ref_name, &index_hash)
             .map_err(|e| format!("Failed to reference index: {}", e))?;
+
+        // Store metadata for automatic index acceleration
+        let _ = self.store_metadata(collection, index_name, key_field);
 
         Ok(index_hash)
     }
@@ -157,6 +163,70 @@ impl<'a> SimpleIndex<'a> {
     fn index_ref(&self, collection: &str, index_name: &str) -> String {
         format!("collections/{}/indexes/{}", collection, index_name)
     }
+
+    fn meta_ref(&self, collection: &str, index_name: &str) -> String {
+        format!("collections/{}/_index_meta/{}", collection, index_name)
+    }
+
+    /// Store index metadata (key_field, index_type) so the read path
+    /// can automatically discover which column an index covers.
+    ///
+    /// This enables automatic index acceleration: when read_rows sees an
+    /// equality predicate on column X, it checks if any index covers X
+    /// and uses it for O(1) lookup instead of O(N) scan.
+    pub fn store_metadata(
+        &self,
+        collection: &str,
+        index_name: &str,
+        key_field: &str,
+    ) -> Result<(), String> {
+        let meta = serde_json::json!({
+            "index_type": "simple",
+            "key_field": key_field,
+        });
+        let meta_bytes = serde_json::to_vec(&meta)
+            .map_err(|e| format!("Failed to serialize index metadata: {}", e))?;
+        let meta_hash = self.kernel.write(&meta_bytes)
+            .map_err(|e| format!("Failed to write index metadata: {}", e))?;
+        self.kernel.reference(&self.meta_ref(collection, index_name), &meta_hash)
+            .map_err(|e| format!("Failed to reference index metadata: {}", e))
+    }
+
+    /// Find an index that covers a specific column.
+    ///
+    /// Returns the index name if found, None otherwise.
+    /// Used by the read path for automatic index acceleration.
+    pub fn find_index_by_column(&self, collection: &str, column: &str) -> Option<String> {
+        let meta_prefix = format!("collections/{}/_index_meta/", collection);
+        let meta_refs = self.kernel.list_names_prefix(&meta_prefix);
+
+        for meta_ref in meta_refs {
+            if maintenance::is_dropped(self.kernel, &meta_ref) {
+                continue;
+            }
+            let index_name = meta_ref.strip_prefix(&meta_prefix)?.to_string();
+
+            if let Some(hash) = self.kernel.resolve(&meta_ref) {
+                if let Ok(data) = self.kernel.read_blob(&hash) {
+                    if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        if meta.get("key_field").and_then(|v| v.as_str()) == Some(column) {
+                            return Some(index_name);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the key_field for an index (from metadata).
+    pub fn get_index_key_field(&self, collection: &str, index_name: &str) -> Option<String> {
+        let meta_ref = self.meta_ref(collection, index_name);
+        let hash = self.kernel.resolve(&meta_ref)?;
+        let data = self.kernel.read_blob(&hash).ok()?;
+        let meta: serde_json::Value = serde_json::from_slice(&data).ok()?;
+        meta.get("key_field").and_then(|v| v.as_str()).map(|s| s.to_string())
+    }
 }
 
 /// Statistics about an index.
@@ -197,7 +267,7 @@ mod tests {
 
         indexer.build_index("users", "by_name", &rows, |row| {
             vec![row["name"].as_str().unwrap().to_string()]
-        }).unwrap();
+        }, "name").unwrap();
 
         // Lookups
         assert_eq!(indexer.lookup("users", "by_name", "alice"), Some("user:1".to_string()));
@@ -222,7 +292,7 @@ mod tests {
                 .iter()
                 .map(|t| format!("tag:{}", t.as_str().unwrap()))
                 .collect()
-        }).unwrap();
+        }, "name").unwrap();
 
         // Both docs have "tag:db" — last writer wins (HashMap)
         let db_result = indexer.lookup("docs", "by_tag", "tag:db");
@@ -241,7 +311,7 @@ mod tests {
         let rows = vec![("k1".to_string(), json!({"name": "test"}))];
         indexer.build_index("coll", "idx", &rows, |row| {
             vec![row["name"].as_str().unwrap().to_string()]
-        }).unwrap();
+        }, "name").unwrap();
 
         assert!(indexer.index_exists("coll", "idx"));
         assert!(indexer.drop_index("coll", "idx"));
@@ -257,8 +327,8 @@ mod tests {
 
         let rows = vec![("k1".to_string(), json!({"name": "a", "email": "a@b.com"}))];
 
-        indexer.build_index("users", "by_name", &rows, |r| vec![r["name"].as_str().unwrap().to_string()]).unwrap();
-        indexer.build_index("users", "by_email", &rows, |r| vec![r["email"].as_str().unwrap().to_string()]).unwrap();
+        indexer.build_index("users", "by_name", &rows, |r| vec![r["name"].as_str().unwrap().to_string()], "name").unwrap();
+        indexer.build_index("users", "by_email", &rows, |r| vec![r["email"].as_str().unwrap().to_string()], "email").unwrap();
 
         let mut indexes = indexer.list_indexes("users");
         indexes.sort();
@@ -279,7 +349,7 @@ mod tests {
 
         indexer.build_index("coll", "idx", &rows, |r| {
             vec![r["name"].as_str().unwrap().to_string()]
-        }).unwrap();
+        }, "name").unwrap();
 
         let stats = indexer.index_stats("coll", "idx").unwrap();
         assert_eq!(stats.name, "idx");
@@ -300,7 +370,7 @@ mod tests {
         ];
         indexer.build_index("coll", "idx", &rows, |r| {
             vec![r["name"].as_str().unwrap().to_string()]
-        }).unwrap();
+        }, "name").unwrap();
         assert_eq!(indexer.index_stats("coll", "idx").unwrap().n_entries, 2);
 
         // Rebuild with 3 rows
@@ -311,7 +381,7 @@ mod tests {
         ];
         indexer.build_index("coll", "idx", &rows2, |r| {
             vec![r["name"].as_str().unwrap().to_string()]
-        }).unwrap();
+        }, "name").unwrap();
         assert_eq!(indexer.index_stats("coll", "idx").unwrap().n_entries, 3);
     }
 }

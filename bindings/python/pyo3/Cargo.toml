@@ -22,5 +22,7 @@ pond_s3 = { path = "../../../core/s3", optional = true }
 pond_ivf_index = { path = "../../../extensions/indexes/ivf/rust" }
 pond_hnsw_index = { path = "../../../extensions/indexes/hnsw/rust" }
 pond_simple_index = { path = "../../../extensions/indexes/simple/rust" }
+pond_semantic = { path = "../../../extensions/semantic/base/rust" }
+pond_ossie_adapter = { path = "../../../extensions/semantic/ossie/rust" }
 pyo3 = { version = "0.22", features = ["extension-module"] }
 serde_json = "1"
