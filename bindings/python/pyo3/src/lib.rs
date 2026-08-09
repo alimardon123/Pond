@@ -749,26 +749,51 @@ impl Storage {
         let storage = self.storage.lock().unwrap();
         let active = storage.get_active_branch(collection);
 
-        // === AUTO-INDEX ACCELERATION (multi-key) ===
+        // === AUTO-INDEX ACCELERATION (multi-key + composite) ===
         // For EACH equality predicate, check if a simple index covers that column.
+        // - Single-column index: O(1) exact lookup
+        // - Composite index: prefix scan (check if any key contains the value)
         // If an index exists AND the lookup key is not found → return empty (early exit).
-        // If all lookups pass → proceed with normal read (we know data exists).
-        // This handles multi-column predicates: WHERE id=5 AND status=1
-        // checks both indexes — if either fails, no rows can match.
         if let Some(ref preds) = predicates {
             let indexer = RustSimpleIndex::new(storage.kernel());
             for (col, op, val) in preds {
                 if op == "=" || op == "==" {
                     if let Some(index_name) = indexer.find_index_by_column(collection, col) {
                         let lookup_key = val.to_string();
-                        match indexer.lookup(collection, &index_name, &lookup_key) {
-                            None => {
-                                // Index says this key doesn't exist → no rows can match
-                                let dict = PyDict::new_bound(py);
-                                return Ok(dict.into());
+                        // Check if this is a composite index
+                        let key_fields = indexer.get_index_key_fields(collection, &index_name);
+                        let is_composite = key_fields.as_ref()
+                            .map(|f| f.len() > 1)
+                            .unwrap_or(false);
+
+                        if is_composite {
+                            // Composite index: scan all keys for a match
+                            // (can't do O(1) lookup on individual column of composite key)
+                            // Read the full index and check if any key contains the value
+                            let ref_name = format!("collections/{}/indexes/{}", collection, index_name);
+                            if let Some(hash) = storage.kernel().resolve(&ref_name) {
+                                if let Ok(data) = storage.kernel().read_blob(&hash) {
+                                    if let Ok(index) = serde_json::from_slice::<std::collections::HashMap<String, String>>(&data) {
+                                        // Check if any key contains the lookup value as a component
+                                        let found = index.keys().any(|k| {
+                                            // Split by unit separator and check each component
+                                            k.split('\x1f').any(|comp| comp == lookup_key)
+                                        });
+                                        if !found {
+                                            let dict = PyDict::new_bound(py);
+                                            return Ok(dict.into());
+                                        }
+                                    }
+                                }
                             }
-                            Some(_) => {
-                                // Key exists — continue checking other predicates
+                        } else {
+                            // Single-column index: O(1) exact lookup
+                            match indexer.lookup(collection, &index_name, &lookup_key) {
+                                None => {
+                                    let dict = PyDict::new_bound(py);
+                                    return Ok(dict.into());
+                                }
+                                Some(_) => {}
                             }
                         }
                     }
@@ -1087,32 +1112,53 @@ impl Storage {
             "simple" => {
                 let indexer = RustSimpleIndex::new(kernel);
                 let cfg = config.as_ref().map(|c| python_to_json(c));
-                let key_field = cfg.as_ref()
-                    .and_then(|c| c.get("key_field"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("id")
-                    .to_string();
+                // Support both key_field (string) and key_fields (list) in config
+                let key_fields: Vec<String> = if let Some(ref c) = cfg {
+                    if let Some(arr) = c.get("key_fields").and_then(|v| v.as_array()) {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    } else if let Some(s) = c.get("key_field").and_then(|v| v.as_str()) {
+                        vec![s.to_string()]
+                    } else {
+                        vec!["id".to_string()]
+                    }
+                } else {
+                    vec!["id".to_string()]
+                };
 
                 let rust_rows: Vec<(String, JsonValue)> = rows.unwrap_or_default()
                     .into_iter()
                     .map(|(rowid, obj)| (rowid, python_to_json(&obj)))
                     .collect();
 
-                let kf = key_field.clone();
+                let kf_refs: Vec<&str> = key_fields.iter().map(|s| s.as_str()).collect();
                 indexer.build_index(collection, index_name, &rust_rows, |row| {
-                    match row.get(&kf) {
-                        Some(JsonValue::String(s)) => vec![s.clone()],
-                        Some(JsonValue::Number(n)) => vec![n.to_string()],
-                        Some(JsonValue::Array(arr)) => arr.iter()
-                            .filter_map(|v| match v {
-                                JsonValue::String(s) => Some(s.clone()),
-                                JsonValue::Number(n) => Some(n.to_string()),
-                                _ => None,
-                            })
-                            .collect(),
-                        _ => vec![],
+                    // Build composite key from all key_fields
+                    let mut parts: Vec<String> = Vec::new();
+                    for kf in &key_fields {
+                        match row.get(kf) {
+                            Some(JsonValue::String(s)) => parts.push(s.clone()),
+                            Some(JsonValue::Number(n)) => parts.push(n.to_string()),
+                            Some(JsonValue::Array(arr)) => {
+                                for v in arr {
+                                    match v {
+                                        JsonValue::String(s) => parts.push(s.clone()),
+                                        JsonValue::Number(n) => parts.push(n.to_string()),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
-                }, &key_field).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+                    // For composite keys: join with separator
+                    if parts.len() > 1 {
+                        vec![parts.join("\x1f")]  // ASCII unit separator
+                    } else {
+                        parts
+                    }
+                }, &kf_refs).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
             }
             "ivf" => {
                 let cfg = config.as_ref().map(|c| python_to_json(c));
