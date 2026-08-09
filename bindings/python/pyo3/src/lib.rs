@@ -1312,21 +1312,80 @@ impl Storage {
     }
 
     // ===================================================================
-    // Semantic model operations — define/query metrics, dimensions, relationships
+    // Semantic model operations — CROSS-COLLECTION models
+    // (follows Apache Ossie pattern: model = datasets + relationships + metrics)
     // ===================================================================
 
-    /// Define a metric on a collection.
+    /// Create a cross-collection semantic model.
+    ///
+    /// A semantic model groups multiple collections (datasets), declares
+    /// relationships between them, and defines metrics that can reference
+    /// fields across collections.
+    ///
+    /// This follows the universal pattern from Apache Ossie, Cube, dbt,
+    /// Malloy, and LookML: the model is a cross-collection container.
     ///
     /// Args:
-    ///   - collection: Collection name (semantic definitions are stored here)
-    ///   - name: Metric name (e.g., "revenue")
-    ///   - expression: Expression (e.g., "SUM(amount)")
-    ///   - description: Optional description
-    fn define_metric(&self, collection: &str, name: &str, expression: &str, description: Option<&str>) -> PyResult<()> {
+    ///   - model_name: Name for this semantic model (e.g., "sales_analytics")
+    ///   - adapter: Export adapter type ("ossie")
+    ///
+    /// After creating a model, use:
+    ///   - add_dataset(model, collection) to register collections
+    ///   - define_metric(model, name, expression) to define metrics
+    ///   - define_dimension(model, name, collection, field, data_type)
+    ///   - define_relationship(model, name, from, to, condition)
+    #[pyo3(signature = (model_name, adapter="ossie"))]
+    fn create_semantic_model(&self, model_name: &str, adapter: &str) -> PyResult<()> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
-        // Store the metric definition as a kernel blob
+        let model_meta = serde_json::json!({
+            "name": model_name,
+            "adapter": adapter,
+        });
+        let meta_bytes = serde_json::to_vec(&model_meta)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let hash = kernel.write(&meta_bytes)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let ref_name = format!("semantic_models/{}/_meta", model_name);
+        kernel.reference(&ref_name, &hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Register a collection (dataset) as part of a semantic model.
+    ///
+    /// Args:
+    ///   - model_name: Semantic model name
+    ///   - collection: Collection to add (becomes a dataset in the model)
+    fn add_dataset(&self, model_name: &str, collection: &str) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+
+        let ds = serde_json::json!({"name": collection, "source": collection});
+        let ds_bytes = serde_json::to_vec(&ds)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let hash = kernel.write(&ds_bytes)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let ref_name = format!("semantic_models/{}/datasets/{}", model_name, collection);
+        kernel.reference(&ref_name, &hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Define a metric on a semantic model.
+    ///
+    /// Metrics can reference fields from any collection in the model.
+    ///
+    /// Args:
+    ///   - model_name: Semantic model name
+    ///   - name: Metric name (e.g., "revenue")
+    ///   - expression: Expression (e.g., "SUM(orders.amount)")
+    ///   - description: Optional description
+    fn define_metric(&self, model_name: &str, name: &str, expression: &str, description: Option<&str>) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+
         let metric = serde_json::json!({
             "name": name,
             "expression": expression,
@@ -1337,46 +1396,49 @@ impl Storage {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let hash = kernel.write(&metric_bytes)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let ref_name = format!("collections/{}/_semantic/metrics/{}", collection, name);
+        let ref_name = format!("semantic_models/{}/metrics/{}", model_name, name);
         kernel.reference(&ref_name, &hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         Ok(())
     }
 
-    /// Define a dimension on a collection.
+    /// Define a dimension on a semantic model.
     ///
     /// Args:
-    ///   - collection: Collection name
+    ///   - model_name: Semantic model name
     ///   - name: Dimension name (e.g., "country")
-    ///   - data_type: Data type (e.g., "string", "number", "time")
-    fn define_dimension(&self, collection: &str, name: &str, data_type: &str) -> PyResult<()> {
+    ///   - collection: Which collection this dimension comes from
+    ///   - field: The column name in that collection
+    ///   - data_type: "string", "number", "time"
+    fn define_dimension(&self, model_name: &str, name: &str, collection: &str, field: &str, data_type: &str) -> PyResult<()> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
         let dim = serde_json::json!({
             "name": name,
+            "dataset": collection,
+            "field": field,
             "data_type": data_type,
-            "description": "",
         });
         let dim_bytes = serde_json::to_vec(&dim)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let hash = kernel.write(&dim_bytes)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let ref_name = format!("collections/{}/_semantic/dimensions/{}", collection, name);
+        let ref_name = format!("semantic_models/{}/dimensions/{}", model_name, name);
         kernel.reference(&ref_name, &hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         Ok(())
     }
 
-    /// Define a relationship between collections.
+    /// Define a relationship between collections in a semantic model.
     ///
     /// Args:
-    ///   - collection: Collection name (where the definition is stored)
+    ///   - model_name: Semantic model name
     ///   - name: Relationship name
     ///   - from_collection: Source collection
     ///   - to_collection: Target collection
     ///   - condition: Join condition (e.g., "users.id = orders.user_id")
-    fn define_relationship(&self, collection: &str, name: &str, from_collection: &str, to_collection: &str, condition: &str) -> PyResult<()> {
+    fn define_relationship(&self, model_name: &str, name: &str, from_collection: &str, to_collection: &str, condition: &str) -> PyResult<()> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
@@ -1385,56 +1447,126 @@ impl Storage {
             "from": from_collection,
             "to": to_collection,
             "condition": condition,
-            "join_type": "inner",
         });
         let rel_bytes = serde_json::to_vec(&rel)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let hash = kernel.write(&rel_bytes)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let ref_name = format!("collections/{}/_semantic/relationships/{}", collection, name);
+        let ref_name = format!("semantic_models/{}/relationships/{}", model_name, name);
         kernel.reference(&ref_name, &hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         Ok(())
     }
 
-    /// List all metrics defined on a collection.
-    fn list_metrics(&self, collection: &str) -> Vec<String> {
+    /// List all semantic models.
+    fn list_semantic_models(&self) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let prefix = format!("collections/{}/_semantic/metrics/", collection);
+        let prefix = "semantic_models/";
+        kernel.list_names_prefix(prefix).into_iter()
+            .filter_map(|n| {
+                // Extract model name from "semantic_models/{model}/_meta"
+                let rest = n.strip_prefix("semantic_models/")?;
+                let model_name = rest.split('/').next()?;
+                if model_name == "_meta" { return None; }
+                Some(model_name.to_string())
+            })
+            .collect()
+    }
+
+    /// List all datasets (collections) in a semantic model.
+    fn list_datasets(&self, model_name: &str) -> Vec<String> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let prefix = format!("semantic_models/{}/datasets/", model_name);
         kernel.list_names_prefix(&prefix).into_iter()
             .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect()
     }
 
-    /// List all dimensions defined on a collection.
-    fn list_dimensions(&self, collection: &str) -> Vec<String> {
+    /// List all metrics in a semantic model.
+    fn list_metrics(&self, model_name: &str) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let prefix = format!("collections/{}/_semantic/dimensions/", collection);
+        let prefix = format!("semantic_models/{}/metrics/", model_name);
         kernel.list_names_prefix(&prefix).into_iter()
             .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect()
+    }
+
+    /// List all dimensions in a semantic model.
+    fn list_dimensions(&self, model_name: &str) -> Vec<String> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let prefix = format!("semantic_models/{}/dimensions/", model_name);
+        kernel.list_names_prefix(&prefix).into_iter()
+            .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// Get quick overview of a semantic model.
+    ///
+    /// Returns a dict with: name, adapter, datasets, metrics, dimensions,
+    /// relationships (each with count + names).
+    fn semantic_model_info(&self, py: Python<'_>, model_name: &str) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+
+        // Read model metadata
+        let model_ref = format!("semantic_models/{}/_meta", model_name);
+        let model_hash = kernel.resolve(&model_ref)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
+                format!("Semantic model '{}' not found", model_name)))?;
+        let model_data = kernel.read_blob(&model_hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let model_meta: serde_json::Value = serde_json::from_slice(&model_data)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        // List datasets, metrics, dimensions, relationships
+        let datasets = self.list_datasets(model_name);
+        let metrics = self.list_metrics(model_name);
+
+        let dim_prefix = format!("semantic_models/{}/dimensions/", model_name);
+        let dimensions: Vec<String> = kernel.list_names_prefix(&dim_prefix).into_iter()
+            .filter_map(|n| n.strip_prefix(&dim_prefix).map(|s| s.to_string()))
+            .collect();
+
+        let rel_prefix = format!("semantic_models/{}/relationships/", model_name);
+        let relationships: Vec<String> = kernel.list_names_prefix(&rel_prefix).into_iter()
+            .filter_map(|n| n.strip_prefix(&rel_prefix).map(|s| s.to_string()))
+            .collect();
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("name", model_meta.get("name").and_then(|v| v.as_str()).unwrap_or(model_name))?;
+        dict.set_item("adapter", model_meta.get("adapter").and_then(|v| v.as_str()).unwrap_or("ossie"))?;
+        dict.set_item("datasets_count", datasets.len())?;
+        dict.set_item("datasets", datasets)?;
+        dict.set_item("metrics_count", metrics.len())?;
+        dict.set_item("metrics", metrics)?;
+        dict.set_item("dimensions_count", dimensions.len())?;
+        dict.set_item("dimensions", dimensions)?;
+        dict.set_item("relationships_count", relationships.len())?;
+        dict.set_item("relationships", relationships)?;
+        Ok(dict.into())
     }
 
     /// Export the semantic model in a specific adapter format.
     ///
     /// Args:
-    ///   - collection: Collection name
+    ///   - model_name: Semantic model name
     ///   - adapter: Adapter type ("ossie")
     ///
     /// Returns:
-    ///   JSON dict of the exported model.
-    #[pyo3(signature = (collection, adapter="ossie"))]
-    fn export_semantic_model(&self, py: Python<'_>, collection: &str, adapter: &str) -> PyResult<PyObject> {
+    ///   JSON dict of the exported model (Ossie format).
+    #[pyo3(signature = (model_name, adapter="ossie"))]
+    fn export_semantic_model(&self, py: Python<'_>, model_name: &str, adapter: &str) -> PyResult<PyObject> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
-        // Read all semantic definitions
         let mut defs = SemanticDefinitions::new();
 
         // Read metrics
-        let metric_prefix = format!("collections/{}/_semantic/metrics/", collection);
+        let metric_prefix = format!("semantic_models/{}/metrics/", model_name);
         for ref_name in kernel.list_names_prefix(&metric_prefix) {
             if let Some(hash) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
@@ -1451,7 +1583,7 @@ impl Storage {
         }
 
         // Read dimensions
-        let dim_prefix = format!("collections/{}/_semantic/dimensions/", collection);
+        let dim_prefix = format!("semantic_models/{}/dimensions/", model_name);
         for ref_name in kernel.list_names_prefix(&dim_prefix) {
             if let Some(hash) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
@@ -1459,7 +1591,7 @@ impl Storage {
                         defs.dimensions.push(pond_semantic::Dimension {
                             name: d.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             data_type: d.get("data_type").and_then(|v| v.as_str()).unwrap_or("string").to_string(),
-                            description: d.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            description: d.get("field").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         });
                     }
                 }
@@ -1467,7 +1599,7 @@ impl Storage {
         }
 
         // Read relationships
-        let rel_prefix = format!("collections/{}/_semantic/relationships/", collection);
+        let rel_prefix = format!("semantic_models/{}/relationships/", model_name);
         for ref_name in kernel.list_names_prefix(&rel_prefix) {
             if let Some(hash) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
@@ -1476,7 +1608,7 @@ impl Storage {
                             name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             from_collection: r.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             to_collection: r.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            join_type: r.get("join_type").and_then(|v| v.as_str()).unwrap_or("inner").to_string(),
+                            join_type: "inner".to_string(),
                             join_condition: r.get("condition").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         });
                     }
@@ -1504,245 +1636,28 @@ impl Storage {
         Ok(result.into())
     }
 
-    /// Create a named semantic model on a collection.
+    /// Create a semantic reflection — pre-computed materialization.
     ///
-    /// A semantic model is a named container for metrics, dimensions, and
-    /// relationships. Multiple query engines/users can read the same model.
-    ///
-    /// Args:
-    ///   - collection: Collection name
-    ///   - model_name: Name for this semantic model (e.g., "sales_analytics")
-    ///   - adapter: Adapter type for export ("ossie", default from config)
-    ///
-    /// After creating a model, use define_metric/define_dimension/
-    /// define_relationship to add definitions to it.
-    #[pyo3(signature = (collection, model_name, adapter="ossie"))]
-    fn create_semantic_model(&self, collection: &str, model_name: &str, adapter: &str) -> PyResult<()> {
+    /// Currently a placeholder for Dremio-style reflections.
+    /// Future: project columns from the model's datasets into a PND2 blob.
+    #[pyo3(signature = (model_name))]
+    fn create_reflection(&self, model_name: &str) -> PyResult<String> {
+        // TODO: Implement reflection creation (read datasets, project columns, materialize)
+        // For now, this is a placeholder that returns a status hash
+        let _ = model_name;
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-
-        let model_meta = serde_json::json!({
-            "name": model_name,
-            "adapter": adapter,
-            "collection": collection,
-        });
-        let meta_bytes = serde_json::to_vec(&model_meta)
+        let status = b"reflection_placeholder";
+        let hash = kernel.write(status)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let hash = kernel.write(&meta_bytes)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let ref_name = format!("collections/{}/_semantic/models/{}", collection, model_name);
-        kernel.reference(&ref_name, &hash)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(())
+        Ok(hash)
     }
 
-    /// List all semantic models on a collection.
-    fn list_semantic_models(&self, collection: &str) -> Vec<String> {
+    /// List all reflections on a semantic model.
+    fn list_reflections(&self, model_name: &str) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let prefix = format!("collections/{}/_semantic/models/", collection);
-        kernel.list_names_prefix(&prefix).into_iter()
-            .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
-            .collect()
-    }
-
-    /// Get quick overview of a semantic model.
-    ///
-    /// Returns a dict with: name, adapter, metrics (count + names),
-    /// dimensions (count + names), relationships (count + names).
-    fn semantic_model_info(&self, py: Python<'_>, collection: &str, model_name: &str) -> PyResult<PyObject> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-
-        // Read model metadata
-        let model_ref = format!("collections/{}/_semantic/models/{}", collection, model_name);
-        let model_hash = kernel.resolve(&model_ref)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
-                format!("Semantic model '{}' not found", model_name)))?;
-        let model_data = kernel.read_blob(&model_hash)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let model_meta: serde_json::Value = serde_json::from_slice(&model_data)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-
-        // Count metrics, dimensions, relationships
-        let metric_prefix = format!("collections/{}/_semantic/metrics/", collection);
-        let metrics: Vec<String> = kernel.list_names_prefix(&metric_prefix).into_iter()
-            .filter_map(|n| n.strip_prefix(&metric_prefix).map(|s| s.to_string()))
-            .collect();
-
-        let dim_prefix = format!("collections/{}/_semantic/dimensions/", collection);
-        let dimensions: Vec<String> = kernel.list_names_prefix(&dim_prefix).into_iter()
-            .filter_map(|n| n.strip_prefix(&dim_prefix).map(|s| s.to_string()))
-            .collect();
-
-        let rel_prefix = format!("collections/{}/_semantic/relationships/", collection);
-        let relationships: Vec<String> = kernel.list_names_prefix(&rel_prefix).into_iter()
-            .filter_map(|n| n.strip_prefix(&rel_prefix).map(|s| s.to_string()))
-            .collect();
-
-        let dict = PyDict::new_bound(py);
-        dict.set_item("name", model_meta.get("name").and_then(|v| v.as_str()).unwrap_or(model_name))?;
-        dict.set_item("adapter", model_meta.get("adapter").and_then(|v| v.as_str()).unwrap_or("ossie"))?;
-        dict.set_item("collection", collection)?;
-        dict.set_item("metrics_count", metrics.len())?;
-        dict.set_item("metrics", metrics)?;
-        dict.set_item("dimensions_count", dimensions.len())?;
-        dict.set_item("dimensions", dimensions)?;
-        dict.set_item("relationships_count", relationships.len())?;
-        dict.set_item("relationships", relationships)?;
-        Ok(dict.into())
-    }
-
-    /// Create a semantic reflection — pre-computed materialization of a
-    /// semantic model query for auto-acceleration.
-    ///
-    /// This is the foundation for Dremio-style reflections in Pond:
-    /// - Reflections are content-addressed PND2 blobs (immutable, deduped)
-    /// - Freshness = set membership (O(1) hash comparison, no polling)
-    /// - Incremental refresh via versioning diff (always append-only path)
-    /// - The read path auto-detects reflections and uses them transparently
-    ///
-    /// Currently creates a RAW reflection (projected columns from the
-    /// collection that the semantic model's metrics/dimensions reference).
-    /// Future: aggregation reflections (pre-grouped by dimensions).
-    ///
-    /// Args:
-    ///   - collection: Source collection
-    ///   - model_name: Semantic model name (defines which columns to materialize)
-    ///
-    /// Returns: reflection blob hash
-    fn create_reflection(&self, collection: &str, model_name: &str) -> PyResult<String> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-
-        // Read the semantic model's metrics and dimensions to determine
-        // which columns to project
-        let metric_prefix = format!("collections/{}/_semantic/metrics/", collection);
-        let dim_prefix = format!("collections/{}/_semantic/dimensions/", collection);
-
-        // Collect referenced columns from metrics and dimensions
-        let mut projected_columns: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        // Read metrics
-        for ref_name in kernel.list_names_prefix(&metric_prefix) {
-            if let Some(hash) = kernel.resolve(&ref_name) {
-                if let Ok(data) = kernel.read_blob(&hash) {
-                    if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        // The expression field may reference column names
-                        if let Some(expr) = m.get("expression").and_then(|v| v.as_str()) {
-                            // Simple extraction: look for column names in the expression
-                            // (e.g., "SUM(amount)" → "amount")
-                            for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                                if !word.is_empty() && word.len() > 1 {
-                                    projected_columns.insert(word.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Read dimensions — their names ARE the column names
-        for ref_name in kernel.list_names_prefix(&dim_prefix) {
-            if let Some(hash) = kernel.resolve(&ref_name) {
-                if let Ok(data) = kernel.read_blob(&hash) {
-                    if let Ok(d) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        if let Some(name) = d.get("name").and_then(|v| v.as_str()) {
-                            projected_columns.insert(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Read the collection's data and project to the referenced columns
-        let active = storage.get_active_branch(collection);
-        let head = kernel.resolve(&pond_storage::branch_ref(collection, &active))
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
-                format!("Collection '{}' has no commits", collection)))?;
-
-        let head_data = kernel.read_blob(&head)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-
-        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-            let (_, mb, _) = pond_storage::pond_pack::decode_pack(&head_data)
-                .ok_or_else(|| pyo3::exceptions::PyIOError::new_err("Failed to decode PondPack"))?;
-            mb
-        } else {
-            let commit = pond_storage::commit::read_commit(kernel, &head)
-                .ok_or_else(|| pyo3::exceptions::PyIOError::new_err("Failed to read commit"))?;
-            kernel.read_blob(&commit.manifest)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
-        };
-
-        let manifest = pond_storage::manifest::CollectionManifest::decode(&manifest_bytes)
-            .ok_or_else(|| pyo3::exceptions::PyIOError::new_err("Failed to decode manifest"))?;
-
-        // Read and project each row group
-        let mut reflection_blob = Vec::new();
-        for rg in &manifest.row_groups {
-            let blob_data = kernel.read_blob(&rg.blob_hash)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-
-            // Decode, project, re-encode
-            if let Ok(cols) = pond_core::pnd2_decode(&blob_data) {
-                let projected: Vec<(&str, pond_core::TypedColumn)> = cols.iter()
-                    .filter(|c| {
-                        let name = c.name.to_string_lossy().to_string();
-                        projected_columns.contains(&name)
-                    })
-                    .map(|c| {
-                        let name: &str = Box::leak(c.name.to_string_lossy().to_string().into_boxed_str());
-                        let col = match c.vtype {
-                            pond_core::VT_INT64 => pond_core::TypedColumn::Int64(c.i64_data.clone()),
-                            pond_core::VT_FLOAT64 => pond_core::TypedColumn::Float64(c.f64_data.clone()),
-                            pond_core::VT_STRING => pond_core::TypedColumn::String(
-                                c.str_data.iter().map(|s| s.to_string_lossy().to_string()).collect()
-                            ),
-                            _ => pond_core::TypedColumn::Int64(vec![]),
-                        };
-                        (name, col)
-                    })
-                    .collect();
-
-                if !projected.is_empty() {
-                    let blob = pond_core::pnd2_encode_multi_typed(&projected);
-                    reflection_blob.extend_from_slice(&blob);
-                }
-            }
-        }
-
-        // Store the reflection as a content-addressed blob
-        let reflection_hash = kernel.write(&reflection_blob)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-
-        // Store reflection metadata
-        let refl_meta = serde_json::json!({
-            "type": "raw",
-            "model": model_name,
-            "anchor_collection": collection,
-            "anchor_commit": head,
-            "reflection_hash": reflection_hash,
-            "projected_columns": projected_columns.iter().collect::<Vec<_>>(),
-        });
-        let meta_bytes = serde_json::to_vec(&refl_meta)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let meta_hash = kernel.write(&meta_bytes)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-
-        let refl_ref = format!("collections/{}/_semantic/reflections/{}", collection, model_name);
-        kernel.reference(&refl_ref, &meta_hash)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-
-        Ok(reflection_hash)
-    }
-
-    /// List all reflections on a collection.
-    fn list_reflections(&self, collection: &str) -> Vec<String> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-        let prefix = format!("collections/{}/_semantic/reflections/", collection);
+        let prefix = format!("semantic_models/{}/reflections/", model_name);
         kernel.list_names_prefix(&prefix).into_iter()
             .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect()
