@@ -575,7 +575,7 @@ fn build_s3_url(
 /// ```
 #[pyclass]
 struct Storage {
-    storage: Mutex<UnifiedStorage>,
+    storage: Arc<Mutex<UnifiedStorage>>,
 }
 
 #[pymethods]
@@ -616,7 +616,7 @@ impl Storage {
                     .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
                 let kernel = PondKernel::new_with_store(Box::new(store));
                 let storage = UnifiedStorage::new(kernel);
-                Ok(Self { storage: Mutex::new(storage) })
+                Ok(Self { storage: Arc::new(Mutex::new(storage)) })
             }
             #[cfg(not(feature = "s3"))]
             {
@@ -629,7 +629,7 @@ impl Storage {
             let path = location.strip_prefix("file://").unwrap_or(location);
             let storage = UnifiedStorage::new_local(path)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            Ok(Self { storage: Mutex::new(storage) })
+            Ok(Self { storage: Arc::new(Mutex::new(storage)) })
         }
     }
 
@@ -644,7 +644,7 @@ impl Storage {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let kernel = PondKernel::new_with_store(Box::new(store));
         let storage = UnifiedStorage::new(kernel);
-        Ok(Self { storage: Mutex::new(storage) })
+        Ok(Self { storage: Arc::new(Mutex::new(storage)) })
     }
 
     /// Write data to a collection on the active branch.
@@ -1312,261 +1312,274 @@ impl Storage {
     }
 
     // ===================================================================
-    // Semantic model operations — CROSS-COLLECTION models
-    // (follows Apache Ossie pattern: model = datasets + relationships + metrics)
+    // Semantic models — cross-collection, handle-based API
     // ===================================================================
 
-    /// Create a cross-collection semantic model.
+    /// Get a semantic model handle (creates the model if it doesn't exist).
     ///
-    /// A semantic model groups multiple collections (datasets), declares
-    /// relationships between them, and defines metrics that can reference
-    /// fields across collections.
-    ///
-    /// This follows the universal pattern from Apache Ossie, Cube, dbt,
-    /// Malloy, and LookML: the model is a cross-collection container.
-    ///
-    /// Args:
-    ///   - model_name: Name for this semantic model (e.g., "sales_analytics")
-    ///   - adapter: Export adapter type ("ossie")
-    ///
-    /// After creating a model, use:
-    ///   - add_dataset(model, collection) to register collections
-    ///   - define_metric(model, name, expression) to define metrics
-    ///   - define_dimension(model, name, collection, field, data_type)
-    ///   - define_relationship(model, name, from, to, condition)
-    #[pyo3(signature = (model_name, adapter="ossie"))]
-    fn create_semantic_model(&self, model_name: &str, adapter: &str) -> PyResult<()> {
+    /// Returns a SemanticModel object that groups all semantic operations:
+    ///   m = s.model('sales')
+    ///   m.add_datasets(['orders', 'users'])
+    ///   m.add_metrics({'revenue': 'SUM(orders.amount)'})
+    ///   m.info()
+    ///   m.export()
+    #[pyo3(signature = (name, adapter=None, enable_reflection=false))]
+    fn model(&self, name: &str, adapter: Option<&str>, enable_reflection: bool) -> PyResult<SemanticModel> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
-        let model_meta = serde_json::json!({
-            "name": model_name,
-            "adapter": adapter,
-        });
-        let meta_bytes = serde_json::to_vec(&model_meta)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let hash = kernel.write(&meta_bytes)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let ref_name = format!("semantic_models/{}/_meta", model_name);
-        kernel.reference(&ref_name, &hash)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(())
-    }
+        // Create model metadata if it doesn't exist
+        let model_ref = format!("semantic_models/{}/_meta", name);
+        if kernel.resolve(&model_ref).is_none() {
+            let adapter_name = adapter.unwrap_or("ossie");
+            let model_meta = serde_json::json!({
+                "name": name,
+                "adapter": adapter_name,
+                "enable_reflection": enable_reflection,
+            });
+            let meta_bytes = serde_json::to_vec(&model_meta)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let hash = kernel.write(&meta_bytes)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            kernel.reference(&model_ref, &hash)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        }
 
-    /// Register a collection (dataset) as part of a semantic model.
-    ///
-    /// Args:
-    ///   - model_name: Semantic model name
-    ///   - collection: Collection to add (becomes a dataset in the model)
-    fn add_dataset(&self, model_name: &str, collection: &str) -> PyResult<()> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-
-        let ds = serde_json::json!({"name": collection, "source": collection});
-        let ds_bytes = serde_json::to_vec(&ds)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let hash = kernel.write(&ds_bytes)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let ref_name = format!("semantic_models/{}/datasets/{}", model_name, collection);
-        kernel.reference(&ref_name, &hash)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Define a metric on a semantic model.
-    ///
-    /// Metrics can reference fields from any collection in the model.
-    ///
-    /// Args:
-    ///   - model_name: Semantic model name
-    ///   - name: Metric name (e.g., "revenue")
-    ///   - expression: Expression (e.g., "SUM(orders.amount)")
-    ///   - description: Optional description
-    fn define_metric(&self, model_name: &str, name: &str, expression: &str, description: Option<&str>) -> PyResult<()> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-
-        let metric = serde_json::json!({
-            "name": name,
-            "expression": expression,
-            "description": description.unwrap_or(""),
-            "format": "number",
-        });
-        let metric_bytes = serde_json::to_vec(&metric)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let hash = kernel.write(&metric_bytes)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let ref_name = format!("semantic_models/{}/metrics/{}", model_name, name);
-        kernel.reference(&ref_name, &hash)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Define a dimension on a semantic model.
-    ///
-    /// Args:
-    ///   - model_name: Semantic model name
-    ///   - name: Dimension name (e.g., "country")
-    ///   - collection: Which collection this dimension comes from
-    ///   - field: The column name in that collection
-    ///   - data_type: "string", "number", "time"
-    fn define_dimension(&self, model_name: &str, name: &str, collection: &str, field: &str, data_type: &str) -> PyResult<()> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-
-        let dim = serde_json::json!({
-            "name": name,
-            "dataset": collection,
-            "field": field,
-            "data_type": data_type,
-        });
-        let dim_bytes = serde_json::to_vec(&dim)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let hash = kernel.write(&dim_bytes)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let ref_name = format!("semantic_models/{}/dimensions/{}", model_name, name);
-        kernel.reference(&ref_name, &hash)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Define a relationship between collections in a semantic model.
-    ///
-    /// Args:
-    ///   - model_name: Semantic model name
-    ///   - name: Relationship name
-    ///   - from_collection: Source collection
-    ///   - to_collection: Target collection
-    ///   - condition: Join condition (e.g., "users.id = orders.user_id")
-    fn define_relationship(&self, model_name: &str, name: &str, from_collection: &str, to_collection: &str, condition: &str) -> PyResult<()> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-
-        let rel = serde_json::json!({
-            "name": name,
-            "from": from_collection,
-            "to": to_collection,
-            "condition": condition,
-        });
-        let rel_bytes = serde_json::to_vec(&rel)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let hash = kernel.write(&rel_bytes)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let ref_name = format!("semantic_models/{}/relationships/{}", model_name, name);
-        kernel.reference(&ref_name, &hash)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(())
+        Ok(SemanticModel {
+            storage: self.storage.clone(),
+            name: name.to_string(),
+        })
     }
 
     /// List all semantic models.
-    fn list_semantic_models(&self) -> Vec<String> {
+    fn models(&self) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let prefix = "semantic_models/";
+        let mut seen = std::collections::HashSet::new();
         kernel.list_names_prefix(prefix).into_iter()
             .filter_map(|n| {
-                // Extract model name from "semantic_models/{model}/_meta"
                 let rest = n.strip_prefix("semantic_models/")?;
                 let model_name = rest.split('/').next()?;
                 if model_name == "_meta" { return None; }
+                if seen.contains(model_name) { return None; }
+                seen.insert(model_name.to_string());
                 Some(model_name.to_string())
             })
             .collect()
     }
+}
 
-    /// List all datasets (collections) in a semantic model.
-    fn list_datasets(&self, model_name: &str) -> Vec<String> {
+// ===========================================================================
+// SemanticModel — handle for cross-collection semantic model operations
+// ===========================================================================
+
+use std::sync::Arc;
+
+/// A handle to a semantic model. All semantic operations go through this handle.
+///
+/// Get one via: `m = s.model('sales')`
+#[pyclass]
+struct SemanticModel {
+    storage: Arc<Mutex<UnifiedStorage>>,
+    name: String,
+}
+
+#[pymethods]
+impl SemanticModel {
+    /// Add multiple datasets (collections) to the model in one call.
+    ///
+    /// Args:
+    ///   - datasets: List of collection names to add
+    fn add_datasets(&self, datasets: Vec<String>) -> PyResult<()> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let prefix = format!("semantic_models/{}/datasets/", model_name);
-        kernel.list_names_prefix(&prefix).into_iter()
-            .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
-            .collect()
+        for ds in &datasets {
+            let ds_json = serde_json::json!({"name": ds, "source": ds});
+            let ds_bytes = serde_json::to_vec(&ds_json)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let hash = kernel.write(&ds_bytes)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let ref_name = format!("semantic_models/{}/datasets/{}", self.name, ds);
+            kernel.reference(&ref_name, &hash)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        }
+        Ok(())
     }
 
-    /// List all metrics in a semantic model.
-    fn list_metrics(&self, model_name: &str) -> Vec<String> {
+    /// Add multiple metrics to the model in one call.
+    ///
+    /// Args:
+    ///   - metrics: Dict of {metric_name: expression}
+    ///
+    /// Example:
+    ///   m.add_metrics({'revenue': 'SUM(orders.amount)', 'count': 'COUNT(orders.id)'})
+    fn add_metrics(&self, metrics: std::collections::HashMap<String, String>) -> PyResult<()> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let prefix = format!("semantic_models/{}/metrics/", model_name);
-        kernel.list_names_prefix(&prefix).into_iter()
-            .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
-            .collect()
+        for (name, expr) in &metrics {
+            let metric = serde_json::json!({
+                "name": name,
+                "expression": expr,
+                "description": "",
+                "format": "number",
+            });
+            let bytes = serde_json::to_vec(&metric)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let hash = kernel.write(&bytes)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let ref_name = format!("semantic_models/{}/metrics/{}", self.name, name);
+            kernel.reference(&ref_name, &hash)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        }
+        Ok(())
     }
 
-    /// List all dimensions in a semantic model.
-    fn list_dimensions(&self, model_name: &str) -> Vec<String> {
+    /// Add multiple dimensions to the model in one call.
+    ///
+    /// Args:
+    ///   - dimensions: Dict of {dim_name: (collection, field, data_type)}
+    ///
+    /// Example:
+    ///   m.add_dimensions({
+    ///       'country': ('users', 'country', 'string'),
+    ///       'order_date': ('orders', 'created_at', 'time'),
+    ///   })
+    fn add_dimensions(&self, dimensions: std::collections::HashMap<String, (String, String, String)>) -> PyResult<()> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let prefix = format!("semantic_models/{}/dimensions/", model_name);
-        kernel.list_names_prefix(&prefix).into_iter()
-            .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
-            .collect()
+        for (name, (dataset, field, data_type)) in &dimensions {
+            let dim = serde_json::json!({
+                "name": name,
+                "dataset": dataset,
+                "field": field,
+                "data_type": data_type,
+            });
+            let bytes = serde_json::to_vec(&dim)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let hash = kernel.write(&bytes)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let ref_name = format!("semantic_models/{}/dimensions/{}", self.name, name);
+            kernel.reference(&ref_name, &hash)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        }
+        Ok(())
     }
 
-    /// Get quick overview of a semantic model.
+    /// Add multiple relationships to the model in one call.
+    ///
+    /// Args:
+    ///   - relationships: Dict of {rel_name: (from, to, condition)}
+    ///
+    /// Example:
+    ///   m.add_relationships({
+    ///       'user_orders': ('users', 'orders', 'users.id = orders.user_id'),
+    ///   })
+    fn add_relationships(&self, relationships: std::collections::HashMap<String, (String, String, String)>) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        for (name, (from, to, condition)) in &relationships {
+            let rel = serde_json::json!({
+                "name": name,
+                "from": from,
+                "to": to,
+                "condition": condition,
+            });
+            let bytes = serde_json::to_vec(&rel)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let hash = kernel.write(&bytes)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let ref_name = format!("semantic_models/{}/relationships/{}", self.name, name);
+            kernel.reference(&ref_name, &hash)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Get a full overview of the model.
     ///
     /// Returns a dict with: name, adapter, datasets, metrics, dimensions,
-    /// relationships (each with count + names).
-    fn semantic_model_info(&self, py: Python<'_>, model_name: &str) -> PyResult<PyObject> {
+    /// relationships (each with count + names), reflection_enabled.
+    fn info(&self, py: Python<'_>) -> PyResult<PyObject> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
         // Read model metadata
-        let model_ref = format!("semantic_models/{}/_meta", model_name);
+        let model_ref = format!("semantic_models/{}/_meta", self.name);
         let model_hash = kernel.resolve(&model_ref)
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
-                format!("Semantic model '{}' not found", model_name)))?;
+                format!("Semantic model '{}' not found", self.name)))?;
         let model_data = kernel.read_blob(&model_hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let model_meta: serde_json::Value = serde_json::from_slice(&model_data)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
-        // List datasets, metrics, dimensions, relationships
-        let datasets = self.list_datasets(model_name);
-        let metrics = self.list_metrics(model_name);
-
-        let dim_prefix = format!("semantic_models/{}/dimensions/", model_name);
-        let dimensions: Vec<String> = kernel.list_names_prefix(&dim_prefix).into_iter()
-            .filter_map(|n| n.strip_prefix(&dim_prefix).map(|s| s.to_string()))
-            .collect();
-
-        let rel_prefix = format!("semantic_models/{}/relationships/", model_name);
-        let relationships: Vec<String> = kernel.list_names_prefix(&rel_prefix).into_iter()
-            .filter_map(|n| n.strip_prefix(&rel_prefix).map(|s| s.to_string()))
-            .collect();
+        let datasets = self.list_datasets_impl(kernel);
+        let metrics = self.list_metrics_impl(kernel);
+        let dimensions = self.list_dimensions_impl(kernel);
+        let relationships = self.list_relationships_impl(kernel);
 
         let dict = PyDict::new_bound(py);
-        dict.set_item("name", model_meta.get("name").and_then(|v| v.as_str()).unwrap_or(model_name))?;
+        dict.set_item("name", model_meta.get("name").and_then(|v| v.as_str()).unwrap_or(&self.name))?;
         dict.set_item("adapter", model_meta.get("adapter").and_then(|v| v.as_str()).unwrap_or("ossie"))?;
-        dict.set_item("datasets_count", datasets.len())?;
+        dict.set_item("reflection_enabled", model_meta.get("enable_reflection").and_then(|v| v.as_bool()).unwrap_or(false))?;
         dict.set_item("datasets", datasets)?;
-        dict.set_item("metrics_count", metrics.len())?;
         dict.set_item("metrics", metrics)?;
-        dict.set_item("dimensions_count", dimensions.len())?;
         dict.set_item("dimensions", dimensions)?;
-        dict.set_item("relationships_count", relationships.len())?;
         dict.set_item("relationships", relationships)?;
         Ok(dict.into())
     }
 
-    /// Export the semantic model in a specific adapter format.
+    /// List datasets in this model.
+    fn datasets(&self) -> Vec<String> {
+        let storage = self.storage.lock().unwrap();
+        self.list_datasets_impl(storage.kernel())
+    }
+
+    /// List metrics in this model.
+    fn metrics(&self) -> Vec<String> {
+        let storage = self.storage.lock().unwrap();
+        self.list_metrics_impl(storage.kernel())
+    }
+
+    /// List dimensions in this model.
+    fn dimensions(&self) -> Vec<String> {
+        let storage = self.storage.lock().unwrap();
+        self.list_dimensions_impl(storage.kernel())
+    }
+
+    /// List relationships in this model.
+    fn relationships(&self) -> Vec<String> {
+        let storage = self.storage.lock().unwrap();
+        self.list_relationships_impl(storage.kernel())
+    }
+
+    /// Export the model in a specific adapter format.
     ///
-    /// Args:
-    ///   - model_name: Semantic model name
-    ///   - adapter: Adapter type ("ossie")
-    ///
-    /// Returns:
-    ///   JSON dict of the exported model (Ossie format).
-    #[pyo3(signature = (model_name, adapter="ossie"))]
-    fn export_semantic_model(&self, py: Python<'_>, model_name: &str, adapter: &str) -> PyResult<PyObject> {
+    /// If adapter is None, uses the model's configured default adapter.
+    #[pyo3(signature = (adapter=None))]
+    fn export(&self, py: Python<'_>, adapter: Option<&str>) -> PyResult<PyObject> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
+        // Determine adapter
+        let model_ref = format!("semantic_models/{}/_meta", self.name);
+        let adapter_name = if let Some(a) = adapter {
+            a.to_string()
+        } else {
+            let model_hash = kernel.resolve(&model_ref)
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Model not found"))?;
+            let model_data = kernel.read_blob(&model_hash)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            let model_meta: serde_json::Value = serde_json::from_slice(&model_data)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            model_meta.get("adapter").and_then(|v| v.as_str()).unwrap_or("ossie").to_string()
+        };
+
+        // Read all definitions
         let mut defs = SemanticDefinitions::new();
 
-        // Read metrics
-        let metric_prefix = format!("semantic_models/{}/metrics/", model_name);
+        let metric_prefix = format!("semantic_models/{}/metrics/", self.name);
         for ref_name in kernel.list_names_prefix(&metric_prefix) {
             if let Some(hash) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
@@ -1582,8 +1595,7 @@ impl Storage {
             }
         }
 
-        // Read dimensions
-        let dim_prefix = format!("semantic_models/{}/dimensions/", model_name);
+        let dim_prefix = format!("semantic_models/{}/dimensions/", self.name);
         for ref_name in kernel.list_names_prefix(&dim_prefix) {
             if let Some(hash) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
@@ -1598,8 +1610,7 @@ impl Storage {
             }
         }
 
-        // Read relationships
-        let rel_prefix = format!("semantic_models/{}/relationships/", model_name);
+        let rel_prefix = format!("semantic_models/{}/relationships/", self.name);
         for ref_name in kernel.list_names_prefix(&rel_prefix) {
             if let Some(hash) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
@@ -1617,18 +1628,16 @@ impl Storage {
         }
 
         // Export using the adapter
-        let model = match adapter {
+        let model = match adapter_name.as_str() {
             "ossie" => {
                 use pond_semantic::SemanticModelAdapter;
-                let ossie = pond_ossie_adapter::OssieAdapter::new();
-                ossie.export_model(&defs)
+                pond_ossie_adapter::OssieAdapter::new().export_model(&defs)
             }
             _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Unknown adapter: '{}'. Supported: ossie", adapter)
+                format!("Unknown adapter: '{}'. Supported: ossie", adapter_name)
             )),
         };
 
-        // Convert to Python dict
         let model_str = serde_json::to_string(&model)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let json_module = py.import_bound("json")?;
@@ -1636,31 +1645,72 @@ impl Storage {
         Ok(result.into())
     }
 
-    /// Create a semantic reflection — pre-computed materialization.
-    ///
-    /// Currently a placeholder for Dremio-style reflections.
-    /// Future: project columns from the model's datasets into a PND2 blob.
-    #[pyo3(signature = (model_name))]
-    fn create_reflection(&self, model_name: &str) -> PyResult<String> {
-        // TODO: Implement reflection creation (read datasets, project columns, materialize)
-        // For now, this is a placeholder that returns a status hash
-        let _ = model_name;
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-        let status = b"reflection_placeholder";
-        let hash = kernel.write(status)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        Ok(hash)
+    /// Enable reflection on this model.
+    fn enable_reflection(&self) -> PyResult<()> {
+        self.set_reflection_flag(true)
     }
 
-    /// List all reflections on a semantic model.
-    fn list_reflections(&self, model_name: &str) -> Vec<String> {
-        let storage = self.storage.lock().unwrap();
-        let kernel = storage.kernel();
-        let prefix = format!("semantic_models/{}/reflections/", model_name);
+    /// Disable reflection on this model.
+    fn disable_reflection(&self) -> PyResult<()> {
+        self.set_reflection_flag(false)
+    }
+}
+
+impl SemanticModel {
+    fn list_datasets_impl(&self, kernel: &PondKernel) -> Vec<String> {
+        let prefix = format!("semantic_models/{}/datasets/", self.name);
         kernel.list_names_prefix(&prefix).into_iter()
             .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect()
+    }
+
+    fn list_metrics_impl(&self, kernel: &PondKernel) -> Vec<String> {
+        let prefix = format!("semantic_models/{}/metrics/", self.name);
+        kernel.list_names_prefix(&prefix).into_iter()
+            .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
+            .collect()
+    }
+
+    fn list_dimensions_impl(&self, kernel: &PondKernel) -> Vec<String> {
+        let prefix = format!("semantic_models/{}/dimensions/", self.name);
+        kernel.list_names_prefix(&prefix).into_iter()
+            .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
+            .collect()
+    }
+
+    fn list_relationships_impl(&self, kernel: &PondKernel) -> Vec<String> {
+        let prefix = format!("semantic_models/{}/relationships/", self.name);
+        kernel.list_names_prefix(&prefix).into_iter()
+            .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
+            .collect()
+    }
+
+    fn set_reflection_flag(&self, enabled: bool) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+
+        // Read existing meta
+        let model_ref = format!("semantic_models/{}/_meta", self.name);
+        let hash = kernel.resolve(&model_ref)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Model not found"))?;
+        let data = kernel.read_blob(&hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let mut meta: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        // Update flag
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("enable_reflection".to_string(), serde_json::json!(enabled));
+        }
+
+        // Write back
+        let new_bytes = serde_json::to_vec(&meta)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let new_hash = kernel.write(&new_bytes)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        kernel.reference(&model_ref, &new_hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -1763,5 +1813,6 @@ fn pond(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_class::<Storage>()?;
+    m.add_class::<SemanticModel>()?;
     Ok(())
 }
