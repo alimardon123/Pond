@@ -1312,82 +1312,94 @@ impl Storage {
     }
 
     // ===================================================================
-    // Semantic models — cross-collection, handle-based API
+    // Semantic layers — cross-collection, handle-based API
+    //
+    // WHY "layer" (not "model"): the word "model" collides with ML models,
+    // which Pond may host in the future. "Semantic Layer" is the industry-
+    // standard term (dbt Semantic Layer, Cube Semantic Layer, Looker LookML).
     // ===================================================================
 
-    /// Get a semantic model handle (creates the model if it doesn't exist).
+    /// Get a semantic layer handle (creates the layer if it doesn't exist).
     ///
-    /// Returns a SemanticModel object that groups all semantic operations:
-    ///   m = s.model('sales')
+    /// Returns a SemanticLayer object that groups all semantic operations:
+    ///   m = s.layer('sales')
     ///   m.add_datasets(['orders', 'users'])
     ///   m.add_metrics({'revenue': 'SUM(orders.amount)'})
     ///   m.info()
     ///   m.export()
-    #[pyo3(signature = (name, adapter=None, enable_reflection=false))]
-    fn model(&self, name: &str, adapter: Option<&str>, enable_reflection: bool) -> PyResult<SemanticModel> {
+    ///
+    /// Multiple adapters: pass a list to `adapters`. A layer can be exposed
+    /// via Ossie + Cube + dbt simultaneously. Adapters can also be added /
+    /// removed later via `m.add_adapter(name)` / `m.remove_adapter(name)`.
+    #[pyo3(signature = (name, adapters=None, enable_reflection=false))]
+    fn layer(&self, name: &str, adapters: Option<Vec<String>>, enable_reflection: bool) -> PyResult<SemanticLayer> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
-        // Create model metadata if it doesn't exist
-        let model_ref = format!("semantic_models/{}/_meta", name);
-        if kernel.resolve(&model_ref).is_none() {
-            let adapter_name = adapter.unwrap_or("ossie");
-            let model_meta = serde_json::json!({
+        // Create layer metadata if it doesn't exist
+        let layer_ref = format!("semantic_layers/{}/_meta", name);
+        if kernel.resolve(&layer_ref).is_none() {
+            // Default to ['ossie'] if no adapters specified
+            let adapter_list = adapters.unwrap_or_else(|| vec!["ossie".to_string()]);
+            let layer_meta = serde_json::json!({
                 "name": name,
-                "adapter": adapter_name,
+                "adapters": adapter_list,
                 "enable_reflection": enable_reflection,
             });
-            let meta_bytes = serde_json::to_vec(&model_meta)
+            let meta_bytes = serde_json::to_vec(&layer_meta)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
             let hash = kernel.write(&meta_bytes)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            kernel.reference(&model_ref, &hash)
+            kernel.reference(&layer_ref, &hash)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
 
-        Ok(SemanticModel {
+        Ok(SemanticLayer {
             storage: self.storage.clone(),
             name: name.to_string(),
         })
     }
 
-    /// List all semantic models.
-    fn models(&self) -> Vec<String> {
+    /// List all semantic layers.
+    fn layers(&self) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        let prefix = "semantic_models/";
+        let prefix = "semantic_layers/";
         let mut seen = std::collections::HashSet::new();
         kernel.list_names_prefix(prefix).into_iter()
             .filter_map(|n| {
-                let rest = n.strip_prefix("semantic_models/")?;
-                let model_name = rest.split('/').next()?;
-                if model_name == "_meta" { return None; }
-                if seen.contains(model_name) { return None; }
-                seen.insert(model_name.to_string());
-                Some(model_name.to_string())
+                let rest = n.strip_prefix("semantic_layers/")?;
+                let layer_name = rest.split('/').next()?;
+                if layer_name == "_meta" { return None; }
+                if seen.contains(layer_name) { return None; }
+                seen.insert(layer_name.to_string());
+                Some(layer_name.to_string())
             })
             .collect()
     }
 }
 
 // ===========================================================================
-// SemanticModel — handle for cross-collection semantic model operations
+// SemanticLayer — handle for cross-collection semantic layer operations
+//
+// WHY "layer" (not "model"): avoids confusion with ML models. Industry
+// standard (dbt Semantic Layer, Cube Semantic Layer, Looker LookML).
 // ===========================================================================
 
 use std::sync::Arc;
 
-/// A handle to a semantic model. All semantic operations go through this handle.
+/// A handle to a semantic layer. All semantic operations go through this handle.
 ///
-/// Get one via: `m = s.model('sales')`
+/// Get one via: `m = s.layer('sales')`
 #[pyclass]
-struct SemanticModel {
+struct SemanticLayer {
     storage: Arc<Mutex<UnifiedStorage>>,
     name: String,
 }
 
 #[pymethods]
-impl SemanticModel {
-    /// Add multiple datasets (collections) to the model in one call.
+impl SemanticLayer {
+    /// Add multiple datasets (collections) to the layer in one call.
     ///
     /// Args:
     ///   - datasets: List of collection names to add
@@ -1400,7 +1412,7 @@ impl SemanticModel {
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
             let hash = kernel.write(&ds_bytes)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            let ref_name = format!("semantic_models/{}/datasets/{}", self.name, ds);
+            let ref_name = format!("semantic_layers/{}/datasets/{}", self.name, ds);
             kernel.reference(&ref_name, &hash)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
@@ -1428,7 +1440,7 @@ impl SemanticModel {
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
             let hash = kernel.write(&bytes)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            let ref_name = format!("semantic_models/{}/metrics/{}", self.name, name);
+            let ref_name = format!("semantic_layers/{}/metrics/{}", self.name, name);
             kernel.reference(&ref_name, &hash)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
@@ -1459,7 +1471,7 @@ impl SemanticModel {
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
             let hash = kernel.write(&bytes)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            let ref_name = format!("semantic_models/{}/dimensions/{}", self.name, name);
+            let ref_name = format!("semantic_layers/{}/dimensions/{}", self.name, name);
             kernel.reference(&ref_name, &hash)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
@@ -1489,29 +1501,29 @@ impl SemanticModel {
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
             let hash = kernel.write(&bytes)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            let ref_name = format!("semantic_models/{}/relationships/{}", self.name, name);
+            let ref_name = format!("semantic_layers/{}/relationships/{}", self.name, name);
             kernel.reference(&ref_name, &hash)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         }
         Ok(())
     }
 
-    /// Get a full overview of the model.
+    /// Get a full overview of the layer.
     ///
-    /// Returns a dict with: name, adapter, datasets, metrics, dimensions,
+    /// Returns a dict with: name, adapters, datasets, metrics, dimensions,
     /// relationships (each with count + names), reflection_enabled.
     fn info(&self, py: Python<'_>) -> PyResult<PyObject> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
-        // Read model metadata
-        let model_ref = format!("semantic_models/{}/_meta", self.name);
-        let model_hash = kernel.resolve(&model_ref)
+        // Read layer metadata
+        let layer_ref = format!("semantic_layers/{}/_meta", self.name);
+        let layer_hash = kernel.resolve(&layer_ref)
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
-                format!("Semantic model '{}' not found", self.name)))?;
-        let model_data = kernel.read_blob(&model_hash)
+                format!("Semantic layer '{}' not found", self.name)))?;
+        let layer_data = kernel.read_blob(&layer_hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let model_meta: serde_json::Value = serde_json::from_slice(&model_data)
+        let layer_meta: serde_json::Value = serde_json::from_slice(&layer_data)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         let datasets = self.list_datasets_impl(kernel);
@@ -1519,10 +1531,20 @@ impl SemanticModel {
         let dimensions = self.list_dimensions_impl(kernel);
         let relationships = self.list_relationships_impl(kernel);
 
+        // adapters: a JSON list (with backward compat for the legacy
+        // single-string "adapter" field).
+        let adapters_val: Vec<String> = if let Some(arr) = layer_meta.get("adapters").and_then(|v| v.as_array()) {
+            arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+        } else if let Some(single) = layer_meta.get("adapter").and_then(|v| v.as_str()) {
+            vec![single.to_string()]
+        } else {
+            vec!["ossie".to_string()]
+        };
+
         let dict = PyDict::new_bound(py);
-        dict.set_item("name", model_meta.get("name").and_then(|v| v.as_str()).unwrap_or(&self.name))?;
-        dict.set_item("adapter", model_meta.get("adapter").and_then(|v| v.as_str()).unwrap_or("ossie"))?;
-        dict.set_item("reflection_enabled", model_meta.get("enable_reflection").and_then(|v| v.as_bool()).unwrap_or(false))?;
+        dict.set_item("name", layer_meta.get("name").and_then(|v| v.as_str()).unwrap_or(&self.name))?;
+        dict.set_item("adapters", adapters_val)?;
+        dict.set_item("reflection_enabled", layer_meta.get("enable_reflection").and_then(|v| v.as_bool()).unwrap_or(false))?;
         dict.set_item("datasets", datasets)?;
         dict.set_item("metrics", metrics)?;
         dict.set_item("dimensions", dimensions)?;
@@ -1530,56 +1552,114 @@ impl SemanticModel {
         Ok(dict.into())
     }
 
-    /// List datasets in this model.
+    /// List datasets in this layer.
     fn datasets(&self) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         self.list_datasets_impl(storage.kernel())
     }
 
-    /// List metrics in this model.
+    /// List metrics in this layer.
     fn metrics(&self) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         self.list_metrics_impl(storage.kernel())
     }
 
-    /// List dimensions in this model.
+    /// List dimensions in this layer.
     fn dimensions(&self) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         self.list_dimensions_impl(storage.kernel())
     }
 
-    /// List relationships in this model.
+    /// List relationships in this layer.
     fn relationships(&self) -> Vec<String> {
         let storage = self.storage.lock().unwrap();
         self.list_relationships_impl(storage.kernel())
     }
 
-    /// Export the model in a specific adapter format.
+    /// List the adapters currently enabled on this layer.
     ///
-    /// If adapter is None, uses the model's configured default adapter.
+    /// A layer can be exposed via multiple adapters simultaneously
+    /// (e.g., Ossie + Cube + dbt). Use `add_adapter` / `remove_adapter`
+    /// to manage them independently of the spec.
+    fn adapters(&self) -> PyResult<Vec<String>> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let layer_ref = format!("semantic_layers/{}/_meta", self.name);
+        let hash = kernel.resolve(&layer_ref)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Layer not found"))?;
+        let data = kernel.read_blob(&hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let meta: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        if let Some(arr) = meta.get("adapters").and_then(|v| v.as_array()) {
+            Ok(arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        } else if let Some(single) = meta.get("adapter").and_then(|v| v.as_str()) {
+            Ok(vec![single.to_string()])
+        } else {
+            Ok(vec!["ossie".to_string()])
+        }
+    }
+
+    /// Add an adapter to this layer. Idempotent.
+    ///
+    /// The layer becomes queryable via this adapter's protocol immediately
+    /// (auto-exposure — no explicit export step needed).
+    fn add_adapter(&self, adapter: String) -> PyResult<()> {
+        let mut current = self.adapters()?;
+        if !current.contains(&adapter) {
+            current.push(adapter);
+            self.set_adapters_field(current)?;
+        }
+        Ok(())
+    }
+
+    /// Remove an adapter from this layer. Returns True if it was present.
+    fn remove_adapter(&self, adapter: String) -> PyResult<bool> {
+        let mut current = self.adapters()?;
+        let before = current.len();
+        current.retain(|a| a != &adapter);
+        let removed = current.len() < before;
+        if removed {
+            self.set_adapters_field(current)?;
+        }
+        Ok(removed)
+    }
+
+    /// Export the layer in a specific adapter format.
+    ///
+    /// If `adapter` is None, uses the first adapter in the layer's
+    /// `adapters` list (the "default" for the layer).
+    ///
+    /// Auto-exposure: this method is OPTIONAL. Adapters can read the
+    /// layer's spec directly from storage at query time. This method
+    /// is for one-shot snapshots (file export, debugging, migration).
     #[pyo3(signature = (adapter=None))]
     fn export(&self, py: Python<'_>, adapter: Option<&str>) -> PyResult<PyObject> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
-        // Determine adapter
-        let model_ref = format!("semantic_models/{}/_meta", self.name);
+        // Determine adapter: explicit > first in adapters list > "ossie"
+        let layer_ref = format!("semantic_layers/{}/_meta", self.name);
         let adapter_name = if let Some(a) = adapter {
             a.to_string()
         } else {
-            let model_hash = kernel.resolve(&model_ref)
-                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Model not found"))?;
-            let model_data = kernel.read_blob(&model_hash)
+            let hash = kernel.resolve(&layer_ref)
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Layer not found"))?;
+            let data = kernel.read_blob(&hash)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            let model_meta: serde_json::Value = serde_json::from_slice(&model_data)
+            let meta: serde_json::Value = serde_json::from_slice(&data)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            model_meta.get("adapter").and_then(|v| v.as_str()).unwrap_or("ossie").to_string()
+            if let Some(arr) = meta.get("adapters").and_then(|v| v.as_array()) {
+                arr.first().and_then(|v| v.as_str()).unwrap_or("ossie").to_string()
+            } else {
+                meta.get("adapter").and_then(|v| v.as_str()).unwrap_or("ossie").to_string()
+            }
         };
 
         // Read all definitions
         let mut defs = SemanticDefinitions::new();
 
-        let metric_prefix = format!("semantic_models/{}/metrics/", self.name);
+        let metric_prefix = format!("semantic_layers/{}/metrics/", self.name);
         for ref_name in kernel.list_names_prefix(&metric_prefix) {
             if let Some(hash) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
@@ -1595,7 +1675,7 @@ impl SemanticModel {
             }
         }
 
-        let dim_prefix = format!("semantic_models/{}/dimensions/", self.name);
+        let dim_prefix = format!("semantic_layers/{}/dimensions/", self.name);
         for ref_name in kernel.list_names_prefix(&dim_prefix) {
             if let Some(hash) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
@@ -1610,7 +1690,7 @@ impl SemanticModel {
             }
         }
 
-        let rel_prefix = format!("semantic_models/{}/relationships/", self.name);
+        let rel_prefix = format!("semantic_layers/{}/relationships/", self.name);
         for ref_name in kernel.list_names_prefix(&rel_prefix) {
             if let Some(hash) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
@@ -1628,7 +1708,7 @@ impl SemanticModel {
         }
 
         // Export using the adapter
-        let model = match adapter_name.as_str() {
+        let layer = match adapter_name.as_str() {
             "ossie" => {
                 use pond_semantic::SemanticModelAdapter;
                 pond_ossie_adapter::OssieAdapter::new().export_model(&defs)
@@ -1638,48 +1718,48 @@ impl SemanticModel {
             )),
         };
 
-        let model_str = serde_json::to_string(&model)
+        let layer_str = serde_json::to_string(&layer)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let json_module = py.import_bound("json")?;
-        let result = json_module.call_method("loads", (model_str,), None)?;
+        let result = json_module.call_method("loads", (layer_str,), None)?;
         Ok(result.into())
     }
 
-    /// Enable reflection on this model.
+    /// Enable reflection on this layer.
     fn enable_reflection(&self) -> PyResult<()> {
         self.set_reflection_flag(true)
     }
 
-    /// Disable reflection on this model.
+    /// Disable reflection on this layer.
     fn disable_reflection(&self) -> PyResult<()> {
         self.set_reflection_flag(false)
     }
 }
 
-impl SemanticModel {
+impl SemanticLayer {
     fn list_datasets_impl(&self, kernel: &PondKernel) -> Vec<String> {
-        let prefix = format!("semantic_models/{}/datasets/", self.name);
+        let prefix = format!("semantic_layers/{}/datasets/", self.name);
         kernel.list_names_prefix(&prefix).into_iter()
             .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect()
     }
 
     fn list_metrics_impl(&self, kernel: &PondKernel) -> Vec<String> {
-        let prefix = format!("semantic_models/{}/metrics/", self.name);
+        let prefix = format!("semantic_layers/{}/metrics/", self.name);
         kernel.list_names_prefix(&prefix).into_iter()
             .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect()
     }
 
     fn list_dimensions_impl(&self, kernel: &PondKernel) -> Vec<String> {
-        let prefix = format!("semantic_models/{}/dimensions/", self.name);
+        let prefix = format!("semantic_layers/{}/dimensions/", self.name);
         kernel.list_names_prefix(&prefix).into_iter()
             .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect()
     }
 
     fn list_relationships_impl(&self, kernel: &PondKernel) -> Vec<String> {
-        let prefix = format!("semantic_models/{}/relationships/", self.name);
+        let prefix = format!("semantic_layers/{}/relationships/", self.name);
         kernel.list_names_prefix(&prefix).into_iter()
             .filter_map(|n| n.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect()
@@ -1690,9 +1770,9 @@ impl SemanticModel {
         let kernel = storage.kernel();
 
         // Read existing meta
-        let model_ref = format!("semantic_models/{}/_meta", self.name);
-        let hash = kernel.resolve(&model_ref)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Model not found"))?;
+        let layer_ref = format!("semantic_layers/{}/_meta", self.name);
+        let hash = kernel.resolve(&layer_ref)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Layer not found"))?;
         let data = kernel.read_blob(&hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let mut meta: serde_json::Value = serde_json::from_slice(&data)
@@ -1708,7 +1788,37 @@ impl SemanticModel {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let new_hash = kernel.write(&new_bytes)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        kernel.reference(&model_ref, &new_hash)
+        kernel.reference(&layer_ref, &new_hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Update the `adapters` list in the layer's _meta. Migrates the
+    /// legacy single-string `adapter` field to the new `adapters` list
+    /// if present.
+    fn set_adapters_field(&self, adapters: Vec<String>) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+
+        let layer_ref = format!("semantic_layers/{}/_meta", self.name);
+        let hash = kernel.resolve(&layer_ref)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Layer not found"))?;
+        let data = kernel.read_blob(&hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let mut meta: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        if let Some(obj) = meta.as_object_mut() {
+            // Migrate: remove legacy single-string `adapter`, set `adapters` list
+            obj.remove("adapter");
+            obj.insert("adapters".to_string(), serde_json::json!(adapters));
+        }
+
+        let new_bytes = serde_json::to_vec(&meta)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let new_hash = kernel.write(&new_bytes)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        kernel.reference(&layer_ref, &new_hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         Ok(())
     }
@@ -1813,6 +1923,6 @@ fn pond(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_class::<Storage>()?;
-    m.add_class::<SemanticModel>()?;
+    m.add_class::<SemanticLayer>()?;
     Ok(())
 }

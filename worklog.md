@@ -5165,3 +5165,99 @@ Stage Summary:
 - The architecture is unchanged — Tier 0 was about honesty and
   execution, not redesign.
 - Ready for the veteran's re-review with updated docs.
+
+---
+Task ID: 68
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Address user feedback on the Semantic API redesign (already on remote):
+  1. Support multiple adapters per layer (the remote's redesign had single adapter).
+  2. Rename "model" → "layer" to avoid confusion with ML models.
+
+Work Log:
+1. ANALYZED the remote state — 58 commits ahead of my previous local state.
+   The remote already has a Rust/PyO3 implementation of the Semantic API:
+     - bindings/python/pyo3/src/lib.rs has a SemanticModel #[pyclass]
+     - Storage::model(name, adapter, enable_reflection) → SemanticModel
+     - Storage::models() → Vec<String>
+     - SemanticModel methods: add_datasets, add_metrics, add_dimensions,
+       add_relationships, info, datasets, metrics, dimensions, relationships,
+       export, enable_reflection, disable_reflection
+   The remote uses "model" naming throughout, with single adapter per model.
+   Storage path: semantic_models/{name}/...
+
+2. REFACTORED bindings/python/pyo3/src/lib.rs:
+   - Renamed SemanticModel → SemanticLayer (struct, impl, #[pyclass])
+   - Renamed Storage::model() → Storage::layer() (Python users call s.layer())
+   - Renamed Storage::models() → Storage::layers()
+   - Changed the `adapter: Option<&str>` (single) parameter to
+     `adapters: Option<Vec<String>>` (multiple). When None, defaults to
+     ["ossie"].
+   - Updated the _meta JSON: "adapter" (String) → "adapters" (Vec<String>).
+   - Storage path renamed: semantic_models/{name}/... → semantic_layers/{name}/...
+   - Updated info() to return "adapters" (list) instead of "adapter" (single
+     string). Added backward compat: if "adapters" missing, falls back to
+     the legacy "adapter" field wrapped in a single-element list.
+   - Updated export() to determine adapter: explicit arg > first adapter in
+     the layer's adapters list > "ossie" default.
+   - Added new methods to SemanticLayer:
+       - adapters() → Vec<String>  — list currently enabled adapters
+       - add_adapter(name: String) — idempotent add, auto-exposes the layer
+       - remove_adapter(name: String) → bool — True if present, False otherwise
+   - Added a private helper set_adapters_field(Vec<String>) that migrates
+     the legacy single-string "adapter" field to the new "adapters" list
+     (removes "adapter", inserts "adapters").
+
+3. UPDATED bindings/python/sdk/extensions/semantic/__init__.py:
+   - Marked the legacy Python SemanticLens/SemanticModelAdapter as DEPRECATED.
+   - Added a module docstring pointing users to the new s.layer() API via
+     the pond PyO3 module.
+   - Documented why "layer" (not "model"): avoids ML model confusion.
+
+4. UPDATED bindings/python/sdk/extensions/semantic/README.md:
+   - Complete rewrite documenting the new SemanticLayer API:
+     - Why "layer" (not "model") — ML model confusion
+     - 7 design principles (optional adapter, multiple adapters, independent
+       adapter management, auto-exposure, batch operations, reflection,
+       storage-independent)
+     - New API usage via s.layer() — multi-adapter, batch, reflection
+     - Storage layout (semantic_layers/{name}/...)
+     - Legacy API documented as deprecated
+     - File table updated to mark legacy files
+
+5. KEY DESIGN DECISIONS:
+   - "Layer" not "model" — avoids ML model confusion, matches industry
+     standard (dbt, Cube, Looker).
+   - Multi-adapter first-class — a layer can be exposed via Ossie + Cube +
+     dbt simultaneously. Adding/removing adapters is independent of the spec.
+   - Auto-exposure default — no explicit export step. Adapters read the
+     layer's spec directly from storage. The export() method is OPTIONAL,
+     for one-shot snapshots (file export, debugging, migration).
+   - Backward compat — info() and adapters() handle both the new "adapters"
+     list and the legacy "adapter" string field.
+   - The legacy Python SemanticLens/SemanticModelAdapter is kept for
+     backward compat but marked DEPRECATED. New code should use s.layer().
+
+6. NOTES:
+   - Cargo is not available in this environment, so the Rust changes can't
+     be compiled here. The changes are syntactically correct (carefully
+     reviewed) and follow the existing patterns in the file. The user can
+     build with `bash build.sh` on a machine with cargo.
+   - The Rust trait `SemanticModelAdapter` in extensions/semantic/base/rust/
+     is internal and NOT exposed to Python. Renaming it would require
+     changes to multiple crates (pond-semantic, pond-ossie-adapter). Left
+     as-is to minimize blast radius; only the Python-facing class was
+     renamed.
+   - No existing tests directly call s.model() / s.models() (verified via
+     grep), so the rename is non-breaking from a test perspective.
+
+Stage Summary:
+- The Semantic API on the remote now supports multiple adapters per layer
+  (was single-adapter).
+- The naming has been changed from "model" to "layer" throughout the
+  Python-facing API (s.model → s.layer, s.models → s.layers, SemanticModel
+  → SemanticLayer, semantic_models/ → semantic_layers/).
+- The legacy Python SemanticLens is kept for backward compat, marked
+  DEPRECATED.
+- Docs (semantic/README.md, semantic/__init__.py) updated to document
+  the new API and explain why "layer" (not "model").
+- The changes are ready for the user to build (cargo build) and test.
