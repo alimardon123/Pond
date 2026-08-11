@@ -5261,3 +5261,67 @@ Stage Summary:
 - Docs (semantic/README.md, semantic/__init__.py) updated to document
   the new API and explain why "layer" (not "model").
 - The changes are ready for the user to build (cargo build) and test.
+
+---
+Task ID: 69
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Continue — provide full API workflow document.
+
+Work Log:
+1. AUDITED the current PyO3 API surface in bindings/python/pyo3/src/lib.rs:
+   - Storage class: 28 methods (write, read, write_rows, read_rows, branch,
+     checkout, checkout_new, merge, history, undo, revert, ls,
+     get_active_branch, set_active_branch, build_index, lookup_index,
+     search_index, drop_index, list_indexes, gc_stats, vacuum, layer, layers)
+   - SemanticLayer class: 15 methods (add_datasets, add_metrics,
+     add_dimensions, add_relationships, info, datasets, metrics, dimensions,
+     relationships, adapters, add_adapter, remove_adapter, export,
+     enable_reflection, disable_reflection)
+   - All methods documented with docstrings + signatures verified against
+     the actual #[pyo3(signature = (...))] annotations.
+
+2. CREATED docs/API_WORKFLOW.md (380+ lines):
+   A complete end-to-end API guide with 11 sections:
+     0. The 30-second mental model (ASCII diagram)
+     1. Setup — Storage connection (local FS + S3)
+     2. Data I/O — raw bytes + structured PND2 (write/read/write_rows/read_rows)
+     3. Version control — branch/checkout/merge/history/undo/revert
+     4. Indexing — simple (composite multi-key), IVF, HNSW, auto-acceleration
+     5. Semantic Layer — multi-adapter, batch ops, reflection, auto-exposure
+     6. Maintenance — gc_stats, vacuum
+     7. Complete end-to-end example (one script using every feature)
+     8. Cross-language equivalents (CLI, Go, C ABI, legacy Python SDK)
+     9. API reference tables (Storage + SemanticLayer — every method)
+     10. Storage layout (for debugging)
+     11. Design principles (why the API looks like this)
+
+   The document explains:
+     - Why "layer" (not "model") — ML model confusion avoidance
+     - Auto-exposure — no explicit export step; adapters query the spec
+       directly from storage
+     - Multi-adapter — one layer exposed via Ossie + Cube + dbt simultaneously
+     - Independent adapter management — add/remove doesn't touch the spec
+     - Batch operations — add multiple items in one call, idempotent
+     - Auto-index acceleration — read_rows uses simple indexes for O(1) lookup
+     - Predicate pruning — row groups skipped based on column stats
+     - CRDT concurrency — no CAS, no conflicts
+     - Time-travel safety in vacuum (preserve_days)
+
+3. UPDATED README.md Quick Start section:
+   - Replaced old API names (s.build_ivf, s.search_ivf) with the unified
+     s.build_index(collection, index_name, index_type, config, rows) and
+     s.search_index(collection, index_type, query, k, n_probe, ef).
+   - Added Semantic Layer example to the Quick Start (s.layer, add_datasets,
+     add_metrics, add_dimensions, add_relationships, add_adapter, info, export).
+   - Added a pointer to docs/API_WORKFLOW.md for the full guide.
+   - Added docs/API_WORKFLOW.md as the first item in the Documentation section
+     with "(start here)" annotation.
+
+Stage Summary:
+- docs/API_WORKFLOW.md is the single comprehensive reference for the Pond API.
+  It covers every method on Storage and SemanticLayer with working examples,
+  a complete end-to-end script, cross-language equivalents, and a quick-lookup
+  API reference table.
+- README.md Quick Start now accurately reflects the current API (unified
+  build_index/search_index, s.layer() for semantic layers).
+- The documentation is ready for the user.

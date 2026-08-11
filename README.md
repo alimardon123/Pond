@@ -149,18 +149,37 @@ s.write('users', b'[{"id":2,"name":"bob"}]', 'add bob')
 s.checkout('users', 'main')
 s.merge('users', 'dev', 'main', 'merge dev')
 
-# Secondary indexes
-s.build_index('users', 'by_name', [('user:1', {'name': 'alice'})], 'name')
+# Unified indexing — simple / ivf / hnsw via one method
+s.build_index('users', 'by_name', 'simple',
+              config={'key_field': 'name'},
+              rows=[('user:1', {'name': 'alice'})])
 rowid = s.lookup_index('users', 'by_name', 'alice')  # → 'user:1'
 
-# Vector ANN (IVF — Bug 10 fixed, HNSW — O(log N))
-s.build_ivf('vectors', n_clusters=10, metric='euclidean')
-results = s.search_ivf('vectors', [0.1, 0.2], k=10, n_probe=5)
+s.build_index('vectors', 'ann', 'ivf',
+              config={'n_clusters': 10, 'metric': 'euclidean'})
+results = s.search_index('vectors', 'ivf', [0.1, 0.2], k=10, n_probe=5)
+
+s.build_index('vectors', 'ann', 'hnsw',
+              config={'m': 16, 'metric': 'l2'})
+results = s.search_index('vectors', 'hnsw', [0.1, 0.2], k=10, ef=50)
+
+# Semantic Layer — multi-adapter, batch ops, auto-exposure
+m = s.layer('sales', adapters=['ossie'], enable_reflection=True)
+m.add_datasets(['orders', 'users'])
+m.add_metrics({'revenue': 'SUM(orders.amount)', 'count': 'COUNT(orders.id)'})
+m.add_dimensions({'country': ('users', 'country', 'string')})
+m.add_relationships({'user_orders': ('users', 'orders', 'users.id = orders.user_id')})
+m.add_adapter('cube')         # multi-adapter — independent of the spec
+m.info()                      # → full spec dict
+m.export('ossie')             # optional one-shot export
 
 # Maintenance
 s.gc_stats()                    # → {'live': N, 'dead': M, ...}
 s.vacuum(preserve_days=7, dry_run=True)
 ```
+
+**Full API workflow**: see [`docs/API_WORKFLOW.md`](docs/API_WORKFLOW.md) for
+the complete end-to-end guide with every method documented.
 
 ### Using the Python reference SDK (legacy)
 
@@ -285,6 +304,7 @@ New development happens in Rust. Python is maintained for bug fixes only.
 
 ## Documentation
 
+- [`docs/API_WORKFLOW.md`](docs/API_WORKFLOW.md) — **Full end-to-end API workflow with examples for every method** (start here)
 - [`DESIGN_GOALS.md`](DESIGN_GOALS.md) — The 8 design principles, in detail
 - [`REPO_ORGANIZATION.md`](REPO_ORGANIZATION.md) — Folder structure rules
 - [`PACKAGES.md`](PACKAGES.md) — Package dependency graph
