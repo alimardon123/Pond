@@ -1096,14 +1096,13 @@ impl Storage {
     ///   # HNSW vector index
     ///   s.build_index('vectors', 'ann', 'hnsw',
     ///       config={'m': 16, 'metric': 'l2'})
-    #[pyo3(signature = (collection, index_name, index_type, config=None, rows=None))]
+    #[pyo3(signature = (collection, index_name, index_type, config=None))]
     fn build_index(
         &self,
         collection: &str,
         index_name: &str,
         index_type: &str,
         config: Option<PyObject>,
-        rows: Option<Vec<(String, PyObject)>>,
     ) -> PyResult<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
@@ -1127,10 +1126,10 @@ impl Storage {
                     vec!["id".to_string()]
                 };
 
-                let rust_rows: Vec<(String, JsonValue)> = rows.unwrap_or_default()
-                    .into_iter()
-                    .map(|(rowid, obj)| (rowid, python_to_json(&obj)))
-                    .collect();
+                // AUTO-READ from the collection — no `rows` parameter needed.
+                // Read all rows from HEAD + shards, convert to (rowid, JSON row) pairs.
+                let rust_rows = read_collection_as_json_rows(&storage, collection, &key_fields)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
                 let kf_refs: Vec<&str> = key_fields.iter().map(|s| s.as_str()).collect();
                 indexer.build_index(collection, index_name, &rust_rows, |row| {
@@ -1171,8 +1170,7 @@ impl Storage {
                     .and_then(|v| v.as_str())
                     .unwrap_or("euclidean");
 
-                // IVF uses the index_name as the ref name
-                // Currently IVF hardcodes "ivf" as the ref — we need to support custom names
+                // IVF reads from the collection directly (internal)
                 let ivf = RustIVFIndex::new(kernel);
                 ivf.build(collection, n_clusters, metric)
                     .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
@@ -1192,6 +1190,7 @@ impl Storage {
                     .and_then(|v| v.as_str())
                     .unwrap_or("l2");
 
+                // HNSW reads from the collection directly (internal)
                 let hnsw = RustHNSWIndex::new(kernel);
                 hnsw.build(collection, m, ef_construction, None, metric)
                     .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
@@ -1308,6 +1307,290 @@ impl Storage {
         dict.set_item("deleted", result.deleted)?;
         dict.set_item("preserved", result.preserved)?;
         dict.set_item("dry_run", result.dry_run)?;
+        Ok(dict.into())
+    }
+
+    // ===================================================================
+    // CRDT Shards — concurrent multi-writer without coordination
+    //
+    // Shards allow multiple writers to write concurrently without CAS:
+    //   - Each writer writes its own shard to a unique path
+    //   - Readers union HEAD + all live shards via read_with_shards
+    //   - compact_shards merges shards into HEAD (clears the shard list)
+    //
+    // Row-level CRDT operations (upsert_shard, delete_shard) add _rowid
+    // + _version to each row, enabling deterministic merge on conflict
+    // (latest _version wins, tombstones suppress).
+    // ===================================================================
+
+    /// Append a CRDT shard to the active branch.
+    ///
+    /// The shard is written to a unique path. Readers will discover and
+    /// merge it via read_with_shards. No CAS, no coordination — works
+    /// on any object store (local FS, S3, R2, MinIO, ...).
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - shard_name: Unique name for this shard (e.g., 'writer1_001')
+    ///   - data: The shard data (raw bytes — JSON, PND2, anything)
+    ///
+    /// Returns: shard blob hash
+    fn append_shard(&self, collection: &str, shard_name: &str, data: &[u8]) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+        pond_storage::shard::append_shard(kernel, collection, &active, shard_name, data)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+    }
+
+    /// Upsert rows as a CRDT shard with _rowid + _version.
+    ///
+    /// Each row gets:
+    ///   - _rowid: UUIDv7 (stable across updates, generated if not present)
+    ///   - _version: HLC (new per write, used for CRDT merge — latest wins)
+    ///   - _deleted: false (tombstone marker)
+    ///
+    /// On merge (read_with_shards), rows with the same _rowid are
+    /// deduplicated — the one with the latest _version wins.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - shard_name: Unique name for this shard
+    ///   - rows: List of row dicts to upsert
+    ///   - key_col: Optional key column name (for legacy non-CRDT rows)
+    ///
+    /// Returns: shard blob hash
+    #[pyo3(signature = (collection, shard_name, rows, key_col=None))]
+    fn upsert_shard(&self, collection: &str, shard_name: &str, rows: Vec<PyObject>, key_col: Option<&str>) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+
+        // Convert Python rows to JSON values
+        let json_rows: Vec<JsonValue> = rows.iter().map(|r| python_to_json(r)).collect();
+
+        // Use a thread-local HLC (clock-skew-safe)
+        use pond_kernel::crdt::HLC;
+        let mut hlc = HLC::new();
+
+        pond_storage::shard::upsert_shard(kernel, collection, &active, shard_name, &json_rows, key_col, &mut hlc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+    }
+
+    /// Delete rows by writing a tombstone shard.
+    ///
+    /// Each deleted _rowid gets a tombstone with _deleted=true and a new
+    /// _version. On merge, if the tombstone's _version is later than any
+    /// live row's _version, the row is suppressed.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - shard_name: Unique name for this tombstone shard
+    ///   - rowids: List of _rowid values to tombstone
+    ///   - key_col: Optional key column name
+    ///
+    /// Returns: shard blob hash
+    #[pyo3(signature = (collection, shard_name, rowids, key_col=None))]
+    fn delete_shard(&self, collection: &str, shard_name: &str, rowids: Vec<String>, key_col: Option<&str>) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+
+        use pond_kernel::crdt::HLC;
+        let mut hlc = HLC::new();
+
+        pond_storage::shard::delete_shard(kernel, collection, &active, shard_name, &rowids, key_col, &mut hlc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+    }
+
+    /// Read HEAD + all live shards (CRDT read path).
+    ///
+    /// Returns a list of (shard_name, data_bytes) tuples. The first
+    /// element is HEAD (name='__head__'), followed by all shards.
+    /// The caller is responsible for merging rows by _rowid (latest
+    /// _version wins, tombstones suppress).
+    ///
+    /// For simple raw-byte reads, use `read()` instead. For structured
+    /// reads with auto-merge, use `read_rows()`.
+    fn read_with_shards<'py>(&self, py: Python<'py>, collection: &str) -> PyResult<Bound<'py, PyList>> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+
+        let (head_manifest, shards) = pond_storage::shard::read_with_shards(kernel, collection, &active);
+
+        let result = PyList::empty_bound(py);
+
+        // Read HEAD data
+        if let Some(manifest_hash) = head_manifest {
+            if let Ok(manifest_bytes) = kernel.read_blob(&manifest_hash) {
+                if let Ok(manifest) = pond_storage::manifest::CollectionManifest::decode(&manifest_bytes) {
+                    for rg in &manifest.row_groups {
+                        if let Ok(data) = kernel.read_blob(&rg.blob_hash) {
+                            let tuple = PyTuple::new_bound(py, [
+                                "__head__".to_object(py),
+                                PyBytes::new_bound(py, &data).into_any(),
+                            ]);
+                            result.append(tuple)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Read shard data
+        for (name, hash) in &shards {
+            if let Ok(data) = kernel.read_blob(hash) {
+                let tuple = PyTuple::new_bound(py, [
+                    name.to_object(py),
+                    PyBytes::new_bound(py, &data).into_any(),
+                ]);
+                result.append(tuple)?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Count the number of live shards for a collection's active branch.
+    fn shard_count(&self, collection: &str) -> usize {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+        pond_storage::shard::shard_count(kernel, collection, &active)
+    }
+
+    /// Compact shards — merge all shards into HEAD and clear the shard list.
+    ///
+    /// After compaction, all shard data is absorbed into HEAD (a new commit),
+    /// and the shard refs are deleted. This reclaims storage space and
+    /// simplifies future reads (no shard merge needed).
+    ///
+    /// Returns: number of shards compacted
+    fn compact_shards(&self, collection: &str) -> PyResult<usize> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+        pond_storage::shard::clear_shards(kernel, collection, &active)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+    }
+
+    // ===================================================================
+    // Atomic Publication (Transactions)
+    //
+    // This is NOT full ACID. It provides ATOMIC VISIBILITY:
+    //   - begin_tx() generates a transaction ID
+    //   - Writers attach tx_id to their shards (shards are tentative)
+    //   - commit_tx() writes a commit marker → all tentative shards
+    //     become visible atomically
+    //   - abort_tx() is a no-op (tentative shards are orphaned until GC)
+    //
+    // There is NO isolation, NO rollback, NO conflict detection.
+    // See docs/HONEST_COMPETITOR_COMPARISON.md §3.
+    // ===================================================================
+
+    /// Begin a transaction. Returns a transaction ID.
+    ///
+    /// The tx_id is used to tag tentative writes. Until commit_tx() is
+    /// called, the writes are invisible to readers. Once committed, all
+    /// tagged writes become visible atomically.
+    fn begin_tx(&self) -> String {
+        pond_storage::transaction::begin_tx()
+    }
+
+    /// Commit a transaction. Writes a commit marker at transactions/{tx_id}.
+    ///
+    /// Once the marker exists, all tentative shards (tagged with tx_id)
+    /// become visible to readers. This is ATOMIC PUBLICATION —
+    /// all-or-nothing visibility.
+    ///
+    /// NOT full ACID: no isolation, no rollback, no conflict detection.
+    fn commit_tx(&self, tx_id: &str, message: &str) -> PyResult<String> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        pond_storage::transaction::commit_tx(kernel, tx_id, message)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
+    }
+
+    /// Abort a transaction. Currently a NO-OP.
+    ///
+    /// Tentative shards are orphaned until GC cleans them up. There is
+    /// no real rollback — the shards remain on storage but are invisible
+    /// to readers (because the commit marker doesn't exist).
+    fn abort_tx(&self, tx_id: &str) {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        pond_storage::transaction::abort_tx(kernel, tx_id)
+    }
+
+    /// Check if a transaction has been committed.
+    fn is_tx_committed(&self, tx_id: &str) -> bool {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        pond_storage::transaction::is_tx_committed(kernel, tx_id)
+    }
+
+    // ===================================================================
+    // Optimize — compact shards + flatten delta manifests
+    //
+    // Delta/Iceberg-style optimize: merges small files into larger ones
+    // for better read performance. Does TWO things:
+    //   1. compact_shards: merge all shards into HEAD (clears shard list)
+    //   2. (future) compact_manifest: flatten delta-manifest chains
+    //
+    // Currently only shard compaction is implemented in the Rust core.
+    // Manifest flattening is a Python SDK feature pending port.
+    // ===================================================================
+
+    /// Optimize storage — compact shards + flatten delta manifests.
+    ///
+    /// Args:
+    ///   - collection: if None, optimize ALL collections. If specified,
+    ///     optimize only that collection.
+    ///
+    /// Returns: dict with collections_optimized, shards_compacted
+    #[pyo3(signature = (collection=None))]
+    fn optimize(&self, py: Python<'_>, collection: Option<&str>) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+
+        // Determine which collections to optimize
+        let collections: Vec<String> = if let Some(c) = collection {
+            vec![c.to_string()]
+        } else {
+            // List all collections by scanning refs
+            kernel.list_names_prefix("collections/")
+                .into_iter()
+                .filter_map(|n| {
+                    // Extract collection name from "collections/{name}/_branches/..."
+                    n.strip_prefix("collections/")?
+                        .split('/').next()
+                        .map(|s| s.to_string())
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect()
+        };
+
+        let mut shards_compacted = 0usize;
+        let mut optimized = 0usize;
+
+        for coll in &collections {
+            let active = storage.get_active_branch(coll);
+            let shard_n = pond_storage::shard::shard_count(kernel, coll, &active);
+            if shard_n > 0 {
+                match pond_storage::shard::clear_shards(kernel, coll, &active) {
+                    Ok(n) => shards_compacted += n,
+                    Err(_) => continue,
+                }
+            }
+            optimized += 1;
+        }
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("collections_optimized", optimized)?;
+        dict.set_item("shards_compacted", shards_compacted)?;
+        dict.set_item("manifests_flattened", 0)?; // pending port from Python
         Ok(dict.into())
     }
 
@@ -1912,6 +2195,155 @@ fn python_values_to_typed_column(values: &[PyObject]) -> TypedColumn {
         // Empty or unknown → default to empty Int64
         TypedColumn::Int64(Vec::new())
     })
+}
+
+/// Read all rows from a collection as (rowid, JSON row) pairs.
+///
+/// This is the auto-read helper used by `build_index` for simple indexes.
+/// It reads HEAD + all shards, decodes PND2 blobs, and converts each row
+/// to a JSON object. The rowid is taken from the first available key column
+/// (tries _rowid, then the first key_field, then _key, then id).
+///
+/// For shard rows (CRDT), the _rowid field is used if present.
+fn read_collection_as_json_rows(
+    storage: &pond_storage::UnifiedStorage,
+    collection: &str,
+    key_fields: &[String],
+) -> Result<Vec<(String, JsonValue)>, String> {
+    use pond_storage::shard;
+    use pond_storage::manifest::CollectionManifest;
+    use pond_storage::commit;
+    use pond_storage::branch_ref;
+
+    let kernel = storage.kernel();
+    let mut rows: Vec<(String, JsonValue)> = Vec::new();
+
+    // Determine the active branch
+    let active = storage.get_active_branch(collection);
+
+    // --- Read HEAD data ---
+    let head = kernel.resolve(&branch_ref(collection, &active));
+    if let Some(ref head_hash) = head {
+        let head_data = kernel.read_blob(head_hash)
+            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
+
+        // Handle PondPack vs old format
+        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
+            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
+                .ok_or_else(|| "Failed to decode PondPack".to_string())?;
+            manifest_bytes
+        } else {
+            let commit = commit::read_commit(kernel, head_hash)
+                .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
+            if commit.manifest.is_empty() {
+                return Ok(rows); // empty collection
+            }
+            kernel.read_blob(&commit.manifest)
+                .map_err(|e| format!("Failed to read manifest: {}", e))?
+        };
+
+        let manifest = CollectionManifest::decode(&manifest_bytes)
+            .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+        // Read each row group, decode PND2, convert to JSON rows
+        for rg in &manifest.row_groups {
+            let blob_data = kernel.read_blob(&rg.blob_hash)
+                .map_err(|e| format!("Failed to read data blob: {}", e))?;
+
+            let cols = pond_core::pnd2_decode(&blob_data)
+                .map_err(|e| format!("Failed to decode PND2: {}", e))?;
+
+            // Determine the number of rows
+            let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+
+            // Convert columnar data to row-oriented JSON
+            for row_idx in 0..n_rows {
+                let mut row_obj = serde_json::Map::new();
+                for col in &cols {
+                    let name = col.name.to_string_lossy().to_string();
+                    use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY, VT_NULL};
+                    let val = match col.vtype {
+                        VT_INT64 => {
+                            col.i64_data.get(row_idx)
+                                .map(|v| JsonValue::Number(serde_json::Number::from(*v)))
+                                .unwrap_or(JsonValue::Null)
+                        }
+                        VT_FLOAT64 => {
+                            col.f64_data.get(row_idx)
+                                .and_then(|v| serde_json::Number::from_f64(*v))
+                                .map(JsonValue::Number)
+                                .unwrap_or(JsonValue::Null)
+                        }
+                        VT_STRING => {
+                            col.str_data.get(row_idx)
+                                .map(|v| JsonValue::String(v.to_string_lossy().to_string()))
+                                .unwrap_or(JsonValue::Null)
+                        }
+                        VT_BINARY | VT_NULL | _ => JsonValue::Null,
+                    };
+                    row_obj.insert(name, val);
+                }
+
+                // Determine the rowid for this row
+                let rowid = determine_rowid(&JsonValue::Object(row_obj.clone()), key_fields);
+                rows.push((rowid, JsonValue::Object(row_obj)));
+            }
+        }
+    }
+
+    // --- Read shard data (CRDT) ---
+    let (_, shards) = shard::read_with_shards(kernel, collection, &active);
+    for (_, shard_hash) in shards {
+        if let Ok(data) = kernel.read_blob(&shard_hash) {
+            // Shards are JSON arrays of row objects
+            if let Ok(arr) = serde_json::from_slice::<Vec<JsonValue>>(&data) {
+                for row in arr {
+                    let rowid = determine_rowid(&row, key_fields);
+                    rows.push((rowid, row));
+                }
+            }
+        }
+    }
+
+    Ok(rows)
+}
+
+/// Determine the rowid for a row.
+///
+/// Tries (in order): _rowid, first key_field, _key, id, then a hash of the row.
+fn determine_rowid(row: &JsonValue, key_fields: &[String]) -> String {
+    // Try _rowid first (CRDT rows have this)
+    if let Some(r) = row.get("_rowid").and_then(|v| v.as_str()) {
+        return r.to_string();
+    }
+    if let Some(n) = row.get("_rowid").and_then(|v| v.as_i64()) {
+        return n.to_string();
+    }
+    // Try the first key_field
+    if let Some(kf) = key_fields.first() {
+        if let Some(s) = row.get(kf).and_then(|v| v.as_str()) {
+            return s.to_string();
+        }
+        if let Some(n) = row.get(kf).and_then(|v| v.as_i64()) {
+            return n.to_string();
+        }
+    }
+    // Try _key, id
+    for fallback in &["_key", "id", "key"] {
+        if let Some(s) = row.get(fallback).and_then(|v| v.as_str()) {
+            return s.to_string();
+        }
+        if let Some(n) = row.get(fallback).and_then(|v| v.as_i64()) {
+            return n.to_string();
+        }
+    }
+    // Last resort: hash the row
+    let s = serde_json::to_string(row).unwrap_or_default();
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 // ---------------------------------------------------------------------------

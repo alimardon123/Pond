@@ -149,11 +149,10 @@ s.write('users', b'[{"id":2,"name":"bob"}]', 'add bob')
 s.checkout('users', 'main')
 s.merge('users', 'dev', 'main', 'merge dev')
 
-# Unified indexing — simple / ivf / hnsw via one method
-s.build_index('users', 'by_name', 'simple',
-              config={'key_field': 'name'},
-              rows=[('user:1', {'name': 'alice'})])
+# Unified indexing — simple / ivf / hnsw via one method (reads from collection)
+s.build_index('users', 'by_name', 'simple', config={'key_field': 'name'})
 rowid = s.lookup_index('users', 'by_name', 'alice')  # → 'user:1'
+# read_rows with equality predicates auto-uses indexes for O(1) lookup
 
 s.build_index('vectors', 'ann', 'ivf',
               config={'n_clusters': 10, 'metric': 'euclidean'})
@@ -162,6 +161,17 @@ results = s.search_index('vectors', 'ivf', [0.1, 0.2], k=10, n_probe=5)
 s.build_index('vectors', 'ann', 'hnsw',
               config={'m': 16, 'metric': 'l2'})
 results = s.search_index('vectors', 'hnsw', [0.1, 0.2], k=10, ef=50)
+
+# CRDT shards — concurrent multi-writer without CAS (updates + deletes)
+s.upsert_shard('users', 'w1_001', rows=[{'id': 1, 'name': 'alice'}], key_col='id')
+s.delete_shard('users', 'w1_del', rowids=['user:2'], key_col='id')
+s.read_rows('users')  # auto-merges HEAD + all shards (latest _version wins)
+
+# Atomic publication (transactions) — NOT full ACID, atomic visibility only
+tx = s.begin_tx()
+s.append_shard('users', f'{tx}_u', b'{"id":3,"name":"carol"}')
+s.append_shard('orders', f'{tx}_o', b'{"id":3,"amount":50.0}')
+s.commit_tx(tx, 'add carol + her order')  # both visible atomically
 
 # Semantic Layer — multi-adapter, batch ops, auto-exposure
 m = s.layer('sales', adapters=['ossie'], enable_reflection=True)
@@ -176,6 +186,7 @@ m.export('ossie')             # optional one-shot export
 # Maintenance
 s.gc_stats()                    # → {'live': N, 'dead': M, ...}
 s.vacuum(preserve_days=7, dry_run=True)
+s.optimize()                    # compact shards + flatten manifests
 ```
 
 **Full API workflow**: see [`docs/API_WORKFLOW.md`](docs/API_WORKFLOW.md) for

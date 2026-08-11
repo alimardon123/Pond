@@ -397,7 +397,157 @@ print(s.layers())   # → ['sales', 'product', 'finance']
 
 ---
 
-## 6. Maintenance — GC and vacuum
+## 6. CRDT Shards — concurrent multi-writer, update, delete
+
+Pond supports concurrent multi-writer without coordination using CRDT
+shards. Each writer writes its own shard to a unique path; readers union
+HEAD + all live shards.
+
+### 6.1 How updates work — `upsert_shard`
+
+```python
+# Writer 1 (concurrent, no coordination with Writer 2)
+s.upsert_shard('users', 'writer1_001',
+               rows=[{'id': 1, 'name': 'alice', 'age': 30}],
+               key_col='id')
+
+# Writer 2 (concurrent)
+s.upsert_shard('users', 'writer2_001',
+               rows=[{'id': 1, 'name': 'alice', 'age': 31}],  # update age
+               key_col='id')
+```
+
+Each row gets:
+- `_rowid`: UUIDv7 (stable across updates, generated if not present)
+- `_version`: HLC (Hybrid Logical Clock — new per write, clock-skew-safe)
+- `_deleted`: false
+
+On merge, rows with the same `_rowid` are deduplicated — **latest `_version`
+wins**. Multiple writers can update the same row concurrently without
+conflicts; the merge is deterministic.
+
+### 6.2 How deletes work — `delete_shard`
+
+```python
+# Delete rows by writing a tombstone shard
+s.delete_shard('users', 'writer1_del',
+               rowids=['user:1', 'user:2'],
+               key_col='id')
+```
+
+Each deleted `_rowid` gets a tombstone with `_deleted=true` and a new
+`_version`. On merge, if the tombstone's `_version` is later than any live
+row's `_version`, the row is suppressed. If a live row has a later
+`_version` (written after the delete), it overrides the tombstone.
+
+### 6.3 How reads merge — `read_with_shards`
+
+```python
+# Read HEAD + all live shards (raw bytes for each)
+shards = s.read_with_shards('users')
+# → [('__head__', b'...PND2...'), ('writer1_001', b'[...]'), ('writer2_001', b'[...]')]
+
+# For structured reads with auto-merge, use read_rows:
+cols = s.read_rows('users')
+# → HEAD + all shards merged by _rowid (latest _version wins, tombstones suppress)
+```
+
+`read_rows` automatically merges HEAD + all shards using the CRDT rules.
+You don't need to call `read_with_shards` manually unless you want raw
+bytes.
+
+### 6.4 Raw shard append (no CRDT metadata)
+
+```python
+# For non-CRDT use cases (e.g., append-only event logs)
+s.append_shard('events', 'producer1_001', b'{"event":"click","ts":123}')
+```
+
+`append_shard` writes raw bytes without adding `_rowid`/`_version`. Use
+this for append-only data where you don't need row-level CRDT merge.
+
+### 6.5 Compact shards
+
+```python
+# Merge all shards into HEAD and clear the shard list
+n = s.compact_shards('users')
+print(f"Compacted {n} shards into HEAD")
+
+# Count live shards
+print(s.shard_count('users'))  # → 0 (after compact)
+```
+
+After compaction, all shard data is absorbed into HEAD (a new commit),
+and the shard refs are deleted. This reclaims storage space and simplifies
+future reads.
+
+### 6.6 How branch merge works
+
+```python
+# Branch + write + merge
+s.branch('users', 'dev')
+s.checkout('users', 'dev')
+s.upsert_shard('users', 'dev_w1', rows=[{'id': 5, 'name': 'eve'}], key_col='id')
+s.checkout('users', 'main')
+s.merge('users', source='dev', target='main', message='merge dev')
+```
+
+Branch merge uses **CRDT union**: the target branch's manifest is updated
+to include all row groups + shards from both branches. No CAS, no conflict
+detection — the merge is deterministic (G-Set union). If both branches
+updated the same `_rowid`, the one with the latest `_version` wins after
+`read_with_shards` merges.
+
+---
+
+## 7. Atomic Publication (Transactions)
+
+Pond provides **atomic publication** — all-or-nothing visibility across
+multiple writes. This is NOT full ACID.
+
+```python
+# Begin a transaction
+tx_id = s.begin_tx()
+# → 'tx_0123456789abcdef'
+
+# Write to multiple collections (tagged with tx_id — tentative, invisible)
+s.append_shard('users',    f'{tx_id}_users',    b'{"id":3,"name":"carol"}')
+s.append_shard('orders',   f'{tx_id}_orders',   b'{"id":3,"amount":50.0}')
+
+# Commit — writes a commit marker. Once the marker exists, all
+# tentative shards become visible atomically.
+s.commit_tx(tx_id, 'add carol + her order')
+
+# OR abort — no-op (tentative shards are orphaned until GC)
+# s.abort_tx(tx_id)
+
+# Check if a transaction has been committed
+print(s.is_tx_committed(tx_id))  # → True
+```
+
+### What this provides
+
+- ✅ **Atomicity of publication**: once the commit marker exists, all
+  tentative shards become visible together.
+- ✅ **Durability**: committed data survives crashes (content-addressed
+  blobs are immutable).
+
+### What this does NOT provide
+
+- ❌ **No isolation**: readers can see committed state from other
+  transactions mid-read.
+- ❌ **No rollback**: `abort_tx` is a no-op. Tentative shards are orphaned
+  until GC cleans them up.
+- ❌ **No conflict detection**: two transactions can write the same
+  `_rowid`; merge is LWW (latest `_version` wins).
+
+This is the honest trade-off for a CRDT-based, CAS-free, storage-independent
+system. For full ACID, you'd need a coordination service (Zookeeper, etcd)
+which Pond deliberately avoids.
+
+---
+
+## 8. Maintenance — GC, vacuum, optimize
 
 ```python
 # Read-only reachability analysis (no deletion)
@@ -414,15 +564,34 @@ result = s.vacuum(preserve_days=7, dry_run=True)
 # Real vacuum (actually deletes)
 result = s.vacuum(preserve_days=7, dry_run=False)
 # → {'deleted': 8, 'preserved': 4, 'dry_run': False}
+
+# Optimize — compact shards + flatten delta manifests
+result = s.optimize()                      # all collections
+# OR: s.optimize('users')                  # one collection
+# → {'collections_optimized': 3, 'shards_compacted': 12, 'manifests_flattened': 0}
 ```
 
-`preserve_days` keeps blobs referenced by commits younger than N days,
-so time-travel reads still work for recent history. Older unreachable
-blobs are deleted.
+- `preserve_days` keeps blobs referenced by commits younger than N days,
+  so time-travel reads still work for recent history.
+- `optimize` merges shards into HEAD (Delta/Iceberg-style small-file
+  compaction). Manifest flattening is pending port from Python.
+
+### About Reflection (semantic layers)
+
+`m.enable_reflection()` / `m.disable_reflection()` on a SemanticLayer
+set a boolean flag in the layer's `_meta` JSON. This is a **registration
+hook** for external query engines (like Dremio) — it is NOT an incremental
+subsystem inside Pond.
+
+When reflection is enabled, the layer is discoverable via the
+`reflections/semantic/{name}` ref. An external reflection-aware query
+engine can find it, read the spec, and build its own accelerations
+(materialized views, aggregates, etc.). Pond itself does not build or
+maintain reflection data structures.
 
 ---
 
-## 7. Complete end-to-end example
+## 9. Complete end-to-end example
 
 ```python
 from pond import Storage
@@ -510,7 +679,7 @@ print(f"Vacuum (dry run): {result}")
 
 ---
 
-## 8. Cross-language equivalents
+## 10. Cross-language equivalents
 
 ### 8.1 Rust CLI (`pond` command)
 
@@ -580,7 +749,7 @@ storage.merge("users", "dev")
 
 ---
 
-## 9. API reference (quick lookup)
+## 11. API reference (quick lookup)
 
 ### `Storage` (the main class)
 
@@ -601,13 +770,24 @@ storage.merge("users", "dev")
 | `ls` | `()` | `list[dict]` | List all collections |
 | `get_active_branch` | `(collection)` | `str` | Get active branch name |
 | `set_active_branch` | `(collection, branch_name)` | `None` | Set active branch |
-| `build_index` | `(collection, index_name, index_type, config?, rows?)` | `str` | Build index (`simple`/`ivf`/`hnsw`) |
+| `build_index` | `(collection, index_name, index_type, config?)` | `str` | Build index (`simple`/`ivf`/`hnsw`) — reads from collection directly |
 | `lookup_index` | `(collection, index_name, index_key)` | `str?` | O(1) exact lookup (simple indexes) |
 | `search_index` | `(collection, index_type, query, k=10, n_probe=10, ef=50)` | `list[(dist, id)]` | ANN search (ivf/hnsw) |
 | `drop_index` | `(collection, index_name)` | `bool` | Drop an index |
 | `list_indexes` | `(collection)` | `list[str]` | List indexes on a collection |
+| `append_shard` | `(collection, shard_name, data: bytes)` | `str` | Append a raw CRDT shard |
+| `upsert_shard` | `(collection, shard_name, rows, key_col?)` | `str` | Upsert CRDT rows (adds _rowid + _version) |
+| `delete_shard` | `(collection, shard_name, rowids, key_col?)` | `str` | Write tombstone shard (deletes by _rowid) |
+| `read_with_shards` | `(collection)` | `list[(name, bytes)]` | Read HEAD + all shards (raw bytes) |
+| `shard_count` | `(collection)` | `int` | Count live shards |
+| `compact_shards` | `(collection)` | `int` | Merge shards into HEAD, clear shard list |
+| `begin_tx` | `()` | `str` | Begin a transaction (returns tx_id) |
+| `commit_tx` | `(tx_id, message)` | `str` | Commit transaction (atomic visibility) |
+| `abort_tx` | `(tx_id)` | `None` | Abort transaction (no-op; orphaned until GC) |
+| `is_tx_committed` | `(tx_id)` | `bool` | Check if transaction is committed |
 | `gc_stats` | `(compute_size=False)` | `dict` | Read-only GC analysis |
 | `vacuum` | `(preserve_days, dry_run)` | `dict` | Delete unreachable blobs |
+| `optimize` | `(collection?)` | `dict` | Compact shards + flatten manifests |
 | `layer` | `(name, adapters?, enable_reflection=False)` | `SemanticLayer` | Get/create a semantic layer handle |
 | `layers` | `()` | `list[str]` | List all semantic layer names |
 
@@ -633,7 +813,7 @@ storage.merge("users", "dev")
 
 ---
 
-## 10. Storage layout (for debugging)
+## 12. Storage layout (for debugging)
 
 ```
 .pond/                                    (local FS) or s3://bucket/prefix/
@@ -664,7 +844,7 @@ The kernel's 3 primitives are: `write(bytes) → hash`, `read(hash) → bytes`,
 
 ---
 
-## 11. Design principles (why the API looks like this)
+## 13. Design principles (why the API looks like this)
 
 1. **Simple** — ONE storage format (PND2), ONE commit format (JSON), ONE concurrency model (CRDT)
 2. **Powerful** — branch/merge + CRDT + IVF + HNSW + streaming + semantic layers + GC

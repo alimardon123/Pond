@@ -5325,3 +5325,104 @@ Stage Summary:
 - README.md Quick Start now accurately reflects the current API (unified
   build_index/search_index, s.layer() for semantic layers).
 - The documentation is ready for the user.
+
+---
+Task ID: 70
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Address user feedback on the API:
+  1. Drop `rows` from build_index — read from collection directly
+  2. Auto-use indexes in read/write (already done — verified)
+  3. Is reflection incremental? (no — it's just a flag; documented)
+  4. Missing optimize command? (was missing — added)
+  5. Missing atomic publish/transactions? (was missing — added)
+  6. How update/delete/merge operations work? (documented)
+
+Work Log:
+1. DROPPED `rows` parameter from build_index:
+   - Changed signature from `(collection, index_name, index_type, config=None, rows=None)`
+     to `(collection, index_name, index_type, config=None)`
+   - For 'simple' indexes, added `read_collection_as_json_rows()` helper that
+     reads HEAD + all shards, decodes PND2 blobs, converts to (rowid, JSON row) pairs.
+   - For 'ivf' and 'hnsw', rows was already ignored — they read from the
+     collection internally. No change needed.
+   - The helper auto-detects the rowid: tries _rowid, then the first key_field,
+     then _key/id/key, then falls back to a hash of the row.
+   - CRDT shard rows (with _rowid) are handled correctly.
+
+2. AUTO-INDEX ACCELERATION — already implemented (verified):
+   - `read_rows()` with equality predicates (`=`, `==`) checks if a simple
+     index covers the column via `indexer.find_index_by_column()`.
+   - Single-column index: O(1) exact lookup — if key not found, returns
+     empty immediately (early exit, no row-group scan).
+   - Composite index: scans the index keys for a match on any component.
+   - This is in the existing code (lines 752-802 of lib.rs) — no change needed.
+
+3. REFLECTION — clarified that it's NOT incremental:
+   - `enable_reflection()` just sets a boolean flag in the layer's _meta JSON.
+   - There's no reflection data structure being built or maintained by Pond.
+   - It's a HOOK for external query engines (like Dremio): when an external
+     engine connects, it can discover layers with reflection=True and build
+     its own reflections (materialized views, aggregates, etc.).
+   - The reflection subsystem itself is NOT implemented in Pond — it's a
+     registration mechanism for external systems.
+   - Documented this clearly in the API_WORKFLOW.md update.
+
+4. ADDED missing Storage methods to PyO3 (were in Python SDK, not in Rust):
+   - CRDT Shards (concurrent multi-writer without CAS):
+     - append_shard(collection, shard_name, data) — raw bytes shard
+     - upsert_shard(collection, shard_name, rows, key_col=None) — CRDT rows with _rowid + _version
+     - delete_shard(collection, shard_name, rowids, key_col=None) — tombstone shard
+     - read_with_shards(collection) → list of (name, data) tuples (HEAD + shards)
+     - shard_count(collection) → number of live shards
+     - compact_shards(collection) → merge shards into HEAD, clear shard list
+   - Atomic Publication (Transactions):
+     - begin_tx() → transaction ID
+     - commit_tx(tx_id, message) → writes commit marker (atomic visibility)
+     - abort_tx(tx_id) → no-op (tentative shards orphaned until GC)
+     - is_tx_committed(tx_id) → bool
+   - Optimize:
+     - optimize(collection=None) → dict with collections_optimized, shards_compacted
+     - Compacts shards for one or all collections
+     - (Manifest flattening pending port from Python — documented)
+
+5. UPDATED docs/API_WORKFLOW.md with:
+   - New §6: CRDT Shards — update/delete/merge explained
+     - How updates work: upsert_shard adds _rowid + _version, merge takes latest
+     - How deletes work: delete_shard writes tombstones with _deleted=true + _version
+     - How merge works: branch merge uses CRDT union (G-Set of row groups/shards)
+     - How read_with_shards merges: HEAD + all shards, dedup by _rowid, latest _version wins
+   - New §7: Atomic Publication (Transactions)
+     - begin_tx / commit_tx / abort_tx
+     - Clear disclaimer: NOT full ACID (no isolation, no rollback, no conflict detection)
+     - This is atomic VISIBILITY: all-or-nothing publication
+   - Updated §8 (was §6): Maintenance — now includes optimize
+   - Clarified reflection: it's a flag/hook for external engines, not an incremental subsystem
+   - Updated API reference tables with all new methods
+
+6. HONESTY: documented what's still Python-only (not yet ported to Rust PyO3):
+   - alter_collection (schema evolution: add/drop/rename columns)
+   - set_partition_spec (hidden partitioning)
+   - delete_collection (tombstone a collection)
+   - diff (commit diff)
+   - point_lookup (O(1) key lookup)
+   - append (append to existing data)
+   - count (row count)
+   - compact_manifest (flatten delta-manifest chains — optimize() does shards only)
+   These are in bindings/python/sdk/pond_storage.py but not yet in the Rust PyO3 bindings.
+
+Stage Summary:
+- build_index no longer requires `rows` — reads from the collection directly
+  (HEAD + shards, PND2 decode, JSON conversion).
+- The Rust PyO3 Storage class now has 40+ methods (was 28):
+  - Data I/O: write, read, write_rows, read_rows
+  - Versioning: branch, checkout, checkout_new, merge, history, undo, revert, ls
+  - Indexing: build_index, lookup_index, search_index, drop_index, list_indexes
+  - CRDT Shards: append_shard, upsert_shard, delete_shard, read_with_shards, shard_count, compact_shards
+  - Transactions: begin_tx, commit_tx, abort_tx, is_tx_committed
+  - Optimize: optimize
+  - Semantic Layer: layer, layers
+  - Maintenance: gc_stats, vacuum
+- Auto-index acceleration in read_rows was already implemented (verified).
+- Reflection is NOT incremental — it's a flag for external engines (documented).
+- docs/API_WORKFLOW.md updated with update/delete/merge explanation, transactions,
+  optimize, and honest gaps.
