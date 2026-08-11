@@ -62,36 +62,93 @@ storing KV pairs, vectors, streaming events, or lakehouse tables.
 
 ---
 
-## 2. Data I/O — write and read
+## 2. Data I/O — the layered write/read model
 
-### The unified write model (how write_rows, upsert_shard, delete_shard relate)
+Pond has a **two-tier API** for data operations:
 
-All data in Pond is CRDT-compatible by default. The write commands compose:
+### Lower-level (shard primitives — for advanced use)
+
+These give you explicit control over shard naming. Use them when you need
+to manage shards directly (e.g., multi-writer concurrency with custom
+shard names).
+
+| Method | Purpose |
+|---|---|
+| `append_shard(collection, shard_name, data)` | Append raw bytes as a shard |
+| `upsert_shard(collection, shard_name, rows, key_col?)` | CRDT upsert (adds _rowid + _version) |
+| `delete_shard(collection, shard_name, rowids, key_col?)` | CRDT delete (tombstones by _rowid) |
+| `read_with_shards(collection)` | Read HEAD + all shards (raw bytes) |
+
+### Higher-level (row operations — beautiful, SQL-like, recommended)
+
+These are built on top of the shard primitives. They auto-generate shard
+names, support predicate filtering (like SQL WHERE), and have an optional
+`crdt=True` flag. **This is the recommended API for most users.**
+
+| Method | SQL equivalent | Purpose |
+|---|---|---|
+| `write_rows(collection, columns, message, crdt=True)` | `CREATE TABLE` / `INSERT` | Bulk load (snapshot) |
+| `update_rows(collection, updates, where?, key_col?, crdt=True)` | `UPDATE ... WHERE` | Update matching rows |
+| `delete_rows(collection, where?, key_col?, crdt=True)` | `DELETE FROM ... WHERE` | Delete matching rows |
+| `merge_rows(collection, rows, key_col?, crdt=True)` | `MERGE` / `INSERT ON CONFLICT` | Upsert by key |
+| `read_rows(collection, columns?, predicates?)` | `SELECT ... WHERE` | Read with projection + pruning |
+
+### The `crdt=True` flag (default)
+
+When `crdt=True` (the default), all operations use **CRDT shards**:
+- `write_rows` auto-adds `_rowid` (UUIDv7) + `_version` (HLC) columns
+- `update_rows` / `delete_rows` / `merge_rows` write shards (no HEAD rewrite)
+- Multiple writers can operate concurrently without coordination
+- `read_rows` auto-merges HEAD + all shards (latest `_version` wins, tombstones suppress)
+
+When `crdt=False`, operations use **snapshot semantics** (rewrite HEAD):
+- No `_rowid` / `_version` columns added
+- `update_rows` / `delete_rows` / `merge_rows` rewrite the entire HEAD
+- Not concurrent-safe (last writer wins)
+- Use for immutable historical data or bulk loads that won't be updated
+
+### The inner columns: `_rowid`, `_version`, `_deleted`
+
+These are always used internally when `crdt=True`:
+- `_rowid` (UUIDv7) — stable row identity across updates
+- `_version` (HLC) — clock-skew-safe version for CRDT merge (latest wins)
+- `_deleted` (bool) — tombstone marker for deletes
+
+`read_rows` **auto-filters** these from results unless you explicitly request
+them via `columns=['_rowid', ...]`.
+
+### How they compose
 
 ```
-write_rows()      → bulk initial load (creates a snapshot + adds _rowid/_version)
-upsert_shard()    → incremental update (adds a shard with same _rowid semantics)
-delete_shard()    → incremental delete (tombstones by _rowid)
-read_rows()       → reads the merged result (HEAD + all shards, latest _version wins)
+write_rows()      → bulk load (creates snapshot + adds _rowid/_version)
+    ↓
+update_rows()     → incremental update (shard, matches by _rowid)
+delete_rows()     → incremental delete (tombstone shard)
+merge_rows()      → upsert (shard, matches by key_col → _rowid)
+    ↓
+read_rows()       → reads merged result (HEAD + shards, latest _version wins)
 ```
-
-**`write_rows` auto-adds `_rowid` (UUIDv7) + `_version` (HLC) by default.**
-This means data written by `write_rows` can later be updated via
-`upsert_shard` or deleted via `delete_shard` — they match by `_rowid`.
 
 ```python
 # Bulk load — auto-adds _rowid + _version
 s.write_rows('users', [('id', [1, 2, 3]), ('name', ['a', 'b', 'c'])], 'init')
-# → stored as: id, name, _rowid, _version
 
-# Incremental update — upsert by _rowid (latest _version wins on merge)
-s.upsert_shard('users', 'w1', rows=[{'_rowid': '<uuid-of-row-1>', 'name': 'ALICE'}])
+# SQL-like UPDATE — filter-based, not just rowids
+s.update_rows('users', {'status': 'active'}, where={'city': 'NYC'})
+# → UPDATE users SET status='active' WHERE city='NYC'
 
-# Incremental delete — tombstone by _rowid
-s.delete_shard('users', 'w1_del', rowids=['<uuid-of-row-2>'])
+# SQL-like DELETE — filter-based
+s.delete_rows('users', where={'status': 'inactive'})
+# → DELETE FROM users WHERE status='inactive'
 
-# Read — auto-merges HEAD + all shards
-cols = s.read_rows('users')   # → sees the updates and deletes
+# SQL-like MERGE — upsert by key
+s.merge_rows('users', [
+    {'id': 1, 'name': 'alice_updated'},
+    {'id': 99, 'name': 'new_user'},
+], key_col='id')
+
+# Read — auto-merges HEAD + shards, filters _rowid/_version/_deleted
+cols = s.read_rows('users')
 ```
 
 To opt out of CRDT metadata (raw bulk load, no updates/deletes later):
@@ -818,7 +875,10 @@ storage.merge("users", "dev")
 | `write` | `(collection, data: bytes, message: str)` | `str` (commit hash) | Write raw bytes |
 | `read` | `(collection)` | `bytes` | Read raw bytes from HEAD |
 | `write_rows` | `(collection, columns, message, crdt=True)` | `str` | Write PND2 columns (auto-adds _rowid + _version by default) |
-| `read_rows` | `(collection, columns?, predicates?)` | `dict` | Read with projection + pruning |
+| `update_rows` | `(collection, updates, where?, key_col?, crdt=True)` | `int` | SQL-like UPDATE ... WHERE → count updated |
+| `delete_rows` | `(collection, where?, key_col?, crdt=True)` | `int` | SQL-like DELETE FROM ... WHERE → count deleted |
+| `merge_rows` | `(collection, rows, key_col?, crdt=True)` | `int` | SQL-like MERGE / INSERT ON CONFLICT → count merged |
+| `read_rows` | `(collection, columns?, predicates?)` | `dict` | Read with projection + pruning (auto-merges shards) |
 | `branch` | `(collection, branch_name)` | `str` | Create a branch |
 | `checkout` | `(collection, branch_name)` | `None` | Switch active branch |
 | `checkout_new` | `(collection, branch_name)` | `None` | Create + checkout (like `git -b`) |

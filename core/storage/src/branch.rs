@@ -207,6 +207,17 @@ pub fn merge(
     kernel.reference(&manifest_ref(collection, target_branch), &manifest_hash)
         .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
 
+    // === Copy shards from source branch to target branch ===
+    // CRDT shards (upsert_shard, delete_shard) live alongside HEAD. When merging
+    // branches, these shards must be copied so that row-level CRDT updates/deletes
+    // from the source branch are visible in the target branch after merge.
+    let source_shards = crate::shard::list_shards(kernel, collection, source_branch);
+    let target_shard_prefix = crate::shards_prefix(collection, target_branch);
+    for (shard_name, shard_hash) in &source_shards {
+        let target_ref = format!("{}{}", target_shard_prefix, shard_name);
+        let _ = kernel.reference(&target_ref, shard_hash);
+    }
+
     Ok(merge_hash)
 }
 

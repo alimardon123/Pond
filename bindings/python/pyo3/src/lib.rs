@@ -500,7 +500,7 @@ use pond_ivf_index::IVFIndex as RustIVFIndex;
 use pond_hnsw_index::HNSWIndex as RustHNSWIndex;
 use pond_simple_index::SimpleIndex as RustSimpleIndex;
 use pond_semantic::SemanticDefinitions;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 use std::sync::Mutex;
 
 /// Build a full S3 URL from a base URL and optional parameters.
@@ -734,6 +734,346 @@ impl Storage {
         }
     }
 
+    // ===================================================================
+    // HIGH-LEVEL ROW OPERATIONS — update_rows, delete_rows, merge_rows
+    //
+    // These are built on top of the shard primitives (upsert_shard,
+    // delete_shard). They auto-generate shard names, support predicate
+    // filtering (like SQL WHERE), and have an optional `crdt=True` flag.
+    //
+    // When crdt=True (default): use shard-based operations (append-only,
+    //   no HEAD rewrite, concurrent-writer safe)
+    // When crdt=False: rewrite HEAD (snapshot semantics, not concurrent-safe)
+    //
+    // The _rowid + _version + _deleted columns are ALWAYS used internally.
+    // ===================================================================
+
+    /// Update rows matching a filter — like SQL `UPDATE ... WHERE`.
+    ///
+    /// Reads existing rows, applies the updates to rows that match the
+    /// `where` filter, and writes them back as a CRDT upsert shard.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - updates: dict of {column: new_value} to apply to matching rows
+    ///   - where: optional filter dict {column: value} for equality matching.
+    ///       If None, updates ALL rows (use with caution).
+    ///   - key_col: the key column for matching (default: '_rowid')
+    ///   - crdt: if True (default), write as a CRDT shard (concurrent-safe,
+    ///       no HEAD rewrite). If False, rewrite HEAD.
+    ///
+    /// Returns: number of rows updated
+    ///
+    /// Example:
+    ///   s.update_rows('users', {'status': 'active'}, where={'city': 'NYC'})
+    ///   # → UPDATE users SET status='active' WHERE city='NYC'
+    #[pyo3(signature = (collection, updates, r#where=None, key_col=None, crdt=true))]
+    fn update_rows(&self, collection: &str, updates: PyObject, r#where: Option<PyObject>, key_col: Option<&str>, crdt: bool) -> PyResult<usize> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+
+        // Parse updates dict
+        let updates_dict = python_to_json(&updates);
+        let updates_obj = updates_dict.as_object()
+            .ok_or_else(|| pyo3::exceptions::PyTypeError::new_err("updates must be a dict"))?;
+
+        // Parse where filter dict
+        let where_dict: serde_json::Map<String, JsonValue> = if let Some(w) = &r#where {
+            let wj = python_to_json(w);
+            wj.as_object().cloned().unwrap_or_default()
+        } else {
+            serde_json::Map::new()
+        };
+
+        // Read all current rows (HEAD + shards) as (rowid, row JSON)
+        let kc: Vec<String> = key_col.map(|k| vec![k.to_string()])
+            .unwrap_or_else(|| vec!["_rowid".to_string()]);
+        let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+        // Filter rows that match the where clause
+        let mut matched: Vec<JsonValue> = Vec::new();
+        for (_rowid, row) in &all_rows {
+            let row_obj = row.as_object()
+                .ok_or_else(|| pyo3::exceptions::PyTypeError::new_err("row is not an object"))?;
+            let mut matches = true;
+            for (k, v) in &where_dict {
+                if row_obj.get(k) != Some(v) {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                // Apply updates to a copy of the row
+                let mut updated = row.clone();
+                if let Some(obj) = updated.as_object_mut() {
+                    for (col, val) in updates_obj {
+                        obj.insert(col.clone(), val.clone());
+                    }
+                    // Bump _version (HLC)
+                    use pond_kernel::crdt::HLC;
+                    let mut hlc = HLC::new();
+                    obj.insert("_version".to_string(), json!(hlc.tick()));
+                }
+                matched.push(updated);
+            }
+        }
+
+        let count = matched.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        if crdt {
+            // Write as a CRDT upsert shard — observe existing versions first
+            // so the updated rows' _version is guaranteed newer than HEAD's.
+            use pond_kernel::crdt::HLC;
+            let mut hlc = HLC::new();
+            for (_, row) in &all_rows {
+                if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+                    hlc.observe(v);
+                }
+            }
+            let shard_name = format!("update_{}", chrono_like_id());
+            pond_storage::shard::upsert_shard(
+                kernel, collection, &active, &shard_name,
+                &matched, key_col, &mut hlc,
+            ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        } else {
+            // Rewrite HEAD: merge updated rows with non-matching rows
+            let mut final_rows: Vec<JsonValue> = Vec::new();
+            let matched_rowids: std::collections::HashSet<String> = matched.iter()
+                .filter_map(|r| r.get("_rowid").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .collect();
+            for (_rowid, row) in &all_rows {
+                let rid = row.get("_rowid").and_then(|v| v.as_str()).map(|s| s.to_string());
+                if let Some(rid) = &rid {
+                    if matched_rowids.contains(rid) {
+                        // Use the updated version
+                        if let Some(updated) = matched.iter().find(|r|
+                            r.get("_rowid").and_then(|v| v.as_str()) == Some(rid.as_str())
+                        ) {
+                            final_rows.push(updated.clone());
+                            continue;
+                        }
+                    }
+                }
+                final_rows.push(row.clone());
+            }
+            // Write as a new HEAD snapshot
+            write_rows_from_json(kernel, collection, &active, &final_rows, "update_rows")?;
+        }
+
+        Ok(count)
+    }
+
+    /// Delete rows matching a filter — like SQL `DELETE FROM ... WHERE`.
+    ///
+    /// Writes tombstones for rows that match the `where` filter. On merge,
+    /// tombstoned rows are suppressed.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - where: optional filter dict {column: value} for equality matching.
+    ///       If None, deletes ALL rows (use with caution).
+    ///   - key_col: the key column for matching (default: '_rowid')
+    ///   - crdt: if True (default), write as a tombstone shard. If False,
+    ///       rewrite HEAD without the deleted rows.
+    ///
+    /// Returns: number of rows deleted
+    ///
+    /// Example:
+    ///   s.delete_rows('users', where={'status': 'inactive'})
+    ///   # → DELETE FROM users WHERE status='inactive'
+    #[pyo3(signature = (collection, r#where=None, key_col=None, crdt=true))]
+    fn delete_rows(&self, collection: &str, r#where: Option<PyObject>, key_col: Option<&str>, crdt: bool) -> PyResult<usize> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+
+        // Parse where filter dict
+        let where_dict: serde_json::Map<String, JsonValue> = if let Some(w) = &r#where {
+            let wj = python_to_json(w);
+            wj.as_object().cloned().unwrap_or_default()
+        } else {
+            serde_json::Map::new()
+        };
+
+        // Read all current rows
+        let kc: Vec<String> = key_col.map(|k| vec![k.to_string()])
+            .unwrap_or_else(|| vec!["_rowid".to_string()]);
+        let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+        // Filter rows that match the where clause
+        let mut matched_rowids: Vec<String> = Vec::new();
+        let mut surviving: Vec<JsonValue> = Vec::new();
+        for (rowid, row) in &all_rows {
+            let row_obj = row.as_object()
+                .ok_or_else(|| pyo3::exceptions::PyTypeError::new_err("row is not an object"))?;
+            let mut matches = true;
+            for (k, v) in &where_dict {
+                if row_obj.get(k) != Some(v) {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                matched_rowids.push(rowid.clone());
+            } else {
+                surviving.push(row.clone());
+            }
+        }
+
+        let count = matched_rowids.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        if crdt {
+            // Write a tombstone shard — observe existing versions first so the
+            // tombstone's _version is guaranteed newer than HEAD's.
+            use pond_kernel::crdt::HLC;
+            let mut hlc = HLC::new();
+            // Observe all existing _version values to advance the HLC past them
+            for (_, row) in &all_rows {
+                if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+                    hlc.observe(v);
+                }
+            }
+            let shard_name = format!("delete_{}", chrono_like_id());
+            pond_storage::shard::delete_shard(
+                kernel, collection, &active, &shard_name,
+                &matched_rowids, key_col, &mut hlc,
+            ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        } else {
+            // Rewrite HEAD without the deleted rows
+            write_rows_from_json(kernel, collection, &active, &surviving, "delete_rows")?;
+        }
+
+        Ok(count)
+    }
+
+    /// Merge rows into a collection — upsert all (insert-or-update).
+    ///
+    /// Like SQL `MERGE` / `INSERT ... ON CONFLICT UPDATE`. Rows matching
+    /// by `key_col` are updated; rows that don't match are inserted.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - rows: list of row dicts to merge
+    ///   - key_col: the key column for matching (default: '_rowid')
+    ///   - crdt: if True (default), write as a CRDT upsert shard. If False,
+    ///       rewrite HEAD with the merged result.
+    ///
+    /// Returns: number of rows merged
+    ///
+    /// Example:
+    ///   s.merge_rows('users', [
+    ///       {'id': 1, 'name': 'alice_updated'},
+    ///       {'id': 99, 'name': 'new_user'},
+    ///   ], key_col='id')
+    #[pyo3(signature = (collection, rows, key_col=None, crdt=true))]
+    fn merge_rows(&self, collection: &str, rows: Vec<PyObject>, key_col: Option<&str>, crdt: bool) -> PyResult<usize> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+
+        let json_rows: Vec<JsonValue> = rows.iter().map(|r| python_to_json(r)).collect();
+        let count = json_rows.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        if crdt {
+            // Write as a CRDT upsert shard — observe existing versions first,
+            // AND match existing _rowid values by key_col so updates override
+            // existing rows instead of creating duplicates.
+            use pond_kernel::crdt::HLC;
+            let mut hlc = HLC::new();
+            let kc: Vec<String> = key_col.map(|k| vec![k.to_string()])
+                .unwrap_or_else(|| vec!["_rowid".to_string()]);
+            let existing = read_collection_as_json_rows(&storage, collection, &kc)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+            // Observe existing versions to advance HLC past them
+            for (_, row) in &existing {
+                if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+                    hlc.observe(v);
+                }
+            }
+
+            // Build a lookup: key_col value → existing _rowid
+            // So incoming rows that match an existing key get the SAME _rowid
+            let mut key_to_rowid: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            if let Some(kc_name) = key_col {
+                for (_, row) in &existing {
+                    if let (Some(key_val), Some(rowid)) = (
+                        row.get(kc_name).map(|v| v.to_string()),
+                        row.get("_rowid").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    ) {
+                        key_to_rowid.insert(key_val, rowid);
+                    }
+                }
+            }
+
+            // For each incoming row: if it matches an existing key, use that _rowid
+            let mut merged_rows: Vec<JsonValue> = Vec::with_capacity(json_rows.len());
+            for mut row in json_rows {
+                if let Some(kc_name) = key_col {
+                    if let Some(key_val) = row.get(kc_name).map(|v| v.to_string()) {
+                        if let Some(existing_rowid) = key_to_rowid.get(&key_val) {
+                            // Match found — use the existing _rowid so CRDT merge overrides
+                            if let Some(obj) = row.as_object_mut() {
+                                obj.insert("_rowid".to_string(), json!(existing_rowid));
+                            }
+                        }
+                    }
+                }
+                merged_rows.push(row);
+            }
+
+            let shard_name = format!("merge_{}", chrono_like_id());
+            pond_storage::shard::upsert_shard(
+                kernel, collection, &active, &shard_name,
+                &merged_rows, key_col, &mut hlc,
+            ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        } else {
+            // Rewrite HEAD: read existing, merge by key_col, write back
+            let kc: Vec<String> = key_col.map(|k| vec![k.to_string()])
+                .unwrap_or_else(|| vec!["_rowid".to_string()]);
+            let existing = read_collection_as_json_rows(&storage, collection, &kc)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+            // Build a map of key → row for existing data
+            let mut merged: std::collections::HashMap<String, JsonValue> = std::collections::HashMap::new();
+            for (_rowid, row) in &existing {
+                let key = key_col
+                    .and_then(|kc| row.get(kc))
+                    .or_else(|| row.get("_rowid"))
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                merged.insert(key, row.clone());
+            }
+
+            // Apply incoming rows (overwrite by key)
+            for row in &json_rows {
+                let key = key_col
+                    .and_then(|kc| row.get(kc))
+                    .or_else(|| row.get("_rowid"))
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                merged.insert(key, row.clone());
+            }
+
+            let final_rows: Vec<JsonValue> = merged.into_values().collect();
+            write_rows_from_json(kernel, collection, &active, &final_rows, "merge_rows")?;
+        }
+
+        Ok(count)
+    }
+
     /// Read structured columns from a collection with optional pruning.
     ///
     /// Decodes PND2 blobs with predicate pruning (skip row groups whose
@@ -761,7 +1101,7 @@ impl Storage {
         predicates: Option<Vec<(String, String, i64)>>,
     ) -> PyResult<PyObject> {
         let storage = self.storage.lock().unwrap();
-        let active = storage.get_active_branch(collection);
+        let kernel = storage.kernel();
 
         // === AUTO-INDEX ACCELERATION (multi-key + composite) ===
         // For EACH equality predicate, check if a simple index covers that column.
@@ -769,28 +1109,22 @@ impl Storage {
         // - Composite index: prefix scan (check if any key contains the value)
         // If an index exists AND the lookup key is not found → return empty (early exit).
         if let Some(ref preds) = predicates {
-            let indexer = RustSimpleIndex::new(storage.kernel());
+            let indexer = RustSimpleIndex::new(kernel);
             for (col, op, val) in preds {
                 if op == "=" || op == "==" {
                     if let Some(index_name) = indexer.find_index_by_column(collection, col) {
                         let lookup_key = val.to_string();
-                        // Check if this is a composite index
                         let key_fields = indexer.get_index_key_fields(collection, &index_name);
                         let is_composite = key_fields.as_ref()
                             .map(|f| f.len() > 1)
                             .unwrap_or(false);
 
                         if is_composite {
-                            // Composite index: scan all keys for a match
-                            // (can't do O(1) lookup on individual column of composite key)
-                            // Read the full index and check if any key contains the value
                             let ref_name = format!("collections/{}/indexes/{}", collection, index_name);
-                            if let Some(hash) = storage.kernel().resolve(&ref_name) {
-                                if let Ok(data) = storage.kernel().read_blob(&hash) {
+                            if let Some(hash) = kernel.resolve(&ref_name) {
+                                if let Ok(data) = kernel.read_blob(&hash) {
                                     if let Ok(index) = serde_json::from_slice::<std::collections::HashMap<String, String>>(&data) {
-                                        // Check if any key contains the lookup value as a component
                                         let found = index.keys().any(|k| {
-                                            // Split by unit separator and check each component
                                             k.split('\x1f').any(|comp| comp == lookup_key)
                                         });
                                         if !found {
@@ -801,7 +1135,6 @@ impl Storage {
                                 }
                             }
                         } else {
-                            // Single-column index: O(1) exact lookup
                             match indexer.lookup(collection, &index_name, &lookup_key) {
                                 None => {
                                     let dict = PyDict::new_bound(py);
@@ -815,96 +1148,61 @@ impl Storage {
             }
         }
 
-        // Resolve HEAD and get manifest (handles PondPack + old format)
-        let head = storage.kernel().resolve(&pond_storage::branch_ref(collection, &active))
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!(
-                "no commits for '{}'", collection)))?;
+        // === READ HEAD + ALL SHARDS, MERGE BY _rowid (CRDT) ===
+        // Use the shared helper that reads HEAD + shards and returns (rowid, JSON row) pairs.
+        // Then apply CRDT merge: dedup by _rowid, latest _version wins, tombstones suppress.
+        let kc: Vec<String> = vec!["_rowid".to_string()];
+        let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
-        let head_data = storage.kernel().read_blob(&head)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-
-        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
-                .ok_or_else(|| pyo3::exceptions::PyIOError::new_err("Failed to decode PondPack"))?;
-            manifest_bytes
-        } else {
-            let commit = pond_storage::commit::read_commit(storage.kernel(), &head)
-                .ok_or_else(|| pyo3::exceptions::PyIOError::new_err("Failed to read commit"))?;
-            storage.kernel().read_blob(&commit.manifest)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
-        };
-
-        let manifest = pond_storage::manifest::CollectionManifest::decode(&manifest_bytes)
-            .ok_or_else(|| pyo3::exceptions::PyIOError::new_err("Failed to decode manifest"))?;
+        // CRDT merge: dedup by _rowid, latest _version wins, tombstones suppress
+        let merged = crdt_merge_rows(all_rows);
 
         // Build projection set
         let projection: Option<std::collections::HashSet<String>> = columns.map(|cols| {
             cols.into_iter().collect()
         });
 
-        // Collect results
+        // Apply row-level predicates (filter after merge, since shards may have updates)
+        let filtered: Vec<&JsonValue> = merged.iter().filter(|row| {
+            if let Some(ref preds) = predicates {
+                for (col, op, value) in preds {
+                    let cell = row.get(col);
+                    let matches = match cell {
+                        Some(JsonValue::Number(n)) => {
+                            if let Some(i) = n.as_i64() {
+                                match op.as_str() {
+                                    "=" | "==" => i == *value,
+                                    "!=" | "<>" => i != *value,
+                                    "<" => i < *value,
+                                    "<=" => i <= *value,
+                                    ">" => i > *value,
+                                    ">=" => i >= *value,
+                                    _ => true,
+                                }
+                            } else { true }
+                        }
+                        _ => true, // can't filter on non-numeric
+                    };
+                    if !matches { return false; }
+                }
+            }
+            true
+        }).collect();
+
+        // Convert to columnar format
         let mut result_cols: std::collections::HashMap<String, Vec<PyObject>> = std::collections::HashMap::new();
 
-        for rg in &manifest.row_groups {
-            // Predicate pruning
-            if let Some(ref preds) = predicates {
-                let mut skip = false;
-                for (col_name, op, value) in preds {
-                    let col_stats = rg.columns.iter().find(|c| c.name == *col_name);
-                    if let Some(stats) = col_stats {
-                        if can_prune_row_group_py(stats, op, *value) {
-                            skip = true;
-                            break;
-                        }
+        for row in &filtered {
+            if let Some(obj) = row.as_object() {
+                for (name, value) in obj {
+                    // Apply projection
+                    if let Some(ref proj) = projection {
+                        if !proj.contains(name) { continue; }
                     }
-                }
-                if skip { continue; }
-            }
-
-            // Read and decode PND2 blob
-            let blob_data = storage.kernel().read_blob(&rg.blob_hash)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-
-            let cols = pond_core::pnd2_decode(&blob_data)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
-
-            for col in &cols {
-                let name = col.name.to_string_lossy().to_string();
-
-                if let Some(ref proj) = projection {
-                    if !proj.contains(&name) { continue; }
-                }
-
-                let entry = result_cols.entry(name.clone()).or_insert_with(Vec::new);
-
-                // Convert to Python objects based on vtype
-                use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY, VT_NULL};
-                match col.vtype {
-                    VT_INT64 => {
-                        for v in &col.i64_data {
-                            entry.push(v.to_object(py));
-                        }
-                    }
-                    VT_FLOAT64 => {
-                        for v in &col.f64_data {
-                            entry.push(v.to_object(py));
-                        }
-                    }
-                    VT_STRING => {
-                        for s in &col.str_data {
-                            entry.push(s.to_string_lossy().to_string().to_object(py));
-                        }
-                    }
-                    VT_BINARY => {
-                        for b in &col.bin_data {
-                            entry.push(PyBytes::new_bound(py, b).into());
-                        }
-                    }
-                    VT_NULL | _ => {
-                        for _ in 0..col.n_values {
-                            entry.push(py.None());
-                        }
-                    }
+                    let entry = result_cols.entry(name.clone()).or_insert_with(Vec::new);
+                    let py_val = json_value_to_py(py, value);
+                    entry.push(py_val);
                 }
             }
         }
@@ -918,7 +1216,6 @@ impl Storage {
 
         let dict = PyDict::new_bound(py);
         for (name, values) in result_cols {
-            // Skip CRDT metadata columns unless explicitly requested
             if !explicit_columns && crdt_cols.contains(name.as_str()) {
                 continue;
             }
@@ -1448,12 +1745,12 @@ impl Storage {
         // Read HEAD data
         if let Some(manifest_hash) = head_manifest {
             if let Ok(manifest_bytes) = kernel.read_blob(&manifest_hash) {
-                if let Ok(manifest) = pond_storage::manifest::CollectionManifest::decode(&manifest_bytes) {
+                if let Some(manifest) = pond_storage::manifest::CollectionManifest::decode(&manifest_bytes) {
                     for rg in &manifest.row_groups {
                         if let Ok(data) = kernel.read_blob(&rg.blob_hash) {
                             let tuple = PyTuple::new_bound(py, [
                                 "__head__".to_object(py),
-                                PyBytes::new_bound(py, &data).into_any(),
+                                PyBytes::new_bound(py, &data).into(),
                             ]);
                             result.append(tuple)?;
                         }
@@ -1467,7 +1764,7 @@ impl Storage {
             if let Ok(data) = kernel.read_blob(hash) {
                 let tuple = PyTuple::new_bound(py, [
                     name.to_object(py),
-                    PyBytes::new_bound(py, &data).into_any(),
+                    PyBytes::new_bound(py, &data).into(),
                 ]);
                 result.append(tuple)?;
             }
@@ -2219,6 +2516,181 @@ fn python_values_to_typed_column(values: &[PyObject]) -> TypedColumn {
         // Empty or unknown → default to empty Int64
         TypedColumn::Int64(Vec::new())
     })
+}
+
+/// Generate a short unique ID for shard names (timestamp-based).
+fn chrono_like_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:016x}", ts)
+}
+
+/// CRDT merge: dedup by _rowid, latest _version wins, tombstones suppress.
+///
+/// Input: Vec<(rowid, row)> from HEAD + all shards.
+/// Output: Vec<row> with duplicates removed and tombstones filtered out.
+///
+/// Rules:
+///   1. Group rows by _rowid
+///   2. Within each group, the row with the latest _version wins
+///   3. If the winning row has _deleted=true, it's suppressed (not in output)
+///   4. Rows without _rowid are passed through as-is (legacy non-CRDT data)
+///   5. Insertion order is preserved (first occurrence of each _rowid)
+fn crdt_merge_rows(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
+    use std::collections::HashMap;
+
+    // Track the latest version + row for each _rowid, AND the order of first
+    // appearance. We use a Vec for order + a HashMap for latest-version lookup.
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: HashMap<String, (String, JsonValue)> = HashMap::new();
+    let mut no_rowid: Vec<JsonValue> = Vec::new();
+
+    for (rowid, row) in rows {
+        let effective_rowid = row.get("_rowid")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or(rowid);
+
+        let is_deleted = row.get("_deleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let version = row.get("_version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        if effective_rowid.is_empty() {
+            if !is_deleted {
+                no_rowid.push(row);
+            }
+            continue;
+        }
+
+        match latest.get(&effective_rowid) {
+            Some((existing_ver, _)) => {
+                if version > *existing_ver {
+                    latest.insert(effective_rowid.clone(), (version, row));
+                }
+            }
+            None => {
+                order.push(effective_rowid.clone());
+                latest.insert(effective_rowid, (version, row));
+            }
+        }
+    }
+
+    // Collect in insertion order, skipping tombstones
+    let mut result: Vec<JsonValue> = no_rowid;
+    for rowid in &order {
+        if let Some((_, row)) = latest.get(rowid) {
+            let is_deleted = row.get("_deleted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !is_deleted {
+                result.push(row.clone());
+            }
+        }
+    }
+
+    result
+}
+
+/// Convert a serde_json::Value to a Python object.
+fn json_value_to_py(py: Python, value: &JsonValue) -> PyObject {
+    match value {
+        JsonValue::Null => py.None(),
+        JsonValue::Bool(b) => b.to_object(py),
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.to_object(py)
+            } else if let Some(f) = n.as_f64() {
+                f.to_object(py)
+            } else {
+                py.None()
+            }
+        }
+        JsonValue::String(s) => s.to_object(py),
+        _ => py.None(), // arrays/objects not supported in columnar cells
+    }
+}
+
+/// Write a list of JSON rows as a new HEAD snapshot (PND2 + manifest + commit).
+///
+/// Converts the JSON rows to typed columns, then delegates to
+/// storage_write::write_rows (which auto-adds _rowid + _version if missing).
+fn write_rows_from_json(
+    kernel: &PondKernel,
+    collection: &str,
+    active_branch: &str,
+    rows: &[JsonValue],
+    message: &str,
+) -> PyResult<String> {
+    if rows.is_empty() {
+        // Write an empty snapshot
+        return storage_write::write(kernel, collection, active_branch, b"[]", message)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e));
+    }
+
+    // Collect all column names from the first row (assume homogeneous)
+    let first_row = rows[0].as_object()
+        .ok_or_else(|| pyo3::exceptions::PyTypeError::new_err("row is not an object"))?;
+    let col_names: Vec<String> = first_row.keys().cloned().collect();
+
+    // Build typed columns
+    let mut typed_cols: Vec<(String, TypedColumn)> = Vec::new();
+    for col_name in &col_names {
+        let mut i64_vals: Vec<i64> = Vec::new();
+        let mut f64_vals: Vec<f64> = Vec::new();
+        let mut str_vals: Vec<String> = Vec::new();
+        let mut col_type: u8 = 0; // 0=unknown, 1=i64, 2=f64, 3=str
+
+        for row in rows {
+            let obj = row.as_object()
+                .ok_or_else(|| pyo3::exceptions::PyTypeError::new_err("row is not an object"))?;
+            match obj.get(col_name) {
+                Some(JsonValue::Number(n)) => {
+                    if let Some(i) = n.as_i64() {
+                        i64_vals.push(i);
+                        if col_type == 0 || col_type == 1 { col_type = 1; }
+                    } else if let Some(f) = n.as_f64() {
+                        f64_vals.push(f);
+                        if col_type == 0 || col_type == 2 { col_type = 2; }
+                    }
+                }
+                Some(JsonValue::String(s)) => {
+                    str_vals.push(s.clone());
+                    if col_type == 0 || col_type == 3 { col_type = 3; }
+                }
+                _ => {
+                    // null or other → push default for the detected type
+                    match col_type {
+                        1 => i64_vals.push(0),
+                        2 => f64_vals.push(0.0),
+                        3 => str_vals.push(String::new()),
+                        _ => { col_type = 3; str_vals.push(String::new()); }
+                    }
+                }
+            }
+        }
+
+        let typed = match col_type {
+            1 => TypedColumn::Int64(i64_vals),
+            2 => TypedColumn::Float64(f64_vals),
+            _ => TypedColumn::String(str_vals),
+        };
+        typed_cols.push((col_name.clone(), typed));
+    }
+
+    let col_refs: Vec<(&str, TypedColumn)> = typed_cols.iter()
+        .map(|(name, col)| (name.as_str(), col.clone()))
+        .collect();
+
+    storage_write::write_rows(kernel, collection, active_branch, &col_refs, message)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
 }
 
 /// Read all rows from a collection as (rowid, JSON row) pairs.

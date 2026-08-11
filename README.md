@@ -142,7 +142,12 @@ s.write_rows('metrics', [('id', [1, 2, 3]), ('val', [10, 20, 30])], 'init')
 cols = s.read_rows('metrics')           # → {'id': [1,2,3], 'val': [10,20,30]}
 cols = s.read_rows('metrics', columns=['val'])  # projection
 cols = s.read_rows('metrics', predicates=[('id', '>', 1)])  # pruning
-# Opt out of CRDT metadata: s.write_rows(..., crdt=False)
+
+# SQL-like row operations (built on CRDT shards, crdt=True by default)
+s.update_rows('metrics', {'val': 999}, where={'id': 2})  # UPDATE ... WHERE
+s.delete_rows('metrics', where={'id': 3})                 # DELETE FROM ... WHERE
+s.merge_rows('metrics', [{'id': 4, 'val': 40}], key_col='id')  # MERGE / upsert
+# Opt out of CRDT: s.write_rows(..., crdt=False) for raw bulk loads
 
 # Version control (git-like)
 s.branch('users', 'dev')
