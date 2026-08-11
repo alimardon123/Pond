@@ -5593,3 +5593,74 @@ Stage Summary:
 - _rowid/_version/_deleted always used internally, auto-filtered from reads
 - Branch merge copies shards → CRDT data merges correctly across branches
 - All 8 tests pass, build succeeds, no regressions
+
+---
+Task ID: 73
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Rich predicates (>, <, >=, <=, !=, IN, LIKE) + where= on all row ops + demo.
+
+User feedback:
+  1. "What about predicates like greater than, smaller than, just like SQL, polars, pyspark?"
+  2. "Would be better if we have where? in write_rows api too. Maybe in merge_rows too"
+  3. "Is it really applying in Rust in same way? Can we have direct bindings from Rust?"
+
+Work Log:
+1. ADDED rich predicate support to the where= parameter:
+   - Equality: {'col': value}
+   - Comparison: {'col': ('>', val)}, ('>=', '<', '<=', '!=', '<>')
+   - IN / NOT IN: {'col': ('in', [v1, v2, v3])}
+   - LIKE (SQL pattern): {'col': ('like', 'pattern%')}
+   - IS NULL / IS NOT NULL: {'col': ('is null',)}, {'col': ('is not null',)}
+   - Range (AND on same column): {'age': [('>', 18), ('<', 65)]}
+   - Multiple columns (AND): {'city': 'NYC', 'age': ('>', 25)}
+   
+   Helper functions added:
+   - row_matches_where(row, where_dict) — evaluates a row against the where filter
+   - eval_condition(cell, condition) — dispatches based on condition type
+   - eval_op_condition(cell, [op, value]) — evaluates a single [op, value] pair
+   - cmp_values(a, b) — numeric + string comparison
+   - like_match(text, pattern) — SQL LIKE with % and _
+
+2. ADDED where= parameter to write_rows and merge_rows:
+   - write_rows(collection, columns, message, crdt=True, where=None)
+     Filters input rows before writing (only writes rows matching the condition)
+   - merge_rows(collection, rows, key_col=None, crdt=True, where=None)
+     Filters incoming rows before merging (only merges matching rows)
+
+3. UPGRADED read_rows predicates to accept any value type:
+   - Before: predicates=Vec<(String, String, i64)> — only integers
+   - After: predicates=Vec<(String, String, PyObject)> — any Python value
+   - Converted to JSON internally, compared via cmp_values()
+   - Now supports: predicates=[('dept', '=', 'eng'), ('name', 'like', 'A%')]
+
+4. CREATED comprehensive demo: tests/integration/test_api_demo.py
+   - Shows raw bytes (JSON, CSV, images)
+   - Shows bulk dataset loading (10 employees)
+   - Shows rich predicates in read_rows (>, <, =, AND)
+   - Shows where= on write_rows (filter input rows)
+   - Shows where= on update_rows (SQL-like UPDATE ... WHERE)
+   - Shows where= on delete_rows (SQL-like DELETE FROM ... WHERE)
+   - Shows where= on merge_rows (filter incoming rows)
+   - Shows crdt=False (snapshot semantics)
+   - Explains the Rust architecture (all logic in Rust, zero Python overhead)
+   - Includes predicate reference cheat sheet
+
+5. ARCHITECTURE CLARIFICATION:
+   All logic runs in Rust. The Python `pond` module is a thin PyO3 wrapper:
+   - Python calls → PyO3 boundary (arg conversion) → Rust functions
+   - No Python logic between calls
+   - PND2 encoding, CRDT merge, predicate evaluation, shard management
+     all happen in compiled Rust code
+   - The only overhead is argument conversion at the call site
+
+TEST RESULTS:
+  - test_api_demo.py: all sections pass ✓
+  - test_beautiful_api.py: 8/8 passed ✓ (no regressions)
+  - Build: cargo build -p pond_python --release ✓
+
+Stage Summary:
+- Rich predicates (SQL/polara/pyspark-style) on all row operations
+- where= parameter added to write_rows and merge_rows
+- read_rows predicates now accept any value type (not just integers)
+- Comprehensive demo shows all features
+- All logic in Rust — zero Python overhead between calls

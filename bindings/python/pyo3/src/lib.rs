@@ -708,8 +708,13 @@ impl Storage {
     ///   ], 'init')
     ///   # → automatically adds _rowid + _version columns
     ///   # → data is now compatible with upsert_shard / delete_shard
-    #[pyo3(signature = (collection, columns, message, crdt=true))]
-    fn write_rows(&self, collection: &str, columns: Vec<(String, Vec<PyObject>)>, message: &str, crdt: bool) -> PyResult<String> {
+    ///
+    /// With `where=` filter (only write rows matching the condition):
+    ///   s.write_rows('users', [('id', [1,2,3]), ('age', [20,30,40])], 'init',
+    ///                where={'age': ('>', 25)})
+    ///   # → only writes rows where age > 25
+    #[pyo3(signature = (collection, columns, message, crdt=true, r#where=None))]
+    fn write_rows(&self, collection: &str, columns: Vec<(String, Vec<PyObject>)>, message: &str, crdt: bool, r#where: Option<PyObject>) -> PyResult<String> {
         let storage = self.storage.lock().unwrap();
         let active = storage.get_active_branch(collection);
 
@@ -721,7 +726,37 @@ impl Storage {
             })
             .collect();
 
-        let col_refs: Vec<(&str, TypedColumn)> = typed_cols.iter()
+        // If where= is provided, filter rows before writing
+        let final_cols: Vec<(String, TypedColumn)> = if let Some(ref w) = r#where {
+            let where_dict = python_to_json(w)
+                .as_object().cloned().unwrap_or_default();
+
+            // Determine number of rows
+            let n_rows = typed_cols.first().map(|(_, c)| c.len()).unwrap_or(0);
+
+            // Build a row-index → keep bool mask
+            let col_names: Vec<&str> = typed_cols.iter().map(|(n, _)| n.as_str()).collect();
+            let mut keep_mask: Vec<bool> = Vec::with_capacity(n_rows);
+            for row_idx in 0..n_rows {
+                // Build a JSON object for this row
+                let mut row_obj = serde_json::Map::new();
+                for (name, col) in &typed_cols {
+                    let val = extract_cell(col, row_idx);
+                    row_obj.insert(name.clone(), val);
+                }
+                let row = JsonValue::Object(row_obj);
+                keep_mask.push(row_matches_where(&row, &where_dict));
+            }
+
+            // Filter each column to only kept rows
+            typed_cols.into_iter()
+                .map(|(name, col)| (name, filter_column(col, &keep_mask)))
+                .collect()
+        } else {
+            typed_cols
+        };
+
+        let col_refs: Vec<(&str, TypedColumn)> = final_cols.iter()
             .map(|(name, col)| (name.as_str(), col.clone()))
             .collect();
 
@@ -792,19 +827,10 @@ impl Storage {
         let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
-        // Filter rows that match the where clause
+        // Filter rows that match the where clause (supports rich predicates)
         let mut matched: Vec<JsonValue> = Vec::new();
         for (_rowid, row) in &all_rows {
-            let row_obj = row.as_object()
-                .ok_or_else(|| pyo3::exceptions::PyTypeError::new_err("row is not an object"))?;
-            let mut matches = true;
-            for (k, v) in &where_dict {
-                if row_obj.get(k) != Some(v) {
-                    matches = false;
-                    break;
-                }
-            }
-            if matches {
+            if row_matches_where(row, &where_dict) {
                 // Apply updates to a copy of the row
                 let mut updated = row.clone();
                 if let Some(obj) = updated.as_object_mut() {
@@ -906,20 +932,11 @@ impl Storage {
         let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
-        // Filter rows that match the where clause
+        // Filter rows that match the where clause (supports rich predicates)
         let mut matched_rowids: Vec<String> = Vec::new();
         let mut surviving: Vec<JsonValue> = Vec::new();
         for (rowid, row) in &all_rows {
-            let row_obj = row.as_object()
-                .ok_or_else(|| pyo3::exceptions::PyTypeError::new_err("row is not an object"))?;
-            let mut matches = true;
-            for (k, v) in &where_dict {
-                if row_obj.get(k) != Some(v) {
-                    matches = false;
-                    break;
-                }
-            }
-            if matches {
+            if row_matches_where(row, &where_dict) {
                 matched_rowids.push(rowid.clone());
             } else {
                 surviving.push(row.clone());
@@ -974,14 +991,33 @@ impl Storage {
     ///       {'id': 1, 'name': 'alice_updated'},
     ///       {'id': 99, 'name': 'new_user'},
     ///   ], key_col='id')
-    #[pyo3(signature = (collection, rows, key_col=None, crdt=true))]
-    fn merge_rows(&self, collection: &str, rows: Vec<PyObject>, key_col: Option<&str>, crdt: bool) -> PyResult<usize> {
+    ///
+    /// With `where=` filter (only merge rows matching the condition):
+    ///   s.merge_rows('users', [
+    ///       {'id': 1, 'name': 'alice', 'age': 30},
+    ///       {'id': 2, 'name': 'bob', 'age': 15},
+    ///   ], key_col='id', where={'age': ('>=', 18)})
+    ///   # → only merges rows where age >= 18 (skips bob)
+    #[pyo3(signature = (collection, rows, key_col=None, crdt=true, r#where=None))]
+    fn merge_rows(&self, collection: &str, rows: Vec<PyObject>, key_col: Option<&str>, crdt: bool, r#where: Option<PyObject>) -> PyResult<usize> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let active = storage.get_active_branch(collection);
 
         let json_rows: Vec<JsonValue> = rows.iter().map(|r| python_to_json(r)).collect();
-        let count = json_rows.len();
+
+        // Apply where= filter to incoming rows if provided
+        let filtered_rows: Vec<JsonValue> = if let Some(ref w) = r#where {
+            let where_dict = python_to_json(w)
+                .as_object().cloned().unwrap_or_default();
+            json_rows.into_iter()
+                .filter(|row| row_matches_where(row, &where_dict))
+                .collect()
+        } else {
+            json_rows
+        };
+
+        let count = filtered_rows.len();
         if count == 0 {
             return Ok(0);
         }
@@ -1019,8 +1055,8 @@ impl Storage {
             }
 
             // For each incoming row: if it matches an existing key, use that _rowid
-            let mut merged_rows: Vec<JsonValue> = Vec::with_capacity(json_rows.len());
-            for mut row in json_rows {
+            let mut merged_rows: Vec<JsonValue> = Vec::with_capacity(filtered_rows.len());
+            for mut row in filtered_rows {
                 if let Some(kc_name) = key_col {
                     if let Some(key_val) = row.get(kc_name).map(|v| v.to_string()) {
                         if let Some(existing_rowid) = key_to_rowid.get(&key_val) {
@@ -1058,7 +1094,7 @@ impl Storage {
             }
 
             // Apply incoming rows (overwrite by key)
-            for row in &json_rows {
+            for row in &filtered_rows {
                 let key = key_col
                     .and_then(|kc| row.get(kc))
                     .or_else(|| row.get("_rowid"))
@@ -1098,19 +1134,26 @@ impl Storage {
         py: Python<'_>,
         collection: &str,
         columns: Option<Vec<String>>,
-        predicates: Option<Vec<(String, String, i64)>>,
+        predicates: Option<Vec<(String, String, PyObject)>>,
     ) -> PyResult<PyObject> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
+
+        // Convert predicates to JSON values for flexible comparison
+        let predicates_json: Vec<(String, String, JsonValue)> = predicates
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(col, op, val)| (col, op, python_to_json(&val)))
+            .collect();
 
         // === AUTO-INDEX ACCELERATION (multi-key + composite) ===
         // For EACH equality predicate, check if a simple index covers that column.
         // - Single-column index: O(1) exact lookup
         // - Composite index: prefix scan (check if any key contains the value)
         // If an index exists AND the lookup key is not found → return empty (early exit).
-        if let Some(ref preds) = predicates {
+        if !predicates_json.is_empty() {
             let indexer = RustSimpleIndex::new(kernel);
-            for (col, op, val) in preds {
+            for (col, op, val) in &predicates_json {
                 if op == "=" || op == "==" {
                     if let Some(index_name) = indexer.find_index_by_column(collection, col) {
                         let lookup_key = val.to_string();
@@ -1164,25 +1207,19 @@ impl Storage {
         });
 
         // Apply row-level predicates (filter after merge, since shards may have updates)
+        // Now supports ANY value type (string, int, float, bool) via JSON comparison
         let filtered: Vec<&JsonValue> = merged.iter().filter(|row| {
-            if let Some(ref preds) = predicates {
-                for (col, op, value) in preds {
+            if !predicates_json.is_empty() {
+                for (col, op, value) in &predicates_json {
                     let cell = row.get(col);
-                    let matches = match cell {
-                        Some(JsonValue::Number(n)) => {
-                            if let Some(i) = n.as_i64() {
-                                match op.as_str() {
-                                    "=" | "==" => i == *value,
-                                    "!=" | "<>" => i != *value,
-                                    "<" => i < *value,
-                                    "<=" => i <= *value,
-                                    ">" => i > *value,
-                                    ">=" => i >= *value,
-                                    _ => true,
-                                }
-                            } else { true }
-                        }
-                        _ => true, // can't filter on non-numeric
+                    let matches = match op.as_str() {
+                        "=" | "==" => cell == Some(value),
+                        "!=" | "<>" => cell != Some(value),
+                        ">" => cmp_values(cell, value) == std::cmp::Ordering::Greater,
+                        ">=" => matches!(cmp_values(cell, value), std::cmp::Ordering::Greater | std::cmp::Ordering::Equal),
+                        "<" => cmp_values(cell, value) == std::cmp::Ordering::Less,
+                        "<=" => matches!(cmp_values(cell, value), std::cmp::Ordering::Less | std::cmp::Ordering::Equal),
+                        _ => true,
                     };
                     if !matches { return false; }
                 }
@@ -2516,6 +2553,236 @@ fn python_values_to_typed_column(values: &[PyObject]) -> TypedColumn {
         // Empty or unknown → default to empty Int64
         TypedColumn::Int64(Vec::new())
     })
+}
+
+/// Extract a single cell from a TypedColumn at a given row index as a JSON value.
+fn extract_cell(col: &TypedColumn, idx: usize) -> JsonValue {
+    match col {
+        TypedColumn::Int64(v) => {
+            v.get(idx).map(|i| JsonValue::Number(serde_json::Number::from(*i)))
+                .unwrap_or(JsonValue::Null)
+        }
+        TypedColumn::Float64(v) => {
+            v.get(idx).and_then(|f| serde_json::Number::from_f64(*f))
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
+        }
+        TypedColumn::String(v) => {
+            v.get(idx).map(|s| JsonValue::String(s.clone()))
+                .unwrap_or(JsonValue::Null)
+        }
+    }
+}
+
+/// Filter a TypedColumn to only rows where keep_mask[idx] is true.
+fn filter_column(col: TypedColumn, keep_mask: &[bool]) -> TypedColumn {
+    match col {
+        TypedColumn::Int64(v) => {
+            TypedColumn::Int64(v.into_iter().enumerate()
+                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
+                .map(|(_, v)| v)
+                .collect())
+        }
+        TypedColumn::Float64(v) => {
+            TypedColumn::Float64(v.into_iter().enumerate()
+                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
+                .map(|(_, v)| v)
+                .collect())
+        }
+        TypedColumn::String(v) => {
+            TypedColumn::String(v.into_iter().enumerate()
+                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
+                .map(|(_, v)| v)
+                .collect())
+        }
+    }
+}
+
+/// Evaluate whether a row matches a `where` filter.
+///
+/// Supports rich predicates (inspired by SQL / polars / pyspark):
+///
+///   where={'city': 'NYC'}                    → city = 'NYC'  (equality)
+///   where={'age': ('>', 25)}                 → age > 25
+///   where={'age': ('>=', 18)}                → age >= 18
+///   where={'age': ('<', 65)}                 → age < 65
+///   where={'age': ('<=', 30)}                → age <= 30
+///   where={'age': ('!=', 30)}                → age != 30
+///   where={'status': ('in', ['active', 'pending'])}  → status IN (...)
+///   where={'city': 'NYC', 'age': ('>', 25)}  → city='NYC' AND age>25  (AND)
+///   where={'age': [('>', 18), ('<', 65)]}    → age>18 AND age<65  (range)
+///
+/// All conditions are AND-combined. For OR, use multiple calls or a list
+/// of where dicts (future enhancement).
+fn row_matches_where(row: &JsonValue, where_dict: &serde_json::Map<String, JsonValue>) -> bool {
+    let row_obj = match row.as_object() {
+        Some(obj) => obj,
+        None => return false,
+    };
+
+    for (col, condition) in where_dict {
+        let cell = row_obj.get(col);
+        if !eval_condition(cell, condition) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Evaluate a single condition against a cell value.
+///
+/// condition can be:
+///   - A bare value (equality): `25`, `"NYC"`, `true`
+///   - A tuple/list [op, value]: `(">", 25)`, `[">=", 18]`
+///   - A list of [op, value] tuples (AND): `[(">", 18), ("<", 65)]`
+fn eval_condition(cell: Option<&JsonValue>, condition: &JsonValue) -> bool {
+    match condition {
+        // Bare value → equality
+        JsonValue::String(_) | JsonValue::Number(_) | JsonValue::Bool(_) => {
+            cell == Some(condition)
+        }
+
+        // Array → could be [op, value] or list of [op, value] tuples
+        JsonValue::Array(arr) => {
+            if arr.is_empty() {
+                return true;
+            }
+
+            // Check if first element is a string (operator) → [op, value]
+            if let Some(first) = arr.first() {
+                if first.is_string() {
+                    // [op, value] — single condition
+                    return eval_op_condition(cell, arr);
+                }
+            }
+
+            // List of conditions — all must match (AND)
+            for sub in arr {
+                if !eval_condition(cell, sub) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        // null → match null cells
+        JsonValue::Null => cell.is_none() || cell == Some(&JsonValue::Null),
+
+        // Object → could be {"op": ">=", "value": 18} format
+        JsonValue::Object(obj) => {
+            if let (Some(op), Some(val)) = (
+                obj.get("op").and_then(|v| v.as_str()),
+                obj.get("value")
+            ) {
+                let fake_arr = vec![JsonValue::String(op.to_string()), val.clone()];
+                eval_op_condition(cell, &fake_arr)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Evaluate a single [op, value] condition.
+fn eval_op_condition(cell: Option<&JsonValue>, op_val: &[JsonValue]) -> bool {
+    if op_val.len() < 2 {
+        return false;
+    }
+    let op = match op_val[0].as_str() {
+        Some(s) => s,
+        None => return false,
+    };
+    let target = &op_val[1];
+
+    match op {
+        "=" | "==" => cell == Some(target),
+        "!=" | "<>" => cell != Some(target),
+        ">" => cmp_values(cell, target) == std::cmp::Ordering::Greater,
+        ">=" => matches!(cmp_values(cell, target), std::cmp::Ordering::Greater | std::cmp::Ordering::Equal),
+        "<" => cmp_values(cell, target) == std::cmp::Ordering::Less,
+        "<=" => matches!(cmp_values(cell, target), std::cmp::Ordering::Less | std::cmp::Ordering::Equal),
+        "in" => {
+            // target is a list of values
+            if let Some(arr) = target.as_array() {
+                arr.iter().any(|v| cell == Some(v))
+            } else {
+                false
+            }
+        }
+        "not in" => {
+            if let Some(arr) = target.as_array() {
+                !arr.iter().any(|v| cell == Some(v))
+            } else {
+                true
+            }
+        }
+        "is null" | "isnull" => cell.is_none() || cell == Some(&JsonValue::Null),
+        "is not null" | "notnull" => cell.is_some() && cell != Some(&JsonValue::Null),
+        "like" => {
+            // Simple SQL LIKE: % = any chars, _ = single char
+            if let (Some(cell_str), Some(pattern)) = (cell.and_then(|c| c.as_str()), target.as_str()) {
+                like_match(cell_str, pattern)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Compare two JSON values (numbers compared numerically, strings lexicographically).
+fn cmp_values(a: Option<&JsonValue>, b: &JsonValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a = match a {
+        Some(v) => v,
+        None => return Ordering::Less,
+    };
+
+    // Try numeric comparison first
+    if let (Some(an), Some(bn)) = (a.as_f64(), b.as_f64()) {
+        return an.partial_cmp(&bn).unwrap_or(Ordering::Equal);
+    }
+
+    // Try string comparison
+    if let (Some(as_), Some(bs)) = (a.as_str(), b.as_str()) {
+        return as_.cmp(bs);
+    }
+
+    // Fallback: string representation
+    a.to_string().cmp(&b.to_string())
+}
+
+/// Simple SQL LIKE pattern matching: % = any chars, _ = single char.
+fn like_match(text: &str, pattern: &str) -> bool {
+    let text_chars: Vec<char> = text.chars().collect();
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    like_match_helper(&text_chars, &pattern_chars)
+}
+
+fn like_match_helper(text: &[char], pattern: &[char]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    match pattern[0] {
+        '%' => {
+            // Match zero or more characters
+            if like_match_helper(text, &pattern[1..]) {
+                return true;
+            }
+            if !text.is_empty() && like_match_helper(&text[1..], pattern) {
+                return true;
+            }
+            false
+        }
+        '_' => {
+            // Match exactly one character
+            !text.is_empty() && like_match_helper(&text[1..], &pattern[1..])
+        }
+        c => {
+            // Match literal character
+            !text.is_empty() && text[0] == c && like_match_helper(&text[1..], &pattern[1..])
+        }
+    }
 }
 
 /// Generate a short unique ID for shard names (timestamp-based).
