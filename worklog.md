@@ -5426,3 +5426,79 @@ Stage Summary:
 - Reflection is NOT incremental — it's a flag for external engines (documented).
 - docs/API_WORKFLOW.md updated with update/delete/merge explanation, transactions,
   optimize, and honest gaps.
+
+---
+Task ID: 71
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Unify the write model — make write_rows auto-add _rowid + _version by default, and clarify how write_rows / upsert_shard / delete_shard / read_rows relate.
+
+User feedback:
+  1. "How do append_shard, upsert_shard, delete_shard, read_with_shards
+     relate with simple read, write commands? Do they include each other?"
+  2. "Each simple write should generate _rowid (UUIDv7) + _version for
+     each row too. It should be default thing."
+
+The problem: write_rows and upsert_shard were separate command families.
+Data written by write_rows had no _rowid, so it couldn't be updated/deleted
+by upsert_shard/delete_shard. This was a design gap.
+
+Work Log:
+1. MODIFIED core/storage/src/write.rs:
+   - write_rows() now auto-adds _rowid (UUIDv7) + _version (HLC) columns
+     if not already present in the input. This is the default behavior.
+   - Added write_rows_no_crdt() for opting out (raw bulk load).
+   - Refactored to write_rows_inner() shared helper.
+   - The manifest schema + column stats now include the auto-added columns.
+   - Uses pond_kernel::crdt::uuidv7() and pond_kernel::crdt::HLC::new()/tick().
+
+2. MODIFIED bindings/python/pyo3/src/lib.rs:
+   - write_rows() now has signature (collection, columns, message, crdt=True)
+   - When crdt=True (default), calls storage_write::write_rows (adds metadata)
+   - When crdt=False, calls storage_write::write_rows_no_crdt (raw bulk load)
+   - Updated docstring to explain CRDT-by-default behavior.
+
+3. ADDED CRDT metadata filtering in read_rows():
+   - Auto-filters _rowid, _version, _deleted from results by default
+   - If the user explicitly requests them via columns=['_rowid', ...],
+     they are included.
+   - This keeps the user-facing API clean (no internal columns leak).
+
+4. DOCUMENTED the unified write model in docs/API_WORKFLOW.md §2:
+   - New "The unified write model" section at the top of §2
+   - Explains how write_rows, upsert_shard, delete_shard, read_rows compose:
+     * write_rows = bulk initial load (snapshot + CRDT metadata)
+     * upsert_shard = incremental update (shard with same _rowid semantics)
+     * delete_shard = incremental delete (tombstone by _rowid)
+     * read_rows = reads merged result (HEAD + shards, latest _version wins)
+   - Updated §6 (CRDT Shards) to clarify these are incremental primitives
+     that compose with write_rows (the bulk load primitive).
+   - Updated API reference table: write_rows now shows crdt=True parameter.
+
+5. UPDATED README.md Quick Start:
+   - Added comment: "Auto-adds _rowid (UUIDv7) + _version (HLC) by default"
+   - Added opt-out example: s.write_rows(..., crdt=False)
+
+THE UNIFIED WRITE MODEL:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ write_rows()      bulk load, creates snapshot, adds _rowid/_ver │
+  │     ↓                                                           │
+  │ upsert_shard()   incremental update, matches by _rowid         │
+  │ delete_shard()   incremental delete, tombstones by _rowid      │
+  │     ↓                                                           │
+  │ read_rows()      reads HEAD + shards, merges by _rowid         │
+  │                  (latest _version wins, tombstones suppress)   │
+  │                  (filters _rowid/_version/_deleted from output) │
+  └─────────────────────────────────────────────────────────────────┘
+
+All data in Pond is now CRDT-compatible by default. You can:
+  1. Bulk load with write_rows → auto-gets _rowid + _version
+  2. Update incrementally with upsert_shard → matches by _rowid
+  3. Delete incrementally with delete_shard → tombstones by _rowid
+  4. Read the merged result with read_rows → auto-merges + filters metadata
+
+Stage Summary:
+- write_rows auto-adds _rowid (UUIDv7) + _version (HLC) by default
+- read_rows auto-filters _rowid/_version/_deleted from results
+- The write commands now compose: write_rows (bulk) → upsert_shard (update) → delete_shard (delete) → read_rows (merged read)
+- Opt out with crdt=False for raw bulk loads
+- Docs updated to explain the unified model

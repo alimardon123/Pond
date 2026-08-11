@@ -137,10 +137,12 @@ s.write('users', b'[{"id":1,"name":"alice"}]', 'init')
 data = s.read('users')
 
 # Structured PND2 columns (auto-encoding: RLE/DICT/BITPACK/RAW + pruning)
+# Auto-adds _rowid (UUIDv7) + _version (HLC) by default — CRDT-compatible
 s.write_rows('metrics', [('id', [1, 2, 3]), ('val', [10, 20, 30])], 'init')
 cols = s.read_rows('metrics')           # → {'id': [1,2,3], 'val': [10,20,30]}
 cols = s.read_rows('metrics', columns=['val'])  # projection
 cols = s.read_rows('metrics', predicates=[('id', '>', 1)])  # pruning
+# Opt out of CRDT metadata: s.write_rows(..., crdt=False)
 
 # Version control (git-like)
 s.branch('users', 'dev')

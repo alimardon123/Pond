@@ -686,10 +686,16 @@ impl Storage {
     ///   - FLOAT64: RAW
     ///   - STRING: RAW
     ///
+    /// **CRDT by default**: auto-adds `_rowid` (UUIDv7) and `_version` (HLC)
+    /// columns if not already present. This makes all data written via
+    /// write_rows compatible with upsert_shard / delete_shard (which match
+    /// by _rowid). Set `crdt=False` to opt out (raw bulk load, no CRDT).
+    ///
     /// Args:
     ///   - collection: Collection name
     ///   - columns: List of (name, list_of_values) tuples
     ///   - message: Commit message
+    ///   - crdt: If True (default), auto-add _rowid + _version columns
     ///
     /// Returns:
     ///   The commit hash
@@ -700,7 +706,10 @@ impl Storage {
     ///       ('score', [1.5, 2.5, 3.5]),
     ///       ('name', ['alice', 'bob', 'carol']),
     ///   ], 'init')
-    fn write_rows(&self, collection: &str, columns: Vec<(String, Vec<PyObject>)>, message: &str) -> PyResult<String> {
+    ///   # → automatically adds _rowid + _version columns
+    ///   # → data is now compatible with upsert_shard / delete_shard
+    #[pyo3(signature = (collection, columns, message, crdt=true))]
+    fn write_rows(&self, collection: &str, columns: Vec<(String, Vec<PyObject>)>, message: &str, crdt: bool) -> PyResult<String> {
         let storage = self.storage.lock().unwrap();
         let active = storage.get_active_branch(collection);
 
@@ -716,8 +725,13 @@ impl Storage {
             .map(|(name, col)| (name.as_str(), col.clone()))
             .collect();
 
-        storage_write::write_rows(storage.kernel(), collection, &active, &col_refs, message)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+        if crdt {
+            storage_write::write_rows(storage.kernel(), collection, &active, &col_refs, message)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+        } else {
+            storage_write::write_rows_no_crdt(storage.kernel(), collection, &active, &col_refs, message)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+        }
     }
 
     /// Read structured columns from a collection with optional pruning.
@@ -895,9 +909,19 @@ impl Storage {
             }
         }
 
-        // Convert to Python dict
+        // Convert to Python dict — filter out CRDT metadata columns
+        // (_rowid, _version, _deleted) unless the user explicitly requested
+        // them via the columns= parameter.
+        let crdt_cols: std::collections::HashSet<&str> = ["_rowid", "_version", "_deleted"]
+            .iter().cloned().collect();
+        let explicit_columns = projection.is_some();
+
         let dict = PyDict::new_bound(py);
         for (name, values) in result_cols {
+            // Skip CRDT metadata columns unless explicitly requested
+            if !explicit_columns && crdt_cols.contains(name.as_str()) {
+                continue;
+            }
             let list = PyList::new_bound(py, values.iter());
             dict.set_item(&name, list)?;
         }

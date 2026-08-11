@@ -265,6 +265,11 @@ pub fn write_rows_i64_packed(
 /// Each column's encoding is chosen automatically (INT64: RLE/DICT/BITPACK/RAW,
 /// FLOAT64: RAW, STRING: RAW).
 ///
+/// **CRDT by default**: auto-adds `_rowid` (UUIDv7) and `_version` (HLC)
+/// columns if not already present in the input. This makes all data
+/// written via write_rows compatible with upsert_shard / delete_shard
+/// (which match by _rowid). To opt out, pass `add_crdt_metadata = false`.
+///
 /// Args:
 ///   - kernel: The PondKernel handle
 ///   - collection: Collection name
@@ -280,10 +285,56 @@ pub fn write_rows(
     columns: &[(&str, TypedColumn)],
     message: &str,
 ) -> Result<String, String> {
+    write_rows_inner(kernel, collection, active_branch, columns, message, true)
+}
+
+/// Write typed columns WITHOUT adding _rowid / _version.
+///
+/// Use this for raw bulk loads where you don't need CRDT compatibility
+/// (e.g., immutable historical data, or data that will never be updated).
+pub fn write_rows_no_crdt(
+    kernel: &PondKernel,
+    collection: &str,
+    active_branch: &str,
+    columns: &[(&str, TypedColumn)],
+    message: &str,
+) -> Result<String, String> {
+    write_rows_inner(kernel, collection, active_branch, columns, message, false)
+}
+
+fn write_rows_inner(
+    kernel: &PondKernel,
+    collection: &str,
+    active_branch: &str,
+    columns: &[(&str, TypedColumn)],
+    message: &str,
+    add_crdt_metadata: bool,
+) -> Result<String, String> {
     let n_rows = columns.first().map(|(_, c)| c.len()).unwrap_or(0);
 
+    // Auto-add _rowid (UUIDv7) + _version (HLC) if requested and not present
+    let has_rowid = columns.iter().any(|(name, _)| *name == "_rowid");
+    let has_version = columns.iter().any(|(name, _)| *name == "_version");
+
+    let mut final_columns: Vec<(&str, TypedColumn)> = columns.to_vec();
+
+    if add_crdt_metadata && !has_rowid && n_rows > 0 {
+        let rowids: Vec<String> = (0..n_rows).map(|_| {
+            pond_kernel::crdt::uuidv7()
+        }).collect();
+        final_columns.push(("_rowid", TypedColumn::String(rowids)));
+    }
+
+    if add_crdt_metadata && !has_version && n_rows > 0 {
+        let mut hlc = pond_kernel::crdt::HLC::new();
+        let versions: Vec<String> = (0..n_rows).map(|_| {
+            hlc.tick()
+        }).collect();
+        final_columns.push(("_version", TypedColumn::String(versions)));
+    }
+
     // Encode as PND2 with per-type encoding
-    let blob = pnd2_encode_multi_typed(columns);
+    let blob = pnd2_encode_multi_typed(&final_columns);
     let data_hash = kernel.write(&blob)
         .map_err(|e| format!("Failed to write PND2 blob: {}", e))?;
 
@@ -294,15 +345,16 @@ pub fn write_rows(
         .map(|c| c.index + 1)
         .unwrap_or(0);
 
-    // Build manifest with schema + column stats
-    let schema: Vec<(String, u8)> = columns.iter()
+    // Build manifest with schema + column stats (use final_columns to include
+    // the auto-added _rowid / _version columns)
+    let schema: Vec<(String, u8)> = final_columns.iter()
         .map(|(name, col)| (name.to_string(), col.vtype()))
         .collect();
-    let key_col = columns.first().map(|(name, _)| name.to_string()).unwrap_or_default();
+    let key_col = final_columns.first().map(|(name, _)| name.to_string()).unwrap_or_default();
     let mut manifest = CollectionManifest::new(schema, key_col);
 
     // Build column stats entries
-    let col_stats: Vec<ColumnStatsEntry> = columns.iter()
+    let col_stats: Vec<ColumnStatsEntry> = final_columns.iter()
         .map(|(name, col)| {
             let (min, max) = col.min_max_bytes()
                 .map(|(mn, mx)| (Some(mn), Some(mx)))

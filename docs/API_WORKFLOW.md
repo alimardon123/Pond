@@ -64,31 +64,70 @@ storing KV pairs, vectors, streaming events, or lakehouse tables.
 
 ## 2. Data I/O — write and read
 
+### The unified write model (how write_rows, upsert_shard, delete_shard relate)
+
+All data in Pond is CRDT-compatible by default. The write commands compose:
+
+```
+write_rows()      → bulk initial load (creates a snapshot + adds _rowid/_version)
+upsert_shard()    → incremental update (adds a shard with same _rowid semantics)
+delete_shard()    → incremental delete (tombstones by _rowid)
+read_rows()       → reads the merged result (HEAD + all shards, latest _version wins)
+```
+
+**`write_rows` auto-adds `_rowid` (UUIDv7) + `_version` (HLC) by default.**
+This means data written by `write_rows` can later be updated via
+`upsert_shard` or deleted via `delete_shard` — they match by `_rowid`.
+
+```python
+# Bulk load — auto-adds _rowid + _version
+s.write_rows('users', [('id', [1, 2, 3]), ('name', ['a', 'b', 'c'])], 'init')
+# → stored as: id, name, _rowid, _version
+
+# Incremental update — upsert by _rowid (latest _version wins on merge)
+s.upsert_shard('users', 'w1', rows=[{'_rowid': '<uuid-of-row-1>', 'name': 'ALICE'}])
+
+# Incremental delete — tombstone by _rowid
+s.delete_shard('users', 'w1_del', rowids=['<uuid-of-row-2>'])
+
+# Read — auto-merges HEAD + all shards
+cols = s.read_rows('users')   # → sees the updates and deletes
+```
+
+To opt out of CRDT metadata (raw bulk load, no updates/deletes later):
+```python
+s.write_rows('logs', [('event', ['click', 'view'])], 'init', crdt=False)
+```
+
 ### 2.1 Raw bytes (JSON, CSV, Parquet, images — anything)
 
 ```python
 # Write raw bytes to a collection (creates a commit on the active branch)
+# Note: raw bytes writes do NOT add _rowid/_version (no structure to tag)
 commit_hash = s.write('users', b'[{"id":1,"name":"alice"}]', 'init')
 
 # Read raw bytes back from the active branch's HEAD
 data = s.read('users')   # → b'[{"id":1,"name":"alice"}]'
 ```
 
-### 2.2 Structured columns (PND2 — auto-encoded, auto-pruned)
+### 2.2 Structured columns (PND2 — auto-encoded, auto-pruned, CRDT by default)
 
 This is the recommended path for tabular data. Pond's PND2 format
 auto-selects the best encoding per column (RLE / DICT / BITPACK / RAW),
-embeds column statistics, and prunes row groups at read time.
+embeds column statistics, and prunes row groups at read time. It also
+auto-adds `_rowid` + `_version` columns for CRDT compatibility.
 
 ```python
 # Write structured columns — auto-detects INT64 / FLOAT64 / STRING
+# Auto-adds _rowid (UUIDv7) + _version (HLC) by default
 s.write_rows('metrics', [
     ('id',    [1, 2, 3, 4, 5]),
     ('score', [1.5, 2.5, 3.5, 4.5, 5.5]),
     ('name',  ['alice', 'bob', 'carol', 'dave', 'eve']),
 ], 'init metrics')
+# → stored columns: id, score, name, _rowid, _version
 
-# Read all columns
+# Read all columns (excludes _rowid/_version from results by default)
 cols = s.read_rows('metrics')
 # → {'id': [1,2,3,4,5], 'score': [1.5,...], 'name': ['alice',...]}
 
@@ -112,6 +151,10 @@ cols = s.read_rows('metrics',
 (see §4.1) and then query with `('col', '=', value)`, the read path
 automatically uses the index for O(1) lookup. If the key isn't in the
 index, the read returns empty immediately — no row-group scan.
+
+**Auto-shard merge**: `read_rows` automatically reads HEAD + all live
+shards and merges them by `_rowid` (latest `_version` wins, tombstones
+suppress). You don't need to call `read_with_shards` manually.
 
 ---
 
@@ -397,23 +440,39 @@ print(s.layers())   # → ['sales', 'product', 'finance']
 
 ---
 
-## 6. CRDT Shards — concurrent multi-writer, update, delete
+## 6. CRDT Shards — incremental update, delete, concurrent multi-writer
 
-Pond supports concurrent multi-writer without coordination using CRDT
-shards. Each writer writes its own shard to a unique path; readers union
-HEAD + all live shards.
+These are the **incremental** write primitives. They compose with
+`write_rows` (the bulk load primitive):
+
+- **`write_rows`** — bulk initial load. Creates a snapshot (new HEAD commit)
+  with `_rowid` + `_version` auto-added. Overwrites previous HEAD.
+- **`upsert_shard`** — incremental update. Appends a shard alongside HEAD
+  with the same `_rowid` semantics. Doesn't overwrite HEAD.
+- **`delete_shard`** — incremental delete. Appends a tombstone shard.
+- **`read_rows`** — reads HEAD + all shards, merges by `_rowid`
+  (latest `_version` wins, tombstones suppress).
+
+Multiple writers can call `upsert_shard` / `delete_shard` concurrently
+without coordination — the merge is deterministic (CRDT G-Set union).
 
 ### 6.1 How updates work — `upsert_shard`
 
 ```python
-# Writer 1 (concurrent, no coordination with Writer 2)
-s.upsert_shard('users', 'writer1_001',
-               rows=[{'id': 1, 'name': 'alice', 'age': 30}],
-               key_col='id')
+# After a bulk load via write_rows (which added _rowid + _version):
+s.write_rows('users', [('id', [1, 2]), ('name', ['alice', 'bob'])], 'init')
 
-# Writer 2 (concurrent)
+# Incremental update — match by _rowid (auto-generated by write_rows)
+# If you don't know the _rowid, upsert_shard generates one for new rows
+# and uses key_col to find existing rows.
+s.upsert_shard('users', 'writer1_001',
+               rows=[{'id': 1, 'name': 'ALICE', 'age': 31}],  # update alice
+               key_col='id')
+# → adds _rowid (matches existing row by key_col=id) + _version (new HLC)
+
+# Concurrent writer — no coordination needed
 s.upsert_shard('users', 'writer2_001',
-               rows=[{'id': 1, 'name': 'alice', 'age': 31}],  # update age
+               rows=[{'id': 1, 'name': 'Alice Updated', 'age': 32}],
                key_col='id')
 ```
 
@@ -758,7 +817,7 @@ storage.merge("users", "dev")
 | `Storage` | `(location, access_key?, secret_key?, region?, endpoint?)` | `Storage` | Create a connection (local FS or S3) |
 | `write` | `(collection, data: bytes, message: str)` | `str` (commit hash) | Write raw bytes |
 | `read` | `(collection)` | `bytes` | Read raw bytes from HEAD |
-| `write_rows` | `(collection, columns: [(name, [values])], message)` | `str` | Write PND2 structured columns |
+| `write_rows` | `(collection, columns, message, crdt=True)` | `str` | Write PND2 columns (auto-adds _rowid + _version by default) |
 | `read_rows` | `(collection, columns?, predicates?)` | `dict` | Read with projection + pruning |
 | `branch` | `(collection, branch_name)` | `str` | Create a branch |
 | `checkout` | `(collection, branch_name)` | `None` | Switch active branch |
