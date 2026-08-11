@@ -5664,3 +5664,72 @@ Stage Summary:
 - read_rows predicates now accept any value type (not just integers)
 - Comprehensive demo shows all features
 - All logic in Rust — zero Python overhead between calls
+
+---
+Task ID: 74
+Agent: main (Super Z, web-a5961fe6 session)
+Task: SQL WHERE string parser + merge cases (on_match/on_miss).
+
+User feedback:
+  1. "Your where= clause is ugly. Can't you just use SQL-like WHERE clause?"
+  2. "Where are the merge cases (when to match, not match, update, insert, delete)?"
+
+Work Log:
+1. BUILT SQL WHERE string parser in Rust (new module: sql_where.rs):
+   - Full tokenizer + recursive descent parser
+   - Supports: =, ==, !=, <>, >, >=, <, <=
+   - Supports: IN, NOT IN, LIKE, IS NULL, IS NOT NULL
+   - Supports: AND, OR, NOT, parentheses ()
+   - Supports: string literals ('text'), numbers (42, 3.14), booleans (true/false), NULL
+   - Produces a WhereExpr AST that can be evaluated against rows
+   - 11 unit tests in the module (all pass)
+
+   Examples:
+     "age >= 18"
+     "city = 'NYC' AND age > 25"
+     "dept = 'eng' AND (salary > 90000 OR age < 30)"
+     "name LIKE 'A%' AND status IN ('active', 'pending')"
+     "email IS NOT NULL"
+
+2. UPDATED all where= parameters to accept SQL strings:
+   - write_rows(where="age >= 25")
+   - update_rows(where="city = 'NYC' AND age > 30")
+   - delete_rows(where="status IN ('inactive', 'banned')")
+   - merge_rows(where="age >= 18")
+   - Backward compat: dict format still works (where={'age': ('>', 18)})
+
+   The parse_where_param() helper auto-detects string vs dict:
+   - String → parse_where() → SQL AST
+   - Dict → dict_to_where_expr() → same AST
+   Both paths produce a WhereExpr that's evaluated identically.
+
+3. ADDED merge cases to merge_rows (SQL MERGE semantics):
+   - on_match='update' (default) → update existing row
+   - on_match='delete' → delete/tombstone the existing row (anti-join)
+   - on_match='skip' → do nothing for matched rows (insert-only)
+   - on_miss='insert' (default) → insert as new row
+   - on_miss='skip' → do nothing for unmatched rows (update-only)
+
+   This covers all SQL MERGE use cases:
+     WHEN MATCHED THEN UPDATE    → on_match='update'
+     WHEN MATCHED THEN DELETE    → on_match='delete'
+     WHEN MATCHED AND ... THEN.. → (use where= on incoming rows)
+     WHEN NOT MATCHED THEN INSERT → on_miss='insert'
+     WHEN NOT MATCHED AND ...     → (use where= on incoming rows)
+
+4. TESTS: 13 new tests in test_sql_where.py (all pass):
+   - SQL WHERE equality, comparison, AND/OR, IN/NOT IN, LIKE, IS NULL
+   - merge_rows on_match='update' / 'skip' / 'delete'
+   - merge_rows on_miss='insert' / 'skip'
+   - merge_rows with SQL WHERE on incoming rows
+   - write_rows with SQL WHERE
+   - Backward compat with dict format
+
+5. All existing tests still pass (8/8 beautiful API, demo runs clean).
+
+Stage Summary:
+- SQL WHERE strings replace the ugly dict-based predicates
+- Full SQL MERGE semantics via on_match / on_miss
+- All parsing + evaluation in Rust (zero Python overhead)
+- Backward compat with dict format
+- 21 total tests pass (8 existing + 13 new)

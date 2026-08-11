@@ -12,9 +12,100 @@
 // This is the correct architecture: the decoder is implemented ONCE in
 // pure Rust, and both the C ABI (in bindings/python/core) and Python (here) use it.
 
+mod sql_where;
+use sql_where::{parse_where, WhereExpr};
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3::Bound;
+
+/// Parse a `where` parameter that can be either:
+///   - A SQL string: where="age >= 18 AND city = 'NYC'"
+///   - A dict (legacy): where={'age': ('>=', 18), 'city': 'NYC'}
+///
+/// Returns a WhereExpr AST that can be evaluated against rows.
+fn parse_where_param(where_val: &PyObject) -> Result<WhereExpr, String> {
+    Python::with_gil(|py| {
+        // Try string first (preferred SQL syntax)
+        if let Ok(s) = where_val.extract::<String>(py) {
+            return parse_where(&s);
+        }
+
+        // Fall back to dict format (legacy)
+        if let Ok(dict) = where_val.extract::<std::collections::HashMap<String, PyObject>>(py) {
+            let mut where_dict = serde_json::Map::new();
+            for (k, v) in dict {
+                where_dict.insert(k, python_to_json(&v));
+            }
+            return dict_to_where_expr(&where_dict);
+        }
+
+        Err("where= must be a SQL string or a dict".to_string())
+    })
+}
+
+/// Convert a legacy dict-based where filter to a WhereExpr AST.
+fn dict_to_where_expr(where_dict: &serde_json::Map<String, JsonValue>) -> Result<WhereExpr, String> {
+    if where_dict.is_empty() {
+        return Ok(WhereExpr::True);
+    }
+
+    let mut exprs: Vec<WhereExpr> = Vec::new();
+    for (col, condition) in where_dict {
+        exprs.push(dict_condition_to_expr(col, condition)?);
+    }
+
+    // AND-combine all conditions
+    let mut result = exprs.remove(0);
+    for e in exprs {
+        result = WhereExpr::And(Box::new(result), Box::new(e));
+    }
+    Ok(result)
+}
+
+fn dict_condition_to_expr(col: &str, condition: &JsonValue) -> Result<WhereExpr, String> {
+    match condition {
+        // Bare value → equality
+        JsonValue::String(_) | JsonValue::Number(_) | JsonValue::Bool(_) => {
+            Ok(WhereExpr::Compare {
+                col: col.to_string(),
+                op: "=".to_string(),
+                value: condition.clone(),
+            })
+        }
+
+        // Array → could be [op, value] or list of [op, value] tuples
+        JsonValue::Array(arr) => {
+            if arr.is_empty() {
+                return Ok(WhereExpr::True);
+            }
+
+            // Check if first element is a string (operator) → [op, value]
+            if let Some(first) = arr.first() {
+                if first.is_string() {
+                    let op = first.as_str().unwrap().to_string();
+                    let value = arr.get(1).cloned().unwrap_or(JsonValue::Null);
+                    return Ok(WhereExpr::Compare { col: col.to_string(), op, value });
+                }
+            }
+
+            // List of conditions — AND-combine
+            let mut exprs: Vec<WhereExpr> = Vec::new();
+            for sub in arr {
+                exprs.push(dict_condition_to_expr(col, sub)?);
+            }
+            let mut result = exprs.remove(0);
+            for e in exprs {
+                result = WhereExpr::And(Box::new(result), Box::new(e));
+            }
+            Ok(result)
+        }
+
+        JsonValue::Null => Ok(WhereExpr::IsNull { col: col.to_string(), negate: false }),
+
+        _ => Err(format!("Invalid condition for column '{}': {:?}", col, condition)),
+    }
+}
 
 // Re-use the shared constants and parser from pond-core.
 use pond_core::{
@@ -728,14 +819,13 @@ impl Storage {
 
         // If where= is provided, filter rows before writing
         let final_cols: Vec<(String, TypedColumn)> = if let Some(ref w) = r#where {
-            let where_dict = python_to_json(w)
-                .as_object().cloned().unwrap_or_default();
+            let where_expr = parse_where_param(w)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
             // Determine number of rows
             let n_rows = typed_cols.first().map(|(_, c)| c.len()).unwrap_or(0);
 
             // Build a row-index → keep bool mask
-            let col_names: Vec<&str> = typed_cols.iter().map(|(n, _)| n.as_str()).collect();
             let mut keep_mask: Vec<bool> = Vec::with_capacity(n_rows);
             for row_idx in 0..n_rows {
                 // Build a JSON object for this row
@@ -745,7 +835,7 @@ impl Storage {
                     row_obj.insert(name.clone(), val);
                 }
                 let row = JsonValue::Object(row_obj);
-                keep_mask.push(row_matches_where(&row, &where_dict));
+                keep_mask.push(where_expr.eval(&row));
             }
 
             // Filter each column to only kept rows
@@ -813,12 +903,12 @@ impl Storage {
         let updates_obj = updates_dict.as_object()
             .ok_or_else(|| pyo3::exceptions::PyTypeError::new_err("updates must be a dict"))?;
 
-        // Parse where filter dict
-        let where_dict: serde_json::Map<String, JsonValue> = if let Some(w) = &r#where {
-            let wj = python_to_json(w);
-            wj.as_object().cloned().unwrap_or_default()
+        // Parse where filter (SQL string or dict)
+        let where_expr: WhereExpr = if let Some(ref w) = r#where {
+            parse_where_param(w)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?
         } else {
-            serde_json::Map::new()
+            WhereExpr::True
         };
 
         // Read all current rows (HEAD + shards) as (rowid, row JSON)
@@ -827,10 +917,10 @@ impl Storage {
         let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
-        // Filter rows that match the where clause (supports rich predicates)
+        // Filter rows that match the where clause
         let mut matched: Vec<JsonValue> = Vec::new();
         for (_rowid, row) in &all_rows {
-            if row_matches_where(row, &where_dict) {
+            if where_expr.eval(row) {
                 // Apply updates to a copy of the row
                 let mut updated = row.clone();
                 if let Some(obj) = updated.as_object_mut() {
@@ -918,12 +1008,12 @@ impl Storage {
         let kernel = storage.kernel();
         let active = storage.get_active_branch(collection);
 
-        // Parse where filter dict
-        let where_dict: serde_json::Map<String, JsonValue> = if let Some(w) = &r#where {
-            let wj = python_to_json(w);
-            wj.as_object().cloned().unwrap_or_default()
+        // Parse where filter (SQL string or dict)
+        let where_expr: WhereExpr = if let Some(ref w) = r#where {
+            parse_where_param(w)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?
         } else {
-            serde_json::Map::new()
+            WhereExpr::True
         };
 
         // Read all current rows
@@ -932,11 +1022,11 @@ impl Storage {
         let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
-        // Filter rows that match the where clause (supports rich predicates)
+        // Filter rows that match the where clause
         let mut matched_rowids: Vec<String> = Vec::new();
         let mut surviving: Vec<JsonValue> = Vec::new();
         for (rowid, row) in &all_rows {
-            if row_matches_where(row, &where_dict) {
+            if where_expr.eval(row) {
                 matched_rowids.push(rowid.clone());
             } else {
                 surviving.push(row.clone());
@@ -982,36 +1072,61 @@ impl Storage {
     ///   - rows: list of row dicts to merge
     ///   - key_col: the key column for matching (default: '_rowid')
     ///   - crdt: if True (default), write as a CRDT upsert shard. If False,
-    ///       rewrite HEAD with the merged result.
+    /// Merge rows into a collection — SQL MERGE / INSERT ON CONFLICT.
     ///
-    /// Returns: number of rows merged
+    /// Like SQL MERGE. Incoming rows are matched against existing rows by
+    /// `key_col`. The `on_match` and `on_miss` parameters control what
+    /// happens for matched and unmatched rows:
     ///
-    /// Example:
+    ///   on_match='update'  (default) → update existing row
+    ///   on_match='delete'             → delete the existing row (tombstone)
+    ///   on_match='skip'               → do nothing for matched rows
+    ///
+    ///   on_miss='insert'  (default)   → insert as a new row
+    ///   on_miss='skip'                → do nothing for unmatched rows
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - rows: list of row dicts to merge
+    ///   - key_col: the key column for matching (default: '_rowid')
+    ///   - crdt: if True (default), write as a CRDT shard. If False, rewrite HEAD.
+    ///   - where: optional SQL WHERE filter on INCOMING rows (only merge
+    ///       rows matching the condition)
+    ///   - on_match: 'update' | 'delete' | 'skip' (default: 'update')
+    ///   - on_miss: 'insert' | 'skip' (default: 'insert')
+    ///
+    /// Returns: number of rows processed
+    ///
+    /// Examples:
+    ///   # Standard upsert (update if exists, insert if new)
     ///   s.merge_rows('users', [
     ///       {'id': 1, 'name': 'alice_updated'},
     ///       {'id': 99, 'name': 'new_user'},
     ///   ], key_col='id')
     ///
-    /// With `where=` filter (only merge rows matching the condition):
-    ///   s.merge_rows('users', [
-    ///       {'id': 1, 'name': 'alice', 'age': 30},
-    ///       {'id': 2, 'name': 'bob', 'age': 15},
-    ///   ], key_col='id', where={'age': ('>=', 18)})
-    ///   # → only merges rows where age >= 18 (skips bob)
-    #[pyo3(signature = (collection, rows, key_col=None, crdt=true, r#where=None))]
-    fn merge_rows(&self, collection: &str, rows: Vec<PyObject>, key_col: Option<&str>, crdt: bool, r#where: Option<PyObject>) -> PyResult<usize> {
+    ///   # Insert-only (skip if already exists)
+    ///   s.merge_rows('users', rows, key_col='id', on_match='skip')
+    ///
+    ///   # Delete matched rows (anti-join)
+    ///   s.merge_rows('users', rows, key_col='id', on_match='delete')
+    ///
+    ///   # Only merge adults
+    ///   s.merge_rows('users', rows, key_col='id',
+    ///                where="age >= 18", on_miss='insert')
+    #[pyo3(signature = (collection, rows, key_col=None, crdt=true, r#where=None, on_match="update", on_miss="insert"))]
+    fn merge_rows(&self, collection: &str, rows: Vec<PyObject>, key_col: Option<&str>, crdt: bool, r#where: Option<PyObject>, on_match: &str, on_miss: &str) -> PyResult<usize> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let active = storage.get_active_branch(collection);
 
         let json_rows: Vec<JsonValue> = rows.iter().map(|r| python_to_json(r)).collect();
 
-        // Apply where= filter to incoming rows if provided
+        // Apply where= filter to incoming rows (SQL string or dict)
         let filtered_rows: Vec<JsonValue> = if let Some(ref w) = r#where {
-            let where_dict = python_to_json(w)
-                .as_object().cloned().unwrap_or_default();
+            let where_expr = parse_where_param(w)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
             json_rows.into_iter()
-                .filter(|row| row_matches_where(row, &where_dict))
+                .filter(|row| where_expr.eval(row))
                 .collect()
         } else {
             json_rows
@@ -1022,16 +1137,70 @@ impl Storage {
             return Ok(0);
         }
 
+        // Read existing rows for matching
+        let kc: Vec<String> = key_col.map(|k| vec![k.to_string()])
+            .unwrap_or_else(|| vec!["_rowid".to_string()]);
+        let existing = read_collection_as_json_rows(&storage, collection, &kc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+        // Build a lookup: key_col value → existing _rowid
+        let mut key_to_rowid: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if let Some(kc_name) = key_col {
+            for (_, row) in &existing {
+                if let (Some(key_val), Some(rowid)) = (
+                    row.get(kc_name).map(|v| v.to_string()),
+                    row.get("_rowid").and_then(|v| v.as_str()).map(|s| s.to_string())
+                ) {
+                    key_to_rowid.insert(key_val, rowid);
+                }
+            }
+        }
+
+        // Classify incoming rows: matched (key exists) vs missed (key not found)
+        let mut to_upsert: Vec<JsonValue> = Vec::new();   // rows to update or insert
+        let mut to_delete: Vec<String> = Vec::new();       // rowids to tombstone
+
+        for mut row in filtered_rows {
+            let key_val = key_col
+                .and_then(|kc| row.get(kc))
+                .map(|v| v.to_string());
+
+            let matched_rowid = key_val.and_then(|k| key_to_rowid.get(&k).cloned());
+
+            match (matched_rowid, on_match, on_miss) {
+                (Some(existing_rowid), "update", _) => {
+                    // Matched + update → use existing _rowid so CRDT merge overrides
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert("_rowid".to_string(), json!(existing_rowid));
+                    }
+                    to_upsert.push(row);
+                }
+                (Some(existing_rowid), "delete", _) => {
+                    // Matched + delete → tombstone the existing row
+                    to_delete.push(existing_rowid);
+                }
+                (Some(_), "skip", _) => {
+                    // Matched + skip → do nothing
+                }
+                (None, _, "insert") => {
+                    // Not matched + insert → add as new row
+                    to_upsert.push(row);
+                }
+                (None, _, "skip") => {
+                    // Not matched + skip → do nothing
+                }
+                (_, bad_match, _) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid on_match='{}' (use 'update', 'delete', or 'skip') or on_miss='{}' (use 'insert' or 'skip')",
+                        bad_match, on_miss
+                    )));
+                }
+            }
+        }
+
         if crdt {
-            // Write as a CRDT upsert shard — observe existing versions first,
-            // AND match existing _rowid values by key_col so updates override
-            // existing rows instead of creating duplicates.
             use pond_kernel::crdt::HLC;
             let mut hlc = HLC::new();
-            let kc: Vec<String> = key_col.map(|k| vec![k.to_string()])
-                .unwrap_or_else(|| vec!["_rowid".to_string()]);
-            let existing = read_collection_as_json_rows(&storage, collection, &kc)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
             // Observe existing versions to advance HLC past them
             for (_, row) in &existing {
@@ -1040,61 +1209,38 @@ impl Storage {
                 }
             }
 
-            // Build a lookup: key_col value → existing _rowid
-            // So incoming rows that match an existing key get the SAME _rowid
-            let mut key_to_rowid: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-            if let Some(kc_name) = key_col {
-                for (_, row) in &existing {
-                    if let (Some(key_val), Some(rowid)) = (
-                        row.get(kc_name).map(|v| v.to_string()),
-                        row.get("_rowid").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    ) {
-                        key_to_rowid.insert(key_val, rowid);
-                    }
-                }
+            // Write upserts (updates + inserts)
+            if !to_upsert.is_empty() {
+                let shard_name = format!("merge_{}", chrono_like_id());
+                pond_storage::shard::upsert_shard(
+                    kernel, collection, &active, &shard_name,
+                    &to_upsert, key_col, &mut hlc,
+                ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
             }
 
-            // For each incoming row: if it matches an existing key, use that _rowid
-            let mut merged_rows: Vec<JsonValue> = Vec::with_capacity(filtered_rows.len());
-            for mut row in filtered_rows {
-                if let Some(kc_name) = key_col {
-                    if let Some(key_val) = row.get(kc_name).map(|v| v.to_string()) {
-                        if let Some(existing_rowid) = key_to_rowid.get(&key_val) {
-                            // Match found — use the existing _rowid so CRDT merge overrides
-                            if let Some(obj) = row.as_object_mut() {
-                                obj.insert("_rowid".to_string(), json!(existing_rowid));
-                            }
-                        }
-                    }
-                }
-                merged_rows.push(row);
+            // Write tombstones (deletes)
+            if !to_delete.is_empty() {
+                let shard_name = format!("merge_del_{}", chrono_like_id());
+                pond_storage::shard::delete_shard(
+                    kernel, collection, &active, &shard_name,
+                    &to_delete, key_col, &mut hlc,
+                ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
             }
-
-            let shard_name = format!("merge_{}", chrono_like_id());
-            pond_storage::shard::upsert_shard(
-                kernel, collection, &active, &shard_name,
-                &merged_rows, key_col, &mut hlc,
-            ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
         } else {
-            // Rewrite HEAD: read existing, merge by key_col, write back
-            let kc: Vec<String> = key_col.map(|k| vec![k.to_string()])
-                .unwrap_or_else(|| vec!["_rowid".to_string()]);
-            let existing = read_collection_as_json_rows(&storage, collection, &kc)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
-
-            // Build a map of key → row for existing data
+            // Rewrite HEAD: apply updates + deletes + inserts
             let mut merged: std::collections::HashMap<String, JsonValue> = std::collections::HashMap::new();
-            for (_rowid, row) in &existing {
-                let key = key_col
-                    .and_then(|kc| row.get(kc))
-                    .or_else(|| row.get("_rowid"))
-                    .map(|v| v.to_string())
+            let delete_rowids: std::collections::HashSet<String> = to_delete.into_iter().collect();
+
+            for (_, row) in &existing {
+                let rowid = row.get("_rowid").and_then(|v| v.as_str()).map(|s| s.to_string())
                     .unwrap_or_default();
-                merged.insert(key, row.clone());
+                if !delete_rowids.contains(&rowid) {
+                    merged.insert(rowid, row.clone());
+                }
             }
 
-            // Apply incoming rows (overwrite by key)
-            for row in &filtered_rows {
+            // Apply upserts
+            for row in &to_upsert {
                 let key = key_col
                     .and_then(|kc| row.get(kc))
                     .or_else(|| row.get("_rowid"))
