@@ -5733,3 +5733,66 @@ Stage Summary:
 - All parsing + evaluation in Rust (zero Python overhead)
 - Backward compat with dict format
 - 21 total tests pass (8 existing + 13 new)
+
+---
+Task ID: 75
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Multi-action merge + multi-key + .sql() method + drop dict backward compat.
+
+User feedback:
+  1. "What if I want 3 operations at once (update + delete + insert)?"
+  2. "What about multi-keys (and keys names not same in both sides)?"
+  3. "Drop dict format backward compat"
+  4. "Add .sql() clause like pyspark/duckdb for full SQL support"
+
+Work Log:
+1. REDESIGNED merge_rows with multi-action + multi-key:
+   - on_match accepts: string, list, or dict with conditional WHERE
+     'update'                           → single action
+     ['update', 'delete']               → multi-action (both run)
+     {'update': 'age >= 18', 'delete': 'age < 18'}  → conditional multi-action
+   - on_miss accepts: 'insert', 'skip', or {'insert': 'age >= 18'}
+   - on= parameter for multi-key with different names:
+     on='id'                            → single key, same name
+     on=['id', 'email']                 → multi-key, same names
+     on=[('user_id', 'id')]             → different names (target, source)
+     on=[('user_id', 'id'), ('code', 'code')]  → multi-key, mixed
+   - Returns dict: {matched, updated, deleted, inserted, skipped}
+
+2. BUILT SQL engine (new module: sql_engine.rs):
+   - Full SQL parser: SELECT, UPDATE, DELETE, INSERT, MERGE
+   - SELECT * | col1, col2 FROM collection [WHERE ...]
+   - UPDATE collection SET col=val, ... [WHERE ...]
+   - DELETE FROM collection [WHERE ...]
+   - INSERT INTO collection (cols) VALUES (vals), (vals)
+   - MERGE INTO target USING source ON key=key WHEN MATCHED THEN ... WHEN NOT MATCHED THEN ...
+   - 7 unit tests in the module
+
+3. ADDED .sql() method to Storage:
+   - s.sql("SELECT * FROM users WHERE age >= 18 AND city = 'NYC'")
+   - s.sql("UPDATE users SET status = 'active' WHERE age >= 18")
+   - s.sql("DELETE FROM users WHERE status = 'inactive'")
+   - s.sql("INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')")
+   - s.sql("MERGE INTO users USING [...] ON id = id WHEN MATCHED THEN UPDATE ...")
+   - All execution in Rust — zero Python overhead
+   - SELECT returns dict of {column: [values]} (same as read_rows)
+   - UPDATE/DELETE return {updated/deleted: count}
+   - INSERT returns {commit: hash}
+
+4. DROPPED dict format backward compat:
+   - where= now accepts SQL strings ONLY
+   - Removed dict_to_where_expr and dict_condition_to_expr helpers
+   - parse_where_param only accepts strings
+
+5. TESTS: all 21 tests pass (8 beautiful API + 13 SQL WHERE)
+   - Updated tests to use SQL strings instead of dict format
+   - Updated merge_rows tests for new dict return + on= parameter
+
+Stage Summary:
+- merge_rows supports ALL 3 actions (update + delete + insert) simultaneously
+  via on_match={'update': cond, 'delete': cond}
+- Multi-key with different names: on=[('target_col', 'source_col'), ...]
+- .sql() method for full SQL support (SELECT/UPDATE/DELETE/INSERT/MERGE)
+- All parsing + execution in Rust — zero Python overhead
+- Dict format dropped — SQL strings only
+- 21 tests pass, build succeeds

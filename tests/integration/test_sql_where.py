@@ -229,11 +229,11 @@ def test_merge_on_match_update():
             ('name', ['alice', 'bob']),
         ], 'init')
 
-        count = s.merge_rows('users', [
+        result = s.merge_rows('users', [
             {'id': 1, 'name': 'ALICE_UPDATED'},
             {'id': 3, 'name': 'carol_new'},
-        ], key_col='id', on_match='update', on_miss='insert')
-        assert count == 2, f"Expected 2, got {count}"
+        ], on='id', on_match='update', on_miss='insert')
+        assert result['matched'] + result['inserted'] == 2, f"Expected 2, got {result}"
 
         cols = s.read_rows('users')
         ids = cols['id']
@@ -259,11 +259,11 @@ def test_merge_on_match_skip():
             ('name', ['alice', 'bob']),
         ], 'init')
 
-        count = s.merge_rows('users', [
+        result = s.merge_rows('users', [
             {'id': 1, 'name': 'SHOULD_NOT_UPDATE'},
             {'id': 3, 'name': 'carol_new'},
-        ], key_col='id', on_match='skip', on_miss='insert')
-        assert count == 2, f"Expected 2 processed, got {count}"
+        ], on='id', on_match='skip', on_miss='insert')
+        assert result["matched"] + result["inserted"] + result["deleted"] == 2, f"Expected 2 processed, got {result}"
 
         cols = s.read_rows('users')
         ids = cols['id']
@@ -291,11 +291,11 @@ def test_merge_on_match_delete():
         ], 'init')
 
         # Delete rows that match id=1 and id=3
-        count = s.merge_rows('users', [
+        result = s.merge_rows('users', [
             {'id': 1},
             {'id': 3},
-        ], key_col='id', on_match='delete', on_miss='skip')
-        assert count == 2, f"Expected 2, got {count}"
+        ], on='id', on_match='delete', on_miss='skip')
+        assert result['deleted'] == 2, f"Expected 2 deleted, got {result}"
 
         cols = s.read_rows('users')
         assert len(cols['id']) == 1, f"Expected 1 remaining, got {len(cols['id'])}"
@@ -318,11 +318,11 @@ def test_merge_on_miss_skip():
             ('name', ['alice', 'bob']),
         ], 'init')
 
-        count = s.merge_rows('users', [
+        result = s.merge_rows('users', [
             {'id': 1, 'name': 'ALICE_UPDATED'},
             {'id': 99, 'name': 'should_not_insert'},
-        ], key_col='id', on_match='update', on_miss='skip')
-        assert count == 2, f"Expected 2 processed, got {count}"
+        ], on='id', on_match='update', on_miss='skip')
+        assert result["matched"] + result["skipped"] == 2, f"Expected 2 processed, got {result}"
 
         cols = s.read_rows('users')
         ids = cols['id']
@@ -352,12 +352,12 @@ def test_merge_with_sql_where():
         ], 'init')
 
         # Only merge adults (age >= 18)
-        count = s.merge_rows('users', [
+        result = s.merge_rows('users', [
             {'id': 1, 'name': 'alice', 'age': 30},
             {'id': 3, 'name': 'minor', 'age': 15},
             {'id': 4, 'name': 'carol', 'age': 25},
-        ], key_col='id', where="age >= 18")
-        assert count == 2, f"Expected 2 (age>=18), got {count}"
+        ], on='id', where="age >= 18")
+        assert result["matched"] + result["inserted"] + result["deleted"] == 2, f"Expected 2 (age>=18), got {result}"
 
         cols = s.read_rows('users')
         ids = cols['id']
@@ -365,7 +365,7 @@ def test_merge_with_sql_where():
         assert 3 not in ids, f"id=3 (minor) should not be inserted: {ids}"
         # id=4 (carol) should be inserted
         assert 4 in ids
-        print(f"  [OK] age >= 18 filter → id=3 skipped, id=1+id=4 merged")
+        print(f"  [OK] age >= 18 filter → {result}")
 
         shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception:
@@ -387,7 +387,7 @@ def test_write_rows_with_sql_where():
         cols = s.read_rows('users')
         assert len(cols['id']) == 3, f"Expected 3 (age>=25), got {len(cols['id'])}"
         assert cols['age'] == [25, 30, 35]
-        print(f"  [OK] write_rows where age>=25 → {cols['age']}")
+        print(f"  [OK] write_rows where age>=25 → {cols["age"]}")
 
         shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception:
@@ -395,9 +395,9 @@ def test_write_rows_with_sql_where():
         raise
 
 
-def test_backward_compat_dict_where():
-    """Backward compat: dict-based where= still works."""
-    print("\n=== Test 13: backward compat with dict where= ===")
+def test_sql_string_where():
+    """SQL string WHERE works."""
+    print("\n=== Test 13: SQL string WHERE ===")
     s, tmpdir = _fresh_storage()
     try:
         s.write_rows('users', [
@@ -405,10 +405,10 @@ def test_backward_compat_dict_where():
             ('age', [20, 25, 30]),
         ], 'init')
 
-        # Dict format still works (legacy)
-        count = s.delete_rows('users', where={'age': ('>', 22)})
+        # SQL string format
+        count = s.delete_rows('users', where="age > 22")
         assert count == 2, f"Expected 2, got {count}"
-        print(f"  [OK] dict where={{'age': ('>', 22)}} → {count} deleted")
+        print(f"  [OK] where=\"age > 22\" → {count} deleted")
 
         shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception:
@@ -430,7 +430,7 @@ def main():
         test_merge_on_miss_skip,
         test_merge_with_sql_where,
         test_write_rows_with_sql_where,
-        test_backward_compat_dict_where,
+        test_sql_string_where,
     ]
     passed = 0
     failed = 0

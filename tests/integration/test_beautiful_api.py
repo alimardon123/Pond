@@ -103,7 +103,7 @@ def test_update_rows_with_filter():
         # UPDATE users SET status='inactive' WHERE city='NYC'
         count = s.update_rows('users',
                               updates={'status': 'inactive'},
-                              where={'city': 'NYC'})
+                              where="city = 'NYC'")
         assert count == 2, f"Expected 2 updates, got {count}"
         print(f"  [OK] Updated {count} rows (city='NYC')")
 
@@ -137,7 +137,7 @@ def test_delete_rows_with_filter():
         ], 'init')
 
         # DELETE FROM users WHERE status='inactive'
-        count = s.delete_rows('users', where={'status': 'inactive'})
+        count = s.delete_rows('users', where="status = 'inactive'")
         assert count == 2, f"Expected 2 deletes, got {count}"
         print(f"  [OK] Deleted {count} rows (status='inactive')")
 
@@ -185,12 +185,12 @@ def test_merge_rows_upsert():
         ], 'init')
 
         # Merge: update id=1, insert id=3
-        count = s.merge_rows('users', [
+        result = s.merge_rows('users', [
             {'id': 1, 'name': 'ALICE_UPDATED'},
             {'id': 3, 'name': 'carol_new'},
-        ], key_col='id')
-        assert count == 2, f"Expected 2 merged, got {count}"
-        print(f"  [OK] Merged {count} rows")
+        ], on='id')
+        assert result['matched'] + result['inserted'] == 2, f"Expected 2 processed, got {result}"
+        print(f"  [OK] Merged: {result}")
 
         # Verify
         cols = s.read_rows('users')
@@ -226,7 +226,7 @@ def test_update_rows_no_crdt():
 
         count = s.update_rows('users',
                               updates={'name': 'UPDATED'},
-                              where={'city': 'NYC'},
+                              where="city = 'NYC'",
                               crdt=False)
         assert count == 2, f"Expected 2 updates, got {count}"
         print(f"  [OK] Updated {count} rows (crdt=False, HEAD rewrite)")
@@ -260,11 +260,11 @@ def test_branch_merge_with_crdt():
         # Update on dev
         s.update_rows('users',
                       updates={'name': 'ALICE_DEV'},
-                      where={'id': 1},
+                      where="id = 1",
                       key_col='id')
 
         # Add a new row on dev
-        s.merge_rows('users', [{'id': 4, 'name': 'dave_dev'}], key_col='id')
+        s.merge_rows('users', [{'id': 4, 'name': 'dave_dev'}], on='id')
 
         # Back to main
         s.checkout('users', 'main')

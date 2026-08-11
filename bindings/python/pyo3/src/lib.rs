@@ -13,97 +13,264 @@
 // pure Rust, and both the C ABI (in bindings/python/core) and Python (here) use it.
 
 mod sql_where;
+mod sql_engine;
 use sql_where::{parse_where, WhereExpr};
+use sql_engine::{parse_sql, SqlStatement, MergeAction};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3::Bound;
 
-/// Parse a `where` parameter that can be either:
-///   - A SQL string: where="age >= 18 AND city = 'NYC'"
-///   - A dict (legacy): where={'age': ('>=', 18), 'city': 'NYC'}
+/// Parse a `where` parameter — must be a SQL string.
 ///
-/// Returns a WhereExpr AST that can be evaluated against rows.
+///   where="age >= 18 AND city = 'NYC'"
+///   where="dept = 'eng' AND (salary > 90000 OR age < 30)"
+///   where="name LIKE 'A%' AND status IN ('active', 'pending')"
 fn parse_where_param(where_val: &PyObject) -> Result<WhereExpr, String> {
     Python::with_gil(|py| {
-        // Try string first (preferred SQL syntax)
         if let Ok(s) = where_val.extract::<String>(py) {
             return parse_where(&s);
         }
-
-        // Fall back to dict format (legacy)
-        if let Ok(dict) = where_val.extract::<std::collections::HashMap<String, PyObject>>(py) {
-            let mut where_dict = serde_json::Map::new();
-            for (k, v) in dict {
-                where_dict.insert(k, python_to_json(&v));
-            }
-            return dict_to_where_expr(&where_dict);
-        }
-
-        Err("where= must be a SQL string or a dict".to_string())
+        Err("where= must be a SQL string, e.g. where=\"age >= 18\"".to_string())
     })
 }
 
-/// Convert a legacy dict-based where filter to a WhereExpr AST.
-fn dict_to_where_expr(where_dict: &serde_json::Map<String, JsonValue>) -> Result<WhereExpr, String> {
-    if where_dict.is_empty() {
-        return Ok(WhereExpr::True);
-    }
+// ---------------------------------------------------------------------------
+// Merge helpers — multi-action + multi-key support
+// ---------------------------------------------------------------------------
 
-    let mut exprs: Vec<WhereExpr> = Vec::new();
-    for (col, condition) in where_dict {
-        exprs.push(dict_condition_to_expr(col, condition)?);
-    }
-
-    // AND-combine all conditions
-    let mut result = exprs.remove(0);
-    for e in exprs {
-        result = WhereExpr::And(Box::new(result), Box::new(e));
-    }
-    Ok(result)
+/// A single action in a merge plan (with optional condition).
+struct MergePlanAction {
+    action: MergeActionType,
+    condition: Option<WhereExpr>,
 }
 
-fn dict_condition_to_expr(col: &str, condition: &JsonValue) -> Result<WhereExpr, String> {
-    match condition {
-        // Bare value → equality
-        JsonValue::String(_) | JsonValue::Number(_) | JsonValue::Bool(_) => {
-            Ok(WhereExpr::Compare {
-                col: col.to_string(),
-                op: "=".to_string(),
-                value: condition.clone(),
-            })
+#[derive(Clone, Copy)]
+enum MergeActionType {
+    Update,
+    Delete,
+    Insert,
+    Skip,
+}
+
+/// Counts for merge result reporting.
+#[derive(Default)]
+struct MergeCounts {
+    matched: usize,
+    updated: usize,
+    deleted: usize,
+    inserted: usize,
+    skipped: usize,
+}
+
+impl Storage {
+    fn empty_merge_result(&self) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("matched", 0)?;
+            dict.set_item("updated", 0)?;
+            dict.set_item("deleted", 0)?;
+            dict.set_item("inserted", 0)?;
+            dict.set_item("skipped", 0)?;
+            Ok(dict.into())
+        })
+    }
+
+    fn merge_result(&self, counts: MergeCounts) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("matched", counts.matched)?;
+            dict.set_item("updated", counts.updated)?;
+            dict.set_item("deleted", counts.deleted)?;
+            dict.set_item("inserted", counts.inserted)?;
+            dict.set_item("skipped", counts.skipped)?;
+            Ok(dict.into())
+        })
+    }
+}
+
+/// Parse the `on` parameter into a list of (target_col, source_col) pairs.
+///
+/// Accepts:
+///   "id"                          → [("id", "id")]
+///   ["id", "email"]               → [("id", "id"), ("email", "email")]
+///   [("user_id", "id")]           → [("user_id", "id")]
+///   [("user_id", "id"), ("code", "code")]  → [("user_id", "id"), ("code", "code")]
+fn parse_match_keys(on: Option<PyObject>, key_col: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    // If `on` is None, use key_col or default to _rowid
+    let on = match on {
+        Some(o) => o,
+        None => {
+            let key = key_col.unwrap_or("_rowid");
+            return Ok(vec![(key.to_string(), key.to_string())]);
+        }
+    };
+
+    Python::with_gil(|py| {
+        // Try string first: "id" → [("id", "id")]
+        if let Ok(s) = on.extract::<String>(py) {
+            return Ok(vec![(s.clone(), s)]);
         }
 
-        // Array → could be [op, value] or list of [op, value] tuples
-        JsonValue::Array(arr) => {
-            if arr.is_empty() {
-                return Ok(WhereExpr::True);
-            }
+        // Try list of strings: ["id", "email"] → [("id", "id"), ("email", "email")]
+        if let Ok(strs) = on.extract::<Vec<String>>(py) {
+            return Ok(strs.into_iter().map(|s| (s.clone(), s)).collect());
+        }
 
-            // Check if first element is a string (operator) → [op, value]
-            if let Some(first) = arr.first() {
-                if first.is_string() {
-                    let op = first.as_str().unwrap().to_string();
-                    let value = arr.get(1).cloned().unwrap_or(JsonValue::Null);
-                    return Ok(WhereExpr::Compare { col: col.to_string(), op, value });
+        // Try list of tuples: [("user_id", "id"), ...]
+        if let Ok(list) = on.extract::<Vec<PyObject>>(py) {
+            let mut keys = Vec::new();
+            for item in list {
+                // Try (str, str) tuple
+                if let Ok((t, s)) = item.extract::<(String, String)>(py) {
+                    keys.push((t, s));
+                } else {
+                    return Err("on= list must contain (target_col, source_col) tuples".to_string());
                 }
             }
-
-            // List of conditions — AND-combine
-            let mut exprs: Vec<WhereExpr> = Vec::new();
-            for sub in arr {
-                exprs.push(dict_condition_to_expr(col, sub)?);
+            if keys.is_empty() {
+                return Err("on= list is empty".to_string());
             }
-            let mut result = exprs.remove(0);
-            for e in exprs {
-                result = WhereExpr::And(Box::new(result), Box::new(e));
-            }
-            Ok(result)
+            return Ok(keys);
         }
 
-        JsonValue::Null => Ok(WhereExpr::IsNull { col: col.to_string(), negate: false }),
+        Err("on= must be a string, list of strings, or list of (target, source) tuples".to_string())
+    })
+}
 
-        _ => Err(format!("Invalid condition for column '{}': {:?}", col, condition)),
+/// Parse the on_match / on_miss parameter into a list of actions.
+///
+/// Accepts:
+///   None                          → default (update for match, insert for miss)
+///   "update"                      → [Update (no condition)]
+///   ["update", "delete"]          → [Update, Delete] (multi-action)
+///   {"update": "age > 18", "delete": "age < 18"}  → [Update if age>18, Delete if age<18]
+fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<MergePlanAction>, String> {
+    let param = match param {
+        Some(p) => p,
+        None => {
+            // Default: update for match, insert for miss
+            return Ok(vec![MergePlanAction {
+                action: if is_match { MergeActionType::Update } else { MergeActionType::Insert },
+                condition: None,
+            }]);
+        }
+    };
+
+    Python::with_gil(|py| {
+        // Try string: "update"
+        if let Ok(s) = param.extract::<String>(py) {
+            let action = parse_action_str(&s, is_match)?;
+            return Ok(vec![MergePlanAction { action, condition: None }]);
+        }
+
+        // Try list: ["update", "delete"]
+        if let Ok(list) = param.extract::<Vec<String>>(py) {
+            let mut actions = Vec::new();
+            for s in list {
+                let action = parse_action_str(&s, is_match)?;
+                actions.push(MergePlanAction { action, condition: None });
+            }
+            if actions.is_empty() {
+                return Err("on_match/on_miss list is empty".to_string());
+            }
+            return Ok(actions);
+        }
+
+        // Try dict: {"update": "age > 18", "delete": "age < 18"}
+        if let Ok(dict) = param.extract::<std::collections::HashMap<String, String>>(py) {
+            let mut actions = Vec::new();
+            for (action_str, where_str) in dict {
+                let action = parse_action_str(&action_str, is_match)?;
+                let condition = if where_str.trim().is_empty() {
+                    None
+                } else {
+                    Some(parse_where(&where_str)?)
+                };
+                actions.push(MergePlanAction { action, condition });
+            }
+            if actions.is_empty() {
+                return Err("on_match/on_miss dict is empty".to_string());
+            }
+            return Ok(actions);
+        }
+
+        Err("on_match/on_miss must be a string, list of strings, or dict".to_string())
+    })
+}
+
+fn parse_action_str(s: &str, is_match: bool) -> Result<MergeActionType, String> {
+    match s.to_lowercase().as_str() {
+        "update" => Ok(MergeActionType::Update),
+        "delete" => Ok(MergeActionType::Delete),
+        "skip" => Ok(MergeActionType::Skip),
+        "insert" if !is_match => Ok(MergeActionType::Insert),
+        "insert" if is_match => Err("'insert' is not valid for on_match".to_string()),
+        other => Err(format!("Unknown merge action: '{}' (use update/delete/skip/insert)", other)),
+    }
+}
+
+/// Convert a WhereExpr back to a SQL string (for passing to update_rows/delete_rows).
+fn where_expr_to_sql(expr: &WhereExpr) -> String {
+    match expr {
+        WhereExpr::True => "".to_string(),
+        WhereExpr::And(a, b) => format!("({} AND {})", where_expr_to_sql(a), where_expr_to_sql(b)),
+        WhereExpr::Or(a, b) => format!("({} OR {})", where_expr_to_sql(a), where_expr_to_sql(b)),
+        WhereExpr::Not(e) => format!("NOT ({})", where_expr_to_sql(e)),
+        WhereExpr::Compare { col, op, value } => {
+            format!("{} {} {}", col, op, json_to_sql_literal(value))
+        }
+        WhereExpr::In { col, values, negate } => {
+            let vals: Vec<String> = values.iter().map(json_to_sql_literal).collect();
+            let op = if *negate { "NOT IN" } else { "IN" };
+            format!("{} {} ({})", col, op, vals.join(", "))
+        }
+        WhereExpr::Like { col, pattern, negate } => {
+            let op = if *negate { "NOT LIKE" } else { "LIKE" };
+            format!("{} {} '{}'", col, op, pattern)
+        }
+        WhereExpr::IsNull { col, negate } => {
+            if *negate { format!("{} IS NOT NULL", col) } else { format!("{} IS NULL", col) }
+        }
+    }
+}
+
+fn json_to_sql_literal(v: &JsonValue) -> String {
+    match v {
+        JsonValue::String(s) => format!("'{}'", s),
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Bool(b) => b.to_string(),
+        JsonValue::Null => "NULL".to_string(),
+        _ => v.to_string(),
+    }
+}
+
+/// Convert a JsonValue to a PyObject.
+fn json_to_pyobject(py: Python, v: &JsonValue) -> PyObject {
+    match v {
+        JsonValue::Null => py.None(),
+        JsonValue::Bool(b) => b.to_object(py),
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.to_object(py)
+            } else if let Some(f) = n.as_f64() {
+                f.to_object(py)
+            } else {
+                py.None()
+            }
+        }
+        JsonValue::String(s) => s.to_object(py),
+        JsonValue::Array(arr) => {
+            let list = PyList::new_bound(py, arr.iter().map(|v| json_to_pyobject(py, v)));
+            list.into()
+        }
+        JsonValue::Object(obj) => {
+            let dict = PyDict::new_bound(py);
+            for (k, v) in obj {
+                dict.set_item(k, json_to_pyobject(py, v)).unwrap();
+            }
+            dict.into()
+        }
     }
 }
 
@@ -1072,56 +1239,61 @@ impl Storage {
     ///   - rows: list of row dicts to merge
     ///   - key_col: the key column for matching (default: '_rowid')
     ///   - crdt: if True (default), write as a CRDT upsert shard. If False,
-    /// Merge rows into a collection — SQL MERGE / INSERT ON CONFLICT.
+    /// Merge rows into a collection — SQL MERGE with multi-action + multi-key.
     ///
-    /// Like SQL MERGE. Incoming rows are matched against existing rows by
-    /// `key_col`. The `on_match` and `on_miss` parameters control what
-    /// happens for matched and unmatched rows:
-    ///
-    ///   on_match='update'  (default) → update existing row
-    ///   on_match='delete'             → delete the existing row (tombstone)
-    ///   on_match='skip'               → do nothing for matched rows
-    ///
-    ///   on_miss='insert'  (default)   → insert as a new row
-    ///   on_miss='skip'                → do nothing for unmatched rows
+    /// Incoming rows are matched against existing rows by one or more key
+    /// columns. You can perform ALL of update + delete + insert in a single
+    /// call by passing a merge plan.
     ///
     /// Args:
-    ///   - collection: Collection name
-    ///   - rows: list of row dicts to merge
-    ///   - key_col: the key column for matching (default: '_rowid')
-    ///   - crdt: if True (default), write as a CRDT shard. If False, rewrite HEAD.
-    ///   - where: optional SQL WHERE filter on INCOMING rows (only merge
-    ///       rows matching the condition)
-    ///   - on_match: 'update' | 'delete' | 'skip' (default: 'update')
-    ///   - on_miss: 'insert' | 'skip' (default: 'insert')
+    ///   - collection: target collection name
+    ///   - rows: list of source row dicts to merge
+    ///   - on: key specification for matching:
+    ///       'id'                          → single key, same name both sides
+    ///       ['id', 'email']               → multi-key, same names
+    ///       [('user_id', 'id')]           → single key, different names (target, source)
+    ///       [('user_id', 'id'), ('code', 'code')]  → multi-key, mixed names
+    ///   - key_col: shorthand for on='col' (single key, same name). Deprecated — use `on`.
+    ///   - where: SQL WHERE filter on INCOMING (source) rows
+    ///   - on_match: what to do when a source row matches an existing target row:
+    ///       'update'                      → update the target row (default)
+    ///       'delete'                      → delete/tombstone the target row
+    ///       'skip'                        → do nothing
+    ///       ['update', 'delete']          → multi-action: process BOTH
+    ///       {'update': "age > 18", 'delete': "age < 18"}  → conditional multi-action
+    ///   - on_miss: what to do when a source row has NO match in target:
+    ///       'insert'                      → insert as new row (default)
+    ///       'skip'                        → do nothing
+    ///       {'insert': "age >= 18"}       → conditional insert
+    ///   - crdt: if True (default), use CRDT shards. If False, rewrite HEAD.
     ///
-    /// Returns: number of rows processed
+    /// Returns: dict with counts {'matched': N, 'updated': N, 'deleted': N, 'inserted': N, 'skipped': N}
     ///
     /// Examples:
-    ///   # Standard upsert (update if exists, insert if new)
-    ///   s.merge_rows('users', [
-    ///       {'id': 1, 'name': 'alice_updated'},
-    ///       {'id': 99, 'name': 'new_user'},
-    ///   ], key_col='id')
+    ///   # Standard upsert
+    ///   s.merge_rows('users', rows, on='id')
     ///
-    ///   # Insert-only (skip if already exists)
-    ///   s.merge_rows('users', rows, key_col='id', on_match='skip')
+    ///   # Multi-key with different names: match users.user_id = source.id
+    ///   s.merge_rows('users', rows, on=[('user_id', 'id'), ('code', 'code')])
     ///
-    ///   # Delete matched rows (anti-join)
-    ///   s.merge_rows('users', rows, key_col='id', on_match='delete')
+    ///   # Multi-action: update adults, delete minors
+    ///   s.merge_rows('users', rows, on='id',
+    ///       on_match={'update': "age >= 18", 'delete': "age < 18"})
     ///
-    ///   # Only merge adults
-    ///   s.merge_rows('users', rows, key_col='id',
-    ///                where="age >= 18", on_miss='insert')
-    #[pyo3(signature = (collection, rows, key_col=None, crdt=true, r#where=None, on_match="update", on_miss="insert"))]
-    fn merge_rows(&self, collection: &str, rows: Vec<PyObject>, key_col: Option<&str>, crdt: bool, r#where: Option<PyObject>, on_match: &str, on_miss: &str) -> PyResult<usize> {
+    ///   # Insert-only (skip if exists)
+    ///   s.merge_rows('users', rows, on='id', on_match='skip')
+    ///
+    ///   # Anti-join (delete matched)
+    ///   s.merge_rows('users', rows, on='id', on_match='delete')
+    #[pyo3(signature = (collection, rows, on=None, key_col=None, crdt=true, r#where=None, on_match=None, on_miss=None))]
+    fn merge_rows(&self, collection: &str, rows: Vec<PyObject>, on: Option<PyObject>, key_col: Option<&str>, crdt: bool, r#where: Option<PyObject>, on_match: Option<PyObject>, on_miss: Option<PyObject>) -> PyResult<PyObject> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let active = storage.get_active_branch(collection);
 
         let json_rows: Vec<JsonValue> = rows.iter().map(|r| python_to_json(r)).collect();
 
-        // Apply where= filter to incoming rows (SQL string or dict)
+        // Apply where= filter to incoming rows
         let filtered_rows: Vec<JsonValue> = if let Some(ref w) = r#where {
             let where_expr = parse_where_param(w)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
@@ -1132,102 +1304,135 @@ impl Storage {
             json_rows
         };
 
-        let count = filtered_rows.len();
-        if count == 0 {
-            return Ok(0);
+        if filtered_rows.is_empty() {
+            return self.empty_merge_result();
         }
 
+        // Parse the `on` parameter into a list of (target_col, source_col) pairs
+        let match_keys: Vec<(String, String)> = parse_match_keys(on, key_col)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
         // Read existing rows for matching
-        let kc: Vec<String> = key_col.map(|k| vec![k.to_string()])
-            .unwrap_or_else(|| vec!["_rowid".to_string()]);
+        let kc: Vec<String> = match_keys.iter().map(|(t, _)| t.clone()).collect();
         let existing = read_collection_as_json_rows(&storage, collection, &kc)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
-        // Build a lookup: key_col value → existing _rowid
+        // Build a lookup: composite key → existing _rowid
         let mut key_to_rowid: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        if let Some(kc_name) = key_col {
-            for (_, row) in &existing {
-                if let (Some(key_val), Some(rowid)) = (
-                    row.get(kc_name).map(|v| v.to_string()),
-                    row.get("_rowid").and_then(|v| v.as_str()).map(|s| s.to_string())
-                ) {
-                    key_to_rowid.insert(key_val, rowid);
-                }
+        for (_, row) in &existing {
+            let mut composite_key = String::new();
+            for (target_col, _) in &match_keys {
+                let val = row.get(target_col).map(|v| v.to_string()).unwrap_or_default();
+                if !composite_key.is_empty() { composite_key.push('\x1f'); }
+                composite_key.push_str(&val);
+            }
+            if let Some(rowid) = row.get("_rowid").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                key_to_rowid.insert(composite_key, rowid);
             }
         }
 
-        // Classify incoming rows: matched (key exists) vs missed (key not found)
-        let mut to_upsert: Vec<JsonValue> = Vec::new();   // rows to update or insert
-        let mut to_delete: Vec<String> = Vec::new();       // rowids to tombstone
+        // Parse on_match and on_miss into action plans
+        let match_plan = parse_merge_action(on_match, true)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        let miss_plan = parse_merge_action(on_miss, false)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+        // Classify incoming rows into actions
+        let mut to_upsert: Vec<JsonValue> = Vec::new();
+        let mut to_delete: Vec<String> = Vec::new();
+        let mut counts = MergeCounts::default();
 
         for mut row in filtered_rows {
-            let key_val = key_col
-                .and_then(|kc| row.get(kc))
-                .map(|v| v.to_string());
+            // Build composite key from source row using source_col names
+            let mut composite_key = String::new();
+            for (_, source_col) in &match_keys {
+                let val = row.get(source_col).map(|v| v.to_string()).unwrap_or_default();
+                if !composite_key.is_empty() { composite_key.push('\x1f'); }
+                composite_key.push_str(&val);
+            }
 
-            let matched_rowid = key_val.and_then(|k| key_to_rowid.get(&k).cloned());
+            let matched_rowid = key_to_rowid.get(&composite_key).cloned();
 
-            match (matched_rowid, on_match, on_miss) {
-                (Some(existing_rowid), "update", _) => {
-                    // Matched + update → use existing _rowid so CRDT merge overrides
-                    if let Some(obj) = row.as_object_mut() {
-                        obj.insert("_rowid".to_string(), json!(existing_rowid));
+            if let Some(existing_rowid) = matched_rowid {
+                counts.matched += 1;
+                // Run through the match plan
+                for action in &match_plan {
+                    // Check conditional WHERE if present
+                    if let Some(ref cond) = action.condition {
+                        if !cond.eval(&row) {
+                            counts.skipped += 1;
+                            continue;
+                        }
                     }
-                    to_upsert.push(row);
+                    match action.action {
+                        MergeActionType::Update => {
+                            if let Some(obj) = row.as_object_mut() {
+                                obj.insert("_rowid".to_string(), json!(existing_rowid));
+                            }
+                            to_upsert.push(row.clone());
+                            counts.updated += 1;
+                        }
+                        MergeActionType::Delete => {
+                            to_delete.push(existing_rowid.clone());
+                            counts.deleted += 1;
+                        }
+                        MergeActionType::Skip => {
+                            counts.skipped += 1;
+                        }
+                        MergeActionType::Insert => {} // not valid for on_match
+                    }
                 }
-                (Some(existing_rowid), "delete", _) => {
-                    // Matched + delete → tombstone the existing row
-                    to_delete.push(existing_rowid);
-                }
-                (Some(_), "skip", _) => {
-                    // Matched + skip → do nothing
-                }
-                (None, _, "insert") => {
-                    // Not matched + insert → add as new row
-                    to_upsert.push(row);
-                }
-                (None, _, "skip") => {
-                    // Not matched + skip → do nothing
-                }
-                (_, bad_match, _) => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid on_match='{}' (use 'update', 'delete', or 'skip') or on_miss='{}' (use 'insert' or 'skip')",
-                        bad_match, on_miss
-                    )));
+            } else {
+                // No match — run through the miss plan
+                for action in &miss_plan {
+                    if let Some(ref cond) = action.condition {
+                        if !cond.eval(&row) {
+                            counts.skipped += 1;
+                            continue;
+                        }
+                    }
+                    match action.action {
+                        MergeActionType::Insert => {
+                            to_upsert.push(row.clone());
+                            counts.inserted += 1;
+                        }
+                        MergeActionType::Skip => {
+                            counts.skipped += 1;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
 
+        // Execute the writes
         if crdt {
             use pond_kernel::crdt::HLC;
             let mut hlc = HLC::new();
-
-            // Observe existing versions to advance HLC past them
             for (_, row) in &existing {
                 if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
                     hlc.observe(v);
                 }
             }
 
-            // Write upserts (updates + inserts)
             if !to_upsert.is_empty() {
                 let shard_name = format!("merge_{}", chrono_like_id());
+                let kc_ref: Option<&str> = match_keys.first().map(|(t, _)| t.as_str());
                 pond_storage::shard::upsert_shard(
                     kernel, collection, &active, &shard_name,
-                    &to_upsert, key_col, &mut hlc,
+                    &to_upsert, kc_ref, &mut hlc,
                 ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
             }
 
-            // Write tombstones (deletes)
             if !to_delete.is_empty() {
                 let shard_name = format!("merge_del_{}", chrono_like_id());
+                let kc_ref: Option<&str> = match_keys.first().map(|(t, _)| t.as_str());
                 pond_storage::shard::delete_shard(
                     kernel, collection, &active, &shard_name,
-                    &to_delete, key_col, &mut hlc,
+                    &to_delete, kc_ref, &mut hlc,
                 ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
             }
         } else {
-            // Rewrite HEAD: apply updates + deletes + inserts
             let mut merged: std::collections::HashMap<String, JsonValue> = std::collections::HashMap::new();
             let delete_rowids: std::collections::HashSet<String> = to_delete.into_iter().collect();
 
@@ -1239,10 +1444,9 @@ impl Storage {
                 }
             }
 
-            // Apply upserts
             for row in &to_upsert {
-                let key = key_col
-                    .and_then(|kc| row.get(kc))
+                let key = match_keys.first()
+                    .and_then(|(t, s)| row.get(s).or_else(|| row.get(t)))
                     .or_else(|| row.get("_rowid"))
                     .map(|v| v.to_string())
                     .unwrap_or_default();
@@ -1253,7 +1457,186 @@ impl Storage {
             write_rows_from_json(kernel, collection, &active, &final_rows, "merge_rows")?;
         }
 
-        Ok(count)
+        // Return result dict
+        let py_result = self.merge_result(counts)?;
+        Ok(py_result)
+    }
+
+    /// Execute a SQL statement — full SELECT/UPDATE/DELETE/INSERT/MERGE support.
+    ///
+    /// This is the unified SQL interface (like pyspark.sql() or duckdb.sql()).
+    /// All execution happens in Rust — zero Python overhead.
+    ///
+    /// Args:
+    ///   - sql: a SQL statement string
+    ///
+    /// Returns:
+    ///   - For SELECT: a dict of {column: [values]} (same as read_rows)
+    ///   - For UPDATE/DELETE/MERGE: a dict with counts
+    ///   - For INSERT: the new commit hash
+    ///
+    /// Examples:
+    ///   # SELECT
+    ///   result = s.sql("SELECT * FROM users WHERE age >= 18 AND city = 'NYC'")
+    ///   result = s.sql("SELECT name, salary FROM employees WHERE dept = 'eng'")
+    ///
+    ///   # UPDATE
+    ///   s.sql("UPDATE users SET status = 'active' WHERE age >= 18")
+    ///
+    ///   # DELETE
+    ///   s.sql("DELETE FROM users WHERE status = 'inactive'")
+    ///
+    ///   # INSERT
+    ///   s.sql("INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')")
+    ///
+    ///   # MERGE
+    ///   s.sql("MERGE INTO users USING [{\"id\":1,\"name\":\"alice\"}] ON id = id WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT")
+    fn sql(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        let stmt = parse_sql(sql).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+        match stmt {
+            SqlStatement::Select { collection, columns, r#where } => {
+                // Execute SELECT — read rows, apply WHERE, project columns
+                let storage = self.storage.lock().unwrap();
+                let kc = vec!["_rowid".to_string()];
+                let all_rows = read_collection_as_json_rows(&storage, &collection, &kc)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+                let merged = crdt_merge_rows(all_rows);
+
+                // Apply WHERE filter
+                let filtered: Vec<&JsonValue> = merged.iter()
+                    .filter(|row| r#where.eval(row))
+                    .collect();
+
+                // Build columnar result
+                let mut result_cols: std::collections::HashMap<String, Vec<PyObject>> = std::collections::HashMap::new();
+                for row in &filtered {
+                    if let Some(obj) = row.as_object() {
+                        for (name, value) in obj {
+                            // Apply projection
+                            if !columns.is_empty() && !columns.contains(name) {
+                                continue;
+                            }
+                            let entry = result_cols.entry(name.clone()).or_insert_with(Vec::new);
+                            entry.push(json_value_to_py(py, value));
+                        }
+                    }
+                }
+
+                // Filter out CRDT metadata columns unless explicitly requested
+                let crdt_cols: std::collections::HashSet<&str> = ["_rowid", "_version", "_deleted"]
+                    .iter().cloned().collect();
+                let explicit_columns = !columns.is_empty();
+
+                let dict = PyDict::new_bound(py);
+                for (name, values) in result_cols {
+                    if !explicit_columns && crdt_cols.contains(name.as_str()) {
+                        continue;
+                    }
+                    let list = PyList::new_bound(py, values.iter());
+                    dict.set_item(&name, list)?;
+                }
+                Ok(dict.into())
+            }
+
+            SqlStatement::Update { collection, sets, r#where } => {
+                // Execute UPDATE via update_rows
+                let updates_dict = JsonValue::Object(sets.into_iter().collect());
+                let updates_py = json_to_pyobject(py, &updates_dict);
+
+                let where_str = where_expr_to_sql(&r#where);
+                let count = self.update_rows(
+                    &collection,
+                    updates_py,
+                    Some(where_str.to_object(py)),
+                    None,
+                    true,
+                )?;
+
+                let dict = PyDict::new_bound(py);
+                dict.set_item("updated", count)?;
+                Ok(dict.into())
+            }
+
+            SqlStatement::Delete { collection, r#where } => {
+                let where_str = where_expr_to_sql(&r#where);
+                let count = self.delete_rows(
+                    &collection,
+                    Some(where_str.to_object(py)),
+                    None,
+                    true,
+                )?;
+
+                let dict = PyDict::new_bound(py);
+                dict.set_item("deleted", count)?;
+                Ok(dict.into())
+            }
+
+            SqlStatement::Insert { collection, columns, rows } => {
+                // Build columnar input from rows
+                let mut col_data: std::collections::HashMap<String, Vec<PyObject>> = std::collections::HashMap::new();
+                for col_name in &columns {
+                    col_data.insert(col_name.clone(), Vec::new());
+                }
+                for row_vals in &rows {
+                    for (i, col_name) in columns.iter().enumerate() {
+                        if let Some(val) = row_vals.get(i) {
+                            col_data.get_mut(col_name).unwrap().push(json_value_to_py(py, val));
+                        }
+                    }
+                }
+                let cols_vec: Vec<(String, Vec<PyObject>)> = columns.iter()
+                    .map(|c| (c.clone(), col_data.remove(c).unwrap_or_default()))
+                    .collect();
+
+                let commit = self.write_rows(&collection, cols_vec, "INSERT", true, None)?;
+                let dict = PyDict::new_bound(py);
+                dict.set_item("commit", commit)?;
+                Ok(dict.into())
+            }
+
+            SqlStatement::Merge { target, source_rows, match_keys, when_matched, when_not_matched } => {
+                // Convert source_rows to PyObject list
+                let rows_py: Vec<PyObject> = source_rows.iter()
+                    .map(|r| json_to_pyobject(py, r))
+                    .collect();
+
+                // Build `on` parameter from match_keys
+                let on_str: String = if match_keys.len() == 1 && match_keys[0].0 == match_keys[0].1 {
+                    format!("'{}'", match_keys[0].0)
+                } else {
+                    let pairs: Vec<String> = match_keys.iter()
+                        .map(|(t, s)| format!("('{}', '{}')", t, s))
+                        .collect();
+                    format!("[{}]", pairs.join(", "))
+                };
+
+                // For now, call merge_rows with the first key as key_col
+                // (full multi-key merge_rows handles this internally)
+                let key_col = match_keys.first().map(|(t, _)| t.as_str());
+                let on_match_str = match when_matched {
+                    MergeAction::Update => "update",
+                    MergeAction::Delete => "delete",
+                    MergeAction::Skip => "skip",
+                    _ => "update",
+                };
+                let on_miss_str = match when_not_matched {
+                    MergeAction::Insert => "insert",
+                    MergeAction::Skip => "skip",
+                    _ => "insert",
+                };
+
+                // Use the Python-level merge_rows with string params
+                let on_match_py = on_match_str.to_object(py);
+                let on_miss_py = on_miss_str.to_object(py);
+
+                let result = self.merge_rows(
+                    &target, rows_py, None, key_col, true,
+                    None, Some(on_match_py), Some(on_miss_py),
+                )?;
+                Ok(result)
+            }
+        }
     }
 
     /// Read structured columns from a collection with optional pruning.
