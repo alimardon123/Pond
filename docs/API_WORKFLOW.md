@@ -1146,17 +1146,31 @@ rows after decode. The merge is deterministic and O(N) in the number of rows.
 
 | Operation | Parallelism | Speedup |
 |---|---|---|
-| S3 batch GETs | Thread pool (already implemented) | N× → ~1× wall-clock |
-| Row group decode | `std::thread::scope` (already implemented) | Up to #cores |
-| INT64 predicate filter | AVX2 SIMD (already implemented) | ~4× per instruction |
+| S3 batch GETs | Thread pool (32 parallel) | N× → ~1× wall-clock |
+| S3 batch PUTs | Thread pool (32 parallel) | N× → ~1× wall-clock |
+| Row group decode | `std::thread::scope` (>2 row groups) | Up to #cores |
+| INT64 predicate filter | AVX2 SIMD (4× i64/instruction) | ~4× per instruction |
+| FLOAT64 predicate filter | AVX2 SIMD (4× f64/instruction) | ~4× per instruction |
+| Columnar predicate eval | SIMD filter BEFORE JSON conversion | 2-4× vs JSON-first |
 | CRDT merge | Sequential (fast enough — in-memory) | N/A |
 | PND2 encode | Sequential (LLVM auto-vectorizes) | ~2× via auto-vec |
 
+### Columnar predicate evaluation benchmark
+
+Filtering 100K rows (10 reads, average per read):
+
+| Operation | Time | Speedup vs full scan |
+|---|---|---|
+| Full scan (no filter) | 257ms | 1× |
+| INT64 filter (50% selectivity) | 116ms | **2.2×** |
+| FLOAT64 filter (33% selectivity) | 66ms | **3.9×** |
+
+The columnar filter skips JSON conversion for filtered-out rows — the biggest
+performance win for selective queries on large datasets.
+
 ### Future performance work
 
-- **`rayon` crate**: parallel iterators for CRDT merge and multi-predicate evaluation
-- **`wide` crate**: explicit SIMD for FLOAT64 columns (currently scalar)
+- **Parallel CRDT merge**: use rayon for chunked merge (currently sequential)
 - **`std::simd`**: portable SIMD API (currently nightly-only, will stabilize)
-- **Columnar predicate evaluation**: evaluate predicates on columnar data
-  BEFORE converting to JSON rows (skip the JSON conversion for filtered-out rows)
-- **Parallel S3 PUTs**: currently only GETs are parallel; batch writes are sequential
+- **Parquet support**: add parquet file reading in .sql() (currently CSV/JSON only)
+- **Columnar output**: skip JSON conversion entirely for simple SELECT queries
