@@ -39,3 +39,4 @@ codegen-units = 1
 # Shared dependencies available to all workspace members
 [workspace.dependencies]
 tempfile = "3"
+rayon = "1"

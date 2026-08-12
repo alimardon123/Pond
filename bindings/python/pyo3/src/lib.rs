@@ -21,6 +21,7 @@ use sql_engine::{parse_sql, SqlStatement, MergeAction, TableRef, JoinClause, Joi
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3::Bound;
+use rayon::prelude::*;
 
 /// Parse a `where` parameter — must be a SQL string.
 ///
@@ -2345,10 +2346,11 @@ impl Storage {
         }
 
         // === READ HEAD + ALL SHARDS, MERGE BY _rowid (CRDT) ===
-        // Use the shared helper that reads HEAD + shards and returns (rowid, JSON row) pairs.
-        // Then apply CRDT merge: dedup by _rowid, latest _version wins, tombstones suppress.
+        // COLUMNAR PREDICATE EVALUATION: pass predicates to the read function
+        // so HEAD data is filtered at the PND2 column level BEFORE JSON conversion.
+        // Shards are already JSON — they're filtered after CRDT merge.
         let kc: Vec<String> = vec!["_rowid".to_string()];
-        let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
+        let all_rows = read_collection_as_json_rows_filtered(&storage, collection, &kc, &predicates_json)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
         // CRDT merge: dedup by _rowid, latest _version wins, tombstones suppress
@@ -4191,6 +4193,22 @@ fn read_collection_as_json_rows(
     collection: &str,
     key_fields: &[String],
 ) -> Result<Vec<(String, JsonValue)>, String> {
+    read_collection_as_json_rows_filtered(storage, collection, key_fields, &[])
+}
+
+/// Read rows with optional columnar predicate filtering.
+///
+/// When predicates are provided, the PND2 columns are filtered at the column
+/// level BEFORE converting to JSON rows. This skips the JSON conversion for
+/// filtered-out rows — major speedup for selective queries on large datasets.
+///
+/// Uses SIMD (AVX2) for INT64 and FLOAT64 columns, scalar for STRING.
+fn read_collection_as_json_rows_filtered(
+    storage: &pond_storage::UnifiedStorage,
+    collection: &str,
+    key_fields: &[String],
+    predicates: &[(String, String, JsonValue)],
+) -> Result<Vec<(String, JsonValue)>, String> {
     use pond_storage::shard;
     use pond_storage::manifest::CollectionManifest;
     use pond_storage::commit;
@@ -4199,7 +4217,6 @@ fn read_collection_as_json_rows(
     let kernel = storage.kernel();
     let mut rows: Vec<(String, JsonValue)> = Vec::new();
 
-    // Determine the active branch
     let active = storage.get_active_branch(collection);
 
     // --- Read HEAD data ---
@@ -4208,7 +4225,6 @@ fn read_collection_as_json_rows(
         let head_data = kernel.read_blob(head_hash)
             .map_err(|e| format!("Failed to read HEAD: {}", e))?;
 
-        // Handle PondPack vs old format
         let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
             let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
                 .ok_or_else(|| "Failed to decode PondPack".to_string())?;
@@ -4217,7 +4233,7 @@ fn read_collection_as_json_rows(
             let commit = commit::read_commit(kernel, head_hash)
                 .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
             if commit.manifest.is_empty() {
-                return Ok(rows); // empty collection
+                return Ok(rows);
             }
             kernel.read_blob(&commit.manifest)
                 .map_err(|e| format!("Failed to read manifest: {}", e))?
@@ -4226,14 +4242,13 @@ fn read_collection_as_json_rows(
         let manifest = CollectionManifest::decode(&manifest_bytes)
             .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-        // Read each row group, decode PND2, convert to JSON rows
-        // PARALLEL: decode multiple row groups in separate threads for
-        // large collections. For small collections (≤2 row groups), use
-        // sequential to avoid thread spawn overhead.
+        // COLUMNAR PREDICATE EVALUATION:
+        // Decode PND2 → apply SIMD columnar filter → only convert surviving rows to JSON
         if manifest.row_groups.len() > 2 {
-            // Parallel decode — each row group is decoded in a separate thread
+            // Parallel decode with columnar filter
             let row_groups = &manifest.row_groups;
             let key_fields_ref = key_fields;
+            let preds_ref = predicates;
             let results: Vec<Result<Vec<(String, JsonValue)>, String>> = std::thread::scope(|s| {
                 let handles: Vec<_> = row_groups.iter().map(|rg| {
                     s.spawn(move || {
@@ -4241,7 +4256,14 @@ fn read_collection_as_json_rows(
                             .map_err(|e| format!("Failed to read data blob: {}", e))?;
                         let cols = pond_core::pnd2_decode(&blob_data)
                             .map_err(|e| format!("Failed to decode PND2: {}", e))?;
-                        Ok(decode_cols_to_rows(&cols, key_fields_ref))
+
+                        // Apply columnar predicate filter BEFORE JSON conversion
+                        if preds_ref.is_empty() {
+                            Ok(decode_cols_to_rows(&cols, key_fields_ref))
+                        } else {
+                            let mask = simd::columnar_filter(&cols, preds_ref);
+                            Ok(decode_cols_to_rows_filtered(&cols, key_fields_ref, Some(&mask)))
+                        }
                     })
                 }).collect();
 
@@ -4252,7 +4274,7 @@ fn read_collection_as_json_rows(
                 rows.extend(result?);
             }
         } else {
-            // Sequential decode (small collections)
+            // Sequential decode with columnar filter
             for rg in &manifest.row_groups {
                 let blob_data = kernel.read_blob(&rg.blob_hash)
                     .map_err(|e| format!("Failed to read data blob: {}", e))?;
@@ -4260,16 +4282,21 @@ fn read_collection_as_json_rows(
                 let cols = pond_core::pnd2_decode(&blob_data)
                     .map_err(|e| format!("Failed to decode PND2: {}", e))?;
 
-                rows.extend(decode_cols_to_rows(&cols, key_fields));
+                if predicates.is_empty() {
+                    rows.extend(decode_cols_to_rows(&cols, key_fields));
+                } else {
+                    let mask = simd::columnar_filter(&cols, predicates);
+                    rows.extend(decode_cols_to_rows_filtered(&cols, key_fields, Some(&mask)));
+                }
             }
         }
     }
 
     // --- Read shard data (CRDT) ---
+    // Shards are JSON — no columnar filter possible (they're already JSON)
     let (_, shards) = shard::read_with_shards(kernel, collection, &active);
     for (_, shard_hash) in shards {
         if let Ok(data) = kernel.read_blob(&shard_hash) {
-            // Shards are JSON arrays of row objects
             if let Ok(arr) = serde_json::from_slice::<Vec<JsonValue>>(&data) {
                 for row in arr {
                     let rowid = determine_rowid(&row, key_fields);
@@ -4286,12 +4313,31 @@ fn read_collection_as_json_rows(
 ///
 /// This is the shared helper used by both the parallel and sequential
 /// decode paths. Extracted to avoid code duplication.
+/// Decode PND2 columns into (rowid, JSON row) pairs.
+///
+/// If a `keep_mask` is provided, only rows where keep_mask[row_idx] is true
+/// are converted to JSON — skipping the JSON conversion for filtered-out rows.
+/// This is the columnar predicate evaluation optimization.
 fn decode_cols_to_rows(cols: &[pond_core::PondColumn], key_fields: &[String]) -> Vec<(String, JsonValue)> {
+    decode_cols_to_rows_filtered(cols, key_fields, None)
+}
+
+fn decode_cols_to_rows_filtered(
+    cols: &[pond_core::PondColumn],
+    key_fields: &[String],
+    keep_mask: Option<&[bool]>,
+) -> Vec<(String, JsonValue)> {
     use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY, VT_NULL};
     let mut rows = Vec::new();
     let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
 
     for row_idx in 0..n_rows {
+        // Skip filtered-out rows — this is the key optimization:
+        // we never convert these rows to JSON
+        if let Some(mask) = keep_mask {
+            if !mask[row_idx] { continue; }
+        }
+
         let mut row_obj = serde_json::Map::new();
         for col in cols {
             let name = col.name.to_string_lossy().to_string();

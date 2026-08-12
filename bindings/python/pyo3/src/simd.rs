@@ -186,6 +186,200 @@ unsafe fn filter_range_i64_avx2(data: &[i64], value_min: i64, value_max: i64, re
 }
 
 // ---------------------------------------------------------------------------
+// FLOAT64 SIMD filters (4x f64 per instruction via AVX2 __m256d)
+// ---------------------------------------------------------------------------
+
+/// Filter a FLOAT64 array by comparison (col op value).
+///
+/// op: "=", "!=", ">", ">=", "<", "<="
+pub fn filter_cmp_f64(data: &[f64], op: &str, value: f64) -> Vec<bool> {
+    let mut result = vec![false; data.len()];
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { filter_cmp_f64_avx2(data, op, value, &mut result); }
+            return result;
+        }
+    }
+
+    // Scalar fallback
+    for (i, &v) in data.iter().enumerate() {
+        result[i] = match op {
+            "=" | "==" => v == value,
+            "!=" | "<>" => v != value,
+            ">" => v > value,
+            ">=" => v >= value,
+            "<" => v < value,
+            "<=" => v <= value,
+            _ => false,
+        };
+    }
+    result
+}
+
+/// Filter FLOAT64 array by range: value_min <= col <= value_max.
+pub fn filter_range_f64(data: &[f64], value_min: f64, value_max: f64) -> Vec<bool> {
+    let mut result = vec![false; data.len()];
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { filter_range_f64_avx2(data, value_min, value_max, &mut result); }
+            return result;
+        }
+    }
+
+    for (i, &v) in data.iter().enumerate() {
+        result[i] = v >= value_min && v <= value_max;
+    }
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_cmp_f64_avx2(data: &[f64], op: &str, value: f64, result: &mut [bool]) {
+    let broadcast = _mm256_set1_pd(value);
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        let chunk = _mm256_loadu_pd(data.as_ptr().add(i));
+        let mask_bits = match op {
+            "=" | "==" => _mm256_movemask_pd(_mm256_cmp_pd(chunk, broadcast, _CMP_EQ_OQ)) as u32,
+            "!=" | "<>" => _mm256_movemask_pd(_mm256_cmp_pd(chunk, broadcast, _CMP_NEQ_OQ)) as u32,
+            ">" => _mm256_movemask_pd(_mm256_cmp_pd(chunk, broadcast, _CMP_GT_OQ)) as u32,
+            ">=" => _mm256_movemask_pd(_mm256_cmp_pd(chunk, broadcast, _CMP_GE_OQ)) as u32,
+            "<" => _mm256_movemask_pd(_mm256_cmp_pd(chunk, broadcast, _CMP_LT_OQ)) as u32,
+            "<=" => _mm256_movemask_pd(_mm256_cmp_pd(chunk, broadcast, _CMP_LE_OQ)) as u32,
+            _ => 0,
+        };
+        for j in 0..4 {
+            result[i + j] = (mask_bits >> j) & 1 != 0;
+        }
+        i += 4;
+    }
+    while i < data.len() {
+        result[i] = match op {
+            "=" | "==" => data[i] == value,
+            "!=" | "<>" => data[i] != value,
+            ">" => data[i] > value,
+            ">=" => data[i] >= value,
+            "<" => data[i] < value,
+            "<=" => data[i] <= value,
+            _ => false,
+        };
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_range_f64_avx2(data: &[f64], value_min: f64, value_max: f64, result: &mut [bool]) {
+    let min_b = _mm256_set1_pd(value_min);
+    let max_b = _mm256_set1_pd(value_max);
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        let chunk = _mm256_loadu_pd(data.as_ptr().add(i));
+        let ge_min = _mm256_cmp_pd(chunk, min_b, _CMP_GE_OQ);
+        let le_max = _mm256_cmp_pd(chunk, max_b, _CMP_LE_OQ);
+        let in_range = _mm256_and_pd(ge_min, le_max);
+        let mask = _mm256_movemask_pd(in_range) as u32;
+        for j in 0..4 {
+            result[i + j] = (mask >> j) & 1 != 0;
+        }
+        i += 4;
+    }
+    while i < data.len() {
+        result[i] = data[i] >= value_min && data[i] <= value_max;
+        i += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Columnar predicate evaluation — filter PondColumn data BEFORE JSON conversion
+// ---------------------------------------------------------------------------
+
+/// Apply predicates directly on decoded PND2 columns.
+///
+/// Returns a boolean mask: true for each row that matches ALL predicates.
+/// This avoids converting filtered-out rows to JSON — major speedup for
+/// selective queries on large datasets.
+///
+/// Uses SIMD for INT64 and FLOAT64 columns, scalar for STRING.
+pub fn columnar_filter(
+    cols: &[pond_core::PondColumn],
+    predicates: &[(String, String, serde_json::Value)],
+) -> Vec<bool> {
+    use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING};
+    use serde_json::Value as JsonValue;
+
+    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+    if n_rows == 0 || predicates.is_empty() {
+        return vec![true; n_rows];
+    }
+
+    let mut keep_mask = vec![true; n_rows];
+
+    for (col_name, op, value) in predicates {
+        // Find the column
+        let col = cols.iter().find(|c| {
+            c.name.to_string_lossy().to_string() == col_name.as_str()
+        });
+
+        let col = match col {
+            Some(c) => c,
+            None => continue, // Column not found — don't filter
+        };
+
+        match col.vtype {
+            VT_INT64 => {
+                if let Some(target) = value.as_i64() {
+                    let col_mask = match op.as_str() {
+                        "=" | "==" => filter_eq_i64(&col.i64_data, target),
+                        "!=" | "<>" | ">" | ">=" | "<" | "<=" => {
+                            filter_cmp_i64(&col.i64_data, op, target)
+                        }
+                        _ => vec![true; n_rows],
+                    };
+                    for (i, m) in col_mask.iter().enumerate() {
+                        keep_mask[i] = keep_mask[i] && *m;
+                    }
+                }
+            }
+            VT_FLOAT64 => {
+                if let Some(target) = value.as_f64() {
+                    let col_mask = filter_cmp_f64(&col.f64_data, op, target);
+                    for (i, m) in col_mask.iter().enumerate() {
+                        keep_mask[i] = keep_mask[i] && *m;
+                    }
+                }
+            }
+            VT_STRING => {
+                // Scalar string comparison
+                let target_str = value.as_str().unwrap_or("");
+                for (i, s) in col.str_data.iter().enumerate() {
+                    if !keep_mask[i] { continue; }
+                    let cell_str = s.to_string_lossy();
+                    let cell_str_ref: &str = &cell_str;
+                    let matches = match op.as_str() {
+                        "=" | "==" => cell_str_ref == target_str,
+                        "!=" | "<>" => cell_str_ref != target_str,
+                        ">" => cell_str_ref > target_str,
+                        ">=" => cell_str_ref >= target_str,
+                        "<" => cell_str_ref < target_str,
+                        "<=" => cell_str_ref <= target_str,
+                        _ => true,
+                    };
+                    keep_mask[i] = keep_mask[i] && matches;
+                }
+            }
+            _ => {} // Skip non-comparable types
+        }
+    }
+
+    keep_mask
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
