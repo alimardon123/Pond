@@ -1095,3 +1095,68 @@ The API surface is deliberately small: **one `Storage` class** with
 methods grouped into 5 sections (Data I/O, Versioning, Indexing,
 Semantic Layer, Maintenance). Everything else is an implementation
 detail.
+
+---
+
+## 14. Performance architecture — SIMD, parallelism, CRDT
+
+### SIMD-accelerated INT64 predicate evaluation
+
+When `read_rows` filters by INT64 predicates (e.g., `predicates=[('age', '>', 18)]`),
+the filter runs through **AVX2 SIMD instructions** that compare 4× `i64` values
+per instruction. On non-x86_64 or pre-AVX2 CPUs, it falls back to scalar
+(which LLVM may still auto-vectorize).
+
+The SIMD path is used when:
+- The predicate column has INT64 values in all rows
+- The predicate value is numeric
+- The operator is one of: `=`, `==`, `!=`, `<>`, `>`, `>=`, `<`, `<=`
+
+For string columns, float columns, or mixed types, the scalar JSON comparison
+path is used (with bool/int coercion for equality checks).
+
+```python
+# This uses AVX2 SIMD (4x i64 per instruction):
+s.read_rows('users', predicates=[('age', '>', 18), ('dept', '=', 'eng')])
+# age > 18 → SIMD (INT64 column)
+# dept = 'eng' → scalar (string column)
+```
+
+### Parallel row group decoding
+
+When a collection has >2 row groups, decoding runs in **parallel threads**
+via `std::thread::scope` (stable since Rust 1.63, no external dependencies).
+Each row group is decoded in a separate thread, then results are merged.
+
+Small collections (≤2 row groups) decode sequentially to avoid thread spawn
+overhead.
+
+### Parallel S3 batch GETs
+
+S3 batch reads (`read_blob_batch`) use a thread pool to issue parallel HTTP
+requests, reducing wall-clock from N×RTT to ~1 RTT for N blobs.
+
+### CRDT merge
+
+The CRDT merge (dedup by `_rowid`, latest `_version` wins, tombstones suppress)
+runs sequentially — it's typically fast because it operates on in-memory JSON
+rows after decode. The merge is deterministic and O(N) in the number of rows.
+
+### Where parallelism helps most
+
+| Operation | Parallelism | Speedup |
+|---|---|---|
+| S3 batch GETs | Thread pool (already implemented) | N× → ~1× wall-clock |
+| Row group decode | `std::thread::scope` (already implemented) | Up to #cores |
+| INT64 predicate filter | AVX2 SIMD (already implemented) | ~4× per instruction |
+| CRDT merge | Sequential (fast enough — in-memory) | N/A |
+| PND2 encode | Sequential (LLVM auto-vectorizes) | ~2× via auto-vec |
+
+### Future performance work
+
+- **`rayon` crate**: parallel iterators for CRDT merge and multi-predicate evaluation
+- **`wide` crate**: explicit SIMD for FLOAT64 columns (currently scalar)
+- **`std::simd`**: portable SIMD API (currently nightly-only, will stabilize)
+- **Columnar predicate evaluation**: evaluate predicates on columnar data
+  BEFORE converting to JSON rows (skip the JSON conversion for filtered-out rows)
+- **Parallel S3 PUTs**: currently only GETs are parallel; batch writes are sequential

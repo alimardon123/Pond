@@ -15,7 +15,7 @@
 mod sql_where;
 mod sql_engine;
 mod simd;
-use sql_where::{parse_where, WhereExpr};
+use sql_where::{parse_where, WhereExpr, json_values_equal};
 use sql_engine::{parse_sql, SqlStatement, MergeAction, TableRef, JoinClause, JoinType};
 
 use pyo3::prelude::*;
@@ -2360,25 +2360,67 @@ impl Storage {
         });
 
         // Apply row-level predicates (filter after merge, since shards may have updates)
-        // Now supports ANY value type (string, int, float, bool) via JSON comparison
-        let filtered: Vec<&JsonValue> = merged.iter().filter(|row| {
-            if !predicates_json.is_empty() {
-                for (col, op, value) in &predicates_json {
-                    let cell = row.get(col);
-                    let matches = match op.as_str() {
-                        "=" | "==" => cell == Some(value),
-                        "!=" | "<>" => cell != Some(value),
-                        ">" => cmp_values(cell, value) == std::cmp::Ordering::Greater,
-                        ">=" => matches!(cmp_values(cell, value), std::cmp::Ordering::Greater | std::cmp::Ordering::Equal),
-                        "<" => cmp_values(cell, value) == std::cmp::Ordering::Less,
-                        "<=" => matches!(cmp_values(cell, value), std::cmp::Ordering::Less | std::cmp::Ordering::Equal),
-                        _ => true,
+        // Uses SIMD-accelerated INT64 filter when possible, falls back to JSON comparison
+        let filtered: Vec<&JsonValue> = if !predicates_json.is_empty() {
+            // Try SIMD-accelerated path: extract INT64 column data and run AVX2 filter
+            // For each predicate, if the column is INT64 and the value is numeric,
+            // use the SIMD filter. Otherwise fall back to JSON comparison.
+            let mut keep_mask: Vec<bool> = vec![true; merged.len()];
+
+            for (col, op, value) in &predicates_json {
+                // Try to extract INT64 values for SIMD acceleration
+                let i64_values: Option<Vec<i64>> = if let Some(target_i) = value.as_i64() {
+                    // Check if all rows have this column as INT64
+                    let vals: Vec<Option<i64>> = merged.iter()
+                        .map(|row| row.get(col).and_then(|v| v.as_i64()))
+                        .collect();
+                    if vals.iter().all(|v| v.is_some()) {
+                        Some(vals.into_iter().map(|v| v.unwrap()).collect())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(ref i64_vals) = i64_values {
+                    // SIMD-accelerated path for INT64 columns
+                    let target = value.as_i64().unwrap();
+                    let col_mask = match op.as_str() {
+                        "=" | "==" => simd::filter_eq_i64(i64_vals, target),
+                        "!=" | "<>" | ">" | ">=" | "<" | "<=" => simd::filter_cmp_i64(i64_vals, op, target),
+                        _ => vec![true; merged.len()],
                     };
-                    if !matches { return false; }
+                    // AND-combine with existing mask
+                    for (i, m) in col_mask.iter().enumerate() {
+                        keep_mask[i] = keep_mask[i] && *m;
+                    }
+                } else {
+                    // Scalar JSON comparison fallback for non-INT64 columns
+                    for (i, row) in merged.iter().enumerate() {
+                        if !keep_mask[i] { continue; }
+                        let cell = row.get(col);
+                        let matches = match op.as_str() {
+                            "=" | "==" => json_values_equal(cell, value),
+                            "!=" | "<>" => !json_values_equal(cell, value),
+                            ">" => cmp_values(cell, value) == std::cmp::Ordering::Greater,
+                            ">=" => matches!(cmp_values(cell, value), std::cmp::Ordering::Greater | std::cmp::Ordering::Equal),
+                            "<" => cmp_values(cell, value) == std::cmp::Ordering::Less,
+                            "<=" => matches!(cmp_values(cell, value), std::cmp::Ordering::Less | std::cmp::Ordering::Equal),
+                            _ => true,
+                        };
+                        keep_mask[i] = keep_mask[i] && matches;
+                    }
                 }
             }
-            true
-        }).collect();
+
+            merged.iter().enumerate()
+                .filter(|(i, _)| keep_mask[*i])
+                .map(|(_, row)| row)
+                .collect()
+        } else {
+            merged.iter().collect()
+        };
 
         // Convert to columnar format — pad missing values with None so all
         // columns have the same length (rows from HEAD + shards may have

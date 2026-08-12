@@ -114,7 +114,7 @@ fn eval_compare(cell: Option<&JsonValue>, op: &str, target: &JsonValue) -> bool 
 
 /// Check if two JSON values are equal, with type coercion:
 ///   Bool(true) == Number(1), Bool(false) == Number(0)
-fn json_values_equal(cell: Option<&JsonValue>, target: &JsonValue) -> bool {
+pub fn json_values_equal(cell: Option<&JsonValue>, target: &JsonValue) -> bool {
     match (cell, target) {
         (Some(JsonValue::Bool(b)), JsonValue::Number(n)) => {
             n.as_i64() == Some(if *b { 1 } else { 0 })
