@@ -40,18 +40,18 @@ fn parse_where_param(where_val: &PyObject) -> Result<WhereExpr, String> {
 // Merge helpers — multi-action + multi-key + column mapping support
 // ---------------------------------------------------------------------------
 
-/// A column mapping for UPDATE/INSERT actions.
-/// Maps target column names to value specs:
-///   "s.col_name" → copy from source row's col_name
-///   "t.col_name" → keep target's existing value (no-op)
-///   "static"     → set to the literal string value
-///   number       → set to numeric literal
-///   None         → copy all source columns (default behavior)
-pub enum SetSpec {
-    /// Copy all source columns (default — no explicit set= provided)
-    All,
-    /// Only update specific columns: {target_col: ValueSpec}
-    Columns(Vec<(String, ValueSpec)>),
+/// A parsed SET clause — controls which columns to update.
+///
+/// Three modes:
+///   None (no SET clause)     → copy ALL source columns
+///   Some(copy_all=false)     → ONLY update listed columns, keep rest from target
+///   Some(copy_all=true)      → copy ALL source columns, THEN override listed ones
+pub struct SetClause {
+    /// If true, copy ALL source columns first, then apply overrides.
+    /// If false, only update the explicitly listed columns.
+    pub copy_all: bool,
+    /// Column overrides: (target_col, value_spec) pairs
+    pub columns: Vec<(String, ValueSpec)>,
 }
 
 pub enum ValueSpec {
@@ -67,7 +67,7 @@ pub enum ValueSpec {
 struct MergePlanAction {
     action: MergeActionType,
     condition: Option<WhereExpr>,
-    set: Option<Vec<(String, ValueSpec)>>,  // None = copy all source cols
+    set: Option<SetClause>,  // None = copy all source cols (default)
 }
 
 #[derive(Clone, Copy)]
@@ -380,11 +380,35 @@ fn parse_merge_action_string(s: &str, is_match: bool) -> Result<Vec<MergePlanAct
 }
 
 /// Parse a SET clause for merge: "t.name = s.full_name, t.status = 'active'"
-fn parse_set_clause_for_merge(s: &str) -> Result<Vec<(String, ValueSpec)>, String> {
-    let mut result = Vec::new();
+/// Parse a SET clause for merge.
+///
+/// Supports three modes:
+///
+///   SET t.name = s.full_name, t.status = 'active'
+///     → ONLY update listed columns, keep rest from target
+///
+///   SET *, t.name = s.full_name, t.status = 'active'
+///     → Copy ALL source columns, THEN override specific ones
+///
+///   SET *  (or no SET clause)
+///     → Copy ALL source columns
+///
+/// The `*` token enables "copy all + override" mode. Without `*`,
+/// only the explicitly listed columns are updated.
+fn parse_set_clause_for_merge(s: &str) -> Result<SetClause, String> {
+    let s = s.trim();
+    let mut copy_all = false;
+    let mut columns: Vec<(String, ValueSpec)> = Vec::new();
+
     for part in s.split(',') {
         let part = part.trim();
         if part.is_empty() { continue; }
+
+        // Check for * token
+        if part == "*" {
+            copy_all = true;
+            continue;
+        }
 
         let eq_pos = part.find('=')
             .ok_or_else(|| format!("Expected '=' in SET clause: '{}'", part))?;
@@ -415,16 +439,17 @@ fn parse_set_clause_for_merge(s: &str) -> Result<Vec<(String, ValueSpec)>, Strin
                 .map(JsonValue::Number)
                 .unwrap_or(JsonValue::Null))
         } else {
-            // Unquoted string → treat as string literal
             ValueSpec::Static(JsonValue::String(value_str.to_string()))
         };
 
-        result.push((target, spec));
+        columns.push((target, spec));
     }
-    if result.is_empty() {
+
+    if !copy_all && columns.is_empty() {
         return Err("SET clause is empty".to_string());
     }
-    Ok(result)
+
+    Ok(SetClause { copy_all, columns })
 }
 
 /// Build a combined context for evaluating WHERE clauses with t./s. prefixes.
@@ -459,13 +484,14 @@ fn build_merge_context(target_row: Option<&JsonValue>, source_row: &JsonValue) -
 
 /// Apply a SET clause to produce the final row for upsert.
 ///
-/// - If set is None: copy all source columns (minus _rowid/_version/_deleted)
-/// - If set is Some: only update the specified columns, keeping target values
-///   for columns not in the SET clause
+/// Three modes:
+///   None                          → copy ALL source columns
+///   Some(copy_all=false)          → ONLY update listed columns, keep rest from target
+///   Some(copy_all=true)           → copy ALL source columns, THEN override listed ones
 fn apply_set_to_row(
     target_row: Option<&JsonValue>,
     source_row: &JsonValue,
-    set: &Option<Vec<(String, ValueSpec)>>,
+    set: &Option<SetClause>,
     existing_rowid: Option<&str>,
 ) -> JsonValue {
     match set {
@@ -479,21 +505,32 @@ fn apply_set_to_row(
             }
             result
         }
-        Some(mappings) => {
-            // Start with the target row (if exists), apply SET overrides
+        Some(clause) => {
             let mut result = serde_json::Map::new();
 
-            // Copy target row as base (preserving columns not in SET)
-            if let Some(target) = target_row {
-                if let Some(obj) = target.as_object() {
-                    for (k, v) in obj {
-                        result.insert(k.clone(), v.clone());
+            if clause.copy_all {
+                // Mode: SET *, t.col = ... → copy ALL source columns first
+                if let Some(src_obj) = source_row.as_object() {
+                    for (k, v) in src_obj {
+                        // Skip CRDT metadata — it'll be set explicitly
+                        if k != "_rowid" && k != "_version" && k != "_deleted" {
+                            result.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            } else {
+                // Mode: SET t.col = ... → start with target row as base
+                if let Some(target) = target_row {
+                    if let Some(obj) = target.as_object() {
+                        for (k, v) in obj {
+                            result.insert(k.clone(), v.clone());
+                        }
                     }
                 }
             }
 
-            // Apply SET mappings
-            for (target_col, spec) in mappings {
+            // Apply column overrides
+            for (target_col, spec) in &clause.columns {
                 let val = match spec {
                     ValueSpec::SourceCol(src_col) => {
                         source_row.get(src_col).cloned().unwrap_or(JsonValue::Null)
@@ -2336,19 +2373,42 @@ impl Storage {
             true
         }).collect();
 
-        // Convert to columnar format
+        // Convert to columnar format — pad missing values with None so all
+        // columns have the same length (rows from HEAD + shards may have
+        // different key sets after CRDT merge)
         let mut result_cols: std::collections::HashMap<String, Vec<PyObject>> = std::collections::HashMap::new();
 
         for row in &filtered {
             if let Some(obj) = row.as_object() {
+                // Track which keys this row has
+                let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+                // Get current max column length (for padding)
+                let current_max = result_cols.values().map(|v| v.len()).max().unwrap_or(0);
+
                 for (name, value) in obj {
                     // Apply projection
                     if let Some(ref proj) = projection {
                         if !proj.contains(name) { continue; }
                     }
-                    let entry = result_cols.entry(name.clone()).or_insert_with(Vec::new);
+                    seen_keys.insert(name.clone());
+                    let entry = result_cols.entry(name.clone()).or_insert_with(|| Vec::with_capacity(filtered.len()));
+                    // Pad with None if this column was missing in previous rows
+                    while entry.len() < current_max {
+                        entry.push(py.None());
+                    }
                     let py_val = json_value_to_py(py, value);
                     entry.push(py_val);
+                }
+
+                // Pad missing columns with None for this row
+                let new_max = result_cols.values().map(|v| v.len()).max().unwrap_or(0);
+                for (name, values) in result_cols.iter_mut() {
+                    if !seen_keys.contains(name.as_str()) {
+                        while values.len() < new_max {
+                            values.push(py.None());
+                        }
+                    }
                 }
             }
         }
