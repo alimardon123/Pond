@@ -14,6 +14,7 @@
 
 mod sql_where;
 mod sql_engine;
+mod simd;
 use sql_where::{parse_where, WhereExpr};
 use sql_engine::{parse_sql, SqlStatement, MergeAction, TableRef, JoinClause, JoinType};
 
@@ -36,13 +37,37 @@ fn parse_where_param(where_val: &PyObject) -> Result<WhereExpr, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Merge helpers — multi-action + multi-key support
+// Merge helpers — multi-action + multi-key + column mapping support
 // ---------------------------------------------------------------------------
 
-/// A single action in a merge plan (with optional condition).
+/// A column mapping for UPDATE/INSERT actions.
+/// Maps target column names to value specs:
+///   "s.col_name" → copy from source row's col_name
+///   "t.col_name" → keep target's existing value (no-op)
+///   "static"     → set to the literal string value
+///   number       → set to numeric literal
+///   None         → copy all source columns (default behavior)
+pub enum SetSpec {
+    /// Copy all source columns (default — no explicit set= provided)
+    All,
+    /// Only update specific columns: {target_col: ValueSpec}
+    Columns(Vec<(String, ValueSpec)>),
+}
+
+pub enum ValueSpec {
+    /// Copy from source column: "s.col_name"
+    SourceCol(String),
+    /// Keep target's existing value: "t.col_name"
+    TargetCol(String),
+    /// Set to a static JSON value
+    Static(JsonValue),
+}
+
+/// A single action in a merge plan (with optional condition + column mapping).
 struct MergePlanAction {
     action: MergeActionType,
     condition: Option<WhereExpr>,
+    set: Option<Vec<(String, ValueSpec)>>,  // None = copy all source cols
 }
 
 #[derive(Clone, Copy)]
@@ -215,6 +240,7 @@ fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<Mer
             return Ok(vec![MergePlanAction {
                 action: if is_match { MergeActionType::Update } else { MergeActionType::Insert },
                 condition: None,
+                set: None,
             }]);
         }
     };
@@ -237,7 +263,7 @@ fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<Mer
                     } else {
                         Some(parse_where(&where_str)?)
                     };
-                    actions.push(MergePlanAction { action, condition });
+                    actions.push(MergePlanAction { action, condition, set: None });
                 } else if let Ok(s) = item.extract::<String>(py) {
                     // Bare string → could be 'update' or 'UPDATE WHERE ...'
                     let sub_actions = parse_merge_action_string(&s, is_match)?;
@@ -262,7 +288,7 @@ fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<Mer
                 } else {
                     Some(parse_where(&where_str)?)
                 };
-                actions.push(MergePlanAction { action, condition });
+                actions.push(MergePlanAction { action, condition, set: None });
             }
             if actions.is_empty() {
                 return Err("on_match/on_miss dict is empty".to_string());
@@ -279,13 +305,19 @@ fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<Mer
 /// Formats:
 ///   'update'                              → [Update]
 ///   'UPDATE WHERE age >= 18'              → [Update if age>=18]
+///   'UPDATE WHERE t.age >= 18 AND s.amount > 100'  → filter on both target+source
+///   'UPDATE SET t.name = s.full_name, t.status = "active"'  → column mapping
 ///   'UPDATE WHERE age >= 18; DELETE WHERE age < 18'  → multi-action
 ///   'WHEN MATCHED THEN UPDATE WHERE age >= 18'       → SQL MERGE syntax
+///
+/// SET clause supports:
+///   t.name = s.full_name    → copy from source column (different name)
+///   t.status = 'active'     → set to static value
+///   t.count = t.count       → keep target value (no-op, explicit)
 fn parse_merge_action_string(s: &str, is_match: bool) -> Result<Vec<MergePlanAction>, String> {
     let s = s.trim();
 
     // Support 'WHEN MATCHED THEN ...' or 'WHEN NOT MATCHED THEN ...' prefix
-    // (strip it — the is_match parameter already encodes this)
     let s = if s.to_uppercase().starts_with("WHEN MATCHED THEN ") {
         s[18..].trim()
     } else if s.to_uppercase().starts_with("WHEN NOT MATCHED THEN ") {
@@ -300,28 +332,188 @@ fn parse_merge_action_string(s: &str, is_match: bool) -> Result<Vec<MergePlanAct
         let clause = clause.trim();
         if clause.is_empty() { continue; }
 
-        // Find WHERE keyword (case-insensitive)
-        let where_pos = clause.to_uppercase().find("WHERE");
+        let upper = clause.to_uppercase();
 
-        let (action_str, where_str) = if let Some(wp) = where_pos {
-            (clause[..wp].trim(), clause[wp + 5..].trim())
-        } else {
-            (clause, "")
+        // Find WHERE keyword
+        let where_pos = upper.find("WHERE");
+
+        // Find SET keyword
+        let set_pos = upper.find("SET");
+
+        // Parse the three parts: ACTION [WHERE ...] [SET ...]
+        // The action is always first (UPDATE, DELETE, INSERT, SKIP)
+        let (action_end, where_str, set_str) = match (where_pos, set_pos) {
+            (Some(wp), Some(sp)) => {
+                let end = wp.min(sp);
+                let w = if wp > sp { clause[wp + 5..].trim() } else { "" };
+                let st = if sp > wp { clause[sp + 3..].trim() } else { "" };
+                (end, w, st)
+            }
+            (Some(wp), None) => (wp, clause[wp + 5..].trim(), ""),
+            (None, Some(sp)) => (sp, "", clause[sp + 3..].trim()),
+            (None, None) => (clause.len(), "", ""),
         };
 
+        let action_str = clause[..action_end].trim();
         let action = parse_action_str(action_str, is_match)?;
+
         let condition = if where_str.is_empty() {
             None
         } else {
             Some(parse_where(where_str)?)
         };
-        actions.push(MergePlanAction { action, condition });
+
+        // Parse SET clause
+        let set = if set_str.is_empty() {
+            None
+        } else {
+            Some(parse_set_clause_for_merge(set_str)?)
+        };
+
+        actions.push(MergePlanAction { action, condition, set });
     }
 
     if actions.is_empty() {
         return Err(format!("No valid actions found in: '{}'", s));
     }
     Ok(actions)
+}
+
+/// Parse a SET clause for merge: "t.name = s.full_name, t.status = 'active'"
+fn parse_set_clause_for_merge(s: &str) -> Result<Vec<(String, ValueSpec)>, String> {
+    let mut result = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() { continue; }
+
+        let eq_pos = part.find('=')
+            .ok_or_else(|| format!("Expected '=' in SET clause: '{}'", part))?;
+
+        let target = part[..eq_pos].trim();
+        let value_str = part[eq_pos + 1..].trim();
+
+        // Strip t. prefix from target
+        let target = target.strip_prefix("t.").unwrap_or(target).to_string();
+
+        // Parse the value spec
+        let spec = if value_str.starts_with("s.") {
+            ValueSpec::SourceCol(value_str[2..].to_string())
+        } else if value_str.starts_with("t.") {
+            ValueSpec::TargetCol(value_str[2..].to_string())
+        } else if value_str.starts_with('\'') && value_str.ends_with('\'') {
+            ValueSpec::Static(JsonValue::String(value_str[1..value_str.len()-1].to_string()))
+        } else if value_str.eq_ignore_ascii_case("true") {
+            ValueSpec::Static(JsonValue::Bool(true))
+        } else if value_str.eq_ignore_ascii_case("false") {
+            ValueSpec::Static(JsonValue::Bool(false))
+        } else if value_str.eq_ignore_ascii_case("null") {
+            ValueSpec::Static(JsonValue::Null)
+        } else if let Ok(i) = value_str.parse::<i64>() {
+            ValueSpec::Static(JsonValue::Number(serde_json::Number::from(i)))
+        } else if let Ok(f) = value_str.parse::<f64>() {
+            ValueSpec::Static(serde_json::Number::from_f64(f)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null))
+        } else {
+            // Unquoted string → treat as string literal
+            ValueSpec::Static(JsonValue::String(value_str.to_string()))
+        };
+
+        result.push((target, spec));
+    }
+    if result.is_empty() {
+        return Err("SET clause is empty".to_string());
+    }
+    Ok(result)
+}
+
+/// Build a combined context for evaluating WHERE clauses with t./s. prefixes.
+///
+/// Returns a JSON object with keys like "t.col" and "s.col" that the
+/// WhereExpr evaluator can look up.
+fn build_merge_context(target_row: Option<&JsonValue>, source_row: &JsonValue) -> JsonValue {
+    let mut ctx = serde_json::Map::new();
+
+    // Add target columns with t. prefix
+    if let Some(target) = target_row {
+        if let Some(obj) = target.as_object() {
+            for (k, v) in obj {
+                ctx.insert(format!("t.{}", k), v.clone());
+                // Also add without prefix for backward compat
+                ctx.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    // Add source columns with s. prefix
+    if let Some(obj) = source_row.as_object() {
+        for (k, v) in obj {
+            ctx.insert(format!("s.{}", k), v.clone());
+            // Only add without prefix if not already present from target
+            ctx.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+
+    JsonValue::Object(ctx)
+}
+
+/// Apply a SET clause to produce the final row for upsert.
+///
+/// - If set is None: copy all source columns (minus _rowid/_version/_deleted)
+/// - If set is Some: only update the specified columns, keeping target values
+///   for columns not in the SET clause
+fn apply_set_to_row(
+    target_row: Option<&JsonValue>,
+    source_row: &JsonValue,
+    set: &Option<Vec<(String, ValueSpec)>>,
+    existing_rowid: Option<&str>,
+) -> JsonValue {
+    match set {
+        None => {
+            // Default: copy all source columns + set _rowid
+            let mut result = source_row.clone();
+            if let Some(obj) = result.as_object_mut() {
+                if let Some(rid) = existing_rowid {
+                    obj.insert("_rowid".to_string(), json!(rid));
+                }
+            }
+            result
+        }
+        Some(mappings) => {
+            // Start with the target row (if exists), apply SET overrides
+            let mut result = serde_json::Map::new();
+
+            // Copy target row as base (preserving columns not in SET)
+            if let Some(target) = target_row {
+                if let Some(obj) = target.as_object() {
+                    for (k, v) in obj {
+                        result.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+
+            // Apply SET mappings
+            for (target_col, spec) in mappings {
+                let val = match spec {
+                    ValueSpec::SourceCol(src_col) => {
+                        source_row.get(src_col).cloned().unwrap_or(JsonValue::Null)
+                    }
+                    ValueSpec::TargetCol(t_col) => {
+                        target_row.and_then(|t| t.get(t_col)).cloned().unwrap_or(JsonValue::Null)
+                    }
+                    ValueSpec::Static(v) => v.clone(),
+                };
+                result.insert(target_col.clone(), val);
+            }
+
+            // Ensure _rowid is set
+            if let Some(rid) = existing_rowid {
+                result.insert("_rowid".to_string(), json!(rid));
+            }
+
+            JsonValue::Object(result)
+        }
+    }
 }
 
 fn parse_action_str(s: &str, is_match: bool) -> Result<MergeActionType, String> {
@@ -1604,8 +1796,9 @@ impl Storage {
         let existing = read_collection_as_json_rows(&storage, collection, &kc)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
-        // Build a lookup: composite key → existing _rowid
-        let mut key_to_rowid: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Build a lookup: composite key → (existing _rowid, existing row)
+        // We store the full target row so we can evaluate WHERE on t. columns
+        let mut key_to_target: std::collections::HashMap<String, (String, JsonValue)> = std::collections::HashMap::new();
         for (_, row) in &existing {
             let mut composite_key = String::new();
             for (target_col, _) in &match_keys {
@@ -1614,7 +1807,7 @@ impl Storage {
                 composite_key.push_str(&val);
             }
             if let Some(rowid) = row.get("_rowid").and_then(|v| v.as_str()).map(|s| s.to_string()) {
-                key_to_rowid.insert(composite_key, rowid);
+                key_to_target.insert(composite_key, (rowid, row.clone()));
             }
         }
 
@@ -1629,7 +1822,7 @@ impl Storage {
         let mut to_delete: Vec<String> = Vec::new();
         let mut counts = MergeCounts::default();
 
-        for mut row in filtered_rows {
+        for row in filtered_rows {
             // Build composite key from source row using source_col names
             let mut composite_key = String::new();
             for (_, source_col) in &match_keys {
@@ -1638,25 +1831,29 @@ impl Storage {
                 composite_key.push_str(&val);
             }
 
-            let matched_rowid = key_to_rowid.get(&composite_key).cloned();
+            let matched = key_to_target.get(&composite_key);
 
-            if let Some(existing_rowid) = matched_rowid {
+            if let Some((existing_rowid, target_row)) = matched {
                 counts.matched += 1;
+                // Build combined context for t./s. prefixed WHERE evaluation
+                let ctx = build_merge_context(Some(target_row), &row);
+
                 // Run through the match plan
                 for action in &match_plan {
-                    // Check conditional WHERE if present
+                    // Check conditional WHERE against combined context
                     if let Some(ref cond) = action.condition {
-                        if !cond.eval(&row) {
+                        if !cond.eval(&ctx) {
                             counts.skipped += 1;
                             continue;
                         }
                     }
                     match action.action {
                         MergeActionType::Update => {
-                            if let Some(obj) = row.as_object_mut() {
-                                obj.insert("_rowid".to_string(), json!(existing_rowid));
-                            }
-                            to_upsert.push(row.clone());
+                            // Apply SET clause (or default: copy all source cols)
+                            let updated = apply_set_to_row(
+                                Some(target_row), &row, &action.set, Some(existing_rowid),
+                            );
+                            to_upsert.push(updated);
                             counts.updated += 1;
                         }
                         MergeActionType::Delete => {
@@ -1671,16 +1868,21 @@ impl Storage {
                 }
             } else {
                 // No match — run through the miss plan
+                // Build context with no target row
+                let ctx = build_merge_context(None, &row);
+
                 for action in &miss_plan {
                     if let Some(ref cond) = action.condition {
-                        if !cond.eval(&row) {
+                        if !cond.eval(&ctx) {
                             counts.skipped += 1;
                             continue;
                         }
                     }
                     match action.action {
                         MergeActionType::Insert => {
-                            to_upsert.push(row.clone());
+                            // Apply SET clause for inserts too (if provided)
+                            let inserted = apply_set_to_row(None, &row, &action.set, None);
+                            to_upsert.push(inserted);
                             counts.inserted += 1;
                         }
                         MergeActionType::Skip => {

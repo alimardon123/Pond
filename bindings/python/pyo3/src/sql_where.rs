@@ -97,15 +97,32 @@ impl WhereExpr {
 }
 
 /// Evaluate a comparison: cell op target.
+///
+/// Handles type coercion: bool true/false is equivalent to int 1/0,
+/// so `flag = true` matches a cell stored as `1`.
 fn eval_compare(cell: Option<&JsonValue>, op: &str, target: &JsonValue) -> bool {
     match op {
-        "=" | "==" => cell == Some(target),
-        "!=" | "<>" => cell != Some(target),
+        "=" | "==" => json_values_equal(cell, target),
+        "!=" | "<>" => !json_values_equal(cell, target),
         ">" => cmp_json(cell, target) == std::cmp::Ordering::Greater,
         ">=" => matches!(cmp_json(cell, target), std::cmp::Ordering::Greater | std::cmp::Ordering::Equal),
         "<" => cmp_json(cell, target) == std::cmp::Ordering::Less,
         "<=" => matches!(cmp_json(cell, target), std::cmp::Ordering::Less | std::cmp::Ordering::Equal),
         _ => false,
+    }
+}
+
+/// Check if two JSON values are equal, with type coercion:
+///   Bool(true) == Number(1), Bool(false) == Number(0)
+fn json_values_equal(cell: Option<&JsonValue>, target: &JsonValue) -> bool {
+    match (cell, target) {
+        (Some(JsonValue::Bool(b)), JsonValue::Number(n)) => {
+            n.as_i64() == Some(if *b { 1 } else { 0 })
+        }
+        (Some(JsonValue::Number(n)), JsonValue::Bool(b)) => {
+            n.as_i64() == Some(if *b { 1 } else { 0 })
+        }
+        _ => cell == Some(target),
     }
 }
 

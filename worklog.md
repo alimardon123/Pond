@@ -5951,3 +5951,65 @@ Stage Summary:
 - on_match/on_miss support SQL-style strings ('UPDATE WHERE age >= 18; DELETE WHERE age < 18')
 - Parallel row group decoding for large collections (>2 row groups)
 - All 21 tests pass, build succeeds
+
+---
+Task ID: 78
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Full SQL MERGE semantics (t./s. in WHERE + SET clause) + SIMD filter.
+
+User feedback:
+  1. "We need t. and s. in on_match/on_miss WHERE clauses too"
+  2. "What if I want static values or column mapping?"
+  3. "Continue with SIMD and vectorized execution"
+
+Work Log:
+1. ADDED t./s. prefix support in merge action WHERE clauses:
+   - on_match="UPDATE WHERE t.status = 'active' AND s.amount > 100"
+   - Conditions evaluate against a COMBINED context with both t. and s. columns
+   - build_merge_context() creates a JSON object with t.col and s.col keys
+   - Allows filtering on BOTH target and source row values simultaneously
+
+2. ADDED SET clause for column mapping + static values:
+   - on_match="UPDATE SET t.name = s.full_name, t.status = 'active', t.balance = 999"
+   - ValueSpec enum: SourceCol(s.col), TargetCol(t.col), Static(value)
+   - When SET is provided: only update specified columns, keep target values for rest
+   - When SET is None: copy all source columns (default behavior)
+   - Supports: column mapping (s.col → t.col), static values, keeping target values
+   - Also works for INSERT: on_miss="INSERT SET t.id = s.cid, t.email = s.mail"
+
+3. ADDED bool/int type coercion in WHERE evaluation:
+   - flag = true now matches INT64 cell value 1 (booleans stored as 1/0 in PND2)
+   - json_values_equal() handles Bool(true) == Number(1) coercion
+
+4. ADDED SIMD-accelerated INT64 filter (new module: simd.rs):
+   - Uses std::arch::x86_64 AVX2 intrinsics for 4x i64 comparison per instruction
+   - filter_eq_i64(data, value) — equality filter
+   - filter_cmp_i64(data, op, value) — comparison filter (>, >=, <, <=, !=)
+   - filter_range_i64(data, min, max) — range filter
+   - Falls back to scalar on non-x86_64 or pre-AVX2 CPUs
+   - LLVM may also auto-vectorize the scalar fallback
+   - 5 unit tests in the module
+
+5. Full SQL MERGE semantics now supported programmatically:
+   s.merge_rows('inventory', [
+       {'id': 2, 'new_qty': 100},
+       {'id': 3, 'remove': True},
+   ], on='t.id = s.id',
+      on_match="UPDATE WHERE t.status = 'low' SET t.qty = s.new_qty, t.status = 'stocked'; DELETE WHERE s.remove = true")
+   # → updates low-stock items from source, deletes items marked for removal
+
+TEST RESULTS:
+  - test_beautiful_api.py: 8/8 passed ✓
+  - test_sql_where.py: 13/13 passed ✓
+  - Manual tests: t./s. WHERE, SET clause, column mapping, multi-action, bool/int ✓
+  - Build: cargo build -p pond_python --release ✓
+
+Stage Summary:
+- Full SQL MERGE semantics: t./s. prefixed WHERE + SET clause + multi-action
+- Column mapping: t.name = s.full_name (different names per side)
+- Static values: t.status = 'active', t.balance = 999
+- Selective updates: only update columns in SET, keep rest from target
+- INSERT with SET: on_miss="INSERT SET t.id = s.cid"
+- SIMD-accelerated INT64 filter (AVX2, 4x i64 per instruction)
+- Bool/int type coercion in WHERE evaluation
+- All 21 tests pass, build succeeds
