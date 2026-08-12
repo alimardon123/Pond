@@ -614,6 +614,123 @@ detection — the merge is deterministic (G-Set union). If both branches
 updated the same `_rowid`, the one with the latest `_version` wins after
 `read_with_shards` merges.
 
+### 6.7 merge_rows — full SQL MERGE reference
+
+`merge_rows` implements complete SQL MERGE semantics with multi-action,
+multi-key, column mapping, and conditional execution.
+
+#### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `collection` | (required) | Target collection name |
+| `rows` | (required) | List of source row dicts |
+| `on` | `'_rowid'` | Key specification for matching (see below) |
+| `key_col` | `None` | Shorthand for `on='col'` (deprecated — use `on`) |
+| `crdt` | `True` | Use CRDT shards (True) or rewrite HEAD (False) |
+| `where` | `None` | SQL WHERE filter on INCOMING (source) rows |
+| `on_match` | `'UPDATE'` | Action(s) for WHEN MATCHED |
+| `on_miss` | `'INSERT'` | Action(s) for WHEN NOT MATCHED BY TARGET |
+| `on_miss_target` | `'SKIP'` | Action(s) for WHEN NOT MATCHED BY SOURCE |
+
+#### `on=` — key matching
+
+```python
+on='id'                           # single key, same name both sides
+on=['id', 'email']                # multi-key, same names
+on=[('user_id', 'id')]            # different names (target, source)
+on='t.user_id = s.id'             # SQL-like (recommended)
+on='t.id = s.id AND t.code = s.code'  # multi-key SQL-like
+```
+
+#### `on_match` / `on_miss` / `on_miss_target` — action plans
+
+All three accept the same formats:
+
+```python
+# String — single action
+on_match='UPDATE'
+on_match='DELETE'
+on_match='SKIP'
+
+# SQL-style string — with condition + SET
+on_match="UPDATE WHERE s.age >= 18 SET t.status = 'adult'"
+on_match="DELETE WHERE s.age < 18"
+on_miss="INSERT WHERE s.age >= 18"
+
+# Multi-action — semicolon-separated
+on_match="UPDATE WHERE s.age >= 18; DELETE WHERE s.age < 18"
+
+# List of strings — multi-action
+on_match=['update', 'delete']
+
+# List of tuples — (action, where) pairs
+on_match=[('update', 's.age >= 18'), ('delete', 's.age < 18')]
+
+# Dict — {action: where}
+on_match={'update': 's.age >= 18', 'delete': 's.age < 18'}
+```
+
+#### SET clause — column mapping
+
+Three modes:
+
+```python
+# No SET → copy ALL source columns (default)
+on_match='UPDATE'
+
+# SET without * → ONLY update listed columns, keep rest from target
+on_match="UPDATE SET t.name = s.full_name, t.status = 'active'"
+
+# SET *, ... → copy ALL source columns, THEN override specific ones
+on_match="UPDATE SET *, t.status = 'active', t.updated_at = 999"
+```
+
+SET value specs:
+- `s.col_name` — copy from source column
+- `t.col_name` — keep target's existing value
+- `'static'` — set to static string
+- `999` — set to static number
+- `true` / `false` — set to static boolean
+- `null` — set to null
+
+#### WHEN clauses
+
+| Parameter | SQL clause | Fires when |
+|---|---|---|
+| `on_match` | WHEN MATCHED | Source row matches a target row |
+| `on_miss` | WHEN NOT MATCHED BY TARGET | Source row has no matching target |
+| `on_miss_target` | WHEN NOT MATCHED BY SOURCE | Target row has no matching source |
+
+#### t./s. prefixes in WHERE
+
+Conditions can reference both target and source columns:
+
+```python
+on_match="UPDATE WHERE t.status = 'active' AND s.amount > 100"
+# → only update when target status is active AND source amount > 100
+```
+
+#### Returns
+
+```python
+{'matched': 2, 'updated': 1, 'deleted': 1, 'inserted': 1, 'skipped': 2}
+```
+
+#### Complete example
+
+```python
+s.merge_rows('inventory', [
+    {'id': 2, 'new_qty': 100, 'remove': False},
+    {'id': 3, 'new_qty': 0, 'remove': True},
+    {'id': 5, 'new_qty': 50, 'remove': False},
+], on='t.id = s.id',
+   on_match="UPDATE WHERE t.status = 'low' SET t.qty = s.new_qty, t.status = 'stocked'; "
+            "DELETE WHERE s.remove = true",
+   on_miss="INSERT WHERE s.new_qty > 0",
+   on_miss_target="DELETE WHERE t.status = 'discontinued'")
+```
+
 ---
 
 ## 7. Atomic Publication (Transactions)

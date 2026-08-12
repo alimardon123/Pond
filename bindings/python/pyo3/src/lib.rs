@@ -1851,8 +1851,15 @@ impl Storage {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
         let miss_plan = parse_merge_action(on_miss, false)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
-        let miss_target_plan = parse_merge_action(on_miss_target, true)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+        // on_miss_target defaults to Skip (do nothing with unmatched targets)
+        // — NOT Update, which would overwrite target rows with empty source data
+        let miss_target_plan = if on_miss_target.is_some() {
+            parse_merge_action(on_miss_target, true)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?
+        } else {
+            vec![MergePlanAction { action: MergeActionType::Skip, condition: None, set: None }]
+        };
 
         // Classify incoming rows into actions
         let mut to_upsert: Vec<JsonValue> = Vec::new();

@@ -322,7 +322,7 @@ def test_merge_on_miss_skip():
             {'id': 1, 'name': 'ALICE_UPDATED'},
             {'id': 99, 'name': 'should_not_insert'},
         ], on='id', on_match='update', on_miss='skip')
-        assert result["matched"] + result["skipped"] == 2, f"Expected 2 processed, got {result}"
+        assert result["matched"] == 1 and result["updated"] == 1, f"Expected 1 matched+updated, got {result}"
 
         cols = s.read_rows('users')
         ids = cols['id']
