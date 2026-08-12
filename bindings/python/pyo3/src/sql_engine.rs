@@ -1,30 +1,87 @@
-// SQL engine — full SELECT / UPDATE / DELETE / MERGE support.
+// SQL engine — full SELECT / UPDATE / DELETE / INSERT / MERGE support.
 //
 // Parses and executes a subset of SQL against Pond collections.
 // All execution happens in Rust — zero Python overhead.
 //
 // Supported statements:
 //
-//   SELECT * | col1, col2, ... FROM collection [WHERE ...]
-//   UPDATE collection SET col1 = val1, col2 = val2 [WHERE ...]
+//   SELECT * | col1, col2, ... FROM collection [JOIN ... ON ...] [WHERE ...]
+//   SELECT * FROM 'data.csv' WHERE ...           (file reading)
+//   SELECT * FROM 'data.json' WHERE ...          (file reading)
+//   UPDATE collection SET col1 = val1 [WHERE ...]
 //   DELETE FROM collection [WHERE ...]
 //   INSERT INTO collection (col1, col2) VALUES (v1, v2), (v3, v4)
 //   MERGE INTO target USING source ON key = key
-//     WHEN MATCHED THEN UPDATE SET ...
-//     WHEN MATCHED THEN DELETE
-//     WHEN NOT MATCHED THEN INSERT (cols) VALUES (vals)
+//     WHEN MATCHED THEN UPDATE | DELETE | SKIP
+//     WHEN NOT MATCHED THEN INSERT | SKIP
+//
+// JOIN support:
+//   SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 18
+//   SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id
+//   SELECT * FROM users u LEFT JOIN orders o ON u.id = o.user_id
+//
+// File reading:
+//   SELECT * FROM 'data.csv' WHERE age > 18
+//   SELECT * FROM 'data.json' WHERE status = 'active'
 //
 // All statements support full WHERE clauses (see sql_where.rs).
 
 use crate::sql_where::{parse_where, WhereExpr};
 use serde_json::{json, Value as JsonValue};
 
+/// A table reference — either a Pond collection or an external file.
+#[derive(Debug, Clone)]
+pub enum TableRef {
+    /// A Pond collection name
+    Collection(String),
+    /// A file path (CSV, JSON, Parquet) — detected by extension
+    File(String),
+}
+
+impl TableRef {
+    /// Parse a table reference from a string. If it looks like a file path
+    /// (contains a '.' extension or starts with a quote), treat it as a file.
+    pub fn parse(s: &str) -> Self {
+        let s = s.trim().trim_matches('\'').trim_matches('"');
+        if s.ends_with(".csv") || s.ends_with(".json") || s.ends_with(".parquet")
+            || s.ends_with(".tsv") || s.ends_with(".ndjson") {
+            TableRef::File(s.to_string())
+        } else {
+            TableRef::Collection(s.to_string())
+        }
+    }
+
+    pub fn collection_name(&self) -> Option<&str> {
+        match self {
+            TableRef::Collection(name) => Some(name),
+            _ => None,
+        }
+    }
+}
+
+/// A JOIN clause in a SELECT statement.
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub table: TableRef,
+    pub alias: Option<String>,
+    pub join_type: JoinType,
+    pub on: Vec<(String, String)>,  // (left_col, right_col) — qualified names like "u.id"
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinType {
+    Inner,
+    Left,
+}
+
 /// A parsed SQL statement.
 #[derive(Debug, Clone)]
 pub enum SqlStatement {
     Select {
-        collection: String,
+        table: TableRef,
+        alias: Option<String>,
         columns: Vec<String>,    // empty = SELECT *
+        joins: Vec<JoinClause>,  // JOIN clauses
         r#where: WhereExpr,
     },
     Update {
@@ -44,7 +101,7 @@ pub enum SqlStatement {
     Merge {
         target: String,
         source_rows: Vec<JsonValue>,
-        match_keys: Vec<(String, String)>,  // (target_col, source_col) pairs
+        match_keys: Vec<(String, String)>,
         when_matched: MergeAction,
         when_not_matched: MergeAction,
     },
@@ -92,8 +149,9 @@ pub fn parse_sql(sql: &str) -> Result<SqlStatement, String> {
 // ---------------------------------------------------------------------------
 
 fn parse_select(sql: &str) -> Result<SqlStatement, String> {
-    // SELECT * FROM collection [WHERE ...]
-    // SELECT col1, col2 FROM collection [WHERE ...]
+    // SELECT * FROM collection [alias] [JOIN ... ON ...] [WHERE ...]
+    // SELECT col1, col2 FROM collection [alias] [JOIN ... ON ...] [WHERE ...]
+    // SELECT * FROM 'data.csv' WHERE ...
 
     let after_select = strip_prefix_ci(sql, "SELECT")
         .ok_or_else(|| "Expected SELECT".to_string())?
@@ -113,20 +171,181 @@ fn parse_select(sql: &str) -> Result<SqlStatement, String> {
         cols_str.split(',').map(|s| s.trim().to_string()).collect()
     };
 
-    // Check for WHERE
-    let (collection, where_expr) = if let Some(where_pos) = find_keyword(after_from, "WHERE") {
-        let coll = after_from[..where_pos].trim().to_string();
-        let where_str = after_from[where_pos + 5..].trim();
-        (coll, parse_where(where_str)?)
+    // Find WHERE (if any) — but we need to parse JOINs first
+    // Split the after_from into: table [alias] [JOIN ...] [WHERE ...]
+    let where_pos = find_keyword(after_from, "WHERE");
+    let (before_where, where_str) = if let Some(wp) = where_pos {
+        (after_from[..wp].trim(), after_from[wp + 5..].trim())
     } else {
-        (after_from.trim().to_string(), WhereExpr::True)
+        (after_from.trim(), "")
+    };
+
+    // Parse table name + optional alias
+    // The table could be: collection_name, collection_name alias, 'file.csv'
+    let mut parts = before_where.split_whitespace().peekable();
+    let table_str = parts.next()
+        .ok_or_else(|| "Expected table name after FROM".to_string())?;
+
+    // Check if the table is a quoted string (file path)
+    let table_str = if table_str.starts_with('\'') {
+        // Find the closing quote — might span multiple words
+        let mut full = String::new();
+        full.push_str(table_str);
+        while !full.ends_with('\'') {
+            if let Some(next) = parts.next() {
+                full.push(' ');
+                full.push_str(next);
+            } else {
+                break;
+            }
+        }
+        full.trim_matches('\'').to_string()
+    } else {
+        table_str.to_string()
+    };
+
+    let table = TableRef::parse(&table_str);
+
+    // Next token could be an alias or JOIN or nothing
+    let alias = if let Some(next) = parts.peek() {
+        let upper = next.to_uppercase();
+        if upper != "JOIN" && upper != "INNER" && upper != "LEFT" && upper != "WHERE" {
+            Some(parts.next().unwrap().to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Parse JOINs
+    let mut joins: Vec<JoinClause> = Vec::new();
+    let mut remaining = parts.collect::<Vec<&str>>().join(" ");
+
+    while !remaining.is_empty() {
+        let upper = remaining.to_uppercase();
+
+        // Check for JOIN or INNER JOIN or LEFT JOIN
+        let (join_type, skip_len) = if upper.starts_with("INNER JOIN") {
+            (JoinType::Inner, 10)
+        } else if upper.starts_with("LEFT JOIN") {
+            (JoinType::Left, 9)
+        } else if upper.starts_with("JOIN") {
+            (JoinType::Inner, 4)
+        } else {
+            break;
+        };
+
+        remaining = remaining[skip_len..].trim().to_string();
+
+        // Parse the joined table name + alias
+        let mut j_parts = remaining.split_whitespace().peekable();
+        let j_table_str = j_parts.next()
+            .ok_or_else(|| "Expected table name after JOIN".to_string())?;
+
+        // Check for quoted file path
+        let j_table_str = if j_table_str.starts_with('\'') {
+            let mut full = String::new();
+            full.push_str(j_table_str);
+            while !full.ends_with('\'') {
+                if let Some(next) = j_parts.next() {
+                    full.push(' ');
+                    full.push_str(next);
+                } else {
+                    break;
+                }
+            }
+            full.trim_matches('\'').to_string()
+        } else {
+            j_table_str.to_string()
+        };
+
+        let j_table = TableRef::parse(&j_table_str);
+
+        // Parse optional alias
+        let j_alias = if let Some(next) = j_parts.peek() {
+            let upper = next.to_uppercase();
+            if upper != "ON" && upper != "WHERE" && upper != "JOIN" && upper != "INNER" && upper != "LEFT" {
+                Some(j_parts.next().unwrap().to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Expect ON
+        remaining = j_parts.collect::<Vec<&str>>().join(" ");
+        let on_pos = find_keyword(&remaining, "ON")
+            .ok_or_else(|| "Expected ON after JOIN table".to_string())?;
+
+        let on_str = remaining[..on_pos].trim();
+        remaining = remaining[on_pos + 2..].trim().to_string();
+
+        // Find where the ON clause ends (at next JOIN, WHERE, or end)
+        let on_end = find_keyword(&remaining, "JOIN")
+            .or_else(|| find_keyword(&remaining, "WHERE"))
+            .or_else(|| find_keyword(&remaining, "INNER"))
+            .or_else(|| find_keyword(&remaining, "LEFT"))
+            .unwrap_or(remaining.len());
+
+        let on_condition = remaining[..on_end].trim().to_string();
+        remaining = remaining[on_end..].trim().to_string();
+
+        // Parse ON clause: "u.id = o.user_id [AND u.code = o.code]"
+        let on_pairs = parse_on_clause_for_join(&on_condition)?;
+
+        joins.push(JoinClause {
+            table: j_table,
+            alias: j_alias,
+            join_type,
+            on: on_pairs,
+        });
+    }
+
+    let where_expr = if where_str.is_empty() {
+        WhereExpr::True
+    } else {
+        parse_where(where_str)?
     };
 
     Ok(SqlStatement::Select {
-        collection,
+        table,
+        alias,
         columns,
+        joins,
         r#where: where_expr,
     })
+}
+
+/// Parse a JOIN ON clause: "u.id = o.user_id [AND u.code = o.code]"
+/// Returns a list of (left_qualified_col, right_qualified_col) pairs.
+fn parse_on_clause_for_join(s: &str) -> Result<Vec<(String, String)>, String> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    let mut pairs = Vec::new();
+    let mut i = 0;
+    while i < parts.len() {
+        let left = parts[i].trim_end_matches(',');
+        i += 1;
+        if i >= parts.len() || parts[i] != "=" {
+            return Err(format!("Expected = in ON clause after '{}'", left));
+        }
+        i += 1;
+        if i >= parts.len() {
+            return Err("Expected column after = in ON clause".to_string());
+        }
+        let right = parts[i].trim_end_matches(',');
+        i += 1;
+        pairs.push((left.to_string(), right.to_string()));
+        // Skip AND
+        if i < parts.len() && parts[i].to_uppercase() == "AND" {
+            i += 1;
+        }
+    }
+    if pairs.is_empty() {
+        return Err("ON clause must have at least one key pair".to_string());
+    }
+    Ok(pairs)
 }
 
 // ---------------------------------------------------------------------------
@@ -509,8 +728,8 @@ mod tests {
     fn test_parse_select_star() {
         let stmt = parse_sql("SELECT * FROM users").unwrap();
         match stmt {
-            SqlStatement::Select { collection, columns, .. } => {
-                assert_eq!(collection, "users");
+            SqlStatement::Select { table, columns, .. } => {
+                assert_eq!(table.collection_name(), Some("users"));
                 assert!(columns.is_empty()); // SELECT *
             }
             _ => panic!("Expected Select"),
@@ -521,10 +740,42 @@ mod tests {
     fn test_parse_select_cols_where() {
         let stmt = parse_sql("SELECT name, age FROM users WHERE age >= 18").unwrap();
         match stmt {
-            SqlStatement::Select { collection, columns, r#where } => {
-                assert_eq!(collection, "users");
+            SqlStatement::Select { table, columns, r#where, .. } => {
+                assert_eq!(table.collection_name(), Some("users"));
                 assert_eq!(columns, vec!["name", "age"]);
                 assert!(matches!(r#where, WhereExpr::Compare { .. }));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_join() {
+        let stmt = parse_sql(
+            "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 18"
+        ).unwrap();
+        match stmt {
+            SqlStatement::Select { table, alias, joins, .. } => {
+                assert_eq!(table.collection_name(), Some("users"));
+                assert_eq!(alias, Some("u".to_string()));
+                assert_eq!(joins.len(), 1);
+                assert_eq!(joins[0].table.collection_name(), Some("orders"));
+                assert_eq!(joins[0].alias, Some("o".to_string()));
+                assert_eq!(joins[0].on, vec![("u.id".to_string(), "o.user_id".to_string())]);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_file() {
+        let stmt = parse_sql("SELECT * FROM 'data.csv' WHERE age > 18").unwrap();
+        match stmt {
+            SqlStatement::Select { table, .. } => {
+                match table {
+                    TableRef::File(path) => assert_eq!(path, "data.csv"),
+                    _ => panic!("Expected File table ref"),
+                }
             }
             _ => panic!("Expected Select"),
         }

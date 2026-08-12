@@ -215,10 +215,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // Identifier or keyword
+        // Identifier or keyword (supports qualified names like u.age, o.amount)
         if c.is_alphabetic() || c == '_' {
             let mut s = String::new();
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
                 s.push(chars[i]);
                 i += 1;
             }

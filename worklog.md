@@ -5796,3 +5796,96 @@ Stage Summary:
 - All parsing + execution in Rust — zero Python overhead
 - Dict format dropped — SQL strings only
 - 21 tests pass, build succeeds
+
+---
+Task ID: 76
+Agent: main (Super Z, web-a5961fe6 session)
+Task: Unify merge action API + on= clause, add JOIN + file reading to .sql(), answer architecture question.
+
+User feedback:
+  1. "Make the merge action API more unified and beautiful"
+  2. "Make the on= clause more unified too"
+  3. "Add JOIN support and file reading (parquet, csv, json) to .sql()"
+  4. "Are we going into building an exec engine? Or is it fine to have those APIs as part of storage?"
+
+Work Log:
+1. UNIFIED merge action API — on_match/on_miss now accept all formats cleanly:
+   - 'update'                                    (string)
+   - ['update', 'delete']                        (list of strings)
+   - [('update', 'age >= 18'), ('delete', 'age < 18')]  (list of (action, where) tuples) ← NEW
+   - {'update': 'age >= 18', 'delete': 'age < 18'}      (dict)
+   The tuple format is the cleanest for conditional multi-action.
+
+2. UNIFIED on= clause — now accepts SQL-like string:
+   - on='id'                        (single key, same name)
+   - on=['id', 'email']             (multi-key, same names)
+   - on=[('user_id', 'id')]         (different names via tuples)
+   - on='user_id = id'              (SQL-like single key) ← NEW
+   - on='user_id = id AND code = c' (SQL-like multi-key) ← NEW
+
+3. ADDED JOIN support to .sql():
+   - INNER JOIN: SELECT * FROM users u JOIN orders o ON u.id = o.user_id
+   - LEFT JOIN: SELECT * FROM users u LEFT JOIN orders o ON u.id = o.user_id
+   - Multi-key JOIN: ON u.id = o.uid AND u.code = o.code
+   - JOIN with WHERE: WHERE u.age > 26 (qualified column names supported)
+   - JOIN with projection: SELECT u.name, o.amount FROM ...
+   - Collection JOIN file: SELECT * FROM users u JOIN 'data.csv' d ON u.id = d.id
+
+4. ADDED file reading to .sql():
+   - CSV: SELECT * FROM 'data.csv' WHERE age > 18
+   - JSON: SELECT * FROM 'data.json' WHERE status = 'active'
+   - NDJSON: SELECT * FROM 'data.ndjson'
+   - TSV: SELECT * FROM 'data.tsv'
+   - Auto type detection: numbers parsed as int/float, booleans, strings, nulls
+   - Parquet: not yet supported (returns clear error message)
+
+5. ARCHITECTURE ANSWER (storage vs exec engine):
+   It's fine to have .sql() as part of storage. Pond's design principle is
+   "storage backbone" — the SQL interface is a convenience layer, not the
+   core value. The current .sql() is a "basic exec engine" that handles:
+   - SELECT with WHERE, JOIN, projection
+   - UPDATE/DELETE/INSERT/MERGE
+   - CRDT merges, predicate evaluation, file reading
+   All in Rust with zero Python overhead.
+
+   For advanced use cases (cost-based optimization, query planning, vectorized
+   execution, distributed execution), external engines (DataFusion, DuckDB,
+   Polars) can connect via the low-level APIs (read_rows, write_rows, shards).
+
+   Architecture:
+     External exec engines (DataFusion, DuckDB, Polars)
+              ↓ uses low-level APIs
+     Pond Storage (read_rows, write_rows, shards, CRDT)
+       + .sql() convenience layer (basic SQL execution)
+              ↓ uses
+     Kernel (write, read, ref — 3 primitives)
+
+6. FIXED WHERE parser to support qualified column names (u.age, o.amount)
+   in JOIN queries.
+
+7. Updated sql_engine.rs:
+   - New TableRef enum (Collection | File)
+   - New JoinClause struct (table, alias, join_type, on)
+   - New JoinType enum (Inner | Left)
+   - Updated Select variant with table, alias, joins
+   - Updated parse_select to handle JOIN syntax
+   - 4 new tests (select_star, select_cols_where, select_join, select_file)
+
+8. Added helper functions in lib.rs:
+   - read_table_rows(): reads from Collection or File
+   - read_file_rows(): reads CSV, JSON, NDJSON, TSV files
+   - execute_join(): hash-based INNER/LEFT JOIN execution
+
+TEST RESULTS:
+  - test_beautiful_api.py: 8/8 passed ✓
+  - test_sql_where.py: 13/13 passed ✓
+  - Manual tests: JOIN, file reading, SQL-like on=, tuple merge actions ✓
+  - Build: cargo build -p pond_python --release ✓
+
+Stage Summary:
+- Unified merge action API (string, list, tuples, dict — all work)
+- Unified on= clause (string, list, tuples, SQL-like string)
+- JOIN support (INNER, LEFT, multi-key, with WHERE + projection)
+- File reading (CSV, JSON, NDJSON, TSV)
+- Architecture clarified: .sql() is a convenience layer on storage
+- All 21 tests pass, build succeeds

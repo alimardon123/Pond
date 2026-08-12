@@ -15,7 +15,7 @@
 mod sql_where;
 mod sql_engine;
 use sql_where::{parse_where, WhereExpr};
-use sql_engine::{parse_sql, SqlStatement, MergeAction};
+use sql_engine::{parse_sql, SqlStatement, MergeAction, TableRef, JoinClause, JoinType};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
@@ -91,13 +91,17 @@ impl Storage {
 
 /// Parse the `on` parameter into a list of (target_col, source_col) pairs.
 ///
-/// Accepts:
-///   "id"                          → [("id", "id")]
-///   ["id", "email"]               → [("id", "id"), ("email", "email")]
-///   [("user_id", "id")]           → [("user_id", "id")]
-///   [("user_id", "id"), ("code", "code")]  → [("user_id", "id"), ("code", "code")]
+/// Unified format — accepts all of these:
+///
+///   on='id'                        → [("id", "id")]
+///   on=['id', 'email']             → [("id", "id"), ("email", "email")]
+///   on=[('user_id', 'id')]         → [("user_id", "id")]
+///   on='user_id = id'              → [("user_id", "id")]  (SQL-like)
+///   on='user_id = id AND code = c' → [("user_id", "id"), ("code", "c")]
+///
+/// The SQL-like string format is the most expressive and consistent with
+/// the WHERE clause syntax.
 fn parse_match_keys(on: Option<PyObject>, key_col: Option<&str>) -> Result<Vec<(String, String)>, String> {
-    // If `on` is None, use key_col or default to _rowid
     let on = match on {
         Some(o) => o,
         None => {
@@ -107,25 +111,23 @@ fn parse_match_keys(on: Option<PyObject>, key_col: Option<&str>) -> Result<Vec<(
     };
 
     Python::with_gil(|py| {
-        // Try string first: "id" → [("id", "id")]
+        // Try string first — could be "id" or SQL-like "user_id = id AND ..."
         if let Ok(s) = on.extract::<String>(py) {
-            return Ok(vec![(s.clone(), s)]);
+            return parse_on_string(&s);
         }
 
-        // Try list of strings: ["id", "email"] → [("id", "id"), ("email", "email")]
-        if let Ok(strs) = on.extract::<Vec<String>>(py) {
-            return Ok(strs.into_iter().map(|s| (s.clone(), s)).collect());
-        }
-
-        // Try list of tuples: [("user_id", "id"), ...]
+        // Try list — could be list of strings or list of tuples
         if let Ok(list) = on.extract::<Vec<PyObject>>(py) {
             let mut keys = Vec::new();
             for item in list {
-                // Try (str, str) tuple
+                // Try (str, str) tuple first
                 if let Ok((t, s)) = item.extract::<(String, String)>(py) {
                     keys.push((t, s));
+                } else if let Ok(s) = item.extract::<String>(py) {
+                    // Bare string → same name both sides
+                    keys.push((s.clone(), s));
                 } else {
-                    return Err("on= list must contain (target_col, source_col) tuples".to_string());
+                    return Err("on= list must contain strings or (target, source) tuples".to_string());
                 }
             }
             if keys.is_empty() {
@@ -138,18 +140,55 @@ fn parse_match_keys(on: Option<PyObject>, key_col: Option<&str>) -> Result<Vec<(
     })
 }
 
+/// Parse a SQL-like ON string: "user_id = id AND code = code"
+fn parse_on_string(s: &str) -> Result<Vec<(String, String)>, String> {
+    let s = s.trim();
+
+    // If no '=' sign, treat as a bare column name (same name both sides)
+    if !s.contains('=') {
+        return Ok(vec![(s.to_string(), s.to_string())]);
+    }
+
+    // Split by AND and parse each "target = source" pair
+    let mut keys = Vec::new();
+    for part in s.split_whitespace().collect::<String>().split("AND") {
+        let part = part.trim();
+        if part.is_empty() { continue; }
+
+        let eq_pos = part.find('=')
+            .ok_or_else(|| format!("Expected '=' in ON clause: '{}'", part))?;
+
+        let target = part[..eq_pos].trim().to_string();
+        let source = part[eq_pos + 1..].trim().to_string();
+
+        if target.is_empty() || source.is_empty() {
+            return Err(format!("Invalid ON clause: '{}'", part));
+        }
+
+        keys.push((target, source));
+    }
+
+    if keys.is_empty() {
+        return Err("ON clause must have at least one key pair".to_string());
+    }
+    Ok(keys)
+}
+
 /// Parse the on_match / on_miss parameter into a list of actions.
 ///
-/// Accepts:
-///   None                          → default (update for match, insert for miss)
-///   "update"                      → [Update (no condition)]
-///   ["update", "delete"]          → [Update, Delete] (multi-action)
-///   {"update": "age > 18", "delete": "age < 18"}  → [Update if age>18, Delete if age<18]
+/// Unified format — accepts all of these:
+///
+///   on_match='update'                                    → [Update]
+///   on_match=['update', 'delete']                        → [Update, Delete]
+///   on_match=[('update', 'age >= 18'), ('delete', 'age < 18')]  → conditional
+///   on_match={'update': 'age >= 18', 'delete': 'age < 18'}      → conditional (dict)
+///
+/// The tuple format (action, where) is the cleanest for conditional multi-action:
+///   on_match=[('update', 'age >= 18'), ('delete', 'age < 18')]
 fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<MergePlanAction>, String> {
     let param = match param {
         Some(p) => p,
         None => {
-            // Default: update for match, insert for miss
             return Ok(vec![MergePlanAction {
                 action: if is_match { MergeActionType::Update } else { MergeActionType::Insert },
                 condition: None,
@@ -164,12 +203,26 @@ fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<Mer
             return Ok(vec![MergePlanAction { action, condition: None }]);
         }
 
-        // Try list: ["update", "delete"]
-        if let Ok(list) = param.extract::<Vec<String>>(py) {
+        // Try list — could be list of strings or list of (action, where) tuples
+        if let Ok(list) = param.extract::<Vec<PyObject>>(py) {
             let mut actions = Vec::new();
-            for s in list {
-                let action = parse_action_str(&s, is_match)?;
-                actions.push(MergePlanAction { action, condition: None });
+            for item in list {
+                // Try (str, str) tuple → (action, where)
+                if let Ok((action_str, where_str)) = item.extract::<(String, String)>(py) {
+                    let action = parse_action_str(&action_str, is_match)?;
+                    let condition = if where_str.trim().is_empty() {
+                        None
+                    } else {
+                        Some(parse_where(&where_str)?)
+                    };
+                    actions.push(MergePlanAction { action, condition });
+                } else if let Ok(s) = item.extract::<String>(py) {
+                    // Bare string → action with no condition
+                    let action = parse_action_str(&s, is_match)?;
+                    actions.push(MergePlanAction { action, condition: None });
+                } else {
+                    return Err("on_match/on_miss list must contain strings or (action, where) tuples".to_string());
+                }
             }
             if actions.is_empty() {
                 return Err("on_match/on_miss list is empty".to_string());
@@ -195,7 +248,7 @@ fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<Mer
             return Ok(actions);
         }
 
-        Err("on_match/on_miss must be a string, list of strings, or dict".to_string())
+        Err("on_match/on_miss must be a string, list, or dict".to_string())
     })
 }
 
@@ -272,6 +325,168 @@ fn json_to_pyobject(py: Python, v: &JsonValue) -> PyObject {
             dict.into()
         }
     }
+}
+
+/// Read rows from a table reference — either a Pond collection or an external file.
+///
+/// For collections: reads HEAD + shards, applies CRDT merge.
+/// For files: reads CSV, JSON, or NDJSON files and converts to JSON rows.
+fn read_table_rows(
+    storage: &pond_storage::UnifiedStorage,
+    table: &TableRef,
+) -> Result<Vec<JsonValue>, String> {
+    match table {
+        TableRef::Collection(name) => {
+            let kc = vec!["_rowid".to_string()];
+            let all_rows = read_collection_as_json_rows(storage, name, &kc)?;
+            Ok(crdt_merge_rows(all_rows))
+        }
+        TableRef::File(path) => {
+            read_file_rows(path)
+        }
+    }
+}
+
+/// Read rows from a file (CSV, JSON, NDJSON).
+fn read_file_rows(path: &str) -> Result<Vec<JsonValue>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+
+    if path.ends_with(".json") || path.ends_with(".ndjson") {
+        // NDJSON: one JSON object per line
+        if path.ends_with(".ndjson") {
+            let mut rows = Vec::new();
+            for line in content.lines() {
+                if line.trim().is_empty() { continue; }
+                let row: JsonValue = serde_json::from_str(line)
+                    .map_err(|e| format!("Failed to parse NDJSON line: {}", e))?;
+                rows.push(row);
+            }
+            Ok(rows)
+        } else {
+            // JSON: could be a single array or a single object
+            let parsed: JsonValue = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+            match parsed {
+                JsonValue::Array(arr) => Ok(arr),
+                JsonValue::Object(obj) => Ok(vec![JsonValue::Object(obj)]),
+                _ => Err("JSON file must contain an array or object".to_string()),
+            }
+        }
+    } else if path.ends_with(".csv") || path.ends_with(".tsv") {
+        // CSV/TSV parsing
+        let delimiter = if path.ends_with(".tsv") { '\t' } else { ',' };
+        let mut rows = Vec::new();
+        let mut lines = content.lines();
+        let header_line = lines.next()
+            .ok_or_else(|| "CSV file is empty".to_string())?;
+        let headers: Vec<String> = header_line.split(delimiter)
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .collect();
+
+        for line in lines {
+            if line.trim().is_empty() { continue; }
+            let values: Vec<&str> = line.split(delimiter).collect();
+            let mut obj = serde_json::Map::new();
+            for (i, header) in headers.iter().enumerate() {
+                let val_str = values.get(i).unwrap_or(&"").trim().trim_matches('"');
+                // Try to parse as number, then bool, then string
+                let val = if let Ok(n) = val_str.parse::<i64>() {
+                    JsonValue::Number(serde_json::Number::from(n))
+                } else if let Ok(f) = val_str.parse::<f64>() {
+                    serde_json::Number::from_f64(f)
+                        .map(JsonValue::Number)
+                        .unwrap_or(JsonValue::String(val_str.to_string()))
+                } else if val_str.eq_ignore_ascii_case("true") {
+                    JsonValue::Bool(true)
+                } else if val_str.eq_ignore_ascii_case("false") {
+                    JsonValue::Bool(false)
+                } else if val_str.is_empty() {
+                    JsonValue::Null
+                } else {
+                    JsonValue::String(val_str.to_string())
+                };
+                obj.insert(header.clone(), val);
+            }
+            rows.push(JsonValue::Object(obj));
+        }
+        Ok(rows)
+    } else if path.ends_with(".parquet") {
+        Err("Parquet file reading not yet supported. Use CSV or JSON.".to_string())
+    } else {
+        Err(format!("Unsupported file format: '{}'", path))
+    }
+}
+
+/// Execute a JOIN between two sets of rows.
+///
+/// ON conditions are pairs of qualified column names like ("u.id", "o.user_id").
+/// The function finds matching rows and merges them into combined row objects.
+fn execute_join(
+    left_rows: Vec<JsonValue>,
+    right_rows: Vec<JsonValue>,
+    on: &[(String, String)],
+    join_type: &JoinType,
+) -> Vec<JsonValue> {
+    // Build an index on right_rows: composite key → list of right rows
+    let mut right_index: std::collections::HashMap<String, Vec<&JsonValue>> = std::collections::HashMap::new();
+    for right_row in &right_rows {
+        let mut composite_key = String::new();
+        for (_, right_col) in on {
+            let val = right_row.get(right_col).map(|v| v.to_string()).unwrap_or_default();
+            if !composite_key.is_empty() { composite_key.push('\x1f'); }
+            composite_key.push_str(&val);
+        }
+        right_index.entry(composite_key).or_insert_with(Vec::new).push(right_row);
+    }
+
+    let mut result: Vec<JsonValue> = Vec::new();
+
+    for left_row in &left_rows {
+        // Build composite key from left row
+        let mut composite_key = String::new();
+        for (left_col, _) in on {
+            let val = left_row.get(left_col).map(|v| v.to_string()).unwrap_or_default();
+            if !composite_key.is_empty() { composite_key.push('\x1f'); }
+            composite_key.push_str(&val);
+        }
+
+        match right_index.get(&composite_key) {
+            Some(matches) => {
+                // Inner join — merge left + each matching right
+                for right_row in matches {
+                    let mut merged = left_row.clone();
+                    if let (Some(merged_obj), Some(right_obj)) = (merged.as_object_mut(), right_row.as_object()) {
+                        for (k, v) in right_obj {
+                            merged_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                    result.push(merged);
+                }
+            }
+            None => {
+                // Left join — include left row with nulls for right columns
+                if *join_type == JoinType::Left {
+                    let mut merged = left_row.clone();
+                    // Add null values for right columns
+                    if let Some(right_row) = right_rows.first() {
+                        if let Some(right_obj) = right_row.as_object() {
+                            if let Some(merged_obj) = merged.as_object_mut() {
+                                for k in right_obj.keys() {
+                                    if !merged_obj.contains_key(k) {
+                                        merged_obj.insert(k.clone(), JsonValue::Null);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    result.push(merged);
+                }
+            }
+        }
+    }
+
+    result
 }
 
 // Re-use the shared constants and parser from pond-core.
@@ -1495,26 +1710,76 @@ impl Storage {
         let stmt = parse_sql(sql).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
         match stmt {
-            SqlStatement::Select { collection, columns, r#where } => {
-                // Execute SELECT — read rows, apply WHERE, project columns
+            SqlStatement::Select { table, alias, columns, joins, r#where } => {
+                // Execute SELECT — read rows from table (collection or file),
+                // apply JOINs, apply WHERE, project columns
                 let storage = self.storage.lock().unwrap();
-                let kc = vec!["_rowid".to_string()];
-                let all_rows = read_collection_as_json_rows(&storage, &collection, &kc)
+
+                // Read the base table
+                let mut result_rows = read_table_rows(&storage, &table)
                     .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
-                let merged = crdt_merge_rows(all_rows);
+
+                // If there's an alias, prefix all columns with the alias
+                if let Some(ref al) = alias {
+                    for row in &mut result_rows {
+                        if let Some(obj) = row.as_object_mut() {
+                            let prefixed: Vec<(String, JsonValue)> = obj.iter()
+                                .map(|(k, v)| (format!("{}.{}", al, k), v.clone()))
+                                .collect();
+                            obj.clear();
+                            for (k, v) in prefixed {
+                                obj.insert(k, v);
+                            }
+                        }
+                    }
+                }
+
+                // Execute JOINs
+                for join in &joins {
+                    let right_rows = read_table_rows(&storage, &join.table)
+                        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+                    // Prefix right rows with alias if present
+                    let mut right_rows_prefixed: Vec<JsonValue> = right_rows;
+                    if let Some(ref al) = join.alias {
+                        for row in &mut right_rows_prefixed {
+                            if let Some(obj) = row.as_object_mut() {
+                                let prefixed: Vec<(String, JsonValue)> = obj.iter()
+                                    .map(|(k, v)| (format!("{}.{}", al, k), v.clone()))
+                                    .collect();
+                                obj.clear();
+                                for (k, v) in prefixed {
+                                    obj.insert(k, v);
+                                }
+                            }
+                        }
+                    }
+
+                    // Execute the join
+                    result_rows = execute_join(result_rows, right_rows_prefixed, &join.on, &join.join_type);
+                }
 
                 // Apply WHERE filter
-                let filtered: Vec<&JsonValue> = merged.iter()
+                let filtered: Vec<&JsonValue> = result_rows.iter()
                     .filter(|row| r#where.eval(row))
                     .collect();
 
-                // Build columnar result
+                // Build columnar result — handle qualified column names
                 let mut result_cols: std::collections::HashMap<String, Vec<PyObject>> = std::collections::HashMap::new();
                 for row in &filtered {
                     if let Some(obj) = row.as_object() {
                         for (name, value) in obj {
-                            // Apply projection
-                            if !columns.is_empty() && !columns.contains(name) {
+                            // Apply projection (support both "col" and "alias.col")
+                            if !columns.is_empty() {
+                                let matches = columns.iter().any(|c| {
+                                    c == name || c.split('.').last() == Some(name.as_str())
+                                        || name.ends_with(&format!(".{}", c))
+                                });
+                                if !matches { continue; }
+                            }
+                            // Skip CRDT metadata
+                            let base_name = name.rsplit('.').next().unwrap_or(name);
+                            if base_name == "_rowid" || base_name == "_version" || base_name == "_deleted" {
                                 continue;
                             }
                             let entry = result_cols.entry(name.clone()).or_insert_with(Vec::new);
@@ -1523,16 +1788,8 @@ impl Storage {
                     }
                 }
 
-                // Filter out CRDT metadata columns unless explicitly requested
-                let crdt_cols: std::collections::HashSet<&str> = ["_rowid", "_version", "_deleted"]
-                    .iter().cloned().collect();
-                let explicit_columns = !columns.is_empty();
-
                 let dict = PyDict::new_bound(py);
                 for (name, values) in result_cols {
-                    if !explicit_columns && crdt_cols.contains(name.as_str()) {
-                        continue;
-                    }
                     let list = PyList::new_bound(py, values.iter());
                     dict.set_item(&name, list)?;
                 }
