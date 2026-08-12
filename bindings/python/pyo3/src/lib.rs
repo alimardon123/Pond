@@ -141,6 +141,19 @@ fn parse_match_keys(on: Option<PyObject>, key_col: Option<&str>) -> Result<Vec<(
 }
 
 /// Parse a SQL-like ON string: "user_id = id AND code = code"
+/// Parse a SQL-like ON string into (target_col, source_col) pairs.
+///
+/// Supports t./s. prefixes for clarity (t = target, s = source):
+///
+///   on='t.user_id = s.id'                     → [("user_id", "id")]
+///   on='t.user_id = s.id AND t.code = s.code' → [("user_id", "id"), ("code", "code")]
+///   on='t.id = s.id'                          → [("id", "id")]
+///
+/// Also supports bare column names (same name both sides):
+///   on='id'                                   → [("id", "id")]
+///   on='user_id = id AND code = code'         → [("user_id", "id"), ("code", "code")]
+///
+/// The t./s. prefix format is recommended — it's unambiguous and SQL-consistent.
 fn parse_on_string(s: &str) -> Result<Vec<(String, String)>, String> {
     let s = s.trim();
 
@@ -158,12 +171,16 @@ fn parse_on_string(s: &str) -> Result<Vec<(String, String)>, String> {
         let eq_pos = part.find('=')
             .ok_or_else(|| format!("Expected '=' in ON clause: '{}'", part))?;
 
-        let target = part[..eq_pos].trim().to_string();
-        let source = part[eq_pos + 1..].trim().to_string();
+        let mut target = part[..eq_pos].trim().to_string();
+        let mut source = part[eq_pos + 1..].trim().to_string();
 
         if target.is_empty() || source.is_empty() {
             return Err(format!("Invalid ON clause: '{}'", part));
         }
+
+        // Strip t./s. prefixes (target/source disambiguation)
+        target = target.strip_prefix("t.").unwrap_or(&target).to_string();
+        source = source.strip_prefix("s.").unwrap_or(&source).to_string();
 
         keys.push((target, source));
     }
@@ -183,8 +200,14 @@ fn parse_on_string(s: &str) -> Result<Vec<(String, String)>, String> {
 ///   on_match=[('update', 'age >= 18'), ('delete', 'age < 18')]  → conditional
 ///   on_match={'update': 'age >= 18', 'delete': 'age < 18'}      → conditional (dict)
 ///
-/// The tuple format (action, where) is the cleanest for conditional multi-action:
-///   on_match=[('update', 'age >= 18'), ('delete', 'age < 18')]
+/// SQL-style string (recommended — most expressive):
+///   on_match='UPDATE'                                    → [Update]
+///   on_match='UPDATE WHERE age >= 18'                    → [Update if age>=18]
+///   on_match='UPDATE WHERE age >= 18; DELETE WHERE age < 18'  → multi-action
+///   on_miss='INSERT WHERE age >= 18'                     → [Insert if age>=18]
+///
+/// The SQL-style string is the recommended format — it's consistent with
+/// the MERGE statement syntax and the WHERE clause format.
 fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<MergePlanAction>, String> {
     let param = match param {
         Some(p) => p,
@@ -197,10 +220,9 @@ fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<Mer
     };
 
     Python::with_gil(|py| {
-        // Try string: "update"
+        // Try string first — could be 'update', 'UPDATE WHERE age >= 18', or multi-action
         if let Ok(s) = param.extract::<String>(py) {
-            let action = parse_action_str(&s, is_match)?;
-            return Ok(vec![MergePlanAction { action, condition: None }]);
+            return parse_merge_action_string(&s, is_match);
         }
 
         // Try list — could be list of strings or list of (action, where) tuples
@@ -217,9 +239,9 @@ fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<Mer
                     };
                     actions.push(MergePlanAction { action, condition });
                 } else if let Ok(s) = item.extract::<String>(py) {
-                    // Bare string → action with no condition
-                    let action = parse_action_str(&s, is_match)?;
-                    actions.push(MergePlanAction { action, condition: None });
+                    // Bare string → could be 'update' or 'UPDATE WHERE ...'
+                    let sub_actions = parse_merge_action_string(&s, is_match)?;
+                    actions.extend(sub_actions);
                 } else {
                     return Err("on_match/on_miss list must contain strings or (action, where) tuples".to_string());
                 }
@@ -250,6 +272,56 @@ fn parse_merge_action(param: Option<PyObject>, is_match: bool) -> Result<Vec<Mer
 
         Err("on_match/on_miss must be a string, list, or dict".to_string())
     })
+}
+
+/// Parse a SQL-style merge action string.
+///
+/// Formats:
+///   'update'                              → [Update]
+///   'UPDATE WHERE age >= 18'              → [Update if age>=18]
+///   'UPDATE WHERE age >= 18; DELETE WHERE age < 18'  → multi-action
+///   'WHEN MATCHED THEN UPDATE WHERE age >= 18'       → SQL MERGE syntax
+fn parse_merge_action_string(s: &str, is_match: bool) -> Result<Vec<MergePlanAction>, String> {
+    let s = s.trim();
+
+    // Support 'WHEN MATCHED THEN ...' or 'WHEN NOT MATCHED THEN ...' prefix
+    // (strip it — the is_match parameter already encodes this)
+    let s = if s.to_uppercase().starts_with("WHEN MATCHED THEN ") {
+        s[18..].trim()
+    } else if s.to_uppercase().starts_with("WHEN NOT MATCHED THEN ") {
+        s[22..].trim()
+    } else {
+        s
+    };
+
+    // Split by ';' for multi-action
+    let mut actions = Vec::new();
+    for clause in s.split(';') {
+        let clause = clause.trim();
+        if clause.is_empty() { continue; }
+
+        // Find WHERE keyword (case-insensitive)
+        let where_pos = clause.to_uppercase().find("WHERE");
+
+        let (action_str, where_str) = if let Some(wp) = where_pos {
+            (clause[..wp].trim(), clause[wp + 5..].trim())
+        } else {
+            (clause, "")
+        };
+
+        let action = parse_action_str(action_str, is_match)?;
+        let condition = if where_str.is_empty() {
+            None
+        } else {
+            Some(parse_where(where_str)?)
+        };
+        actions.push(MergePlanAction { action, condition });
+    }
+
+    if actions.is_empty() {
+        return Err(format!("No valid actions found in: '{}'", s));
+    }
+    Ok(actions)
 }
 
 fn parse_action_str(s: &str, is_match: bool) -> Result<MergeActionType, String> {
@@ -3795,47 +3867,40 @@ fn read_collection_as_json_rows(
             .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
         // Read each row group, decode PND2, convert to JSON rows
-        for rg in &manifest.row_groups {
-            let blob_data = kernel.read_blob(&rg.blob_hash)
-                .map_err(|e| format!("Failed to read data blob: {}", e))?;
+        // PARALLEL: decode multiple row groups in separate threads for
+        // large collections. For small collections (≤2 row groups), use
+        // sequential to avoid thread spawn overhead.
+        if manifest.row_groups.len() > 2 {
+            // Parallel decode — each row group is decoded in a separate thread
+            let row_groups = &manifest.row_groups;
+            let key_fields_ref = key_fields;
+            let results: Vec<Result<Vec<(String, JsonValue)>, String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = row_groups.iter().map(|rg| {
+                    s.spawn(move || {
+                        let blob_data = kernel.read_blob(&rg.blob_hash)
+                            .map_err(|e| format!("Failed to read data blob: {}", e))?;
+                        let cols = pond_core::pnd2_decode(&blob_data)
+                            .map_err(|e| format!("Failed to decode PND2: {}", e))?;
+                        Ok(decode_cols_to_rows(&cols, key_fields_ref))
+                    })
+                }).collect();
 
-            let cols = pond_core::pnd2_decode(&blob_data)
-                .map_err(|e| format!("Failed to decode PND2: {}", e))?;
+                handles.into_iter().map(|h| h.join().unwrap_or(Err("Thread panicked".to_string()))).collect()
+            });
 
-            // Determine the number of rows
-            let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+            for result in results {
+                rows.extend(result?);
+            }
+        } else {
+            // Sequential decode (small collections)
+            for rg in &manifest.row_groups {
+                let blob_data = kernel.read_blob(&rg.blob_hash)
+                    .map_err(|e| format!("Failed to read data blob: {}", e))?;
 
-            // Convert columnar data to row-oriented JSON
-            for row_idx in 0..n_rows {
-                let mut row_obj = serde_json::Map::new();
-                for col in &cols {
-                    let name = col.name.to_string_lossy().to_string();
-                    use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY, VT_NULL};
-                    let val = match col.vtype {
-                        VT_INT64 => {
-                            col.i64_data.get(row_idx)
-                                .map(|v| JsonValue::Number(serde_json::Number::from(*v)))
-                                .unwrap_or(JsonValue::Null)
-                        }
-                        VT_FLOAT64 => {
-                            col.f64_data.get(row_idx)
-                                .and_then(|v| serde_json::Number::from_f64(*v))
-                                .map(JsonValue::Number)
-                                .unwrap_or(JsonValue::Null)
-                        }
-                        VT_STRING => {
-                            col.str_data.get(row_idx)
-                                .map(|v| JsonValue::String(v.to_string_lossy().to_string()))
-                                .unwrap_or(JsonValue::Null)
-                        }
-                        VT_BINARY | VT_NULL | _ => JsonValue::Null,
-                    };
-                    row_obj.insert(name, val);
-                }
+                let cols = pond_core::pnd2_decode(&blob_data)
+                    .map_err(|e| format!("Failed to decode PND2: {}", e))?;
 
-                // Determine the rowid for this row
-                let rowid = determine_rowid(&JsonValue::Object(row_obj.clone()), key_fields);
-                rows.push((rowid, JsonValue::Object(row_obj)));
+                rows.extend(decode_cols_to_rows(&cols, key_fields));
             }
         }
     }
@@ -3855,6 +3920,46 @@ fn read_collection_as_json_rows(
     }
 
     Ok(rows)
+}
+
+/// Decode PND2 columns into (rowid, JSON row) pairs.
+///
+/// This is the shared helper used by both the parallel and sequential
+/// decode paths. Extracted to avoid code duplication.
+fn decode_cols_to_rows(cols: &[pond_core::PondColumn], key_fields: &[String]) -> Vec<(String, JsonValue)> {
+    use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY, VT_NULL};
+    let mut rows = Vec::new();
+    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+
+    for row_idx in 0..n_rows {
+        let mut row_obj = serde_json::Map::new();
+        for col in cols {
+            let name = col.name.to_string_lossy().to_string();
+            let val = match col.vtype {
+                VT_INT64 => {
+                    col.i64_data.get(row_idx)
+                        .map(|v| JsonValue::Number(serde_json::Number::from(*v)))
+                        .unwrap_or(JsonValue::Null)
+                }
+                VT_FLOAT64 => {
+                    col.f64_data.get(row_idx)
+                        .and_then(|v| serde_json::Number::from_f64(*v))
+                        .map(JsonValue::Number)
+                        .unwrap_or(JsonValue::Null)
+                }
+                VT_STRING => {
+                    col.str_data.get(row_idx)
+                        .map(|v| JsonValue::String(v.to_string_lossy().to_string()))
+                        .unwrap_or(JsonValue::Null)
+                }
+                VT_BINARY | VT_NULL | _ => JsonValue::Null,
+            };
+            row_obj.insert(name, val);
+        }
+        let rowid = determine_rowid(&JsonValue::Object(row_obj.clone()), key_fields);
+        rows.push((rowid, JsonValue::Object(row_obj)));
+    }
+    rows
 }
 
 /// Determine the rowid for a row.

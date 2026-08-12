@@ -5889,3 +5889,65 @@ Stage Summary:
 - File reading (CSV, JSON, NDJSON, TSV)
 - Architecture clarified: .sql() is a convenience layer on storage
 - All 21 tests pass, build succeeds
+
+---
+Task ID: 77
+Agent: main (Super Z, web-a5961fe6 session)
+Task: t./s. prefix for on=, SQL-style merge actions, parallel row group decoding.
+
+User feedback:
+  1. "Use t. for target and s. for source in on= clause"
+  2. "Support SQL commands in on_match/on_miss too"
+  3. "Are we using SIMD? Can we use parallel execution?"
+
+Work Log:
+1. ADDED t./s. prefix support to on= clause:
+   - on='t.user_id = s.id'              → unambiguous (target.user_id = source.id)
+   - on='t.id = s.id AND t.code = s.code' → multi-key with prefixes
+   - Backward compat: bare names still work (on='id = id')
+
+2. ADDED SQL-style strings to on_match/on_miss:
+   - on_match='UPDATE'                                    → single action
+   - on_match='UPDATE WHERE age >= 18'                    → conditional
+   - on_match='UPDATE WHERE age >= 18; DELETE WHERE age < 18'  → multi-action
+   - on_match='WHEN MATCHED THEN UPDATE WHERE age >= 18'  → full SQL MERGE syntax
+   - on_miss='INSERT WHERE age >= 18'                     → conditional insert
+   - All formats still work: string, list, tuples, dict
+
+3. ADDED parallel row group decoding:
+   - When a collection has >2 row groups, decode them in parallel threads
+   - Uses std::thread::scope (stable since Rust 1.63, no external deps)
+   - Small collections (≤2 row groups) use sequential to avoid thread overhead
+   - Extracted decode_cols_to_rows() helper to avoid code duplication
+   - CRDT merge + shard reading still sequential (typically small)
+
+4. SIMD STATUS — answered:
+   Currently Pond does NOT use explicit SIMD intrinsics. However:
+   - Rust's compiler (LLVM) auto-vectorizes simple loops (memcpy, comparison)
+   - PND2 INT64 arrays are stored contiguously → LLVM can auto-vectorize
+   - For explicit SIMD, we'd add the `wide` crate or use std::simd (nightly)
+   - The biggest performance win is parallel I/O (already done for S3 batch GETs)
+   - Next steps: add `rayon` for parallel iterator support, use `wide` for SIMD predicates
+
+   Current parallelism:
+   - S3 batch GETs: parallel (thread pool, already implemented)
+   - Row group decode: parallel (>2 row groups, new in this commit)
+   - CRDT merge: sequential (typically small, low overhead)
+   - Predicate evaluation: sequential (auto-vectorized by LLVM)
+
+5. Updated parse_merge_action_string to support:
+   - Semicolon-separated multi-action: 'UPDATE WHERE ...; DELETE WHERE ...'
+   - WHEN MATCHED THEN / WHEN NOT MATCHED THEN prefix (SQL MERGE syntax)
+   - Case-insensitive action keywords (UPDATE/update/Update all work)
+
+TEST RESULTS:
+  - test_beautiful_api.py: 8/8 passed ✓
+  - test_sql_where.py: 13/13 passed ✓
+  - Manual tests: t./s. prefix, SQL merge actions, parallel decode ✓
+  - Build: cargo build -p pond_python --release ✓
+
+Stage Summary:
+- on= clause supports t./s. prefix (t.id = s.id) — clean and SQL-consistent
+- on_match/on_miss support SQL-style strings ('UPDATE WHERE age >= 18; DELETE WHERE age < 18')
+- Parallel row group decoding for large collections (>2 row groups)
+- All 21 tests pass, build succeeds
