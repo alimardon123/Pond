@@ -1764,8 +1764,8 @@ impl Storage {
     ///
     ///   # Anti-join (delete matched)
     ///   s.merge_rows('users', rows, on='id', on_match='delete')
-    #[pyo3(signature = (collection, rows, on=None, key_col=None, crdt=true, r#where=None, on_match=None, on_miss=None))]
-    fn merge_rows(&self, collection: &str, rows: Vec<PyObject>, on: Option<PyObject>, key_col: Option<&str>, crdt: bool, r#where: Option<PyObject>, on_match: Option<PyObject>, on_miss: Option<PyObject>) -> PyResult<PyObject> {
+    #[pyo3(signature = (collection, rows, on=None, key_col=None, crdt=true, r#where=None, on_match=None, on_miss=None, on_miss_target=None))]
+    fn merge_rows(&self, collection: &str, rows: Vec<PyObject>, on: Option<PyObject>, key_col: Option<&str>, crdt: bool, r#where: Option<PyObject>, on_match: Option<PyObject>, on_miss: Option<PyObject>, on_miss_target: Option<PyObject>) -> PyResult<PyObject> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let active = storage.get_active_branch(collection);
@@ -1783,10 +1783,6 @@ impl Storage {
             json_rows
         };
 
-        if filtered_rows.is_empty() {
-            return self.empty_merge_result();
-        }
-
         // Parse the `on` parameter into a list of (target_col, source_col) pairs
         let match_keys: Vec<(String, String)> = parse_match_keys(on, key_col)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
@@ -1797,7 +1793,6 @@ impl Storage {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
 
         // Build a lookup: composite key → (existing _rowid, existing row)
-        // We store the full target row so we can evaluate WHERE on t. columns
         let mut key_to_target: std::collections::HashMap<String, (String, JsonValue)> = std::collections::HashMap::new();
         for (_, row) in &existing {
             let mut composite_key = String::new();
@@ -1811,10 +1806,15 @@ impl Storage {
             }
         }
 
-        // Parse on_match and on_miss into action plans
+        // Track which target rows were matched (for on_miss_target)
+        let mut matched_target_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Parse action plans
         let match_plan = parse_merge_action(on_match, true)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
         let miss_plan = parse_merge_action(on_miss, false)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        let miss_target_plan = parse_merge_action(on_miss_target, true)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
         // Classify incoming rows into actions
@@ -1822,7 +1822,7 @@ impl Storage {
         let mut to_delete: Vec<String> = Vec::new();
         let mut counts = MergeCounts::default();
 
-        for row in filtered_rows {
+        for row in &filtered_rows {
             // Build composite key from source row using source_col names
             let mut composite_key = String::new();
             for (_, source_col) in &match_keys {
@@ -1834,13 +1834,12 @@ impl Storage {
             let matched = key_to_target.get(&composite_key);
 
             if let Some((existing_rowid, target_row)) = matched {
+                // WHEN MATCHED (source matches target)
+                matched_target_keys.insert(composite_key);
                 counts.matched += 1;
-                // Build combined context for t./s. prefixed WHERE evaluation
-                let ctx = build_merge_context(Some(target_row), &row);
+                let ctx = build_merge_context(Some(target_row), row);
 
-                // Run through the match plan
                 for action in &match_plan {
-                    // Check conditional WHERE against combined context
                     if let Some(ref cond) = action.condition {
                         if !cond.eval(&ctx) {
                             counts.skipped += 1;
@@ -1849,9 +1848,8 @@ impl Storage {
                     }
                     match action.action {
                         MergeActionType::Update => {
-                            // Apply SET clause (or default: copy all source cols)
                             let updated = apply_set_to_row(
-                                Some(target_row), &row, &action.set, Some(existing_rowid),
+                                Some(target_row), row, &action.set, Some(existing_rowid),
                             );
                             to_upsert.push(updated);
                             counts.updated += 1;
@@ -1863,13 +1861,12 @@ impl Storage {
                         MergeActionType::Skip => {
                             counts.skipped += 1;
                         }
-                        MergeActionType::Insert => {} // not valid for on_match
+                        MergeActionType::Insert => {}
                     }
                 }
             } else {
-                // No match — run through the miss plan
-                // Build context with no target row
-                let ctx = build_merge_context(None, &row);
+                // WHEN NOT MATCHED BY TARGET (source has no matching target)
+                let ctx = build_merge_context(None, row);
 
                 for action in &miss_plan {
                     if let Some(ref cond) = action.condition {
@@ -1880,8 +1877,7 @@ impl Storage {
                     }
                     match action.action {
                         MergeActionType::Insert => {
-                            // Apply SET clause for inserts too (if provided)
-                            let inserted = apply_set_to_row(None, &row, &action.set, None);
+                            let inserted = apply_set_to_row(None, row, &action.set, None);
                             to_upsert.push(inserted);
                             counts.inserted += 1;
                         }
@@ -1889,6 +1885,59 @@ impl Storage {
                             counts.skipped += 1;
                         }
                         _ => {}
+                    }
+                }
+            }
+        }
+
+        // WHEN NOT MATCHED BY SOURCE (target rows with no matching source)
+        // Process target rows that were NOT matched by any source row
+        if !miss_target_plan.is_empty() {
+            // Build a set of matched target rowids
+            let matched_rowids: std::collections::HashSet<String> = matched_target_keys.iter()
+                .filter_map(|k| key_to_target.get(k).map(|(r, _)| r.clone()))
+                .collect();
+
+            for (_, target_row) in &existing {
+                let target_rowid = target_row.get("_rowid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+
+                if matched_rowids.contains(&target_rowid) {
+                    continue; // This target was matched — skip
+                }
+
+                // This target has no matching source → apply on_miss_target plan
+                let ctx = build_merge_context(Some(target_row), &JsonValue::Object(serde_json::Map::new()));
+
+                for action in &miss_target_plan {
+                    if let Some(ref cond) = action.condition {
+                        if !cond.eval(&ctx) {
+                            counts.skipped += 1;
+                            continue;
+                        }
+                    }
+                    match action.action {
+                        MergeActionType::Delete => {
+                            to_delete.push(target_rowid.clone());
+                            counts.deleted += 1;
+                        }
+                        MergeActionType::Update => {
+                            // Update with SET (no source row → only static/t.col values work)
+                            let updated = apply_set_to_row(
+                                Some(target_row),
+                                &JsonValue::Object(serde_json::Map::new()),
+                                &action.set,
+                                Some(&target_rowid),
+                            );
+                            to_upsert.push(updated);
+                            counts.updated += 1;
+                        }
+                        MergeActionType::Skip => {
+                            counts.skipped += 1;
+                        }
+                        MergeActionType::Insert => {} // not valid for on_miss_target
                     }
                 }
             }
@@ -2163,7 +2212,7 @@ impl Storage {
 
                 let result = self.merge_rows(
                     &target, rows_py, None, key_col, true,
-                    None, Some(on_match_py), Some(on_miss_py),
+                    None, Some(on_match_py), Some(on_miss_py), None,
                 )?;
                 Ok(result)
             }
