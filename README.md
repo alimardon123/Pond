@@ -141,12 +141,25 @@ data = s.read('users')
 s.write_rows('metrics', [('id', [1, 2, 3]), ('val', [10, 20, 30])], 'init')
 cols = s.read_rows('metrics')           # → {'id': [1,2,3], 'val': [10,20,30]}
 cols = s.read_rows('metrics', columns=['val'])  # projection
-cols = s.read_rows('metrics', predicates=[('id', '>', 1)])  # pruning
+cols = s.read_rows('metrics', predicates=[('id', '>', 1)])  # SIMD-accelerated pruning
 
-# SQL-like row operations (built on CRDT shards, crdt=True by default)
-s.update_rows('metrics', {'val': 999}, where={'id': 2})  # UPDATE ... WHERE
-s.delete_rows('metrics', where={'id': 3})                 # DELETE FROM ... WHERE
-s.merge_rows('metrics', [{'id': 4, 'val': 40}], key_col='id')  # MERGE / upsert
+# SQL-like row operations (SQL WHERE strings, CRDT shards by default)
+s.update_rows('metrics', {'val': 999}, where="id = 2")        # UPDATE ... WHERE
+s.delete_rows('metrics', where="id = 3")                       # DELETE FROM ... WHERE
+s.merge_rows('metrics', [{'id': 4, 'val': 40}], on='t.id = s.id')  # MERGE / upsert
+
+# Full SQL MERGE with multi-action + column mapping + t./s. prefixes
+s.merge_rows('inventory', rows, on='t.id = s.id',
+    on_match="UPDATE WHERE t.status = 'low' SET t.qty = s.new_qty; DELETE WHERE s.remove = true",
+    on_miss="INSERT WHERE s.qty > 0",
+    on_miss_target="DELETE WHERE t.status = 'discontinued'")  # WHEN NOT MATCHED BY SOURCE
+
+# .sql() — full SQL interface (SELECT/UPDATE/DELETE/INSERT/MERGE + JOIN + files)
+result = s.sql("SELECT * FROM users WHERE age >= 18 AND city = 'NYC'")
+s.sql("UPDATE users SET status = 'active' WHERE age >= 18")
+s.sql("SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id")
+s.sql("SELECT * FROM 'data.csv' WHERE age > 25")  # read CSV files
+
 # Opt out of CRDT: s.write_rows(..., crdt=False) for raw bulk loads
 
 # Version control (git-like)
@@ -276,34 +289,51 @@ No format conversion needed — blobs and paths use the same layout.
 
 ---
 
-## Cross-Language C ABI
+## Cross-Language Support
 
-One header (`bindings/base/pond.h`) exposes all three layers:
+All bindings share the same Rust core (`core/kernel`, `core/storage`, `core/codec`).
+The Python PyO3 binding is the most complete — it's the primary development surface.
 
-| Layer | Functions | Purpose |
-|---|---|---|
-| Kernel | `pond_kernel_new/write/read/reference/resolve` | 3 primitives |
-| Storage | `pond_storage_new/new_s3/write/read/branch/merge/undo` | Versioning |
-| Codec | `pond_pnd2_decode/encode_i64/encode_f64/encode_str` | PND2 format |
+| Feature | Python (PyO3) | Go (cgo) | C ABI | Rust CLI |
+|---|---|---|---|---|
+| write / read (raw bytes) | ✅ | ✅ | ✅ | ✅ |
+| write_rows / read_rows (PND2) | ✅ | ❌ | ❌ | ❌ |
+| branch / checkout / merge | ✅ | ✅ | ✅ | ✅ |
+| history / undo / revert | ✅ | ✅ | ✅ | ✅ |
+| update_rows / delete_rows | ✅ | ❌ | ❌ | ❌ |
+| merge_rows (SQL MERGE) | ✅ | ❌ | ❌ | ❌ |
+| .sql() (SELECT/JOIN/INSERT/UPDATE/DELETE/MERGE) | ✅ | ❌ | ❌ | ❌ |
+| CRDT shards (upsert/delete/read_with_shards) | ✅ | ❌ | ❌ | ❌ |
+| Transactions (begin/commit/abort_tx) | ✅ | ❌ | ❌ | ❌ |
+| build_index / search_index / lookup_index | ✅ | ❌ | ❌ | ❌ |
+| Semantic Layer (layer/add_metrics/etc.) | ✅ | ❌ | ❌ | ❌ |
+| gc_stats / vacuum / optimize | ✅ | ❌ | ✅ (gc/vacuum) | ✅ (gc/vacuum) |
+| SIMD-accelerated INT64 filter | ✅ | ❌ | ❌ | ❌ |
+| Parallel row group decode | ✅ | ❌ | ❌ | ❌ |
 
-Any language that can call C gets full Pond access:
-- **Go**: `bindings/go/` (cgo wrapper)
-- **Python**: `bindings/python/pyo3/` (PyO3 — calls Rust directly, not C ABI)
-- **Java**: future (JNI wrapper around C ABI)
-- **Node**: future (N-API wrapper around C ABI)
-- **C/C++**: `#include "pond.h"` (direct)
+**Go SDK** (`bindings/go/`): wraps the C ABI via cgo. Currently exposes basic
+operations (write, read, branch, merge, undo, revert). To add high-level APIs,
+extend `bindings/go/pond/pond.go` with cgo calls to the C ABI.
+
+**C ABI** (`bindings/base/pond.h`): the lowest-level interface. Exposes kernel
+primitives, storage versioning, and PND2 codec. Other languages (Java, Node)
+would wrap this.
+
+**Rust CLI** (`cli/`): a standalone binary for git-like operations. Currently
+supports init, write, read, branch, checkout, merge, history, undo, revert,
+gc, vacuum. Does not expose structured row operations or .sql().
 
 ---
 
 ## Design Principles
 
 1. **Simple** — ONE storage format, ONE commit format, ONE concurrency model
-2. **Powerful** — branch/merge + CRDT + IVF + streaming + GC + optimize
-3. **Performant** — O(1) point lookup, O(1) warm writes, O(1) shard writes
+2. **Powerful** — branch/merge + CRDT + IVF + HNSW + SQL MERGE + .sql() + semantic layers
+3. **Performant** — AVX2 SIMD filters, parallel row group decode, parallel S3 GETs
 4. **Scalable** — linear PUTs, flat GETs, PB-scale via StatsTree
 5. **Efficient** — immutable blobs (deduped), O(live) GC, parallel fetch
-6. **Beautiful** — shards ARE branches, CRDT = G-Set union, no CAS
-7. **Functional** — lakehouse, KV, vector, streaming, notebook, git
+6. **Beautiful** — shards ARE branches, CRDT = G-Set union, no CAS, SQL WHERE strings
+7. **Functional** — lakehouse, KV, vector, streaming, semantic, OLTP
 8. **Storage-Independent** — no CAS, works on local FS / S3 / R2 / MinIO / GCS
 
 ---
