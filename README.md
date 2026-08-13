@@ -45,20 +45,14 @@ s.write('images/logo.png', png_bytes, 'upload')
 s.write('docs/report.pdf', pdf_bytes, 'upload')
 data = s.read('images/logo.png')  # → raw bytes
 
-# Media in structured tables — blob_hash reference pattern (Pixeltable-inspired)
-# Step 1: Upload binary file → get content-addressed hash
-blob_hash = s.write('files/logo.png', png_bytes, 'upload')
-# Step 2: Store metadata + hash in structured table (queryable with SQL/SIMD)
-s.write_rows('media', [
-    ('id', [1]),
-    ('name', ['logo.png']),
-    ('mime_type', ['image/png']),
-    ('blob_hash', [blob_hash]),    # reference to binary blob
-    ('size', [len(png_bytes)]),
-], 'init')
-# Step 3: Query metadata with SQL, lazy-load bytes when needed
-cols = s.read_rows('media', predicates=[('mime_type', '=', 'image/png')])
-file_data = s.read('files/logo.png')  # lazy-load the actual bytes
+# Media in structured tables — upload/download (Pixeltable-inspired)
+# One call to upload: stores blob (content-addressed) + metadata row (CRDT)
+s.upload('media', 'video.mp4', video_bytes, duration=120.5, location='Hawaii')
+s.upload('media', 'photo.jpg', photo_bytes, album='vacation', width=1920)
+# Query metadata with SQL/SIMD (fast — bytes not loaded)
+cols = s.read_rows('media', predicates=[('mime_type', '=', 'video/mp4')])
+# Download — lazy-load the actual bytes when needed
+data = s.download('media', 'video.mp4')  # or: s.download('media', where="id = 1")
 ```
 
 All three types get the same benefits: **versioning** (branch/merge),

@@ -3172,6 +3172,173 @@ impl Storage {
     }
 
     // ===================================================================
+    // Media upload/download — ergonomic unstructured data in structured tables
+    //
+    // upload() combines write() (store bytes) + write_rows() (store metadata)
+    // into one call. download() lazy-loads bytes by querying the table.
+    //
+    // Inspired by Pixeltable's media reference pattern, but simpler:
+    //   s.upload('media', 'video.mp4', video_bytes, duration=120.5)
+    //   data = s.download('media', where="name = 'video.mp4'")
+    // ===================================================================
+
+    /// Upload a file into a structured table with metadata.
+    ///
+    /// Combines write() (store bytes as content-addressed blob) + upsert_shard()
+    /// (store metadata row with blob_hash reference) in one call.
+    /// Auto-extracts: name, size, blob_hash. Extra metadata via kwargs.
+    ///
+    /// Args:
+    ///   - collection: target collection name
+    ///   - name: file name (e.g., 'video.mp4')
+    ///   - data: file content as bytes
+    ///   - mime_type: optional MIME type (auto-detected from extension if omitted)
+    ///   - **metadata: any additional columns to store (id, duration, tags, etc.)
+    ///
+    /// Returns: the row that was inserted (as a dict)
+    ///
+    /// Example:
+    ///   s.upload('media', 'video.mp4', video_bytes, mime_type='video/mp4', duration=120.5)
+    ///   s.upload('media', 'photo.jpg', photo_bytes, album='vacation')
+    #[pyo3(signature = (collection, name, data, mime_type=None, **kwargs))]
+    fn upload(&self, py: Python<'_>, collection: &str, name: &str, data: &[u8], mime_type: Option<&str>, kwargs: Option<PyObject>) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        let active = storage.get_active_branch(collection);
+
+        // Step 1: Store the binary blob as a content-addressed blob (NOT a commit)
+        // This stores it in the kernel's object store without creating a HEAD commit
+        let blob_hash = kernel.write(data)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        // Also store as a named blob for easy retrieval
+        let blob_ref = format!("files/{}", name);
+        kernel.reference(&blob_ref, &blob_hash)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        // Step 2: Auto-detect MIME type from extension
+        let mime = mime_type.unwrap_or_else(|| guess_mime(name));
+
+        // Step 3: Build the metadata row
+        let mut row = serde_json::Map::new();
+        row.insert("name".to_string(), json!(name));
+        row.insert("mime_type".to_string(), json!(mime));
+        row.insert("blob_hash".to_string(), json!(blob_hash));
+        row.insert("size".to_string(), json!(data.len()));
+        row.insert("_blob_ref".to_string(), json!(blob_ref));
+
+        // Add any extra metadata from kwargs
+        if let Some(ref kw) = kwargs {
+            let kw_json = python_to_json(kw);
+            if let Some(obj) = kw_json.as_object() {
+                for (k, v) in obj {
+                    row.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        let row_json = JsonValue::Object(row);
+
+        // Step 4: Upsert the row (CRDT shard — concurrent-safe)
+        use pond_kernel::crdt::HLC;
+        let mut hlc = HLC::new();
+
+        // Observe existing versions
+        let kc = vec!["name".to_string()];
+        let existing = read_collection_as_json_rows(&storage, collection, &kc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        for (_, r) in &existing {
+            if let Some(v) = r.get("_version").and_then(|v| v.as_str()) {
+                hlc.observe(v);
+            }
+        }
+
+        let shard_name = format!("upload_{}", chrono_like_id());
+        pond_storage::shard::upsert_shard(
+            kernel, collection, &active, &shard_name,
+            &[row_json.clone()], Some("name"), &mut hlc,
+        ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+
+        // Return the row as a Python dict
+        Ok(json_to_pyobject(py, &row_json))
+    }
+
+    /// Download a file's bytes from a structured table.
+    ///
+    /// Queries the table by name (or WHERE clause), finds the blob_hash,
+    /// and lazy-loads the actual bytes.
+    ///
+    /// Args:
+    ///   - collection: collection name
+    ///   - name: file name (default lookup), OR use where= for custom query
+    ///   - where: SQL WHERE to find the row (e.g., "id = 1")
+    ///
+    /// Returns: file content as bytes, or None if not found
+    ///
+    /// Example:
+    ///   data = s.download('media', 'video.mp4')
+    ///   data = s.download('media', where="id = 1")
+    #[pyo3(signature = (collection, name=None, r#where=None))]
+    fn download(&self, py: Python<'_>, collection: &str, name: Option<&str>, r#where: Option<PyObject>) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+
+        // Build the WHERE clause
+        let where_str = if let Some(ref w) = r#where {
+            // Use the provided WHERE clause
+            match w.extract::<String>(py) {
+                Ok(s) => s,
+                Err(_) => return Ok(py.None()),
+            }
+        } else if let Some(n) = name {
+            // Default: look up by name
+            format!("name = '{}'", n.replace('\'', "\\'"))
+        } else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Must provide either name= or where= to download()"
+            ));
+        };
+
+        let where_expr = parse_where(&where_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+        // Read all rows and find the matching one
+        let kc = vec!["_rowid".to_string()];
+        let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        let merged = crdt_merge_rows(all_rows);
+
+        // Find the matching row
+        for row in &merged {
+            if where_expr.eval(row) {
+                // Get the blob reference
+                let blob_ref = row.get("_blob_ref").and_then(|v| v.as_str())
+                    .or_else(|| row.get("blob_hash").and_then(|v| v.as_str()));
+
+                if let Some(ref_str) = blob_ref {
+                    // Try to resolve as a name first, then as a hash
+                    let hash = kernel.resolve(ref_str)
+                        .unwrap_or_else(|| ref_str.to_string());
+                    match kernel.read_blob(&hash) {
+                        Ok(data) => return Ok(PyBytes::new_bound(py, &data).into()),
+                        Err(_) => {
+                            // Try reading directly as hash
+                            match kernel.read_blob(ref_str) {
+                                Ok(data) => return Ok(PyBytes::new_bound(py, &data).into()),
+                                Err(e) => return Err(pyo3::exceptions::PyIOError::new_err(
+                                    format!("Failed to read blob: {}", e))),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Not found
+        Ok(py.None())
+    }
+
+    // ===================================================================
     // Semantic layers — cross-collection, handle-based API
     //
     // WHY "layer" (not "model"): the word "model" collides with ML models,
@@ -4018,6 +4185,39 @@ fn like_match_helper(text: &[char], pattern: &[char]) -> bool {
             // Match literal character
             !text.is_empty() && text[0] == c && like_match_helper(&text[1..], &pattern[1..])
         }
+    }
+}
+
+/// Guess MIME type from file extension.
+fn guess_mime(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp4" => "video/mp4",
+        "avi" => "video/x-msvideo",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "txt" => "text/plain",
+        "html" => "text/html",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "gz" | "gzip" => "application/gzip",
+        "tar" => "application/x-tar",
+        "parquet" => "application/vnd.apache.parquet",
+        "pt" | "pth" => "application/octet-stream",  // PyTorch model
+        "onnx" => "application/octet-stream",
+        _ => "application/octet-stream",
     }
 }
 
