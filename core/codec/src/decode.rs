@@ -210,7 +210,7 @@ pub fn decode_raw(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
                 bin_data: vec![], n_values: n,
             }
         }
-        VT_STRING | VT_BINARY => {
+        VT_STRING | VT_VARIANT => {
             // String RAW format: [len(4B) + bytes]*N, optionally with a
             // null bitmap prefix. We try without bitmap first; if the
             // value count doesn't match n_rows, retry with bitmap.
@@ -340,7 +340,7 @@ fn decode_raw_string_or_binary(data: &[u8], vtype: u8, n_rows: usize) -> PondCol
 
 /// Build a STRING or BINARY PondColumn from a list of byte slices.
 fn build_string_or_binary_col(vtype: u8, vals: &[&[u8]], n_rows: usize) -> PondColumn {
-    if vtype == VT_STRING {
+    if vtype == VT_STRING || vtype == VT_VARIANT {
         let strs: Vec<CString> = vals.iter()
             .map(|v| bytes_to_cstring(v))
             .collect();
@@ -453,7 +453,7 @@ pub fn decode_dict(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
                 off += 8;
             }
         }
-        VT_STRING | VT_BINARY => {
+        VT_STRING | VT_VARIANT => {
             for _ in 0..n_unique {
                 if off + 4 > payload.len() { break; }
                 let slen = u32::from_le_bytes([
@@ -607,7 +607,7 @@ pub fn decode_rle(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
                     total_rows += 1;
                 }
             }
-            VT_STRING | VT_BINARY => {
+            VT_STRING | VT_VARIANT => {
                 if off + 4 > data.len() { break; }
                 let slen = u32::from_le_bytes([
                     data[off], data[off+1], data[off+2], data[off+3]

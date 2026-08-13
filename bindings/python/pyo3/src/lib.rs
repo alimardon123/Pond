@@ -3913,43 +3913,87 @@ fn python_to_json(obj: &PyObject) -> JsonValue {
 
 /// Convert a Vec<PyObject> (Python list of values) to a TypedColumn.
 ///
-/// Auto-detects the type from the first non-None element:
-///   - int → TypedColumn::Int64
-///   - float → TypedColumn::Float64
-///   - str → TypedColumn::String
-///   - empty → TypedColumn::Int64 (default)
+/// Auto-detects the type from the values:
+///   - All ints → TypedColumn::Int64
+///   - All floats → TypedColumn::Float64
+///   - All strings → TypedColumn::String
+///   - All bytes → TypedColumn::Binary
+///   - Mixed types (int + float + string + bool + None + dict + list) → TypedColumn::Variant
+///   - Empty → TypedColumn::Int64 (default)
 fn python_values_to_typed_column(values: &[PyObject]) -> TypedColumn {
     Python::with_gil(|py| {
-        // Detect type from first element
-        for v in values.iter() {
-            if let Ok(_) = v.extract::<i64>(py) {
-                let vals: Vec<i64> = values.iter()
-                    .map(|v| v.extract::<i64>(py).unwrap_or(0))
-                    .collect();
-                return TypedColumn::Int64(vals);
-            }
-            if let Ok(_) = v.extract::<f64>(py) {
-                let vals: Vec<f64> = values.iter()
-                    .map(|v| v.extract::<f64>(py).unwrap_or(0.0))
-                    .collect();
-                return TypedColumn::Float64(vals);
-            }
-            if let Ok(_) = v.extract::<&[u8]>(py) {
-                // bytes → Binary column
-                let vals: Vec<Vec<u8>> = values.iter()
-                    .map(|v| v.extract::<&[u8]>(py).unwrap_or(&[]).to_vec())
-                    .collect();
-                return TypedColumn::Binary(vals);
-            }
-            if let Ok(_) = v.extract::<String>(py) {
-                let vals: Vec<String> = values.iter()
-                    .map(|v| v.extract::<String>(py).unwrap_or_default())
-                    .collect();
-                return TypedColumn::String(vals);
+        if values.is_empty() {
+            return TypedColumn::Int64(Vec::new());
+        }
+
+        // Classify each value's type
+        #[derive(PartialEq, Clone, Copy)]
+        enum PyType { Int, Float, Str, Bytes, Bool, None, Other }
+
+        let types: Vec<PyType> = values.iter().map(|v| {
+            if v.is_none(py) { PyType::None }
+            else if let Ok(true) = v.extract::<bool>(py) { PyType::Bool }
+            else if v.extract::<i64>(py).is_ok() { PyType::Int }
+            else if v.extract::<f64>(py).is_ok() { PyType::Float }
+            else if v.extract::<&[u8]>(py).is_ok() { PyType::Bytes }
+            else if v.extract::<String>(py).is_ok() { PyType::Str }
+            else { PyType::Other }
+        }).collect();
+
+        // Check if all values are the same type (excluding None)
+        let non_none_types: Vec<PyType> = types.iter()
+            .filter(|t| **t != PyType::None)
+            .cloned()
+            .collect();
+
+        if non_none_types.is_empty() {
+            // All None → Int64 with zeros (will be treated as null)
+            return TypedColumn::Int64(vec![0; values.len()]);
+        }
+
+        let first_type = non_none_types[0];
+        let all_same = non_none_types.iter().all(|t| *t == first_type);
+
+        if all_same {
+            // Homogeneous column — use the specific type
+            match first_type {
+                PyType::Int => {
+                    let vals: Vec<i64> = values.iter()
+                        .map(|v| v.extract::<i64>(py).unwrap_or(0))
+                        .collect();
+                    return TypedColumn::Int64(vals);
+                }
+                PyType::Float => {
+                    let vals: Vec<f64> = values.iter()
+                        .map(|v| v.extract::<f64>(py).unwrap_or(0.0))
+                        .collect();
+                    return TypedColumn::Float64(vals);
+                }
+                PyType::Str => {
+                    let vals: Vec<String> = values.iter()
+                        .map(|v| v.extract::<String>(py).unwrap_or_default())
+                        .collect();
+                    return TypedColumn::String(vals);
+                }
+                PyType::Bytes => {
+                    let vals: Vec<Vec<u8>> = values.iter()
+                        .map(|v| v.extract::<&[u8]>(py).unwrap_or(&[]).to_vec())
+                        .collect();
+                    return TypedColumn::Binary(vals);
+                }
+                _ => {} // Fall through to Variant
             }
         }
-        // Empty or unknown → default to empty Int64
-        TypedColumn::Int64(Vec::new())
+
+        // Mixed types or contains dicts/lists/bools → Variant column
+        // Each value is stored as a JSON-encoded string
+        let vals: Vec<String> = values.iter()
+            .map(|v| {
+                let jv = python_to_json(v);
+                jv.to_string()
+            })
+            .collect();
+        TypedColumn::Variant(vals)
     })
 }
 
@@ -3970,9 +4014,14 @@ fn extract_cell(col: &TypedColumn, idx: usize) -> JsonValue {
                 .unwrap_or(JsonValue::Null)
         }
         TypedColumn::Binary(v) => {
-            // Binary data stored as base64 string in JSON path — decoded back to bytes on read
             v.get(idx)
                 .map(|b| JsonValue::String(format!("__bin_b64__:{}", base64_encode(b))))
+                .unwrap_or(JsonValue::Null)
+        }
+        TypedColumn::Variant(v) => {
+            // Variant: JSON-encoded string — parse back to JSON value
+            v.get(idx)
+                .and_then(|s| serde_json::from_str::<JsonValue>(s).ok())
                 .unwrap_or(JsonValue::Null)
         }
     }
@@ -4001,6 +4050,12 @@ fn filter_column(col: TypedColumn, keep_mask: &[bool]) -> TypedColumn {
         }
         TypedColumn::Binary(v) => {
             TypedColumn::Binary(v.into_iter().enumerate()
+                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
+                .map(|(_, v)| v)
+                .collect())
+        }
+        TypedColumn::Variant(v) => {
+            TypedColumn::Variant(v.into_iter().enumerate()
                 .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
                 .map(|(_, v)| v)
                 .collect())
@@ -4473,6 +4528,7 @@ fn crdt_merge_rows_parallel(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
 
 /// Convert a serde_json::Value to a Python object.
 /// Binary data encoded as "__bin_b64__:" prefix is decoded back to bytes.
+/// JSON arrays and objects (from VARIANT columns) are converted to Python lists/dicts.
 fn json_value_to_py(py: Python, value: &JsonValue) -> PyObject {
     match value {
         JsonValue::Null => py.None(),
@@ -4495,7 +4551,17 @@ fn json_value_to_py(py: Python, value: &JsonValue) -> PyObject {
                 s.to_object(py)
             }
         }
-        _ => py.None(), // arrays/objects not supported in columnar cells
+        JsonValue::Array(arr) => {
+            let list = PyList::new_bound(py, arr.iter().map(|v| json_value_to_py(py, v)));
+            list.into()
+        }
+        JsonValue::Object(obj) => {
+            let dict = PyDict::new_bound(py);
+            for (k, v) in obj {
+                dict.set_item(k, json_value_to_py(py, v)).unwrap();
+            }
+            dict.into()
+        }
     }
 }
 
@@ -4756,6 +4822,15 @@ fn decode_cols_to_rows_filtered(
                     // Binary data stored as base64 string — decoded back to bytes on read
                     col.bin_data.get(row_idx)
                         .map(|b| JsonValue::String(format!("__bin_b64__:{}", base64_encode(b))))
+                        .unwrap_or(JsonValue::Null)
+                }
+                VT_VARIANT => {
+                    // Variant: JSON-encoded string — parse back to JSON value
+                    col.str_data.get(row_idx)
+                        .and_then(|s| {
+                            let s_str = s.to_string_lossy();
+                            serde_json::from_str::<JsonValue>(&s_str).ok()
+                        })
                         .unwrap_or(JsonValue::Null)
                 }
                 VT_NULL | _ => JsonValue::Null,

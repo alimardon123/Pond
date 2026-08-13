@@ -520,13 +520,19 @@ fn encode_raw_str_payload(values: &[&str]) -> Vec<u8> {
 
 /// A typed column for multi-type PND2 encoding.
 ///
-/// Supports INT64, FLOAT64, and STRING value types.
+/// Supports INT64, FLOAT64, STRING, BINARY, and VARIANT value types.
+/// VARIANT is for mixed-type columns where each value can be a different type
+/// (int, float, string, bool, null, nested JSON) — stored as JSON-encoded strings.
 #[derive(Clone, Debug)]
 pub enum TypedColumn {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
     String(Vec<String>),
     Binary(Vec<Vec<u8>>),
+    /// Mixed-type column — each value is a JSON-encoded string.
+    /// Stored as VT_VARIANT in PND2, encoded as length-prefixed JSON strings.
+    /// Examples: [42, 3.14, "hello", true, null, {"nested": "json"}]
+    Variant(Vec<String>),
 }
 
 impl TypedColumn {
@@ -536,6 +542,7 @@ impl TypedColumn {
             TypedColumn::Float64(_) => VT_FLOAT64,
             TypedColumn::String(_) => VT_STRING,
             TypedColumn::Binary(_) => VT_BINARY,
+            TypedColumn::Variant(_) => VT_VARIANT,
         }
     }
 
@@ -545,6 +552,7 @@ impl TypedColumn {
             TypedColumn::Float64(v) => v.len(),
             TypedColumn::String(v) => v.len(),
             TypedColumn::Binary(v) => v.len(),
+            TypedColumn::Variant(v) => v.len(),
         }
     }
 
@@ -560,14 +568,24 @@ impl TypedColumn {
                 encode_raw_str_payload(&refs)
             }
             TypedColumn::Binary(v) => {
-                // Binary format: n_values(4B LE) + [length(4B LE) + data]*N
-                // This matches decode_raw_binary() in decode.rs
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 for data in v {
                     let len = data.len() as u32;
                     payload.extend_from_slice(&len.to_le_bytes());
                     payload.extend_from_slice(data);
+                }
+                payload
+            }
+            TypedColumn::Variant(v) => {
+                // Variant: same format as STRING RAW (VT_VARIANT byte + length-prefixed strings)
+                // The decode path handles VT_VARIANT the same as VT_STRING
+                let mut payload = Vec::new();
+                payload.push(VT_VARIANT); // value_type byte (same as STRING's VT_STRING byte)
+                for s in v {
+                    let bytes = s.as_bytes();
+                    payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(bytes);
                 }
                 payload
             }
@@ -580,6 +598,7 @@ impl TypedColumn {
             TypedColumn::Float64(_) => ENC_RAW,
             TypedColumn::String(_) => ENC_RAW,
             TypedColumn::Binary(_) => ENC_RAW,
+            TypedColumn::Variant(_) => ENC_RAW,
         }
     }
 
@@ -595,7 +614,7 @@ impl TypedColumn {
                 let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 Some((min.to_le_bytes().to_vec(), max.to_le_bytes().to_vec()))
             }
-            _ => None, // No stats for strings, binary, or empty columns
+            _ => None, // No stats for strings, binary, variant, or empty columns
         }
     }
 }
