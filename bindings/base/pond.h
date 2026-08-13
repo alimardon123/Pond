@@ -86,6 +86,25 @@ const char* pond_storage_list_branches(PondStorageHandle* s, const char* collect
 void        pond_storage_string_free(char* s);
 void        pond_storage_data_free(uint8_t* data, size_t len);
 
+/* Structured row operations (write_rows, read_rows) */
+
+/* Write structured columns as PND2.
+ * col_types: 0=i64, 1=f64, 2=string
+ * For string columns, col_data[i] points to an array of const char* pointers.
+ * Returns: commit hash (caller must free), or NULL on error. */
+const char* pond_storage_write_rows(PondStorageHandle* s, const char* collection,
+                                     const char* message,
+                                     size_t num_cols,
+                                     const char* const* col_names,
+                                     const void* const* col_data,
+                                     const size_t* col_lens,
+                                     const uint8_t* col_types,
+                                     size_t n_rows);
+
+/* Read structured columns from a collection's HEAD.
+ * Returns: PondResult* (free with pond_result_free), or NULL on error. */
+PondResult* pond_storage_read_rows(PondStorageHandle* s, const char* collection);
+
 /* ============================================================= *
  * Layer 3: Codec (PND2 — encode, decode, all encodings/vtypes)
  * ============================================================= */
