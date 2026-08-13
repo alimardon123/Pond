@@ -15,6 +15,42 @@ CRDT concurrency (no CAS), and PB-scale performance.
 
 ---
 
+## Universal data support — structured, semi-structured, unstructured
+
+Pond treats **all data types as first-class citizens**:
+
+| Data type | How to store | How to query | Example |
+|---|---|---|---|
+| **Structured** (tabular) | `write_rows()` — INT64, FLOAT64, STRING columns | `read_rows()`, `.sql()`, predicates, SIMD filter | User tables, metrics, logs |
+| **Semi-structured** (JSON) | `write_rows()` with JSON in STRING columns, or `write()` with raw JSON bytes | `.sql()` on metadata columns + `json.loads()` on payload | Event streams, API logs, documents |
+| **Unstructured** (binary) | `write()` — raw bytes (images, PDFs, audio, video) | `read()` — get bytes back by collection name | Images, PDFs, model weights, archives |
+
+```python
+# Structured — typed columns with SIMD-accelerated queries
+s.write_rows('users', [('id', [1, 2]), ('name', ['alice', 'bob'])], 'init')
+s.read_rows('users', predicates=[('id', '>', 1)])  # AVX2 SIMD filter
+
+# Semi-structured — JSON in STRING columns + raw JSON blobs
+s.write_rows('events', [
+    ('id', [1, 2]),
+    ('event', ['click', 'purchase']),
+    ('payload', [json.dumps({'btn': 'buy'}), json.dumps({'item': 'widget', 'price': 9.99})]),
+], 'init')
+# Or store as raw JSON bytes:
+s.write('documents', json.dumps(docs).encode(), 'init')
+
+# Unstructured — raw bytes (images, PDFs, anything)
+s.write('images/logo.png', png_bytes, 'upload')
+s.write('docs/report.pdf', pdf_bytes, 'upload')
+data = s.read('images/logo.png')  # → raw bytes
+```
+
+All three types get the same benefits: **versioning** (branch/merge),
+**CRDT** (concurrent writes), **content-addressed dedup**, and
+**storage-independence** (local FS / S3 / R2 / MinIO).
+
+---
+
 ## Architecture
 
 ```

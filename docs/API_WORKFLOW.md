@@ -32,6 +32,17 @@ Everything is **one `Storage` object**. You create it once, point it at
 local disk or S3, and use it for data, versioning, indexing, semantic
 layers, and maintenance.
 
+### Universal data support — all types are first-class
+
+| Data type | Store | Query | Example |
+|---|---|---|---|
+| **Structured** | `write_rows()` — INT64, FLOAT64, STRING | `read_rows()`, `.sql()`, SIMD predicates | Tables, metrics |
+| **Semi-structured** | `write_rows()` with JSON in STRING cols, or `write()` raw JSON | `.sql()` on metadata + `json.loads()` on payload | Events, logs, documents |
+| **Unstructured** | `write()` — raw bytes (any format) | `read()` — get bytes by name | Images, PDFs, model weights |
+
+All types get: versioning (branch/merge), CRDT (concurrent writes),
+content-addressed dedup, and storage-independence (local FS / S3).
+
 ---
 
 ## 1. Setup — create a Storage connection
@@ -156,18 +167,57 @@ To opt out of CRDT metadata (raw bulk load, no updates/deletes later):
 s.write_rows('logs', [('event', ['click', 'view'])], 'init', crdt=False)
 ```
 
-### 2.1 Raw bytes (JSON, CSV, Parquet, images — anything)
+### 2.1 Raw bytes — unstructured data (images, PDFs, any binary)
 
 ```python
-# Write raw bytes to a collection (creates a commit on the active branch)
-# Note: raw bytes writes do NOT add _rowid/_version (no structure to tag)
-commit_hash = s.write('users', b'[{"id":1,"name":"alice"}]', 'init')
+# Write raw bytes — any format: images, PDFs, audio, video, archives
+s.write('images/logo.png', png_bytes, 'upload logo')
+s.write('docs/report.pdf', pdf_bytes, 'upload report')
+s.write('models/bert.pt', model_weights, 'save model')
 
-# Read raw bytes back from the active branch's HEAD
-data = s.read('users')   # → b'[{"id":1,"name":"alice"}]'
+# Read raw bytes back from HEAD
+data = s.read('images/logo.png')   # → raw bytes
 ```
 
-### 2.2 Structured columns (PND2 — auto-encoded, auto-pruned, CRDT by default)
+Raw bytes get the same benefits as structured data: versioning (branch/merge),
+content-addressed dedup, and storage-independence. But they do NOT get
+_rowid/_version (no structure to tag) — use `write_rows` for CRDT compatibility.
+
+### 2.2 Semi-structured data (JSON in columns or as raw blobs)
+
+```python
+import json
+
+# Option A: JSON in STRING columns (queryable metadata + flexible payload)
+s.write_rows('events', [
+    ('id', [1, 2, 3]),
+    ('event', ['click', 'view', 'purchase']),
+    ('payload', [
+        json.dumps({'button': 'buy', 'color': 'red'}),
+        json.dumps({'page': '/home', 'duration': 5.2}),
+        json.dumps({'item': 'widget', 'price': 9.99, 'qty': 2}),
+    ]),
+], 'init')
+
+# Query metadata columns with SQL + SIMD, then parse payload in Python
+cols = s.read_rows('events', predicates=[('event', '=', 'click')])
+payload = json.loads(cols['payload'][0])  # → {'button': 'buy', 'color': 'red'}
+
+# Or use .sql() for the metadata filter
+result = s.sql("SELECT * FROM events WHERE event = 'click'")
+
+# Option B: Raw JSON blobs (for document-style data)
+s.write('documents', json.dumps([
+    {'id': 1, 'name': 'alice', 'tags': ['dev', 'admin'], 'meta': {'team': 'eng'}},
+]).encode(), 'init')
+
+# CRDT works on semi-structured data too:
+s.upsert_shard('events', 'w1', rows=[
+    {'id': 4, 'event': 'signup', 'payload': json.dumps({'source': 'web', 'plan': 'pro'})},
+], key_col='id')
+```
+
+### 2.3 Structured columns (PND2 — auto-encoded, auto-pruned, CRDT by default)
 
 This is the recommended path for tabular data. Pond's PND2 format
 auto-selects the best encoding per column (RLE / DICT / BITPACK / RAW),
