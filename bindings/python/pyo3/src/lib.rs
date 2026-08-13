@@ -16,7 +16,7 @@ mod sql_where;
 mod sql_engine;
 mod simd;
 use sql_where::{parse_where, WhereExpr, json_values_equal};
-use sql_engine::{parse_sql, SqlStatement, MergeAction, TableRef, JoinClause, JoinType};
+use sql_engine::{parse_sql, SqlStatement, MergeAction, TableRef, JoinType};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
@@ -793,11 +793,10 @@ fn execute_join(
 
 // Re-use the shared constants and parser from pond-core.
 use pond_core::{
-    PND2_MAGIC, PND2_VERSION, FLAG_HAS_STATS, FLAG_COMPRESSED,
-    COMPRESSION_NONE, COMPRESSION_ZSTD,
+    PND2_MAGIC, PND2_VERSION, FLAG_HAS_STATS,
+    COMPRESSION_NONE,
     VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY,
-    ENC_RAW, ENC_RLE, ENC_DICT, ENC_BITPACK,
-    PND2Parser, PondColumn, TypedColumn,
+    ENC_RAW, ENC_RLE, ENC_DICT, ENC_BITPACK, PondColumn, TypedColumn,
 };
 
 // ---------------------------------------------------------------------------
@@ -2227,7 +2226,7 @@ impl Storage {
                     .collect();
 
                 // Build `on` parameter from match_keys
-                let on_str: String = if match_keys.len() == 1 && match_keys[0].0 == match_keys[0].1 {
+                let _on_str: String = if match_keys.len() == 1 && match_keys[0].0 == match_keys[0].1 {
                     format!("'{}'", match_keys[0].0)
                 } else {
                     let pairs: Vec<String> = match_keys.iter()
@@ -2371,7 +2370,7 @@ impl Storage {
 
             for (col, op, value) in &predicates_json {
                 // Try to extract INT64 values for SIMD acceleration
-                let i64_values: Option<Vec<i64>> = if let Some(target_i) = value.as_i64() {
+                let i64_values: Option<Vec<i64>> = if let Some(_target_i) = value.as_i64() {
                     // Check if all rows have this column as INT64
                     let vals: Vec<Option<i64>> = merged.iter()
                         .map(|row| row.get(col).and_then(|v| v.as_i64()))
@@ -4026,11 +4025,26 @@ fn chrono_like_id() -> String {
 ///   3. If the winning row has _deleted=true, it's suppressed (not in output)
 ///   4. Rows without _rowid are passed through as-is (legacy non-CRDT data)
 ///   5. Insertion order is preserved (first occurrence of each _rowid)
+///
+/// For large row sets (>10K), uses rayon for parallel chunked merge.
+/// Each chunk is merged independently, then chunk results are merged
+/// sequentially (the final merge is O(unique_keys) which is fast).
 fn crdt_merge_rows(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
     use std::collections::HashMap;
 
-    // Track the latest version + row for each _rowid, AND the order of first
-    // appearance. We use a Vec for order + a HashMap for latest-version lookup.
+    const PARALLEL_THRESHOLD: usize = 10_000;
+
+    if rows.len() > PARALLEL_THRESHOLD {
+        return crdt_merge_rows_parallel(rows);
+    }
+
+    crdt_merge_rows_sequential(rows)
+}
+
+/// Sequential CRDT merge (for small row sets).
+fn crdt_merge_rows_sequential(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
+    use std::collections::HashMap;
+
     let mut order: Vec<String> = Vec::new();
     let mut latest: HashMap<String, (String, JsonValue)> = HashMap::new();
     let mut no_rowid: Vec<JsonValue> = Vec::new();
@@ -4070,10 +4084,112 @@ fn crdt_merge_rows(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
         }
     }
 
-    // Collect in insertion order, skipping tombstones
     let mut result: Vec<JsonValue> = no_rowid;
     for rowid in &order {
         if let Some((_, row)) = latest.get(rowid) {
+            let is_deleted = row.get("_deleted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !is_deleted {
+                result.push(row.clone());
+            }
+        }
+    }
+
+    result
+}
+
+/// Parallel CRDT merge using rayon (for large row sets >10K).
+///
+/// Splits rows into chunks, merges each chunk in parallel (producing a
+/// HashMap per chunk), then merges the chunk HashMaps sequentially.
+/// The parallel phase is O(N/num_threads) per thread; the sequential
+/// merge phase is O(unique_keys) which is typically much smaller than N.
+fn crdt_merge_rows_parallel(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
+    use std::collections::HashMap;
+
+    // Split into chunks and merge each chunk in parallel
+    let chunk_size = (rows.len() / rayon::current_num_threads().max(1)).max(1000);
+
+    let chunk_results: Vec<(Vec<JsonValue>, Vec<(String, String, JsonValue)>)> = rows
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut no_rowid: Vec<JsonValue> = Vec::new();
+            let mut latest: HashMap<String, (String, JsonValue)> = HashMap::new();
+
+            for (rowid, row) in chunk {
+                let row = row.clone();
+                let effective_rowid = row.get("_rowid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| rowid.clone());
+
+                let is_deleted = row.get("_deleted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let version = row.get("_version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+
+                if effective_rowid.is_empty() {
+                    if !is_deleted {
+                        no_rowid.push(row);
+                    }
+                    continue;
+                }
+
+                match latest.get(&effective_rowid) {
+                    Some((existing_ver, _)) => {
+                        if version > *existing_ver {
+                            latest.insert(effective_rowid, (version, row));
+                        }
+                    }
+                    None => {
+                        latest.insert(effective_rowid, (version, row));
+                    }
+                }
+            }
+
+            // Convert HashMap to Vec for the sequential merge phase
+            let merged: Vec<(String, String, JsonValue)> = latest
+                .into_iter()
+                .map(|(rowid, (version, row))| (rowid, version, row))
+                .collect();
+
+            (no_rowid, merged)
+        })
+        .collect();
+
+    // Sequential merge phase: combine all chunk results
+    let mut result: Vec<JsonValue> = Vec::new();
+    let mut final_latest: HashMap<String, (String, JsonValue)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    for (no_rowid, merged) in chunk_results {
+        // Add non-CRDT rows directly
+        result.extend(no_rowid);
+
+        // Merge CRDT rows — latest version wins across chunks
+        for (rowid, version, row) in merged {
+            match final_latest.get(&rowid) {
+                Some((existing_ver, _)) => {
+                    if version > *existing_ver {
+                        final_latest.insert(rowid.clone(), (version, row));
+                    }
+                }
+                None => {
+                    order.push(rowid.clone());
+                    final_latest.insert(rowid, (version, row));
+                }
+            }
+        }
+    }
+
+    // Collect in insertion order, skipping tombstones
+    for rowid in &order {
+        if let Some((_, row)) = final_latest.get(rowid) {
             let is_deleted = row.get("_deleted")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
