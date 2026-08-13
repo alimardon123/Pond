@@ -24,6 +24,7 @@ Pond treats **all data types as first-class citizens**:
 | **Structured** (tabular) | `write_rows()` — INT64, FLOAT64, STRING columns | `read_rows()`, `.sql()`, predicates, SIMD filter | User tables, metrics, logs |
 | **Semi-structured** (JSON) | `write_rows()` with JSON in STRING columns, or `write()` with raw JSON bytes | `.sql()` on metadata columns + `json.loads()` on payload | Event streams, API logs, documents |
 | **Unstructured** (binary) | `write()` — raw bytes (images, PDFs, audio, video) | `read()` — get bytes back by collection name | Images, PDFs, model weights, archives |
+| **Media in tables** | `write()` for bytes + `write_rows()` with `blob_hash` STRING column | `.sql()` on metadata, `read(hash)` for lazy-load | Video, photos, audio in structured tables |
 
 ```python
 # Structured — typed columns with SIMD-accelerated queries
@@ -43,6 +44,21 @@ s.write('documents', json.dumps(docs).encode(), 'init')
 s.write('images/logo.png', png_bytes, 'upload')
 s.write('docs/report.pdf', pdf_bytes, 'upload')
 data = s.read('images/logo.png')  # → raw bytes
+
+# Media in structured tables — blob_hash reference pattern (Pixeltable-inspired)
+# Step 1: Upload binary file → get content-addressed hash
+blob_hash = s.write('files/logo.png', png_bytes, 'upload')
+# Step 2: Store metadata + hash in structured table (queryable with SQL/SIMD)
+s.write_rows('media', [
+    ('id', [1]),
+    ('name', ['logo.png']),
+    ('mime_type', ['image/png']),
+    ('blob_hash', [blob_hash]),    # reference to binary blob
+    ('size', [len(png_bytes)]),
+], 'init')
+# Step 3: Query metadata with SQL, lazy-load bytes when needed
+cols = s.read_rows('media', predicates=[('mime_type', '=', 'image/png')])
+file_data = s.read('files/logo.png')  # lazy-load the actual bytes
 ```
 
 All three types get the same benefits: **versioning** (branch/merge),

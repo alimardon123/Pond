@@ -3762,6 +3762,13 @@ fn python_values_to_typed_column(values: &[PyObject]) -> TypedColumn {
                     .collect();
                 return TypedColumn::Float64(vals);
             }
+            if let Ok(_) = v.extract::<&[u8]>(py) {
+                // bytes → Binary column
+                let vals: Vec<Vec<u8>> = values.iter()
+                    .map(|v| v.extract::<&[u8]>(py).unwrap_or(&[]).to_vec())
+                    .collect();
+                return TypedColumn::Binary(vals);
+            }
             if let Ok(_) = v.extract::<String>(py) {
                 let vals: Vec<String> = values.iter()
                     .map(|v| v.extract::<String>(py).unwrap_or_default())
@@ -3790,6 +3797,10 @@ fn extract_cell(col: &TypedColumn, idx: usize) -> JsonValue {
             v.get(idx).map(|s| JsonValue::String(s.clone()))
                 .unwrap_or(JsonValue::Null)
         }
+        TypedColumn::Binary(_) => {
+            // Binary data can't be represented in JSON — return null (use read_rows for binary)
+            JsonValue::Null
+        }
     }
 }
 
@@ -3810,6 +3821,12 @@ fn filter_column(col: TypedColumn, keep_mask: &[bool]) -> TypedColumn {
         }
         TypedColumn::String(v) => {
             TypedColumn::String(v.into_iter().enumerate()
+                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
+                .map(|(_, v)| v)
+                .collect())
+        }
+        TypedColumn::Binary(v) => {
+            TypedColumn::Binary(v.into_iter().enumerate()
                 .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
                 .map(|(_, v)| v)
                 .collect())

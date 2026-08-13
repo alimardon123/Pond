@@ -526,6 +526,7 @@ pub enum TypedColumn {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
     String(Vec<String>),
+    Binary(Vec<Vec<u8>>),
 }
 
 impl TypedColumn {
@@ -534,6 +535,7 @@ impl TypedColumn {
             TypedColumn::Int64(_) => VT_INT64,
             TypedColumn::Float64(_) => VT_FLOAT64,
             TypedColumn::String(_) => VT_STRING,
+            TypedColumn::Binary(_) => VT_BINARY,
         }
     }
 
@@ -542,6 +544,7 @@ impl TypedColumn {
             TypedColumn::Int64(v) => v.len(),
             TypedColumn::Float64(v) => v.len(),
             TypedColumn::String(v) => v.len(),
+            TypedColumn::Binary(v) => v.len(),
         }
     }
 
@@ -556,6 +559,16 @@ impl TypedColumn {
                 let refs: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
                 encode_raw_str_payload(&refs)
             }
+            TypedColumn::Binary(v) => {
+                // Encode binary arrays: for each value, store length (4 bytes LE) + data
+                let mut payload = Vec::new();
+                for data in v {
+                    let len = data.len() as u32;
+                    payload.extend_from_slice(&len.to_le_bytes());
+                    payload.extend_from_slice(data);
+                }
+                payload
+            }
         }
     }
 
@@ -564,6 +577,7 @@ impl TypedColumn {
             TypedColumn::Int64(v) => encode_i64_auto(v).0,
             TypedColumn::Float64(_) => ENC_RAW,
             TypedColumn::String(_) => ENC_RAW,
+            TypedColumn::Binary(_) => ENC_RAW,
         }
     }
 
@@ -579,7 +593,7 @@ impl TypedColumn {
                 let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 Some((min.to_le_bytes().to_vec(), max.to_le_bytes().to_vec()))
             }
-            _ => None, // No stats for strings or empty columns
+            _ => None, // No stats for strings, binary, or empty columns
         }
     }
 }
