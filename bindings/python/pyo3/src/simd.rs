@@ -61,6 +61,7 @@ pub fn filter_cmp_i64(data: &[i64], op: &str, value: i64) -> Vec<bool> {
 }
 
 /// Filter INT64 array by range: value_min <= col <= value_max.
+#[allow(dead_code)]
 pub fn filter_range_i64(data: &[i64], value_min: i64, value_max: i64) -> Vec<bool> {
     let mut result = vec![false; data.len()];
 
@@ -154,6 +155,7 @@ unsafe fn filter_cmp_i64_avx2(data: &[i64], op: &str, value: i64, result: &mut [
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn filter_range_i64_avx2(data: &[i64], value_min: i64, value_max: i64, result: &mut [bool]) {
     let min_broadcast = _mm256_set1_epi64x(value_min);
     let max_broadcast = _mm256_set1_epi64x(value_max);
@@ -219,6 +221,7 @@ pub fn filter_cmp_f64(data: &[f64], op: &str, value: f64) -> Vec<bool> {
 }
 
 /// Filter FLOAT64 array by range: value_min <= col <= value_max.
+#[allow(dead_code)]
 pub fn filter_range_f64(data: &[f64], value_min: f64, value_max: f64) -> Vec<bool> {
     let mut result = vec![false; data.len()];
 
@@ -273,6 +276,7 @@ unsafe fn filter_cmp_f64_avx2(data: &[f64], op: &str, value: f64, result: &mut [
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn filter_range_f64_avx2(data: &[f64], value_min: f64, value_max: f64, result: &mut [bool]) {
     let min_b = _mm256_set1_pd(value_min);
     let max_b = _mm256_set1_pd(value_max);
@@ -310,7 +314,7 @@ pub fn columnar_filter(
     predicates: &[(String, String, serde_json::Value)],
 ) -> Vec<bool> {
     use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING};
-    use serde_json::Value as JsonValue;
+    
 
     let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
     if n_rows == 0 || predicates.is_empty() {
