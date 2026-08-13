@@ -113,7 +113,7 @@ def main():
             ('name', ['Alice', 'Bob', 'Carol', 'Dave', 'Eve']),
             ('age', [30, 25, 35, 40, 28]),
             ('dept', ['eng', 'eng', 'sales', 'sales', 'eng']),
-        ], 'init', where={'age': ('>', 30)})
+        ], 'init', where="age > 30")
         cols = s.read_rows('senior_eng')
         print(f"  write_rows where age>30: {cols['name']} (ages: {cols['age']})")
 
@@ -123,7 +123,7 @@ def main():
             ('name', ['Alice', 'Bob', 'Carol', 'Dave', 'Eve']),
             ('age', [30, 25, 35, 40, 28]),
             ('city', ['NYC', 'SF', 'NYC', 'LA', 'SF']),
-        ], 'init', where={'age': ('>', 30), 'city': 'NYC'})
+        ], 'init', where="age > 30 AND city = 'NYC'")
         cols = s.read_rows('senior_eng_nyc')
         print(f"  write_rows where age>30 AND city=NYC: {cols['name']}")
 
@@ -131,7 +131,7 @@ def main():
         s.write_rows('mid_age', [
             ('id', [1, 2, 3, 4, 5]),
             ('age', [20, 25, 30, 35, 40]),
-        ], 'init', where={'age': [('>', 25), ('<', 40)]})
+        ], 'init', where="age > 25 AND age < 40")
         cols = s.read_rows('mid_age')
         print(f"  write_rows where 25<age<40: ages={cols['age']}")
 
@@ -143,19 +143,19 @@ def main():
         # Give a raise to high earners
         count = s.update_rows('employees',
                               updates={'salary': 120000},
-                              where={'salary': ('>', 100000)})
+                              where="salary > 100000")
         print(f"  UPDATE salary=120000 WHERE salary>100k → {count} rows")
 
         # Update by dept
         count = s.update_rows('employees',
                               updates={'dept': 'engineering'},
-                              where={'dept': 'eng'})
+                              where="dept = 'eng'")
         print(f"  UPDATE dept='engineering' WHERE dept='eng' → {count} rows")
 
         # Range update: everyone age 25-35 gets a bonus
         count = s.update_rows('employees',
                               updates={'salary': 75000},
-                              where={'age': [('>=', 25), ('<=', 35)]})
+                              where="age >= 25 AND age <= 35")
         print(f"  UPDATE salary=75k WHERE 25<=age<=35 → {count} rows")
 
         # ============================================================
@@ -164,11 +164,11 @@ def main():
         print("\n--- delete_rows: SQL-like DELETE FROM ... WHERE ---")
 
         # Delete by equality
-        count = s.delete_rows('employees', where={'city': 'LA'})
+        count = s.delete_rows('employees', where="city = 'LA'")
         print(f"  DELETE WHERE city='LA' → {count} rows deleted")
 
         # Delete by range
-        count = s.delete_rows('employees', where={'age': ('>', 40)})
+        count = s.delete_rows('employees', where="age > 40")
         print(f"  DELETE WHERE age>40 → {count} rows deleted")
 
         cols = s.read_rows('employees')
@@ -184,7 +184,7 @@ def main():
             {'id': 1, 'name': 'Alice', 'age': 30},
             {'id': 2, 'name': 'Bob', 'age': 15},   # skipped (age < 18)
             {'id': 3, 'name': 'Carol', 'age': 25},
-        ], key_col='id', where={'age': ('>=', 18)})
+        ], key_col='id', where="age >= 18")
         print(f"  MERGE where age>=18 → {count} rows merged (Bob skipped)")
 
         cols = s.read_rows('users')
