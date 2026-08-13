@@ -21,38 +21,39 @@ Pond treats **all data types as first-class citizens**:
 
 | Data type | How to store | How to query | Example |
 |---|---|---|---|
-| **Structured** (tabular) | `write_rows()` — INT64, FLOAT64, STRING columns | `read_rows()`, `.sql()`, predicates, SIMD filter | User tables, metrics, logs |
-| **Semi-structured** (JSON) | `write_rows()` with JSON in STRING columns, or `write()` with raw JSON bytes | `.sql()` on metadata columns + `json.loads()` on payload | Event streams, API logs, documents |
-| **Unstructured** (binary) | `write()` — raw bytes (images, PDFs, audio, video) | `read()` — get bytes back by collection name | Images, PDFs, model weights, archives |
-| **Media in tables** | `write()` for bytes + `write_rows()` with `blob_hash` STRING column | `.sql()` on metadata, `read(hash)` for lazy-load | Video, photos, audio in structured tables |
+| **Structured** (tabular) | `write_rows()` — INT64, FLOAT64, STRING, BINARY columns | `read_rows()`, `.sql()`, predicates, SIMD filter | User tables, metrics, logs |
+| **Semi-structured** (JSON) | `write_rows()` with JSON in STRING columns | `.sql()` on metadata + `json.loads()` on payload | Event streams, API logs, documents |
+| **Unstructured** (binary) | `write_rows()` with BINARY columns (video, images, PDFs) | `read_rows()` returns `bytes`, `.sql()` returns `bytes` | Video, photos, audio, model weights |
+| **Raw bytes** | `write()` — any format, no structure | `read()` — get bytes by name | Configs, blobs without metadata |
 
 ```python
 # Structured — typed columns with SIMD-accelerated queries
 s.write_rows('users', [('id', [1, 2]), ('name', ['alice', 'bob'])], 'init')
 s.read_rows('users', predicates=[('id', '>', 1)])  # AVX2 SIMD filter
 
-# Semi-structured — JSON in STRING columns + raw JSON blobs
+# Semi-structured — JSON in STRING columns
 s.write_rows('events', [
     ('id', [1, 2]),
     ('event', ['click', 'purchase']),
     ('payload', [json.dumps({'btn': 'buy'}), json.dumps({'item': 'widget', 'price': 9.99})]),
 ], 'init')
-# Or store as raw JSON bytes:
-s.write('documents', json.dumps(docs).encode(), 'init')
 
-# Unstructured — raw bytes (images, PDFs, anything)
-s.write('images/logo.png', png_bytes, 'upload')
-s.write('docs/report.pdf', pdf_bytes, 'upload')
-data = s.read('images/logo.png')  # → raw bytes
+# Unstructured — BINARY column holds raw bytes (video, images, PDFs)
+# All operations work uniformly: write_rows, read_rows, .sql(), CRDT, merge_rows
+s.write_rows('assets', [
+    ('id', [1, 2]),
+    ('name', ['video.mp4', 'photo.jpg']),
+    ('mime_type', ['video/mp4', 'image/jpeg']),
+    ('duration', [120.5, 0.0]),                    # FLOAT64
+    ('file_data', [video_bytes, photo_bytes]),      # BINARY — raw bytes inline!
+], 'init')
+cols = s.read_rows('assets')
+cols['file_data'][0]  # → bytes (the actual video)
+s.sql("SELECT name FROM assets WHERE duration > 60")  # SQL on metadata
 
-# Media in structured tables — upload/download (Pixeltable-inspired)
-# One call to upload: stores blob (content-addressed) + metadata row (CRDT)
-s.upload('media', 'video.mp4', video_bytes, duration=120.5, location='Hawaii')
-s.upload('media', 'photo.jpg', photo_bytes, album='vacation', width=1920)
-# Query metadata with SQL/SIMD (fast — bytes not loaded)
-cols = s.read_rows('media', predicates=[('mime_type', '=', 'video/mp4')])
-# Download — lazy-load the actual bytes when needed
-data = s.download('media', 'video.mp4')  # or: s.download('media', where="id = 1")
+# Raw bytes — no structure needed
+s.write('configs/app.json', config_bytes, 'init')
+data = s.read('configs/app.json')  # → raw bytes
 ```
 
 All three types get the same benefits: **versioning** (branch/merge),

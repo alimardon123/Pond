@@ -3885,6 +3885,11 @@ fn can_prune_row_group_py(
 /// Convert a Python object to a serde_json::Value.
 fn python_to_json(obj: &PyObject) -> JsonValue {
     Python::with_gil(|py| {
+        // Try bytes FIRST (before String — bytes don't extract as String)
+        if let Ok(b) = obj.extract::<&[u8]>(py) {
+            // Binary data encoded as base64 string with prefix
+            return JsonValue::String(format!("__bin_b64__:{}", base64_encode(b)));
+        }
         if let Ok(s) = obj.extract::<String>(py) {
             JsonValue::String(s)
         } else if let Ok(i) = obj.extract::<i64>(py) {
@@ -3964,9 +3969,11 @@ fn extract_cell(col: &TypedColumn, idx: usize) -> JsonValue {
             v.get(idx).map(|s| JsonValue::String(s.clone()))
                 .unwrap_or(JsonValue::Null)
         }
-        TypedColumn::Binary(_) => {
-            // Binary data can't be represented in JSON — return null (use read_rows for binary)
-            JsonValue::Null
+        TypedColumn::Binary(v) => {
+            // Binary data stored as base64 string in JSON path — decoded back to bytes on read
+            v.get(idx)
+                .map(|b| JsonValue::String(format!("__bin_b64__:{}", base64_encode(b))))
+                .unwrap_or(JsonValue::Null)
         }
     }
 }
@@ -4186,6 +4193,51 @@ fn like_match_helper(text: &[char], pattern: &[char]) -> bool {
             !text.is_empty() && text[0] == c && like_match_helper(&text[1..], &pattern[1..])
         }
     }
+}
+
+/// Simple base64 encoding (no external dependency).
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+/// Simple base64 decoding.
+fn base64_decode(s: &str) -> Vec<u8> {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0;
+    for c in s.bytes() {
+        if c == b'=' { break; }
+        let val = CHARS.iter().position(|&x| x == c).map(|i| i as u32).unwrap_or(0);
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            result.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    result
 }
 
 /// Guess MIME type from file extension.
@@ -4420,6 +4472,7 @@ fn crdt_merge_rows_parallel(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
 }
 
 /// Convert a serde_json::Value to a Python object.
+/// Binary data encoded as "__bin_b64__:" prefix is decoded back to bytes.
 fn json_value_to_py(py: Python, value: &JsonValue) -> PyObject {
     match value {
         JsonValue::Null => py.None(),
@@ -4433,7 +4486,15 @@ fn json_value_to_py(py: Python, value: &JsonValue) -> PyObject {
                 py.None()
             }
         }
-        JsonValue::String(s) => s.to_object(py),
+        JsonValue::String(s) => {
+            // Check for binary data encoded as base64
+            if let Some(b64) = s.strip_prefix("__bin_b64__:") {
+                let bytes = base64_decode(b64);
+                PyBytes::new_bound(py, &bytes).into()
+            } else {
+                s.to_object(py)
+            }
+        }
         _ => py.None(), // arrays/objects not supported in columnar cells
     }
 }
@@ -4691,7 +4752,13 @@ fn decode_cols_to_rows_filtered(
                         .map(|v| JsonValue::String(v.to_string_lossy().to_string()))
                         .unwrap_or(JsonValue::Null)
                 }
-                VT_BINARY | VT_NULL | _ => JsonValue::Null,
+                VT_BINARY => {
+                    // Binary data stored as base64 string — decoded back to bytes on read
+                    col.bin_data.get(row_idx)
+                        .map(|b| JsonValue::String(format!("__bin_b64__:{}", base64_encode(b))))
+                        .unwrap_or(JsonValue::Null)
+                }
+                VT_NULL | _ => JsonValue::Null,
             };
             row_obj.insert(name, val);
         }

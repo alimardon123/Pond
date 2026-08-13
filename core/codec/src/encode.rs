@@ -560,8 +560,10 @@ impl TypedColumn {
                 encode_raw_str_payload(&refs)
             }
             TypedColumn::Binary(v) => {
-                // Encode binary arrays: for each value, store length (4 bytes LE) + data
+                // Binary format: n_values(4B LE) + [length(4B LE) + data]*N
+                // This matches decode_raw_binary() in decode.rs
                 let mut payload = Vec::new();
+                payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 for data in v {
                     let len = data.len() as u32;
                     payload.extend_from_slice(&len.to_le_bytes());
