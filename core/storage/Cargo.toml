@@ -9,6 +9,13 @@ description = "Pond UnifiedStorage — manifest management, CRDT shards, commits
 name = "pond_storage"
 crate-type = ["rlib", "staticlib", "cdylib"]
 
+[features]
+# `async` is OPT-IN. When enabled, exposes async read helpers
+# (`read::read_rows_async`) that call `PondKernel::read_blob_async`.
+# Forwards to `pond_kernel/async` so the kernel's async API is available
+# alongside this crate's async helpers.
+async = ["pond_kernel/async"]
+
 [dependencies]
 pond_kernel = { path = "../kernel" }
 pond_core = { path = "../codec" }
@@ -17,3 +24,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# For async tests in the storage crate (when the `async` feature is on).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

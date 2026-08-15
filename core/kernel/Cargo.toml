@@ -12,6 +12,15 @@ name = "pond_kernel"
 # cdylib:    shared library (.so/.dylib/.dll) for dynamic FFI
 crate-type = ["rlib", "staticlib", "cdylib"]
 
+[features]
+# `async` is OPT-IN. When enabled, exposes:
+#   - `AsyncObjectStore` trait (put_blob_async, get_blob_async, ...)
+#   - `PondKernel::{write_async, read_blob_async, read_async, ...}`
+# Implemented with `tokio::task::spawn_blocking` so the sync API stays usable
+# from async contexts (no duplicate code path for object-store logic).
+# The sync API is unchanged when this feature is OFF (the default).
+async = ["dep:tokio", "dep:async-trait"]
+
 [dependencies]
 # NONE — the kernel is pure Rust with no external deps, matching pond-core's
 # zero-dependency principle. This is critical for the single-binary
@@ -19,5 +28,11 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 sha2 = "0.10"
 lru = "0.12"
 
+# Optional async I/O. Only pulled in with `--features async`.
+tokio = { version = "1", features = ["rt", "fs", "io-util"], optional = true }
+async-trait = { version = "0.1", optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
+# tokio with macros + test macro so we can `#[tokio::test]` async tests.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util"] }

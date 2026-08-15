@@ -23,9 +23,11 @@ pub mod object_store;
 pub mod c_abi;
 
 pub use object_store::{ObjectStore, LocalFSObjectStore, StoreStats};
+#[cfg(feature = "async")]
+pub use object_store::AsyncObjectStore;
 
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
@@ -61,7 +63,10 @@ pub fn hash_bytes(data: &[u8]) -> String {
 ///   Read(hash_or_name) → bytes — read by hash or by name
 ///   Ref(name, hash)         — mutable name → hash mapping
 pub struct PondKernel {
-    store: Box<dyn ObjectStore>,
+    // `Arc` (not `Box`) so async methods can clone the store into a
+    // `spawn_blocking` closure without owning the kernel. The public API
+    // (`new_with_store`) still accepts `Box<dyn ObjectStore>` for back-compat.
+    store: Arc<dyn ObjectStore>,
     stats: Mutex<KernelStats>,
 }
 
@@ -77,7 +82,7 @@ impl PondKernel {
     pub fn new_local(base_dir: impl AsRef<std::path::Path>) -> io::Result<Self> {
         let store = LocalFSObjectStore::new(base_dir)?;
         Ok(Self {
-            store: Box::new(store),
+            store: Arc::new(store),
             stats: Mutex::new(KernelStats::default()),
         })
     }
@@ -85,7 +90,7 @@ impl PondKernel {
     /// Create a kernel with a custom ObjectStore (for S3, GCS, etc.).
     pub fn new_with_store(store: Box<dyn ObjectStore>) -> Self {
         Self {
-            store,
+            store: Arc::from(store),
             stats: Mutex::new(KernelStats::default()),
         }
     }
@@ -198,6 +203,102 @@ impl PondKernel {
             })
             .filter(|h| h.starts_with(prefix))
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async API — behind `feature = "async"`.
+//
+// Strategy: `PondKernel.store` is `Arc<dyn ObjectStore>`, so async methods
+// clone the Arc into a `spawn_blocking` closure and await the join handle.
+// This gives async callers a non-blocking API without duplicating the sync
+// backend logic. Backends with native async I/O (LocalFS via tokio::fs,
+// S3 via reqwest) can be used directly via the `AsyncObjectStore` trait.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+impl PondKernel {
+    /// Async variant of [`write`](Self::write). Writes bytes via the sync
+    /// `ObjectStore::put_blob` on a blocking thread.
+    ///
+    /// The `??` unwraps both `JoinError` (panic in the blocking task) and
+    /// `io::Error` (from the store).
+    pub async fn write_async(&self, data: Vec<u8>) -> io::Result<String> {
+        let store = self.store.clone();
+        let h = tokio::task::spawn_blocking(move || store.put_blob(&data)).await??;
+        self.stats.lock().unwrap().writes += 1;
+        Ok(h)
+    }
+
+    /// Async variant of [`read_blob`](Self::read_blob).
+    pub async fn read_blob_async(&self, hash: &str) -> io::Result<Vec<u8>> {
+        let store = self.store.clone();
+        let hash = hash.to_string();
+        let data = tokio::task::spawn_blocking(move || store.get_blob(&hash)).await??;
+        self.stats.lock().unwrap().reads += 1;
+        Ok(data)
+    }
+
+    /// Async variant of [`read`](Self::read) — resolves a name to a hash
+    /// (sync, fast — just a ref lookup) and then reads the blob async.
+    pub async fn read_async(&self, hash_or_name: &str) -> io::Result<Vec<u8>> {
+        if is_hash(hash_or_name) {
+            return self.read_blob_async(hash_or_name).await;
+        }
+        let h = self.resolve(hash_or_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
+                format!("Name '{}' not found", hash_or_name)))?;
+        self.read_blob_async(&h).await
+    }
+
+    /// Async variant of [`reference`](Self::reference).
+    pub async fn reference_async(&self, name: &str, h: &str) -> io::Result<()> {
+        let store = self.store.clone();
+        let name = name.to_string();
+        let h = h.to_string();
+        tokio::task::spawn_blocking(move || {
+            if !store.blob_exists(&h) {
+                return Err(io::Error::new(io::ErrorKind::NotFound,
+                    format!("Hash '{}' does not refer to an existing blob", h)));
+            }
+            store.put_path(&name, &h)
+        }).await??;
+        self.stats.lock().unwrap().references += 1;
+        Ok(())
+    }
+
+    /// Async variant of [`delete_blob`](Self::delete_blob).
+    pub async fn delete_blob_async(&self, hash: &str) -> io::Result<bool> {
+        let store = self.store.clone();
+        let hash = hash.to_string();
+        // `await?` flattens `Result<Result<bool, io::Error>, JoinError>` →
+        // `Result<bool, io::Error>` (JoinError auto-converts to io::Error).
+        tokio::task::spawn_blocking(move || store.delete_blob(&hash)).await?
+    }
+
+    /// Async variant of [`list_blobs_prefix`](Self::list_blobs_prefix).
+    pub async fn list_blobs_prefix_async(&self, prefix: &str) -> Vec<String> {
+        let store = self.store.clone();
+        let prefix = prefix.to_string();
+        match tokio::task::spawn_blocking(move || {
+            let shard = match prefix.get(..2) {
+                Some(s) => s.to_string(),
+                None => return Vec::new(),
+            };
+            let list_key = format!("blobs/{}/", shard);
+            store.list_paths(&list_key)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| {
+                    let parts: Vec<&str> = p.split('/').collect();
+                    parts.get(2).map(|s| s.to_string())
+                })
+                .filter(|h| h.starts_with(&prefix))
+                .collect::<Vec<_>>()
+        }).await {
+            Ok(v) => v,
+            Err(_) => Vec::new(),
+        }
     }
 }
 
@@ -338,5 +439,160 @@ mod tests {
         let content = std::fs::read_to_string(&ref_file).unwrap();
         assert!(content.contains(r#""hash":"#), "ref must store JSON, got: {}", content);
         assert!(content.contains(&h), "ref must contain the hash, got: {}", content);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async tests — only compiled when `feature = "async"` is on.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "async"))]
+mod async_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Round-trip: write_async → read_blob_async.
+    #[tokio::test]
+    async fn test_async_write_read_roundtrip() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let h = kernel.write_async(b"hello, async pond!".to_vec()).await.unwrap();
+        let data = kernel.read_blob_async(&h).await.unwrap();
+        assert_eq!(data, b"hello, async pond!");
+    }
+
+    /// Async read by name (reference_async + read_async).
+    #[tokio::test]
+    async fn test_async_reference_and_read_by_name() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let h = kernel.write_async(b"by name async".to_vec()).await.unwrap();
+        kernel.reference_async("my_coll", &h).await.unwrap();
+        assert_eq!(kernel.resolve("my_coll"), Some(h.clone()));
+        let data = kernel.read_async("my_coll").await.unwrap();
+        assert_eq!(data, b"by name async");
+    }
+
+    /// Async dedup: same bytes → same hash (matches sync behavior).
+    #[tokio::test]
+    async fn test_async_dedup() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let h1 = kernel.write_async(b"same".to_vec()).await.unwrap();
+        let h2 = kernel.write_async(b"same".to_vec()).await.unwrap();
+        assert_eq!(h1, h2);
+    }
+
+    /// Async delete_blob returns true on existing, false after deletion.
+    #[tokio::test]
+    async fn test_async_delete_blob() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let h = kernel.write_async(b"to be deleted".to_vec()).await.unwrap();
+        assert!(kernel.delete_blob_async(&h).await.unwrap());
+        // Second delete returns false (already gone).
+        assert!(!kernel.delete_blob_async(&h).await.unwrap());
+    }
+
+    /// Async list_blobs_prefix matches sync list_blobs_prefix for the
+    /// same set of written blobs.
+    #[tokio::test]
+    async fn test_async_list_blobs_prefix_matches_sync() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        // Write many blobs so at least 2 land in the same shard (blobs/{xx}/).
+        // With 20 blobs, the probability of all 20 having distinct 2-char
+        // prefixes is essentially zero (256 shards, birthday paradox).
+        let mut all_hashes = Vec::new();
+        for i in 0..20u32 {
+            let h = kernel
+                .write_async(format!("blob-{:04}", i).into_bytes())
+                .await
+                .unwrap();
+            all_hashes.push(h);
+        }
+
+        // Pick the first 2 chars of the first hash as the prefix. The sync
+        // and async paths should both return every blob whose hash starts
+        // with that prefix — and they should agree exactly.
+        let prefix = all_hashes[0][..2].to_string();
+        let matching: Vec<String> = all_hashes.iter()
+            .filter(|h| h.starts_with(&prefix))
+            .cloned()
+            .collect();
+        assert!(!matching.is_empty(), "expected at least 1 blob in shard {}", prefix);
+
+        let sync_list = kernel.list_blobs_prefix(&prefix);
+        let async_list = kernel.list_blobs_prefix_async(&prefix).await;
+
+        let mut s = sync_list.clone();
+        let mut a = async_list.clone();
+        s.sort();
+        a.sort();
+        assert_eq!(s, a, "sync and async prefix listing must match");
+
+        // And the list must contain every matching hash we wrote.
+        for h in &matching {
+            assert!(s.contains(h), "list must contain {}", h);
+        }
+    }
+
+    /// AsyncObjectStore impl on LocalFSObjectStore: direct trait call,
+    /// bypassing the kernel. Verifies the trait is usable standalone.
+    #[tokio::test]
+    async fn test_async_object_store_local_fs() {
+        use crate::AsyncObjectStore;
+        let dir = tempdir().unwrap();
+        let store = LocalFSObjectStore::new(dir.path()).unwrap();
+        let h = store.put_blob_async(b"via trait".to_vec()).await.unwrap();
+        let data = store.get_blob_async(&h).await.unwrap();
+        assert_eq!(data, b"via trait");
+        assert!(store.delete_blob_async(&h).await.unwrap());
+        // After deletion, get_blob_async returns NotFound.
+        let err = store.get_blob_async(&h).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Async read of a non-existent hash returns NotFound.
+    #[tokio::test]
+    async fn test_async_read_blob_not_found() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let fake = "0".repeat(64);
+        let err = kernel.read_blob_async(&fake).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Concurrent async writes from many tasks don't deadlock or lose data.
+    #[tokio::test]
+    async fn test_async_concurrent_writes() {
+        let dir = tempdir().unwrap();
+        // We can't clone PondKernel itself (it's not Clone by design), so
+        // wrap it in Arc and have each task use `&PondKernel` via the Arc.
+        let kernel = std::sync::Arc::new(PondKernel::new_local(dir.path()).unwrap());
+        let n = 32;
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let k = kernel.clone();
+            handles.push(tokio::spawn(async move {
+                let payload = format!("payload-{}", i);
+                // Borrow through the Arc — async methods take &self.
+                k.write_async(payload.into_bytes()).await.unwrap()
+            }));
+        }
+        let mut hashes = Vec::with_capacity(n);
+        for h in handles {
+            hashes.push(h.await.unwrap());
+        }
+        // Each hash should read back its own payload.
+        for (i, h) in hashes.iter().enumerate() {
+            let data = kernel.read_blob_async(h).await.unwrap();
+            assert_eq!(data, format!("payload-{}", i).into_bytes());
+        }
+        // All hashes should be distinct (different content → different hash).
+        let mut unique = hashes.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), n, "all {} hashes must be distinct", n);
     }
 }

@@ -82,6 +82,43 @@ pub trait ObjectStore: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// AsyncObjectStore trait — async version, behind `feature = "async"`
+// ---------------------------------------------------------------------------
+
+/// Async variant of [`ObjectStore`]. Only available with the `async` feature.
+///
+/// All backends that want to expose true async I/O (rather than just blocking
+/// the sync API on a thread pool) should implement this trait in addition to
+/// [`ObjectStore`]. The sync trait remains the source of truth — async
+/// methods are a performance opt-in for high-throughput concurrent workloads
+/// (e.g. AI frameworks that use `asyncio`, which currently have to block the
+/// GIL on every S3 call through the PyO3 binding).
+///
+/// `LocalFSObjectStore` implements this with `tokio::fs`; `S3ObjectStore`
+/// implements it with `reqwest`.
+///
+/// NOTE: this trait does NOT extend [`ObjectStore`] — backends implement both
+/// independently. The kernel's async methods (`PondKernel::read_blob_async`,
+/// etc.) call `spawn_blocking` on the sync `ObjectStore` for now, which keeps
+/// the trait object story simple. Backends that want true async I/O bypass
+/// the kernel and call their `AsyncObjectStore` impl directly.
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+pub trait AsyncObjectStore: Send + Sync {
+    /// Write bytes content-addressed, returning the hash. Idempotent.
+    async fn put_blob_async(&self, data: Vec<u8>) -> io::Result<String>;
+
+    /// Read bytes by content hash.
+    async fn get_blob_async(&self, hash: &str) -> io::Result<Vec<u8>>;
+
+    /// Physically delete a blob (maintenance op). Returns true if it existed.
+    async fn delete_blob_async(&self, hash: &str) -> io::Result<bool>;
+
+    /// List all blob hashes with a given prefix (relative to the blobs/ tree).
+    async fn list_blobs_prefix_async(&self, prefix: &str) -> Vec<String>;
+}
+
+// ---------------------------------------------------------------------------
 // LocalFSObjectStore — local filesystem implementation
 // ---------------------------------------------------------------------------
 
@@ -255,4 +292,92 @@ fn extract_hash_from_json(json: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// AsyncObjectStore impl for LocalFSObjectStore — tokio::fs
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+impl AsyncObjectStore for LocalFSObjectStore {
+    async fn put_blob_async(&self, data: Vec<u8>) -> io::Result<String> {
+        let h = hash_bytes(&data);
+        let path = self.blob_path(&h);
+
+        // Dedup: skip if exists. `tokio::fs::try_exists` is stable on Rust 1.70+.
+        // We use `tokio::fs::metadata` for compatibility with older toolchains.
+        let already_exists = tokio::fs::metadata(&path).await.is_ok();
+        if !already_exists {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            // Write to temp file, then rename (POSIX atomic).
+            let tmp = format!("{}.tmp.{}", path.display(), std::process::id());
+            tokio::fs::write(&tmp, &data).await?;
+            tokio::fs::rename(&tmp, &path).await?;
+        }
+        let mut s = self.stats.lock().unwrap();
+        s.puts += 1;
+        s.bytes_written += data.len() as u64;
+        Ok(h)
+    }
+
+    async fn get_blob_async(&self, hash: &str) -> io::Result<Vec<u8>> {
+        let path = self.blob_path(hash);
+        // Mirror the sync error: NotFound when the blob is missing.
+        if tokio::fs::metadata(&path).await.is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Blob '{}' not found", hash),
+            ));
+        }
+        let data = tokio::fs::read(&path).await?;
+        let mut s = self.stats.lock().unwrap();
+        s.gets += 1;
+        s.bytes_read += data.len() as u64;
+        Ok(data)
+    }
+
+    async fn delete_blob_async(&self, hash: &str) -> io::Result<bool> {
+        let path = self.blob_path(hash);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                let mut s = self.stats.lock().unwrap();
+                s.gets += 1; // count as a maintenance op (matches sync impl)
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn list_blobs_prefix_async(&self, prefix: &str) -> Vec<String> {
+        if prefix.len() < 2 {
+            return Vec::new();
+        }
+        let shard = &prefix[..2];
+        let list_prefix = self.base_dir.join("blobs").join(shard);
+
+        // Collect into a Vec<PathBuf> first, then map to strings. We use
+        // tokio::fs::read_dir for an async walk. For simplicity we walk
+        // single-level (blobs/{shard}/ only — Pond never nests deeper).
+        let mut entries = match tokio::fs::read_dir(&list_prefix).await {
+            Ok(rd) => rd,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut hashes = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+                let name = entry.file_name();
+                let name = name.to_string_lossy().replace('\\', "/");
+                if name.starts_with(prefix) {
+                    hashes.push(name);
+                }
+            }
+        }
+        hashes.sort();
+        hashes
+    }
 }

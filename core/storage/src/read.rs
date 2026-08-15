@@ -4,6 +4,7 @@
 
 use crate::branch_ref;
 use crate::commit;
+use crate::commit::Commit;
 use crate::manifest::CollectionManifest;
 use crate::shard;
 use pond_kernel::PondKernel;
@@ -67,6 +68,92 @@ pub fn read_at_snapshot(
 
     if let Some(rg) = manifest.row_groups.first() {
         return kernel.read_blob(&rg.blob_hash)
+            .map_err(|e| format!("Failed to read data blob: {}", e));
+    }
+
+    Err("Manifest has no row groups".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Async read path — behind `feature = "async"`.
+//
+// `read_rows_async` is the async equivalent of [`read`]. It uses
+// `PondKernel::read_blob_async` (which is itself `spawn_blocking` on the
+// sync `ObjectStore`) so callers get a non-blocking API without the storage
+// crate having to re-implement the manifest / commit / row-group logic.
+//
+// Ref lookups (`resolve`) stay sync — they're fast (one stat or one HEAD
+// request) and don't benefit from async. Only blob reads (which can be
+// hundreds of KB) are async.
+// ---------------------------------------------------------------------------
+
+/// Async variant of [`read`].
+///
+/// Reads the HEAD data for a collection on the given branch, using the
+/// kernel's async blob API. Returns the same bytes that [`read`] would.
+///
+/// The function is named `read_rows_async` for parity with the async API
+/// spec, but it returns raw bytes (not structured rows) — same as [`read`].
+/// For structured row reads with projection + pruning, see [`read_rows_i64`]
+/// (a sync-only API for now).
+#[cfg(feature = "async")]
+pub async fn read_rows_async(
+    kernel: &PondKernel,
+    collection: &str,
+    branch: &str,
+) -> Result<Vec<u8>, String> {
+    // 1. Resolve HEAD commit ref — sync, fast (one stat / one HEAD request).
+    let head = kernel.resolve(&branch_ref(collection, branch))
+        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+
+    // 2. Read the commit blob async.
+    let commit_bytes = kernel.read_blob_async(&head).await
+        .map_err(|e| format!("Failed to read HEAD commit: {}", e))?;
+    let commit = Commit::from_json_bytes(&commit_bytes)
+        .ok_or_else(|| "Failed to decode HEAD commit".to_string())?;
+
+    if commit.manifest.is_empty() {
+        return Err("HEAD commit has no manifest".to_string());
+    }
+
+    // 3. Read the manifest blob async.
+    let manifest_bytes = kernel.read_blob_async(&commit.manifest).await
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+    let manifest = CollectionManifest::decode(&manifest_bytes)
+        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+    // 4. Read the first row group's data blob async.
+    if let Some(rg) = manifest.row_groups.first() {
+        return kernel.read_blob_async(&rg.blob_hash).await
+            .map_err(|e| format!("Failed to read data blob: {}", e));
+    }
+
+    Err("Manifest has no row groups".to_string())
+}
+
+/// Async variant of [`read_at_snapshot`]. Reads the data at a specific
+/// commit hash, ignoring shards written after that commit.
+#[cfg(feature = "async")]
+pub async fn read_at_snapshot_async(
+    kernel: &PondKernel,
+    commit_hash: &str,
+) -> Result<Vec<u8>, String> {
+    let commit_bytes = kernel.read_blob_async(commit_hash).await
+        .map_err(|e| format!("Failed to read commit: {}", e))?;
+    let commit = Commit::from_json_bytes(&commit_bytes)
+        .ok_or_else(|| "Commit not found or corrupt".to_string())?;
+
+    if commit.manifest.is_empty() {
+        return Err("Commit has no manifest".to_string());
+    }
+
+    let manifest_bytes = kernel.read_blob_async(&commit.manifest).await
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+    let manifest = CollectionManifest::decode(&manifest_bytes)
+        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+    if let Some(rg) = manifest.row_groups.first() {
+        return kernel.read_blob_async(&rg.blob_hash).await
             .map_err(|e| format!("Failed to read data blob: {}", e));
     }
 
@@ -402,5 +489,93 @@ mod tests {
         let score_col = cols.iter().find(|(n, _)| n == "score").expect("score column");
         assert_eq!(id_col.1, ids);
         assert_eq!(score_col.1, scores);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async tests — only compiled when `feature = "async"` is on.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "async"))]
+mod async_tests {
+    use super::*;
+    use crate::UnifiedStorage;
+    use crate::write;
+
+    /// `read_rows_async` returns the same bytes as the sync `read`.
+    #[tokio::test]
+    async fn test_read_rows_async_matches_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        write::write(kernel, "users", "main", b"hello async", "initial").unwrap();
+
+        let sync_data = read(kernel, "users", "main").unwrap();
+        let async_data = read_rows_async(kernel, "users", "main").await.unwrap();
+        assert_eq!(sync_data, async_data, "sync and async read must return identical bytes");
+        assert_eq!(async_data, b"hello async");
+    }
+
+    /// `read_at_snapshot_async` returns the snapshot data (not the latest HEAD).
+    #[tokio::test]
+    async fn test_read_at_snapshot_async_isolates_from_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let c1 = write::write(kernel, "users", "main", b"v1", "first").unwrap();
+        // Write a second commit — the snapshot read should still see v1.
+        write::write(kernel, "users", "main", b"v2", "second").unwrap();
+
+        let snap = read_at_snapshot_async(kernel, &c1).await.unwrap();
+        assert_eq!(snap, b"v1", "snapshot read must isolate from later writes");
+    }
+
+    /// `read_rows_async` on a non-existent collection returns Err.
+    #[tokio::test]
+    async fn test_read_rows_async_missing_collection_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let err = read_rows_async(kernel, "ghosts", "main").await.unwrap_err();
+        assert!(err.contains("no commits") || err.contains("ghosts"),
+            "error message should mention the missing collection: {}", err);
+    }
+
+    /// Concurrent `read_rows_async` calls on different collections don't
+    /// deadlock and each returns the right bytes.
+    #[tokio::test]
+    async fn test_read_rows_async_concurrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // Write 4 collections with distinct payloads.
+        let names = ["a", "b", "c", "d"];
+        let payloads = [b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec(), b"delta".to_vec()];
+        for (n, p) in names.iter().zip(payloads.iter()) {
+            write::write(kernel, n, "main", p, "init").unwrap();
+        }
+
+        // Read them concurrently — borrow kernel via &PondKernel through Arc.
+        let kernel_arc = std::sync::Arc::new(storage);
+        let mut handles = Vec::new();
+        for n in &names {
+            let k = kernel_arc.clone();
+            let n = n.to_string();
+            handles.push(tokio::spawn(async move {
+                read_rows_async(k.kernel(), &n, "main").await.unwrap()
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        // Each result must match its corresponding payload.
+        for (r, p) in results.iter().zip(payloads.iter()) {
+            assert_eq!(r, p);
+        }
     }
 }

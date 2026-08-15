@@ -269,6 +269,10 @@ pub struct S3ObjectStore {
     credentials: S3Credentials,
     agent: ureq::Agent,
     stats: Mutex<StoreStats>,
+    /// Lazily-initialized async HTTP client. Only present with `feature = "async"`.
+    /// `OnceLock` so we don't need to thread an `Option` through `new()`.
+    #[cfg(feature = "async")]
+    async_client: std::sync::OnceLock<reqwest::Client>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -311,6 +315,8 @@ impl S3ObjectStore {
             credentials,
             agent,
             stats: Mutex::new(StoreStats::default()),
+            #[cfg(feature = "async")]
+            async_client: std::sync::OnceLock::new(),
         }
     }
 
@@ -369,15 +375,19 @@ impl S3ObjectStore {
 
     // --- HTTP request with SigV4 signing ---
 
-    /// Make a signed S3 request and return the response.
-    fn s3_request(
+    /// Build a fully-signed S3 request (URL + headers + body), without
+    /// executing it. Shared by the sync `s3_request` and the async
+    /// `s3_request_async` so SigV4 signing logic lives in exactly one place.
+    ///
+    /// Returns a [`SignedS3Request`] which can be executed via any HTTP client.
+    fn build_signed_request(
         &self,
         method: &str,
         key: &str,
         query: Option<&str>,
         body: Option<&[u8]>,
         extra_headers: &[(String, String)],
-    ) -> Result<ureq::Response, io::Error> {
+    ) -> Result<SignedS3Request, io::Error> {
         let (timestamp, date_stamp) = sigv4_timestamp();
         let payload = body.unwrap_or(&[]);
         let payload_hash = sha256_hex(payload);
@@ -449,34 +459,59 @@ impl S3ObjectStore {
             &signature,
         );
 
-        // Build the ureq request
+        // Add the Authorization header (not part of the signed headers list
+        // — it's the signature itself).
+        headers.push(("Authorization".to_string(), auth_header));
+
+        Ok(SignedS3Request {
+            method: method.to_string(),
+            url,
+            body: payload.to_vec(),
+            headers,
+        })
+    }
+
+    /// Make a signed S3 request and return the response.
+    fn s3_request(
+        &self,
+        method: &str,
+        key: &str,
+        query: Option<&str>,
+        body: Option<&[u8]>,
+        extra_headers: &[(String, String)],
+    ) -> Result<ureq::Response, io::Error> {
+        let signed = self.build_signed_request(method, key, query, body, extra_headers)?;
+
+        // Build the ureq request. Each call builds a fresh agent (matches
+        // pre-refactor behavior — the struct's `self.agent` field is unused
+        // for this path; it's preserved for back-compat).
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(30))
             .build();
 
-        let req = match method {
-            "GET" => agent.get(&url),
-            "PUT" => agent.put(&url),
-            "DELETE" => agent.delete(&url),
-            "HEAD" => agent.head(&url),
+        let req = match signed.method.as_str() {
+            "GET" => agent.get(&signed.url),
+            "PUT" => agent.put(&signed.url),
+            "DELETE" => agent.delete(&signed.url),
+            "HEAD" => agent.head(&signed.url),
             _ => return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("unsupported method: {}", method))),
+                format!("unsupported method: {}", signed.method))),
         };
 
         // Add all signed headers
-        let mut req = req.set("Authorization", &auth_header);
-        for (k, v) in &headers {
+        let mut req = req;
+        for (k, v) in &signed.headers {
             req = req.set(k, v);
         }
 
         // Execute
-        let response = if method == "PUT" {
-            req.send_bytes(payload)
-        } else if method == "GET" || method == "HEAD" || method == "DELETE" {
-            if payload.is_empty() {
+        let response = if signed.method == "PUT" {
+            req.send_bytes(&signed.body)
+        } else if signed.method == "GET" || signed.method == "HEAD" || signed.method == "DELETE" {
+            if signed.body.is_empty() {
                 req.call()
             } else {
-                req.send_bytes(payload)
+                req.send_bytes(&signed.body)
             }
         } else {
             req.call()
@@ -499,6 +534,72 @@ impl S3ObjectStore {
             }
         })
     }
+
+    /// Async variant of [`s3_request`](Self::s3_request) using `reqwest`.
+    ///
+    /// Builds the same SigV4-signed request via [`build_signed_request`](Self::build_signed_request)
+    /// and executes it asynchronously. The `reqwest::Client` is created once
+    /// and cached in `self.async_client` (a `OnceLock`) so connection
+    /// pooling/keep-alive works across calls.
+    #[cfg(feature = "async")]
+    async fn s3_request_async(
+        &self,
+        method: &str,
+        key: &str,
+        query: Option<&str>,
+        body: Option<&[u8]>,
+        extra_headers: &[(String, String)],
+    ) -> Result<reqwest::Response, io::Error> {
+        let signed = self.build_signed_request(method, key, query, body, extra_headers)?;
+
+        let client = self.async_client.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        });
+
+        let method_enum = match signed.method.as_str() {
+            "GET" => reqwest::Method::GET,
+            "PUT" => reqwest::Method::PUT,
+            "DELETE" => reqwest::Method::DELETE,
+            "HEAD" => reqwest::Method::HEAD,
+            "POST" => reqwest::Method::POST,
+            other => return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported method: {}", other),
+            )),
+        };
+
+        let mut req = client.request(method_enum, &signed.url);
+        for (k, v) in &signed.headers {
+            req = req.header(k, v);
+        }
+        if !signed.body.is_empty() {
+            req = req.body(signed.body);
+        }
+
+        req.send().await.map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("reqwest transport error: {}", e))
+        })
+        // Note: reqwest::Response doesn't error on 4xx/5xx by default —
+        // callers must check .status() themselves. The sync path returns
+        // errors for non-2xx via ureq::Error::Status; async callers should
+        // use .error_for_status() to mirror that behavior.
+    }
+}
+
+/// A fully-signed S3 request, ready to be executed by any HTTP client.
+///
+/// Produced by [`S3ObjectStore::build_signed_request`]. Contains the URL,
+/// HTTP method, body bytes (empty for GET/HEAD/DELETE), and all required
+/// headers (host, x-amz-content-sha256, x-amz-date, x-amz-security-token
+/// if present, plus the Authorization header).
+struct SignedS3Request {
+    method: String,
+    url: String,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +933,198 @@ impl ObjectStore for S3ObjectStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Async S3 methods — behind `feature = "async"`.
+//
+// These are INHERENT methods on `S3ObjectStore` (not an `AsyncObjectStore`
+// trait impl) so callers don't have to import a trait to use them. They
+// reuse [`build_signed_request`](S3ObjectStore::build_signed_request) and
+// execute via [`s3_request_async`](S3ObjectStore::s3_request_async) using
+// `reqwest`.
+//
+// SigV4 signing is bit-for-bit identical between sync and async — only the
+// HTTP client differs (`ureq` vs `reqwest`).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+impl S3ObjectStore {
+    /// Async variant of [`ObjectStore::put_blob`].
+    ///
+    /// Computes the content hash, signs a PUT request via SigV4, and executes
+    /// it via `reqwest`. Returns the hash.
+    pub async fn put_blob_async(&self, data: Vec<u8>) -> io::Result<String> {
+        let h = pond_kernel::hash_bytes(&data);
+        let key = self.blob_key(&h);
+        // S3 PUT is idempotent for same content — no need for HEAD first.
+        let resp = self.s3_request_async("PUT", &key, None, Some(&data), &[]).await?;
+        // reqwest doesn't error on 4xx/5xx by default — convert here so the
+        // async API matches the sync one (which errors via ureq::Error::Status).
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("S3 returned {}: {}", status, body),
+            ));
+        }
+        let mut s = self.stats.lock().unwrap();
+        s.puts += 1;
+        s.bytes_written += data.len() as u64;
+        Ok(h)
+    }
+
+    /// Async variant of [`ObjectStore::get_blob`].
+    pub async fn get_blob_async(&self, hash: &str) -> io::Result<Vec<u8>> {
+        let key = self.blob_key(hash);
+        let resp = self.s3_request_async("GET", &key, None, None, &[]).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Blob '{}' not found in S3", hash),
+            ));
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("S3 returned {}: {}", status, body),
+            ));
+        }
+        let body = resp.bytes().await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("read body: {}", e)))?;
+        let body = body.to_vec();
+        let mut s = self.stats.lock().unwrap();
+        s.gets += 1;
+        s.bytes_read += body.len() as u64;
+        Ok(body)
+    }
+
+    /// Async variant of [`ObjectStore::delete_blob`].
+    pub async fn delete_blob_async(&self, hash: &str) -> io::Result<bool> {
+        let key = self.blob_key(hash);
+        let resp = self.s3_request_async("DELETE", &key, None, None, &[]).await?;
+        let status = resp.status();
+        // S3 DELETE is idempotent — 204 means deleted, 404 means it was already gone.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("S3 returned {}: {}", status, body),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Async variant of [`PondKernel::list_blobs_prefix`](pond_kernel::PondKernel::list_blobs_prefix).
+    ///
+    /// Uses S3 ListObjectsV2 with `prefix={prefix}/blobs/{xx}/` to enumerate
+    /// blob hashes in a single shard. Returns matching hashes (sorted).
+    pub async fn list_blobs_prefix_async(&self, prefix: &str) -> Vec<String> {
+        if prefix.len() < 2 {
+            return Vec::new();
+        }
+        let shard = &prefix[..2];
+        // Build the S3 list prefix: {our_prefix/}blobs/{shard}/
+        let list_prefix = if self.prefix.is_empty() {
+            format!("blobs/{}/", shard)
+        } else {
+            format!("{}/blobs/{}/", self.prefix, shard)
+        };
+
+        // ListObjectsV2 query — same as sync `list_paths` but only one shard.
+        let query = format!(
+            "list-type=2&prefix={}",
+            urlencoding::encode(&list_prefix)
+        );
+
+        let resp = match self.s3_request_async("GET", "", Some(&query), None, &[]).await {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        };
+
+        // Extract <Key>...</Key> values from the XML response.
+        // The key shape is: {our_prefix/}blobs/{shard}/{hash}
+        // We want just the {hash} portion, filtered by the caller's prefix.
+        let strip_len = list_prefix.len(); // includes trailing '/'
+        let mut hashes = Vec::new();
+        let mut search_from = 0;
+        while search_from < body.len() {
+            let key_start = match body[search_from..].find("<Key>") {
+                Some(p) => search_from + p + 5,
+                None => break,
+            };
+            let key_end = match body[key_start..].find("</Key>") {
+                Some(p) => key_start + p,
+                None => break,
+            };
+            let key = &body[key_start..key_end];
+            // Strip the list prefix to get just the hash.
+            let hash = if key.len() >= strip_len {
+                &key[strip_len..]
+            } else {
+                key
+            };
+            if hash.starts_with(prefix) {
+                hashes.push(hash.to_string());
+            }
+            search_from = key_end + 6;
+        }
+        hashes.sort();
+        hashes.dedup();
+        hashes
+    }
+
+    /// Async variant of [`ObjectStore::put_path`]. Binds a named path to a
+    /// content hash by writing a `{"hash":"..."}` JSON object to S3.
+    pub async fn put_path_async(&self, path: &str, hash: &str) -> io::Result<()> {
+        let key = self.path_key(path);
+        let body = format!(r#"{{"hash":"{}"}}"#, hash).into_bytes();
+        let resp = self.s3_request_async("PUT", &key, None, Some(&body), &[]).await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("S3 returned {}: {}", status, body),
+            ));
+        }
+        let mut s = self.stats.lock().unwrap();
+        s.puts += 1;
+        Ok(())
+    }
+
+    /// Async variant of [`ObjectStore::get_path`]. Resolves a named path
+    /// to its content hash. Returns `None` if the path is unbound or on error.
+    pub async fn get_path_async(&self, path: &str) -> Option<String> {
+        let key = self.path_key(path);
+        let resp = match self.s3_request_async("GET", &key, None, None, &[]).await {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        let mut s = self.stats.lock().unwrap();
+        s.gets += 1;
+        extract_hash_from_json(&body)
+    }
+}
+
 /// Extract the "hash" field from a JSON string like {"hash":"abc123"}.
 /// (Same minimal parser as LocalFSObjectStore — copied to avoid a cross-crate dep.)
 fn extract_hash_from_json(json: &str) -> Option<String> {
@@ -1088,5 +1381,238 @@ mod tests {
             ureq::Agent::new(),
         );
         assert_eq!(store_no_prefix.blob_key("abcdef1234567890"), "blobs/ab/abcdef1234567890");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async tests — only compiled when `feature = "async"` is on.
+//
+// These don't hit real S3. They verify:
+//   - `build_signed_request` produces a well-formed SignedS3Request
+//     (URL + Authorization header + signed headers).
+//   - Async methods on S3ObjectStore return io::Error (not panic) when the
+//     endpoint is unreachable — i.e. the async error path mirrors the sync
+//     one (errors are propagated, not swallowed).
+//
+// Real-S3 round-trip tests live in the integration suite (`tests/`) and
+// require AWS credentials in the environment. They're skipped here to keep
+// `cargo test` hermetic.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "async"))]
+mod async_tests {
+    use super::*;
+
+    /// Helper: build an S3ObjectStore pointing at a fake endpoint.
+    fn fake_store() -> S3ObjectStore {
+        S3ObjectStore::new(
+            "my-bucket",
+            "prod",
+            "us-east-1",
+            "https://s3.amazonaws.com",
+            S3Credentials {
+                access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                session_token: None,
+            },
+            ureq::Agent::new(),
+        )
+    }
+
+    /// `build_signed_request` produces a SignedS3Request with:
+    ///   - the right URL (endpoint + bucket + key)
+    ///   - an `Authorization` header containing the SigV4 credential string
+    ///   - the host, x-amz-content-sha256, x-amz-date headers
+    ///   - the original body bytes preserved
+    #[test]
+    fn test_build_signed_request_shape() {
+        let store = fake_store();
+        let body = b"hello s3".to_vec();
+        let signed = store
+            .build_signed_request("PUT", "prod/blobs/ab/abcdef", None, Some(&body), &[])
+            .unwrap();
+
+        assert_eq!(signed.method, "PUT");
+        assert_eq!(signed.url, "https://s3.amazonaws.com/my-bucket/prod/blobs/ab/abcdef");
+        assert_eq!(signed.body, body);
+
+        // Authorization header is SigV4-shaped.
+        let auth = signed.headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.as_str())
+            .expect("Authorization header must be present");
+        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
+        assert!(auth.contains("/us-east-1/s3/aws4_request"));
+        assert!(auth.contains("Signature="));
+
+        // Required SigV4 headers are present.
+        let header_names: Vec<String> = signed.headers.iter()
+            .map(|(k, _)| k.to_lowercase())
+            .collect();
+        assert!(header_names.contains(&"host".to_string()));
+        assert!(header_names.contains(&"x-amz-content-sha256".to_string()));
+        assert!(header_names.contains(&"x-amz-date".to_string()));
+    }
+
+    /// A signed PUT and a signed GET for the same key produce DIFFERENT
+    /// Authorization headers (because the method is part of the canonical
+    /// request). This catches a class of bugs where signing forgets the method.
+    #[test]
+    fn test_signing_differs_per_method() {
+        let store = fake_store();
+        let key = "prod/blobs/ab/abcdef";
+        let data = b"payload".to_vec();
+
+        let put = store.build_signed_request("PUT", key, None, Some(&data), &[]).unwrap();
+        let get = store.build_signed_request("GET", key, None, None, &[]).unwrap();
+
+        let put_auth = put.headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let get_auth = get.headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.clone())
+            .unwrap();
+
+        assert_ne!(put_auth, get_auth,
+            "PUT and GET must produce different signatures (method is part of canonical request)");
+    }
+
+    /// Async `get_blob_async` against an unreachable endpoint returns an
+    /// `io::Error` rather than panicking. This is the basic safety contract:
+    /// async errors must be propagated through `Result`, not unwound.
+    #[tokio::test]
+    async fn test_async_get_blob_unreachable_endpoint_errors() {
+        // Point at a localhost port that's almost certainly closed.
+        let store = S3ObjectStore::new(
+            "my-bucket", "prod", "us-east-1",
+            "http://127.0.0.1:1", // port 1 — nothing listening
+            S3Credentials {
+                access_key: "test".to_string(),
+                secret_key: "test".to_string(),
+                session_token: None,
+            },
+            ureq::Agent::new(),
+        );
+
+        let result = store.get_blob_async("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890").await;
+        assert!(result.is_err(), "expected Err, got: {:?}", result);
+        let err = result.unwrap_err();
+        // We don't assert on the exact error kind — reqwest maps connection
+        // failures to its own error type — but it must be an io::Error.
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// Async `list_blobs_prefix_async` returns an empty Vec (not an error)
+    /// when the endpoint is unreachable — matches the sync behavior where
+    /// `list_paths` returns `unwrap_or_default()` on failure.
+    #[tokio::test]
+    async fn test_async_list_blobs_prefix_unreachable_returns_empty() {
+        let store = S3ObjectStore::new(
+            "my-bucket", "prod", "us-east-1",
+            "http://127.0.0.1:1",
+            S3Credentials {
+                access_key: "test".to_string(),
+                secret_key: "test".to_string(),
+                session_token: None,
+            },
+            ureq::Agent::new(),
+        );
+
+        // 64-char hex hash prefix.
+        let prefix = "ab";
+        let result = store.list_blobs_prefix_async(prefix).await;
+        assert!(result.is_empty(), "expected empty Vec on unreachable endpoint, got: {:?}", result);
+    }
+
+    /// `S3ObjectStore::new` works with the async feature on — the
+    /// `async_client` OnceLock is initialized lazily (not in `new()`).
+    #[test]
+    fn test_new_with_async_feature_smoke() {
+        let store = fake_store();
+        // Just confirm we can construct without panicking. The OnceLock
+        // is empty until the first async call touches it.
+        let _ = &store;
+    }
+
+    /// `put_blob_async` against an unreachable endpoint errors (does not
+    /// hang or panic). This verifies the request-building path doesn't
+    /// short-circuit on the body.
+    #[tokio::test]
+    async fn test_async_put_blob_unreachable_endpoint_errors() {
+        let store = S3ObjectStore::new(
+            "my-bucket", "prod", "us-east-1",
+            "http://127.0.0.1:1",
+            S3Credentials {
+                access_key: "test".to_string(),
+                secret_key: "test".to_string(),
+                session_token: None,
+            },
+            ureq::Agent::new(),
+        );
+
+        let result = store.put_blob_async(b"some data".to_vec()).await;
+        assert!(result.is_err(), "expected Err, got: {:?}", result);
+    }
+
+    /// `delete_blob_async` against an unreachable endpoint errors.
+    #[tokio::test]
+    async fn test_async_delete_blob_unreachable_endpoint_errors() {
+        let store = S3ObjectStore::new(
+            "my-bucket", "prod", "us-east-1",
+            "http://127.0.0.1:1",
+            S3Credentials {
+                access_key: "test".to_string(),
+                secret_key: "test".to_string(),
+                session_token: None,
+            },
+            ureq::Agent::new(),
+        );
+
+        let fake_hash = "ab".repeat(32); // 64 hex chars
+        let result = store.delete_blob_async(&fake_hash).await;
+        assert!(result.is_err(), "expected Err, got: {:?}", result);
+    }
+
+    /// Async S3 round-trip — only runs when AWS credentials are present
+    /// (sets `POND_ASYNC_S3_INTEGRATION=1` to opt in explicitly).
+    ///
+    /// To run locally:
+    ///   POND_ASYNC_S3_INTEGRATION=1 \
+    ///   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+    ///   POND_S3_TEST_URL='s3://my-bucket/pond-async-test?region=us-east-1' \
+    ///   cargo test -p pond_s3 --features async test_async_s3_round_trip -- --nocapture
+    #[tokio::test]
+    async fn test_async_s3_round_trip_integration() {
+        // Gate on both env vars so CI doesn't try to hit real S3.
+        let ok = std::env::var("POND_ASYNC_S3_INTEGRATION").ok().as_deref() == Some("1");
+        if !ok {
+            eprintln!("[skipped] POND_ASYNC_S3_INTEGRATION not set — skipping live S3 async round-trip");
+            return;
+        }
+        let url = match std::env::var("POND_S3_TEST_URL") {
+            Ok(u) => u,
+            Err(_) => {
+                eprintln!("[skipped] POND_S3_TEST_URL not set — skipping live S3 async round-trip");
+                return;
+            }
+        };
+        let store = S3ObjectStore::from_url(&url).expect("from_url");
+
+        let payload = b"async s3 round-trip payload".to_vec();
+        let h = store.put_blob_async(payload.clone()).await
+            .expect("put_blob_async");
+        let got = store.get_blob_async(&h).await
+            .expect("get_blob_async");
+        assert_eq!(got, payload);
+
+        let deleted = store.delete_blob_async(&h).await
+            .expect("delete_blob_async");
+        assert!(deleted, "delete should report true for existing blob");
+
+        // Second get should 404.
+        let err = store.get_blob_async(&h).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

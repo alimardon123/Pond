@@ -12,6 +12,16 @@ name = "pond_s3"
 # cdylib:    shared library for dynamic FFI
 crate-type = ["rlib", "staticlib", "cdylib"]
 
+[features]
+# `async` is OPT-IN. When enabled, exposes async S3 methods
+# (`put_blob_async`, `get_blob_async`, `delete_blob_async`,
+# `list_blobs_prefix_async`) on `S3ObjectStore` using `reqwest` instead of
+# `ureq`. SigV4 signing is shared between sync and async paths.
+#
+# Enables `pond_kernel/async` so callers can build an async-capable kernel
+# alongside async S3.
+async = ["dep:reqwest", "dep:tokio", "pond_kernel/async"]
+
 [dependencies]
 pond_kernel = { path = "../kernel" }
 pond_storage = { path = "../storage" }
@@ -22,5 +32,11 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 url = "2"
 
+# Optional async I/O. Only pulled in with `--features async`.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
+# For async tests in the S3 crate (when the `async` feature is on).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
