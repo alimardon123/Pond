@@ -19,6 +19,7 @@ members = [
     "extensions/indexes/simple/rust",
     "extensions/semantic/base/rust",
     "extensions/semantic/ossie/rust",
+    "mcp-server",
 ]
 
 [workspace.package]

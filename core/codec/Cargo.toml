@@ -24,3 +24,8 @@ zstd = ["dep:ruzstd"]
 # This is critical for cross-language linking: consumers (Go, Java, Node)
 # must not have to satisfy transitive Rust crate dependencies.
 ruzstd = { version = "0.9", optional = true }
+
+# serde_json is used by the hybrid search module (BM25 + RRF) to operate
+# on JSON-typed rows. It's a small, pure-Rust crate with no transitive
+# native deps, so it doesn't compromise the cross-language linking story.
+serde_json = "1"
