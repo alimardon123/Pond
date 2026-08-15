@@ -127,6 +127,63 @@ pond_repo/
 
 ---
 
+## v1 Features
+
+### Core Engine
+- **PND2 columnar format** with 10 types: INT64, FLOAT64, STRING, NULL, BINARY, VARIANT, BOOLEAN, DATE, TIMESTAMP, VECTOR
+- **Null bitmap** for INT64/FLOAT64 (Arrow-style, bit=1 = null)
+- **Row-level CRDT branch merge** (latest _version wins, tombstone retention for associativity)
+- **LRU block cache** (256 entries, Arc sharing, cache invalidation on delete)
+- **CSPRNG** for UUIDv7 (/dev/urandom + BCryptGenRandom)
+- **Bloom filter** for point lookups (SHA-256 double hashing, 1.1% FPR)
+- **PondPack** atomic publication (commit+manifest fused in one blob)
+- **Real abort_tx** with is_tx_aborted + tx_status
+- **vacuum()** respects preserve_days (time-travel safety) + tracks freed_bytes
+
+### SQL Engine (pure-Rust, in `core/sql/`)
+- **SELECT, INSERT, UPDATE, DELETE, MERGE**
+- **6 JOIN types**: INNER, LEFT, RIGHT, FULL OUTER, CROSS + subqueries
+- **Aggregates**: SUM, COUNT, AVG, MIN, MAX with GROUP BY, HAVING
+- **ORDER BY, LIMIT/OFFSET**
+- **Parquet read** via arrow-rs (all scalar types)
+- **RFC 4180 CSV parser** (quoted fields, embedded newlines, CRLF)
+- **File reading**: CSV, TSV, JSON, NDJSON, Parquet
+
+### Performance
+- **AVX2+FMA SIMD** (x86_64, 8 f32/instruction) for vector distance
+- **NEON SIMD** (aarch64, 4 f32/instruction) — Apple Silicon, AWS Graviton
+- **SIMD range filters** wired into columnar_filter
+- **Parallel PND2 decode** (rayon, >4 row groups threshold)
+- **S3 multipart upload** (100MB threshold, 16MB parts, 4-way parallel)
+- **S3 connection pooling** (ureq::Agent with split-phase timeouts)
+- **Real XML parser** for ListObjectsV2 (replaces string search)
+- **Async I/O** (tokio + reqwest, feature-gated behind `--features async`)
+
+### AI/Agent Features
+- **Native VECTOR type** with SIMD distance (L2, cosine, dot)
+- **search_vectors** — brute-force k-NN with optional WHERE filter
+- **Hybrid search** — BM25 + vector + filter with weighted RRF fusion
+- **MCP server** (9 tools: write_rows, read_rows, sql, list_collections, branch, merge, vacuum, get_schema, search_vectors)
+- **Streaming reads** (read_rows_stream iterator)
+- **UDF pushdown** in SQL WHERE (register_udf)
+- **Row-Level Security** (set_rls_policy + auto _tenant column)
+
+### Multi-Language Support
+- **Python** (PyO3) — full API with .pyi type stubs (50+ methods)
+- **Go SDK** — WriteRows, ReadRows, ReadRowsWithProjection, ReadRowsWithPredicates
+- **C ABI** — 36+ functions (shards, tx, maintenance, history, layers)
+- **CLI** — write-rows, read-rows, sql, shell (REPL with \l \d \b \history)
+- **MCP** — 9 tools for any AI agent (Claude, GPT, etc.)
+
+### Trust & Verification
+- **TLA+ specification** (6 invariants pass TLC model check)
+- **Property-based CRDT tests** (commutativity, associativity, idempotence, 200 iterations)
+- **Chaos tests** (concurrent branch merges under HLC skew)
+- **Benchmark suite** (5 criterion groups: write, read, vector search, CRDT merge, upsert)
+- **340+ tests** passing, 0 failures
+
+---
+
 ## Quick Start
 
 ### Using the Rust CLI (recommended)
