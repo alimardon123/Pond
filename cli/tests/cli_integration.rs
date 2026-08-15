@@ -262,3 +262,139 @@ fn test_auto_discovery_creates_pond_marker() {
     assert!(!has_active_storage,
         "local FS config should NOT have an active 'storage=' line (only comments)");
 }
+
+// ===========================================================================
+// Structured row tests — write-rows + read-rows round-trips
+// ===========================================================================
+
+#[test]
+fn test_write_rows_and_read_rows_round_trip() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    // Write a small users table.
+    let json = r#"[
+        {"id": 1, "name": "alice", "age": 30},
+        {"id": 2, "name": "bob",   "age": 25},
+        {"id": 3, "name": "carol", "age": 35}
+    ]"#;
+    let out = run(dir.path(), &["write-rows", "users", "--json", json, "-m", "seed users"]);
+    // Output is "<12-char-hash>\t<collection>"
+    assert!(out.contains("users"), "write-rows output should mention collection: {}", out);
+
+    // Read back as JSON.
+    let read = run(dir.path(), &["read-rows", "users"]);
+    let parsed: serde_json::Value = serde_json::from_str(&read)
+        .unwrap_or_else(|e| panic!("read-rows output is not valid JSON: {}\noutput: {}", e, read));
+
+    let arr = parsed.as_array().expect("read-rows output should be a JSON array");
+    assert_eq!(arr.len(), 3, "expected 3 rows, got: {}", read);
+
+    // Find alice's row and verify.
+    let alice = arr.iter().find(|r| r.get("name").and_then(|v| v.as_str()) == Some("alice"))
+        .unwrap_or_else(|| panic!("alice not found in rows: {}", read));
+    assert_eq!(alice.get("id").and_then(|v| v.as_i64()), Some(1));
+    assert_eq!(alice.get("age").and_then(|v| v.as_i64()), Some(30));
+}
+
+#[test]
+fn test_read_rows_with_where_filter() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    let json = r#"[
+        {"id": 1, "name": "alice", "age": 30},
+        {"id": 2, "name": "bob",   "age": 25},
+        {"id": 3, "name": "carol", "age": 35},
+        {"id": 4, "name": "dave",  "age": 40}
+    ]"#;
+    run(dir.path(), &["write-rows", "users", "--json", json, "-m", "seed"]);
+
+    // WHERE age > 30 → carol (35) + dave (40).
+    let read = run(dir.path(), &["read-rows", "users", "--where", "age > 30"]);
+    let parsed: serde_json::Value = serde_json::from_str(&read)
+        .unwrap_or_else(|e| panic!("read-rows output is not valid JSON: {}\noutput: {}", e, read));
+    let arr = parsed.as_array().expect("array");
+    assert_eq!(arr.len(), 2, "expected 2 rows with age > 30, got: {}", read);
+
+    let names: Vec<&str> = arr.iter()
+        .filter_map(|r| r.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(names.contains(&"carol"));
+    assert!(names.contains(&"dave"));
+}
+
+#[test]
+fn test_read_rows_with_column_projection() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    let json = r#"[
+        {"id": 1, "name": "alice", "age": 30, "city": "NYC"},
+        {"id": 2, "name": "bob",   "age": 25, "city": "LA"}
+    ]"#;
+    run(dir.path(), &["write-rows", "users", "--json", json, "-m", "seed"]);
+
+    // Project only id and name.
+    let read = run(dir.path(), &["read-rows", "users", "--columns", "id,name"]);
+    let parsed: serde_json::Value = serde_json::from_str(&read)
+        .unwrap_or_else(|e| panic!("read-rows output is not valid JSON: {}\noutput: {}", e, read));
+    let arr = parsed.as_array().expect("array");
+    assert_eq!(arr.len(), 2);
+
+    for row in arr {
+        let obj = row.as_object().unwrap();
+        assert!(obj.contains_key("id"), "id column should be present: {:?}", obj);
+        assert!(obj.contains_key("name"), "name column should be present: {:?}", obj);
+        assert!(!obj.contains_key("age"), "age should be projected out: {:?}", obj);
+        assert!(!obj.contains_key("city"), "city should be projected out: {:?}", obj);
+    }
+}
+
+#[test]
+fn test_sql_select_star() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    // Seed via SQL INSERT.
+    let insert_sql = "INSERT INTO products (id, name, price) VALUES (10, 'widget', 9.99), (20, 'gadget', 19.99)";
+    let out = run(dir.path(), &["sql", insert_sql]);
+    let parsed: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("sql output is not valid JSON: {}\noutput: {}", e, out));
+    // INSERT returns a commit status row.
+    assert!(parsed.get("rows").is_some(), "sql output should have rows: {}", out);
+
+    // SELECT * FROM products.
+    let select_out = run(dir.path(), &["sql", "SELECT * FROM products"]);
+    let select_parsed: serde_json::Value = serde_json::from_str(&select_out)
+        .unwrap_or_else(|e| panic!("sql SELECT output is not valid JSON: {}\noutput: {}", e, select_out));
+    let rows = select_parsed.get("rows").and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("sql SELECT output should have rows array: {}", select_out));
+    assert_eq!(rows.len(), 2, "expected 2 product rows, got: {}", select_out);
+}
+
+#[test]
+fn test_sql_select_with_where_and_limit() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    // Seed 5 users.
+    let insert_sql = "INSERT INTO users (id, name, age) VALUES \
+        (1, 'alice', 30), (2, 'bob', 25), (3, 'carol', 35), \
+        (4, 'dave', 40), (5, 'erin', 28)";
+    run(dir.path(), &["sql", insert_sql]);
+
+    // SELECT with WHERE age >= 30 LIMIT 2.
+    let out = run(dir.path(), &["sql", "SELECT name, age FROM users WHERE age >= 30 ORDER BY age ASC LIMIT 2"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("sql output is not valid JSON: {}\noutput: {}", e, out));
+    let rows = parsed.get("rows").and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("sql output should have rows: {}", out));
+
+    assert_eq!(rows.len(), 2, "expected 2 rows after LIMIT, got: {}", out);
+    // Ordered by age ASC, the two youngest >=30 are alice (30) and carol (35).
+    let first_age = rows[0].get("age").and_then(|v| v.as_i64());
+    let second_age = rows[1].get("age").and_then(|v| v.as_i64());
+    assert_eq!(first_age, Some(30), "first row age should be 30: {}", out);
+    assert_eq!(second_age, Some(35), "second row age should be 35: {}", out);
+}

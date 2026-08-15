@@ -1121,9 +1121,12 @@ name = "pond_cli"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "pond_core",
  "pond_kernel",
  "pond_s3",
+ "pond_sql",
  "pond_storage",
+ "serde",
  "serde_json",
  "tempfile",
 ]

@@ -25,8 +25,11 @@
 //   - Config holds Pond-level settings (NOT storage URL — that's passed via --root)
 
 use clap::{Parser, Subcommand};
+use pond_core::{pnd2_decode, TypedColumn, VT_BOOLEAN, VT_FLOAT64, VT_INT64, VT_STRING};
 use pond_kernel::PondKernel;
-use pond_storage::{UnifiedStorage, branch, commit, shard, write, read, transaction};
+use pond_storage::manifest::CollectionManifest;
+use pond_storage::{branch, commit, read, write, UnifiedStorage};
+use serde_json::{json, Value as JsonValue};
 use std::io::{self, Read as IoRead, Write as IoWrite};
 
 #[derive(Parser)]
@@ -96,6 +99,53 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Write structured rows (JSON array of objects) as a PND2 blob.
+    /// Column types are inferred automatically (INT64, FLOAT64, STRING, BOOLEAN).
+    ///
+    /// Example:
+    ///   pond write-rows users --json '[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]' -m "seed"
+    WriteRows {
+        collection: String,
+        /// Inline JSON array of row objects.
+        #[arg(long, group = "input")]
+        json: Option<String>,
+        /// Read JSON array from a file (use "-" for stdin).
+        #[arg(long, group = "input")]
+        file: Option<String>,
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// Read structured rows from a collection's HEAD as JSON or aligned table.
+    ///
+    /// Example:
+    ///   pond read-rows users
+    ///   pond read-rows users --where "age > 30" --columns id,name --limit 10
+    ///   pond read-rows users --format table
+    ReadRows {
+        collection: String,
+        /// Simple WHERE filter: "col op val [AND col op val ...]"
+        /// e.g. "age > 30", "city = 'NYC' AND age < 40"
+        #[arg(long)]
+        r#where: Option<String>,
+        /// Comma-separated list of columns to project.
+        #[arg(long)]
+        columns: Option<String>,
+        /// Maximum number of rows to return.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output format: "json" (default) or "table".
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    /// Execute a SQL statement against the storage.
+    ///
+    /// Example:
+    ///   pond sql "SELECT * FROM users WHERE age > 30"
+    ///   pond sql "INSERT INTO users (id, name) VALUES (1, 'alice')"
+    Sql {
+        /// SQL query string.
+        query: String,
+    },
     Version,
 }
 
@@ -159,6 +209,15 @@ fn main() {
                 }
                 Commands::Vacuum { preserve_days, dry_run } => {
                     cmd_vacuum(&storage, preserve_days, dry_run);
+                }
+                Commands::WriteRows { collection, json, file, message } => {
+                    cmd_write_rows(&storage, &collection, json, file, message);
+                }
+                Commands::ReadRows { collection, r#where, columns, limit, format } => {
+                    cmd_read_rows(&storage, &collection, r#where, columns, limit, &format);
+                }
+                Commands::Sql { query } => {
+                    cmd_sql(&storage, &query);
                 }
                 _ => unreachable!(),
             }
@@ -690,5 +749,712 @@ fn cmd_vacuum(storage: &UnifiedStorage, preserve_days: u32, dry_run: bool) {
         println!("  Preserved: {} blobs", result.preserved);
     } else {
         println!("\nNo dead blobs to vacuum.");
+    }
+}
+
+// ===========================================================================
+// Structured row commands — write-rows, read-rows, sql
+// ===========================================================================
+
+/// write-rows: parse a JSON array of objects, infer column types, encode as
+/// PND2 via `pond_storage::write::write_rows`, and print the commit hash.
+fn cmd_write_rows(
+    storage: &UnifiedStorage,
+    collection: &str,
+    json_arg: Option<String>,
+    file_arg: Option<String>,
+    message: Option<String>,
+) {
+    let raw: Vec<u8> = if let Some(j) = json_arg {
+        match serde_json::from_str::<JsonValue>(&j) {
+            Ok(_) => j.into_bytes(),
+            Err(e) => {
+                eprintln!("Error: invalid JSON: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(path) = file_arg {
+        if path == "-" {
+            let mut buf = Vec::new();
+            io::stdin().read_to_end(&mut buf).unwrap();
+            buf
+        } else {
+            std::fs::read(&path).unwrap_or_else(|e| {
+                eprintln!("Error: failed to read {}: {}", path, e);
+                std::process::exit(1);
+            })
+        }
+    } else {
+        eprintln!("Error: no input provided. Use --json '<json array>' or --file <path>");
+        std::process::exit(1);
+    };
+
+    let parsed: Vec<JsonValue> = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: input must be a JSON array of objects: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if parsed.is_empty() {
+        eprintln!("Error: empty JSON array — nothing to write");
+        std::process::exit(1);
+    }
+
+    // Infer column types and build TypedColumn values.
+    let typed = json_to_typed_columns(&parsed);
+
+    if typed.is_empty() {
+        eprintln!("Error: no columns inferred from input rows");
+        std::process::exit(1);
+    }
+
+    // Verify all columns have the same length.
+    let n_rows = parsed.len();
+    for (name, col) in &typed {
+        if col.len() != n_rows {
+            eprintln!(
+                "Error: column '{}' has {} values, expected {} (all rows must have the same keys)",
+                name,
+                col.len(),
+                n_rows
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Build the slice-of-tuples that write_rows expects.
+    let columns_ref: Vec<(&str, TypedColumn)> = typed
+        .iter()
+        .map(|(name, col)| (name.as_str(), col.clone()))
+        .collect();
+
+    let active = storage.get_active_branch(collection);
+    match write::write_rows(
+        storage.kernel(),
+        collection,
+        &active,
+        &columns_ref,
+        &message.unwrap_or_default(),
+    ) {
+        Ok(hash) => println!("{}\t{}", &hash[..12], collection),
+        Err(e) => {
+            eprintln!("Error: write_rows failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// read-rows: load HEAD manifest, decode PND2 row groups, apply WHERE/columns/
+/// LIMIT, print as JSON array or aligned table.
+fn cmd_read_rows(
+    storage: &UnifiedStorage,
+    collection: &str,
+    where_filter: Option<String>,
+    columns: Option<String>,
+    limit: Option<usize>,
+    format: &str,
+) {
+    let rows = match read_rows_as_json(storage, collection, where_filter.as_deref(), columns.as_deref(), limit) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    print_rows(&rows, format);
+}
+
+/// sql: delegate to `pond_sql::execute`, print results as JSON.
+fn cmd_sql(storage: &UnifiedStorage, query: &str) {
+    let result = match pond_sql::execute(storage, query) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: SQL execution failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Output: a JSON object with `columns` and `rows`.
+    let out = json!({
+        "columns": result.columns,
+        "rows": result.rows,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for write-rows / read-rows / sql
+// ---------------------------------------------------------------------------
+
+/// Infer column types from a JSON array of row objects.
+///
+/// Type inference rules (per column, looking at all non-null values):
+///   - All integers        → INT64
+///   - All numbers (mix)    → FLOAT64
+///   - All strings          → STRING
+///   - All booleans         → BOOLEAN
+///   - Mixed or all-null    → STRING (safe default; nulls become "")
+///
+/// Returns a Vec<(column_name, TypedColumn)> in the order columns first
+/// appear in the input rows.
+fn json_to_typed_columns(rows: &[JsonValue]) -> Vec<(String, TypedColumn)> {
+    use std::collections::BTreeMap;
+
+    let mut cols: BTreeMap<String, ColInfo> = BTreeMap::new();
+    let mut order_counter = 0usize;
+
+    for row in rows {
+        let obj = match row.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        for (k, v) in obj {
+            let info = cols.entry(k.clone()).or_insert_with(|| {
+                let i = ColInfo {
+                    order: order_counter,
+                    ..Default::default()
+                };
+                order_counter += 1;
+                i
+            });
+            info.values.push(v.clone());
+            match v {
+                JsonValue::Null => info.null_count += 1,
+                JsonValue::Bool(_) => info.has_bool = true,
+                JsonValue::Number(n) => {
+                    if n.is_i64() {
+                        info.has_int = true;
+                    } else {
+                        info.has_float = true;
+                    }
+                }
+                JsonValue::String(_) => info.has_str = true,
+                _ => info.has_other = true,
+            }
+        }
+    }
+
+    // For columns that didn't appear in every row, pad with nulls at the
+    // missing positions. We re-walk the rows to build aligned value vectors.
+    let mut padded: BTreeMap<String, Vec<JsonValue>> = BTreeMap::new();
+    for name in cols.keys() {
+        padded.insert(name.clone(), Vec::with_capacity(rows.len()));
+    }
+    for row in rows {
+        let obj = row.as_object();
+        for name in cols.keys() {
+            let v = obj
+                .and_then(|o| o.get(name))
+                .cloned()
+                .unwrap_or(JsonValue::Null);
+            padded.get_mut(name).unwrap().push(v);
+        }
+    }
+    for (name, info) in cols.iter_mut() {
+        info.values = padded.remove(name).unwrap();
+    }
+
+    // Order columns by their first-appearance index, then build TypedColumns.
+    let mut ordered: Vec<(String, ColInfo)> = cols.into_iter().collect();
+    ordered.sort_by_key(|(_, info)| info.order);
+
+    ordered
+        .into_iter()
+        .map(|(name, info)| {
+            let col = build_typed_column(&info);
+            (name, col)
+        })
+        .collect()
+}
+
+/// Per-column type inference state.
+#[derive(Default)]
+struct ColInfo {
+    order: usize,
+    has_int: bool,
+    has_float: bool,
+    has_str: bool,
+    has_bool: bool,
+    has_other: bool,
+    null_count: usize,
+    values: Vec<JsonValue>,
+}
+
+/// Build a TypedColumn from inferred ColInfo, substituting default values
+/// for any nulls.
+fn build_typed_column(info: &ColInfo) -> TypedColumn {
+    let has_int = info.has_int;
+    let has_float = info.has_float;
+    let has_str = info.has_str;
+    let has_bool = info.has_bool;
+    let has_other = info.has_other;
+    let values = &info.values;
+
+    // Decide the column type.
+    if has_other || (has_int as u8 + has_float as u8 + has_bool as u8 > 1 && !has_str) {
+        // Mixed non-string types → fall back to STRING (JSON-encoded).
+        let strs: Vec<String> = values
+            .iter()
+            .map(|v| match v {
+                JsonValue::String(s) => s.clone(),
+                JsonValue::Null => String::new(),
+                other => other.to_string(),
+            })
+            .collect();
+        return TypedColumn::String(strs);
+    }
+    if has_str {
+        let strs: Vec<String> = values
+            .iter()
+            .map(|v| match v {
+                JsonValue::String(s) => s.clone(),
+                JsonValue::Null => String::new(),
+                other => other.to_string(),
+            })
+            .collect();
+        return TypedColumn::String(strs);
+    }
+    if has_float {
+        let nums: Vec<f64> = values
+            .iter()
+            .map(|v| match v {
+                JsonValue::Number(n) => n.as_f64().unwrap_or(0.0),
+                JsonValue::Null => 0.0,
+                _ => 0.0,
+            })
+            .collect();
+        return TypedColumn::Float64(nums);
+    }
+    if has_int {
+        let nums: Vec<i64> = values
+            .iter()
+            .map(|v| match v {
+                JsonValue::Number(n) => n.as_i64().unwrap_or(0),
+                JsonValue::Null => 0,
+                _ => 0,
+            })
+            .collect();
+        return TypedColumn::Int64(nums);
+    }
+    if has_bool {
+        let bools: Vec<bool> = values
+            .iter()
+            .map(|v| match v {
+                JsonValue::Bool(b) => *b,
+                JsonValue::Null => false,
+                _ => false,
+            })
+            .collect();
+        return TypedColumn::Boolean(bools);
+    }
+    // All-null column → default to STRING with empty strings.
+    let strs: Vec<String> = values.iter().map(|_| String::new()).collect();
+    TypedColumn::String(strs)
+}
+
+/// Read all rows from a collection's HEAD as JSON objects, applying optional
+/// WHERE filter, column projection, and LIMIT.
+///
+/// WHERE syntax: "col op val [AND col op val ...]"
+///   op: =, !=, <, <=, >, >=
+///   val: integer (42), float (3.14), 'string', "string", true, false
+fn read_rows_as_json(
+    storage: &UnifiedStorage,
+    collection: &str,
+    where_filter: Option<&str>,
+    columns: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<JsonValue>, String> {
+    let kernel = storage.kernel();
+    let active = storage.get_active_branch(collection);
+
+    // Resolve HEAD commit.
+    let head = kernel
+        .resolve(&pond_storage::branch_ref(collection, &active))
+        .or_else(|| kernel.resolve(collection))
+        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+
+    // Read the commit (or unpack PondPack) to get the manifest bytes.
+    let head_data = kernel
+        .read_blob(&head)
+        .map_err(|e| format!("Failed to read HEAD: {}", e))?;
+
+    let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
+        let (_, mb, _) = pond_storage::pond_pack::decode_pack(&head_data)
+            .ok_or_else(|| "Failed to decode PondPack".to_string())?;
+        mb
+    } else {
+        let commit = commit::read_commit(kernel, &head)
+            .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
+        if commit.manifest.is_empty() {
+            return Ok(Vec::new());
+        }
+        kernel
+            .read_blob(&commit.manifest)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?
+    };
+
+    let manifest = CollectionManifest::decode(&manifest_bytes)
+        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+    // Decode each row group's PND2 blob into JSON rows.
+    let mut all_rows: Vec<JsonValue> = Vec::new();
+    for rg in &manifest.row_groups {
+        let blob = kernel
+            .read_blob(&rg.blob_hash)
+            .map_err(|e| format!("Failed to read data blob: {}", e))?;
+        let cols = pnd2_decode(&blob).map_err(|e| format!("Failed to decode PND2: {}", e))?;
+        let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+        for row_idx in 0..n_rows {
+            let mut row_obj = serde_json::Map::new();
+            for col in &cols {
+                let name = col.name.to_string_lossy().to_string();
+                // Skip CRDT metadata columns — they're internal.
+                if name == "_rowid" || name == "_version" || name == "_deleted" {
+                    continue;
+                }
+                let val = match col.vtype {
+                    VT_INT64 => col
+                        .i64_data
+                        .get(row_idx)
+                        .map(|v| json!(*v))
+                        .unwrap_or(JsonValue::Null),
+                    VT_FLOAT64 => col
+                        .f64_data
+                        .get(row_idx)
+                        .and_then(|v| serde_json::Number::from_f64(*v))
+                        .map(JsonValue::Number)
+                        .unwrap_or(JsonValue::Null),
+                    VT_STRING => col
+                        .str_data
+                        .get(row_idx)
+                        .map(|v| json!(v.to_string_lossy().to_string()))
+                        .unwrap_or(JsonValue::Null),
+                    VT_BOOLEAN => col
+                        .i64_data
+                        .get(row_idx)
+                        .map(|v| json!(*v != 0))
+                        .unwrap_or(JsonValue::Null),
+                    _ => JsonValue::Null,
+                };
+                row_obj.insert(name, val);
+            }
+            all_rows.push(JsonValue::Object(row_obj));
+        }
+    }
+
+    // Apply WHERE filter.
+    if let Some(w) = where_filter {
+        if !w.trim().is_empty() {
+            let predicates = parse_where_clause(w)?;
+            all_rows = all_rows
+                .into_iter()
+                .filter(|r| predicates.iter().all(|(c, op, v)| eval_predicate(r, c, op, v)))
+                .collect();
+        }
+    }
+
+    // Apply column projection.
+    if let Some(cols_str) = columns {
+        if !cols_str.trim().is_empty() {
+            let col_list: Vec<String> = cols_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            all_rows = all_rows
+                .into_iter()
+                .map(|r| {
+                    if let Some(obj) = r.as_object() {
+                        let mut new_obj = serde_json::Map::new();
+                        for c in &col_list {
+                            if let Some(v) = obj.get(c) {
+                                new_obj.insert(c.clone(), v.clone());
+                            } else {
+                                new_obj.insert(c.clone(), JsonValue::Null);
+                            }
+                        }
+                        JsonValue::Object(new_obj)
+                    } else {
+                        r
+                    }
+                })
+                .collect();
+        }
+    }
+
+    // Apply LIMIT.
+    if let Some(lim) = limit {
+        all_rows.truncate(lim);
+    }
+
+    Ok(all_rows)
+}
+
+/// Parse a simple WHERE clause into a list of (column, op, value) predicates
+/// joined by implicit AND.
+///
+/// Grammar: predicate (AND predicate)*
+///   predicate: col op value
+///   op: =, ==, !=, <>, <, <=, >, >=
+///   value: integer | float | 'string' | "string" | true | false | null
+///
+/// Returns an error if the clause can't be parsed.
+fn parse_where_clause(s: &str) -> Result<Vec<(String, String, JsonValue)>, String> {
+    // Split on " AND " (case-insensitive). We do a simple scan rather than
+    // a regex to keep dependencies minimal.
+    let mut parts: Vec<&str> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + 4 < bytes.len() {
+        if bytes[i..i + 5].eq_ignore_ascii_case(b" and ") {
+            // Only treat as a separator if we're not inside a quoted string.
+            // (We can be inside a quoted string if the user has " AND " inside
+            // a value, but for simplicity we check the preceding quote count.)
+            let prefix = &s[start..i];
+            let single_q = prefix.matches('\'').count();
+            let double_q = prefix.matches('"').count();
+            if single_q % 2 == 0 && double_q % 2 == 0 {
+                parts.push(&s[start..i]);
+                start = i + 5;
+                i = start;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    parts.push(&s[start..]);
+
+    let mut out = Vec::new();
+    for part in parts {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let (col, op, val) = parse_single_predicate(p)?;
+        out.push((col, op, val));
+    }
+    Ok(out)
+}
+
+/// Parse a single predicate: "col op value".
+fn parse_single_predicate(s: &str) -> Result<(String, String, JsonValue), String> {
+    // Find the operator. We check 2-char ops first, then 1-char.
+    let ops_2 = ["==", "!=", "<=", ">=", "<>"];
+    let ops_1 = ["=", "<", ">"];
+
+    let mut found: Option<(usize, &str)> = None;
+    for op in ops_2.iter() {
+        if let Some(idx) = s.find(op) {
+            // Make sure we're not matching inside a quoted string.
+            if !is_inside_quotes(s, idx) {
+                found = Some((idx, op));
+                break;
+            }
+        }
+    }
+    if found.is_none() {
+        for op in ops_1.iter() {
+            if let Some(idx) = s.find(op) {
+                if !is_inside_quotes(s, idx) {
+                    found = Some((idx, op));
+                    break;
+                }
+            }
+        }
+    }
+
+    let (op_idx, op) = found.ok_or_else(|| {
+        format!("invalid predicate '{}': expected operator (=, !=, <, <=, >, >=)", s)
+    })?;
+
+    let col = s[..op_idx].trim().to_string();
+    let val_str = s[op_idx + op.len()..].trim();
+
+    if col.is_empty() {
+        return Err(format!("invalid predicate '{}': missing column name", s));
+    }
+
+    let val = parse_value(val_str)?;
+
+    // Normalize <> to !=.
+    let op_norm = if op == "<>" { "!=".to_string() } else { op.to_string() };
+
+    Ok((col, op_norm, val))
+}
+
+/// Check if the byte at position `idx` is inside a quoted string.
+fn is_inside_quotes(s: &str, idx: usize) -> bool {
+    let bytes = s.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    for i in 0..idx {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+    }
+    in_single || in_double
+}
+
+/// Parse a predicate value: integer, float, 'string', "string", true, false, null.
+fn parse_value(s: &str) -> Result<JsonValue, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty value".to_string());
+    }
+
+    // Quoted string.
+    if (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
+        || (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
+    {
+        return Ok(JsonValue::String(s[1..s.len() - 1].to_string()));
+    }
+
+    // Booleans / null.
+    match s.to_ascii_lowercase().as_str() {
+        "true" => return Ok(json!(true)),
+        "false" => return Ok(json!(false)),
+        "null" => return Ok(JsonValue::Null),
+        _ => {}
+    }
+
+    // Integer.
+    if let Ok(i) = s.parse::<i64>() {
+        return Ok(json!(i));
+    }
+    // Float.
+    if let Ok(f) = s.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return Ok(JsonValue::Number(n));
+        }
+    }
+
+    // Bare string (no quotes).
+    Ok(JsonValue::String(s.to_string()))
+}
+
+/// Evaluate a single (col, op, value) predicate against a JSON row.
+fn eval_predicate(row: &JsonValue, col: &str, op: &str, value: &JsonValue) -> bool {
+    let cell = match row.get(col) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // Try numeric comparison first.
+    if let (Some(a), Some(b)) = (cell.as_f64(), value.as_f64()) {
+        return match op {
+            "=" | "==" => a == b,
+            "!=" => a != b,
+            "<" => a < b,
+            "<=" => a <= b,
+            ">" => a > b,
+            ">=" => a >= b,
+            _ => false,
+        };
+    }
+
+    // String comparison.
+    if let (Some(a), Some(b)) = (cell.as_str(), value.as_str()) {
+        return match op {
+            "=" | "==" => a == b,
+            "!=" => a != b,
+            "<" => a < b,
+            "<=" => a <= b,
+            ">" => a > b,
+            ">=" => a >= b,
+            _ => false,
+        };
+    }
+
+    // Boolean comparison.
+    if let (Some(a), Some(b)) = (cell.as_bool(), value.as_bool()) {
+        return match op {
+            "=" | "==" => a == b,
+            "!=" => a != b,
+            _ => false,
+        };
+    }
+
+    // Equality fallback (JSON structural equality).
+    match op {
+        "=" | "==" => cell == value,
+        "!=" => cell != value,
+        _ => false,
+    }
+}
+
+/// Print rows as a JSON array (default) or an aligned text table.
+fn print_rows(rows: &[JsonValue], format: &str) {
+    match format.to_ascii_lowercase().as_str() {
+        "json" | "" => {
+            let arr = JsonValue::Array(rows.to_vec());
+            println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string()));
+        }
+        "table" => {
+            if rows.is_empty() {
+                println!("(no rows)");
+                return;
+            }
+            // Collect column names from the first row, preserving order.
+            let mut headers: Vec<String> = Vec::new();
+            if let Some(obj) = rows[0].as_object() {
+                for k in obj.keys() {
+                    headers.push(k.clone());
+                }
+            }
+            // Compute column widths.
+            let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+            let cells: Vec<Vec<String>> = rows
+                .iter()
+                .map(|r| {
+                    let obj = r.as_object();
+                    headers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| {
+                            let v = obj.and_then(|o| o.get(h)).cloned().unwrap_or(JsonValue::Null);
+                            let s = match v {
+                                JsonValue::String(s) => s,
+                                other => other.to_string(),
+                            };
+                            if s.len() > widths[i] {
+                                widths[i] = s.len();
+                            }
+                            s
+                        })
+                        .collect()
+                })
+                .collect();
+
+            // Header line.
+            let header_line: String = headers
+                .iter()
+                .enumerate()
+                .map(|(i, h)| format!("{:width$}", h, width = widths[i]))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            println!("{}", header_line);
+            println!("{}", "-".repeat(header_line.len()));
+
+            // Data rows.
+            for row_cells in &cells {
+                let line: String = row_cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{:width$}", c, width = widths[i]))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                println!("{}", line);
+            }
+        }
+        other => {
+            eprintln!("Error: unknown format '{}' (use 'json' or 'table')", other);
+            std::process::exit(1);
+        }
     }
 }

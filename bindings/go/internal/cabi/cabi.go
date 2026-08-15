@@ -9,13 +9,71 @@
 package cabi
 
 // #cgo CFLAGS: -I${SRCDIR}/../../../../bindings/base
-// #cgo LDFLAGS: ${SRCDIR}/../../../../target/release/libpond_storage.a ${SRCDIR}/../../../../target/release/libpond_kernel.a -lpthread -ldl -lm
+// #cgo LDFLAGS: ${SRCDIR}/../../../../target/release/libpond_storage.a ${SRCDIR}/../../../../target/release/libpond_kernel.a ${SRCDIR}/../../../../target/release/libpond_core.a -lpthread -ldl -lm
 //
 // #include <stdlib.h>
+// #include <string.h>
+//
+// // pond.h declares pond_storage_read_rows returning PondResult*, but uses
+// // PondResult before it is typedef'd (the typedef is in Layer 3, after the
+// // Layer 2 declaration). Forward-declare the type so the header compiles.
+// typedef struct PondResult PondResult;
+//
+// // pond.h declares pond_storage_write_rows and pond_storage_read_rows with
+// // signatures that do NOT match the actual Rust implementations in
+// // core/storage/src/lib.rs. The Rust impl signatures are:
+// //   pond_storage_write_rows(handle, collection, message, n_columns,
+// //                            col_names, col_types, col_data, col_lens)
+// //     -> *mut c_char
+// //   pond_storage_read_rows(handle, collection, out_data, out_len) -> i32
+// //
+// // We expose C wrapper functions (pond_go_write_rows / pond_go_read_rows)
+// // with the correct argument order and call the Rust functions through a
+// // cast function pointer to bypass pond.h's incorrect prototypes.
 // #include "pond.h"
+//
+// // pond_go_write_rows: write structured columns as a PND2 blob.
+// //   - types[i]: 1=INT64, 2=FLOAT64, 3=STRING
+// //   - data[i]: for INT64/FLOAT64, pointer to the value array.
+// //              for STRING, pointer to an array of const char* pointers.
+// //   - lens[i]: number of values in column i.
+// // Returns: commit hash (caller must free with pond_storage_string_free),
+// //          or NULL on error.
+// static const char* pond_go_write_rows(PondStorageHandle* s,
+//                                        const char* coll,
+//                                        const char* msg,
+//                                        size_t ncols,
+//                                        const char** names,
+//                                        const uint8_t* types,
+//                                        void** data,
+//                                        const size_t* lens) {
+//     typedef const char* (*fn_t)(PondStorageHandle*, const char*, const char*,
+//                                  size_t, const char* const*, const uint8_t*,
+//                                  const void* const*, const size_t*);
+//     fn_t fn = (fn_t)(void*)pond_storage_write_rows;
+//     return fn(s, coll, msg, ncols,
+//               (const char* const*)names,
+//               types,
+//               (const void* const*)data,
+//               lens);
+// }
+//
+// // pond_go_read_rows: read HEAD PND2 blob from a collection.
+// // Returns 0 on success (out_data/out_len populated), -1 on error.
+// // Caller MUST free *out_data with pond_storage_data_free.
+// static int pond_go_read_rows(PondStorageHandle* s,
+//                               const char* coll,
+//                               uint8_t** out_data,
+//                               size_t* out_len) {
+//     typedef int (*fn_t)(const PondStorageHandle*, const char*,
+//                         uint8_t**, size_t*);
+//     fn_t fn = (fn_t)(void*)pond_storage_read_rows;
+//     return fn((const PondStorageHandle*)s, coll, out_data, out_len);
+// }
 import "C"
 
 import (
+        "fmt"
         "strings"
         "unsafe"
 )
@@ -545,4 +603,209 @@ func StorageListBranches(s *PondStorage, collection string) ([]string, error) {
                 return []string{}, nil
         }
         return strings.Split(joined, "\n"), nil
+}
+
+// ---------------------------------------------------------------------------
+// Structured row operations — write_rows / read_rows
+// ---------------------------------------------------------------------------
+
+// WriteColumnSpec describes one column to write via StorageWriteRows.
+//
+// Type is one of: 1 (INT64), 2 (FLOAT64), 3 (STRING).
+// Exactly one of Int64Data, Float64Data, StringData must be populated,
+// matching the Type field.
+type WriteColumnSpec struct {
+        Name        string
+        Type        uint8 // 1=INT64, 2=FLOAT64, 3=STRING
+        Int64Data   []int64
+        Float64Data []float64
+        StringData  []string
+}
+
+// StorageWriteRows writes structured columns to a collection as a PND2 blob
+// (with auto-added CRDT _rowid/_version columns). Returns the commit hash.
+//
+// The Go-side `cols` slice is converted to C arrays:
+//   - col_names: array of C string pointers (one per column)
+//   - col_types: array of u8 type codes
+//   - col_data:  array of pointers — for INT64/FLOAT64, pointer to a C-allocated
+//                copy of the value array; for STRING, pointer to a C-allocated
+//                array of C string pointers.
+//   - col_lens:  array of column lengths (number of values per column)
+//
+// All column data is copied into C-allocated memory so the cgo pointer
+// checker is happy (we never pass a Go pointer that contains a Go pointer).
+// The C memory is freed before returning.
+//
+// All columns must have the same length (the row count).
+func StorageWriteRows(s *PondStorage, collection, message string, cols []WriteColumnSpec) (string, error) {
+        if s == nil {
+                return "", &Error{Code: "null_storage", Msg: "PondStorage handle is nil"}
+        }
+        if len(cols) == 0 {
+                return "", &Error{Code: "empty_input", Msg: "no columns provided"}
+        }
+
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+        cMsg := C.CString(message)
+        defer C.free(unsafe.Pointer(cMsg))
+
+        n := len(cols)
+        cNames := make([]*C.char, n)
+        cTypes := make([]C.uint8_t, n)
+        // cDataPtrs holds C pointers (returned by C.malloc) — NOT Go pointers.
+        // This keeps the cgo pointer checker happy: passing &cDataPtrs[0] to
+        // C is passing a Go pointer to Go memory that contains only C pointers.
+        cDataPtrs := make([]unsafe.Pointer, n)
+        cLens := make([]C.size_t, n)
+
+        // Hold all C-allocated memory (string allocations + per-column data
+        // buffers) so we can free them after the call.
+        var cStrs []*C.char
+        var cAllocs []unsafe.Pointer
+        defer func() {
+                for _, cs := range cStrs {
+                        C.free(unsafe.Pointer(cs))
+                }
+                for _, p := range cAllocs {
+                        C.free(p)
+                }
+        }()
+
+        for i, col := range cols {
+                cname := C.CString(col.Name)
+                cNames[i] = cname
+                cStrs = append(cStrs, cname)
+                cTypes[i] = C.uint8_t(col.Type)
+                cLens[i] = 0
+
+                switch col.Type {
+                case VT_INT64:
+                        if len(col.Int64Data) == 0 {
+                                return "", &Error{
+                                        Code: "empty_input",
+                                        Msg:  fmt.Sprintf("column %d (%s): INT64 data is empty", i, col.Name),
+                                }
+                        }
+                        // Copy the int64 data into C-allocated memory.
+                        byteSize := len(col.Int64Data) * C.sizeof_int64_t
+                        ptr := C.malloc(C.size_t(byteSize))
+                        if ptr == nil {
+                                return "", &Error{Code: "malloc_failed", Msg: "C.malloc returned NULL for INT64 data"}
+                        }
+                        cAllocs = append(cAllocs, ptr)
+                        C.memcpy(ptr, unsafe.Pointer(&col.Int64Data[0]), C.size_t(byteSize))
+                        cDataPtrs[i] = ptr
+                        cLens[i] = C.size_t(len(col.Int64Data))
+
+                case VT_FLOAT64:
+                        if len(col.Float64Data) == 0 {
+                                return "", &Error{
+                                        Code: "empty_input",
+                                        Msg:  fmt.Sprintf("column %d (%s): FLOAT64 data is empty", i, col.Name),
+                                }
+                        }
+                        byteSize := len(col.Float64Data) * C.sizeof_double
+                        ptr := C.malloc(C.size_t(byteSize))
+                        if ptr == nil {
+                                return "", &Error{Code: "malloc_failed", Msg: "C.malloc returned NULL for FLOAT64 data"}
+                        }
+                        cAllocs = append(cAllocs, ptr)
+                        C.memcpy(ptr, unsafe.Pointer(&col.Float64Data[0]), C.size_t(byteSize))
+                        cDataPtrs[i] = ptr
+                        cLens[i] = C.size_t(len(col.Float64Data))
+
+                case VT_STRING:
+                        if len(col.StringData) == 0 {
+                                return "", &Error{
+                                        Code: "empty_input",
+                                        Msg:  fmt.Sprintf("column %d (%s): STRING data is empty", i, col.Name),
+                                }
+                        }
+                        // Allocate a C array of char* pointers (one per string).
+                        ptrSize := C.size_t(unsafe.Sizeof((*C.char)(nil)))
+                        arrPtr := C.malloc(C.size_t(len(col.StringData)) * ptrSize)
+                        if arrPtr == nil {
+                                return "", &Error{Code: "malloc_failed", Msg: "C.malloc returned NULL for STRING ptr array"}
+                        }
+                        cAllocs = append(cAllocs, arrPtr)
+                        // View the C memory as a []*C.char slice for assignment.
+                        arrSlice := unsafe.Slice((**C.char)(arrPtr), len(col.StringData))
+                        for j, s := range col.StringData {
+                                cs := C.CString(s)
+                                cStrs = append(cStrs, cs)
+                                arrSlice[j] = cs
+                        }
+                        cDataPtrs[i] = arrPtr
+                        cLens[i] = C.size_t(len(col.StringData))
+
+                default:
+                        return "", &Error{
+                                Code: "bad_column_type",
+                                Msg:  fmt.Sprintf("column %d (%s): unknown type %d", i, col.Name, col.Type),
+                        }
+                }
+        }
+
+        // All columns must have the same length.
+        firstLen := cLens[0]
+        for i := 1; i < n; i++ {
+                if cLens[i] != firstLen {
+                        return "", &Error{
+                                Code: "column_length_mismatch",
+                                Msg:  fmt.Sprintf("column %d has %d values, expected %d", i, cLens[i], firstLen),
+                        }
+                }
+        }
+
+        hash := C.pond_go_write_rows(
+                s, cColl, cMsg,
+                C.size_t(n),
+                &cNames[0],
+                &cTypes[0],
+                &cDataPtrs[0],
+                &cLens[0],
+        )
+        if hash == nil {
+                return "", &Error{Code: "storage_write_rows_failed", Msg: "write_rows returned NULL"}
+        }
+        result := C.GoString(hash)
+        C.pond_storage_string_free(hash)
+        return result, nil
+}
+
+// StorageReadRows reads the HEAD PND2 blob from a collection, decodes it,
+// and returns the decoded PondResult handle.
+//
+// The caller MUST call ResultFree on the returned handle when done.
+// Returns nil, error if the collection has no commits or the decode fails.
+func StorageReadRows(s *PondStorage, collection string) (*PondResult, error) {
+        if s == nil {
+                return nil, &Error{Code: "null_storage", Msg: "PondStorage handle is nil"}
+        }
+        cColl := C.CString(collection)
+        defer C.free(unsafe.Pointer(cColl))
+
+        var outData *C.uint8_t
+        var outLen C.size_t
+        rc := C.pond_go_read_rows(s, cColl, &outData, &outLen)
+        if rc != 0 {
+                return nil, &Error{Code: "storage_read_rows_failed", Msg: "read_rows returned non-zero status"}
+        }
+        if outData == nil || outLen == 0 {
+                return nil, &Error{Code: "storage_read_rows_empty", Msg: "read_rows returned empty data"}
+        }
+
+        // Decode the PND2 blob into a PondResult (owned by us).
+        result := C.pond_pnd2_decode(outData, outLen)
+
+        // Free the raw PND2 bytes — the decoder copies the data into
+        // PondResult-owned memory.
+        C.pond_storage_data_free(outData, outLen)
+
+        if result == nil {
+                return nil, &Error{Code: "storage_read_rows_decode_failed", Msg: "pond_pnd2_decode returned NULL"}
+        }
+        return result, nil
 }

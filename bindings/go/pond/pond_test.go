@@ -384,3 +384,147 @@ func contains(slice []string, s string) bool {
         }
         return false
 }
+
+// ===========================================================================
+// WriteRows / ReadRows tests — structured row round-trips via C ABI
+// ===========================================================================
+
+// TestStorageWriteAndReadRowsInt64 verifies that INT64 columns written via
+// Storage.WriteRows can be read back via Storage.ReadRows with byte-exact
+// fidelity.
+func TestStorageWriteAndReadRowsInt64(t *testing.T) {
+        dir := t.TempDir()
+        store, err := pond.NewStorage(dir)
+        if err != nil {
+                t.Fatalf("NewStorage: %v", err)
+        }
+        defer store.Free()
+
+        ids := []int64{1, 2, 3, 4, 5}
+        ages := []int64{30, 25, 35, 40, 28}
+
+        cols := []pond.Column{
+                {Name: "id", Type: pond.ColumnInt64, Int64Data: ids},
+                {Name: "age", Type: pond.ColumnInt64, Int64Data: ages},
+        }
+        hash, err := store.WriteRows("users", cols)
+        if err != nil {
+                t.Fatalf("WriteRows: %v", err)
+        }
+        if len(hash) != 64 {
+                t.Errorf("hash length: got %d, want 64", len(hash))
+        }
+
+        result, err := store.ReadRows("users")
+        if err != nil {
+                t.Fatalf("ReadRows: %v", err)
+        }
+        defer result.Free()
+
+        // The result will include _rowid and _version columns (auto-added by
+        // the CRDT layer). Verify our two INT64 columns survived the round
+        // trip and matched the input values.
+        if len(result.Columns) < 2 {
+                t.Fatalf("expected at least 2 columns, got %d", len(result.Columns))
+        }
+
+        idCol := findColumn(t, result.Columns, "id")
+        if idCol.Vtype != pond.VTInt64 {
+                t.Errorf("id vtype: got %s, want INT64", idCol.Vtype)
+        }
+        if idCol.Len() != len(ids) {
+                t.Fatalf("id column length: got %d, want %d", idCol.Len(), len(ids))
+        }
+        gotIDs := idCol.Int64()
+        for i, want := range ids {
+                if gotIDs[i] != want {
+                        t.Errorf("id[%d]: got %d, want %d", i, gotIDs[i], want)
+                }
+        }
+
+        ageCol := findColumn(t, result.Columns, "age")
+        if ageCol.Vtype != pond.VTInt64 {
+                t.Errorf("age vtype: got %s, want INT64", ageCol.Vtype)
+        }
+        gotAges := ageCol.Int64()
+        for i, want := range ages {
+                if gotAges[i] != want {
+                        t.Errorf("age[%d]: got %d, want %d", i, gotAges[i], want)
+                }
+        }
+}
+
+// TestStorageWriteAndReadRowsString verifies that STRING columns written via
+// Storage.WriteRows can be read back via Storage.ReadRows with byte-exact
+// fidelity.
+func TestStorageWriteAndReadRowsString(t *testing.T) {
+        dir := t.TempDir()
+        store, err := pond.NewStorage(dir)
+        if err != nil {
+                t.Fatalf("NewStorage: %v", err)
+        }
+        defer store.Free()
+
+        names := []string{"alice", "bob", "carol", "dave", ""}
+        cities := []string{"NYC", "LA", "NYC", "SF", "LA"}
+
+        cols := []pond.Column{
+                {Name: "name", Type: pond.ColumnString, StringData: names},
+                {Name: "city", Type: pond.ColumnString, StringData: cities},
+        }
+        hash, err := store.WriteRows("people", cols)
+        if err != nil {
+                t.Fatalf("WriteRows: %v", err)
+        }
+        if len(hash) != 64 {
+                t.Errorf("hash length: got %d, want 64", len(hash))
+        }
+
+        result, err := store.ReadRows("people")
+        if err != nil {
+                t.Fatalf("ReadRows: %v", err)
+        }
+        defer result.Free()
+
+        if len(result.Columns) < 2 {
+                t.Fatalf("expected at least 2 columns, got %d", len(result.Columns))
+        }
+
+        nameCol := findColumn(t, result.Columns, "name")
+        if nameCol.Vtype != pond.VTString {
+                t.Errorf("name vtype: got %s, want STRING", nameCol.Vtype)
+        }
+        if nameCol.Len() != len(names) {
+                t.Fatalf("name column length: got %d, want %d", nameCol.Len(), len(names))
+        }
+        gotNames := nameCol.String()
+        for i, want := range names {
+                if gotNames[i] != want {
+                        t.Errorf("name[%d]: got %q, want %q", i, gotNames[i], want)
+                }
+        }
+
+        cityCol := findColumn(t, result.Columns, "city")
+        if cityCol.Vtype != pond.VTString {
+                t.Errorf("city vtype: got %s, want STRING", cityCol.Vtype)
+        }
+        gotCities := cityCol.String()
+        for i, want := range cities {
+                if gotCities[i] != want {
+                        t.Errorf("city[%d]: got %q, want %q", i, gotCities[i], want)
+                }
+        }
+}
+
+// findColumn returns the column with the given name, failing the test if it
+// is not present.
+func findColumn(t *testing.T, cols []pond.Column, name string) pond.Column {
+        t.Helper()
+        for _, c := range cols {
+                if c.Name == name {
+                        return c
+                }
+        }
+        t.Fatalf("column %q not found in %d columns", name, len(cols))
+        return pond.Column{}
+}

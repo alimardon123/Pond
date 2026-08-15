@@ -83,20 +83,48 @@ type Result struct {
         Columns  []Column
 }
 
-// Column is a decoded PND2 column. The Values field is one of:
-//   - VTInt64:   []int64
-//   - VTFloat64: []float64
-//   - VTString:  []string
-//   - VTBinary:  [][]byte
-//   - VTNull:    nil (use Len() for the row count)
+// Column is a decoded PND2 column (when produced by Decode/ReadRows) or a
+// write-side column specification (when passed to WriteRows).
+//
+// Decode-side fields (populated by Decode/ReadRows):
+//   - Vtype:  the PND2 value type (VTInt64, VTFloat64, VTString, ...)
+//   - Values: a typed `any` holding []int64, []float64, []string, or [][]byte
+//
+// Write-side fields (populated by callers of WriteRows):
+//   - Type:        the column type to write (ColumnInt64, ColumnFloat64, ColumnString)
+//   - Int64Data:   values for INT64 columns
+//   - Float64Data: values for FLOAT64 columns
+//   - StringData:  values for STRING columns
+//
+// The accessor methods (Int64, Float64, String, Binary, Len) prefer the
+// write-side typed fields when populated, falling back to the Values field
+// otherwise. This keeps the decode-side API stable while letting WriteRows
+// callers express their input in a typed, ergonomic way.
 type Column struct {
-        Name   string
+        Name string
+
+        // Decode-side.
         Vtype  VType
         Values any
+
+        // Write-side.
+        Type        ColumnType
+        Int64Data   []int64
+        Float64Data []float64
+        StringData  []string
 }
 
 // Len returns the number of values in the column.
 func (c Column) Len() int {
+        if c.Int64Data != nil {
+                return len(c.Int64Data)
+        }
+        if c.Float64Data != nil {
+                return len(c.Float64Data)
+        }
+        if c.StringData != nil {
+                return len(c.StringData)
+        }
         switch v := c.Values.(type) {
         case []int64:
                 return len(v)
@@ -110,21 +138,30 @@ func (c Column) Len() int {
         return 0
 }
 
-// Int64 returns the column's values as []int64. Panics if the column is
-// not VTInt64.
+// Int64 returns the column's values as []int64. Returns the write-side
+// Int64Data if populated, otherwise the decode-side Values.
 func (c Column) Int64() []int64 {
+        if c.Int64Data != nil {
+                return c.Int64Data
+        }
         v, _ := c.Values.([]int64)
         return v
 }
 
 // Float64 returns the column's values as []float64.
 func (c Column) Float64() []float64 {
+        if c.Float64Data != nil {
+                return c.Float64Data
+        }
         v, _ := c.Values.([]float64)
         return v
 }
 
 // String returns the column's values as []string.
 func (c Column) String() []string {
+        if c.StringData != nil {
+                return c.StringData
+        }
         v, _ := c.Values.([]string)
         return v
 }
@@ -149,7 +186,15 @@ func Decode(blob []byte) (*Result, error) {
         if h == nil {
                 return nil, fmt.Errorf("pond: decode failed (bad magic, malformed header, or zstd-compressed)")
         }
+        return resultFromHandle(h)
+}
 
+// resultFromHandle walks a *cabi.PondResult handle and builds a *Result.
+//
+// Shared between Decode (which decodes a PND2 blob) and Storage.ReadRows
+// (which receives a *PondResult directly from the storage C ABI). The
+// caller owns the handle — Result.Free will release it.
+func resultFromHandle(h *cabi.PondResult) (*Result, error) {
         n := cabi.ResultNumColumns(h)
         cols := make([]Column, n)
         for i := 0; i < n; i++ {
@@ -174,6 +219,7 @@ func Decode(blob []byte) (*Result, error) {
                         for r := 0; r < nRows; r++ {
                                 b, err := cabi.ResultColumnBin(h, i, r)
                                 if err != nil {
+                                        cabi.ResultFree(h)
                                         return nil, fmt.Errorf("pond: column %d row %d: %w", i, r, err)
                                 }
                                 bs[r] = b
@@ -349,4 +395,106 @@ func (s *Storage) Revert(collection, commitHash string) error {
 // ListBranches lists all branches for a collection.
 func (s *Storage) ListBranches(collection string) ([]string, error) {
         return cabi.StorageListBranches(s.handle, collection)
+}
+
+// ===========================================================================
+// Structured row operations — WriteRows / ReadRows
+// ===========================================================================
+
+// ColumnType identifies the value type of a write-side Column. The numeric
+// values match the PND2 vtype codes (1=INT64, 2=FLOAT64, 3=STRING) so they
+// can be passed straight through to the C ABI.
+type ColumnType uint8
+
+const (
+        ColumnInt64   ColumnType = 1
+        ColumnFloat64 ColumnType = 2
+        ColumnString  ColumnType = 3
+)
+
+// String returns a human-readable name for the column type.
+func (t ColumnType) String() string {
+        switch t {
+        case ColumnInt64:
+                return "INT64"
+        case ColumnFloat64:
+                return "FLOAT64"
+        case ColumnString:
+                return "STRING"
+        default:
+                return fmt.Sprintf("UNKNOWN(%d)", uint8(t))
+        }
+}
+
+// Column describes one typed column for Storage.WriteRows. Exactly one of
+// Int64Data, Float64Data, or StringData must be populated, matching the
+// Type field. All columns passed to WriteRows must have the same length.
+//
+// NOTE: this is the same struct as the decode-side Column above (which
+// also has Vtype + Values fields for decode results). WriteRows only reads
+// the Name, Type, and the matching *Data field; the other fields can be
+// left zero.
+
+// WriteRows encodes the given columns as a PND2 blob and writes them to the
+// collection on the active branch. The Rust storage layer auto-adds _rowid
+// and _version CRDT metadata columns. Returns the commit hash.
+//
+// All columns MUST have the same length (the row count) and be non-empty.
+// The Type field of each Column determines which *Data field is read.
+//
+// Usage:
+//
+//      cols := []pond.Column{
+//              {Name: "id",   Type: pond.ColumnInt64,  Int64Data: []int64{1, 2, 3}},
+//              {Name: "name", Type: pond.ColumnString, StringData: []string{"a", "b", "c"}},
+//      }
+//      hash, err := store.WriteRows("users", cols)
+func (s *Storage) WriteRows(collection string, columns []Column) (string, error) {
+        if s == nil || s.handle == nil {
+                return "", fmt.Errorf("pond: Storage is nil or freed")
+        }
+        if len(columns) == 0 {
+                return "", fmt.Errorf("pond: no columns provided")
+        }
+        specs := make([]cabi.WriteColumnSpec, len(columns))
+        for i, c := range columns {
+                specs[i] = cabi.WriteColumnSpec{
+                        Name:        c.Name,
+                        Type:        uint8(c.Type),
+                        Int64Data:   c.Int64Data,
+                        Float64Data: c.Float64Data,
+                        StringData:  c.StringData,
+                }
+        }
+        // Pass empty message — the Rust impl substitutes "write_rows" as default.
+        return cabi.StorageWriteRows(s.handle, collection, "", specs)
+}
+
+// ReadRows reads the HEAD PND2 blob from a collection, decodes it, and
+// returns the result. The caller MUST call result.Free() when done.
+//
+// The returned Result contains all columns from the HEAD manifest's first
+// row group, including the auto-added _rowid and _version columns. Callers
+// that don't need CRDT metadata should filter them out by name.
+//
+// Usage:
+//
+//      result, err := store.ReadRows("users")
+//      if err != nil { ... }
+//      defer result.Free()
+//      for _, col := range result.Columns {
+//              fmt.Printf("%s: %d values\n", col.Name, col.Len())
+//      }
+func (s *Storage) ReadRows(collection string) (*Result, error) {
+        if s == nil || s.handle == nil {
+                return nil, fmt.Errorf("pond: Storage is nil or freed")
+        }
+        h, err := cabi.StorageReadRows(s.handle, collection)
+        if err != nil {
+                return nil, err
+        }
+        if h == nil {
+                return nil, fmt.Errorf("pond: StorageReadRows returned nil handle")
+        }
+        return resultFromHandle(h)
 }
