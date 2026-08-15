@@ -325,10 +325,14 @@ struct SelectTailSplits<'a> {
 fn split_select_tail(s: &str) -> SelectTailSplits<'_> {
     let empty = "";
 
-    // Find the FIRST occurrence of WHERE / GROUP BY / ORDER BY / LIMIT —
-    // anything before that is table+alias+JOINs.
+    // Find the FIRST occurrence of WHERE / GROUP BY / HAVING / ORDER BY /
+    // LIMIT / OFFSET — anything before that is table+alias+JOINs.
+    //
+    // HAVING is included here (even though standard SQL only allows it
+    // after GROUP BY) so that `SELECT COUNT(*) FROM t HAVING ...` doesn't
+    // get its HAVING clause mis-parsed as the table alias.
     let mut head_end = s.len();
-    for kw in ["WHERE", "GROUP BY", "ORDER BY", "LIMIT"] {
+    for kw in ["WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET"] {
         if let Some(p) = find_keyword(s, kw) {
             if p < head_end {
                 head_end = p;

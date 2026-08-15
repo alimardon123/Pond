@@ -10,6 +10,9 @@
 //   - ORDER BY ASC/DESC
 //   - LIMIT/OFFSET
 //   - Subqueries in WHERE
+//   - Parquet file reading (basic types, nulls, multiple row groups,
+//     end-to-end SQL SELECT)
+//   - HAVING with bare aggregates (COUNT(*), AVG, SUM)
 
 use pond_sql::execute;
 use pond_storage::UnifiedStorage;
@@ -393,4 +396,532 @@ fn test_merge_statement() {
         .expect("select after merge");
     // Should be 3 rows total: id=1 (updated), id=2 (unchanged), id=3 (inserted).
     assert_eq!(select.rows.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Parquet file reading
+// ---------------------------------------------------------------------------
+
+/// Build a `RecordBatch` from column arrays + a schema.
+///
+/// Tiny helper used by the parquet tests below.
+fn make_batch(
+    schema: arrow::datatypes::Schema,
+    arrays: Vec<std::sync::Arc<dyn arrow::array::Array>>,
+) -> arrow::record_batch::RecordBatch {
+    use std::sync::Arc;
+    arrow::record_batch::RecordBatch::try_new(Arc::new(schema), arrays)
+        .expect("build record batch")
+}
+
+/// Write a parquet file containing `batches`. The writer is configured to
+/// use UNCOMPRESSED pages (since pond_sql's parquet dep doesn't enable any
+/// compression codecs) and a small row group size to facilitate multi-row
+/// group tests.
+fn write_parquet(
+    path: &std::path::Path,
+    batches: &[arrow::record_batch::RecordBatch],
+    max_row_group_size: usize,
+) {
+    use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    let schema = batches[0].schema();
+    let file = File::create(path).expect("create parquet file");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_max_row_group_size(max_row_group_size)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("open writer");
+    for batch in batches {
+        writer.write(batch).expect("write batch");
+    }
+    writer.close().expect("close writer");
+}
+
+#[test]
+fn test_select_file_parquet_basic_types() {
+    use arrow::array::{
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        Int8Array, LargeStringArray, StringArray, UInt16Array, UInt32Array, UInt64Array,
+        UInt8Array,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let dir = setup();
+    let path = dir.path().join("types.parquet");
+
+    let schema = Schema::new(vec![
+        Field::new("b", DataType::Boolean, false),
+        Field::new("i8", DataType::Int8, false),
+        Field::new("i16", DataType::Int16, false),
+        Field::new("i32", DataType::Int32, false),
+        Field::new("i64", DataType::Int64, false),
+        Field::new("u8", DataType::UInt8, false),
+        Field::new("u16", DataType::UInt16, false),
+        Field::new("u32", DataType::UInt32, false),
+        Field::new("u64", DataType::UInt64, false),
+        Field::new("f32", DataType::Float32, false),
+        Field::new("f64", DataType::Float64, false),
+        Field::new("s", DataType::Utf8, false),
+        Field::new("ls", DataType::LargeUtf8, false),
+    ]);
+
+    let batch = make_batch(
+        schema,
+        vec![
+            Arc::new(BooleanArray::from(vec![true, false])),
+            Arc::new(Int8Array::from(vec![1i8, -2i8])),
+            Arc::new(Int16Array::from(vec![1000i16, -2000i16])),
+            Arc::new(Int32Array::from(vec![100_000i32, -100_001i32])),
+            Arc::new(Int64Array::from(vec![1_000_000_000i64, -1_000_000_001i64])),
+            Arc::new(UInt8Array::from(vec![200u8, 255u8])),
+            Arc::new(UInt16Array::from(vec![60_000u16, 65535u16])),
+            Arc::new(UInt32Array::from(vec![4_000_000_000u32, 3_999_999_999u32])),
+            Arc::new(UInt64Array::from(vec![18_000_000_000_000_000_000u64, 1u64])),
+            Arc::new(Float32Array::from(vec![1.5f32, 2.5f32])),
+            Arc::new(Float64Array::from(vec![3.14f64, 6.28f64])),
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            Arc::new(LargeStringArray::from(vec!["alpha", "beta"])),
+        ],
+    );
+
+    write_parquet(&path, &[batch], 1024);
+
+    let storage = open_storage(&dir);
+    let pq_str = path.to_str().unwrap();
+    let result = execute(&storage, &format!("SELECT * FROM '{}'", pq_str))
+        .expect("select from parquet");
+
+    assert_eq!(result.rows.len(), 2);
+
+    let r0 = &result.rows[0];
+    assert_eq!(row_col(r0, "b"), JsonValue::Bool(true));
+    assert_eq!(row_col(r0, "i8"), JsonValue::Number(serde_json::Number::from(1)));
+    assert_eq!(row_col(r0, "i16"), JsonValue::Number(serde_json::Number::from(1000)));
+    assert_eq!(row_col(r0, "i32"), JsonValue::Number(serde_json::Number::from(100_000)));
+    assert_eq!(row_col(r0, "i64"), JsonValue::Number(serde_json::Number::from(1_000_000_000)));
+    assert_eq!(row_col(r0, "u8"), JsonValue::Number(serde_json::Number::from(200u64)));
+    assert_eq!(row_col(r0, "u16"), JsonValue::Number(serde_json::Number::from(60_000u64)));
+    assert_eq!(row_col(r0, "u32"), JsonValue::Number(serde_json::Number::from(4_000_000_000u64)));
+    assert_eq!(row_col(r0, "u64"), JsonValue::Number(serde_json::Number::from(18_000_000_000_000_000_000u64)));
+    assert_eq!(row_col(r0, "f32").as_f64(), Some(1.5));
+    assert_eq!(row_col(r0, "f64").as_f64(), Some(3.14));
+    assert_eq!(row_col(r0, "s"), JsonValue::String("alice".to_string()));
+    assert_eq!(row_col(r0, "ls"), JsonValue::String("alpha".to_string()));
+
+    let r1 = &result.rows[1];
+    assert_eq!(row_col(r1, "b"), JsonValue::Bool(false));
+    assert_eq!(row_col(r1, "i8"), JsonValue::Number(serde_json::Number::from(-2)));
+    assert_eq!(row_col(r1, "i32"), JsonValue::Number(serde_json::Number::from(-100_001)));
+    assert_eq!(row_col(r1, "u64"), JsonValue::Number(serde_json::Number::from(1u64)));
+    assert_eq!(row_col(r1, "f64").as_f64(), Some(6.28));
+    assert_eq!(row_col(r1, "s"), JsonValue::String("bob".to_string()));
+    assert_eq!(row_col(r1, "ls"), JsonValue::String("beta".to_string()));
+}
+
+#[test]
+fn test_select_file_parquet_nulls() {
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let dir = setup();
+    let path = dir.path().join("nulls.parquet");
+
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("age", DataType::Int32, true),
+    ]);
+
+    // id: [1, 2, 3]
+    // name: ["alice", NULL, "carol"]
+    // age: [NULL, 25, 35]
+    let batch = make_batch(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                Some("alice"),
+                None,
+                Some("carol"),
+            ])),
+            Arc::new(Int32Array::from(vec![None, Some(25), Some(35)])),
+        ],
+    );
+
+    write_parquet(&path, &[batch], 1024);
+
+    let storage = open_storage(&dir);
+    let pq_str = path.to_str().unwrap();
+    let result = execute(&storage, &format!("SELECT * FROM '{}'", pq_str))
+        .expect("select from parquet with nulls");
+
+    assert_eq!(result.rows.len(), 3);
+
+    let r0 = &result.rows[0];
+    assert_eq!(row_col(r0, "id"), JsonValue::Number(serde_json::Number::from(1)));
+    assert_eq!(row_col(r0, "name"), JsonValue::String("alice".to_string()));
+    assert_eq!(row_col(r0, "age"), JsonValue::Null);
+
+    let r1 = &result.rows[1];
+    assert_eq!(row_col(r1, "id"), JsonValue::Number(serde_json::Number::from(2)));
+    assert_eq!(row_col(r1, "name"), JsonValue::Null);
+    assert_eq!(row_col(r1, "age"), JsonValue::Number(serde_json::Number::from(25)));
+
+    let r2 = &result.rows[2];
+    assert_eq!(row_col(r2, "name"), JsonValue::String("carol".to_string()));
+    assert_eq!(row_col(r2, "age"), JsonValue::Number(serde_json::Number::from(35)));
+}
+
+#[test]
+fn test_select_file_parquet_multiple_row_groups() {
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    let dir = setup();
+    let path = dir.path().join("multi_rg.parquet");
+
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    // 6 rows; with max_row_group_size=2 this produces 3 row groups.
+    let batch = make_batch(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
+            Arc::new(StringArray::from(vec![
+                "a", "b", "c", "d", "e", "f",
+            ])),
+        ],
+    );
+
+    write_parquet(&path, &[batch], 2);
+
+    // Sanity-check that the parquet file really has 3 row groups — otherwise
+    // this test wouldn't actually exercise the "iterate over multiple
+    // record batches" code path in read_parquet_file.
+    let file = File::open(&path).expect("open parquet for metadata check");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("builder");
+    assert_eq!(builder.metadata().num_row_groups(), 3,
+        "parquet file should have 3 row groups (6 rows / max_row_group_size=2)");
+
+    let storage = open_storage(&dir);
+    let pq_str = path.to_str().unwrap();
+    let result = execute(&storage, &format!("SELECT * FROM '{}' ORDER BY id ASC", pq_str))
+        .expect("select from multi-row-group parquet");
+
+    // All 6 rows should be present regardless of how many row groups they
+    // span — the reader iterates over every record batch the parquet
+    // reader produces.
+    assert_eq!(result.rows.len(), 6);
+    let ids: Vec<i64> = result.rows.iter()
+        .filter_map(|r| row_col(r, "id").as_i64())
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+    let names: Vec<String> = result.rows.iter()
+        .filter_map(|r| row_col(r, "name").as_str().map(|s| s.to_string()))
+        .collect();
+    assert_eq!(names, vec!["a", "b", "c", "d", "e", "f"]);
+}
+
+#[test]
+fn test_select_file_parquet_dates_and_timestamps() {
+    use arrow::array::{
+        Date32Array, Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc;
+
+    let dir = setup();
+    let path = dir.path().join("dates.parquet");
+
+    let schema = Schema::new(vec![
+        Field::new("d32", DataType::Date32, false),
+        Field::new("d64", DataType::Date64, false),
+        Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), false),
+        Field::new("ts_ms", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+        Field::new("ts_us", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("ts_ns", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+    ]);
+
+    // Epoch (1970-01-01 00:00:00 UTC) for every column.
+    let batch = make_batch(
+        schema,
+        vec![
+            Arc::new(Date32Array::from(vec![0])),
+            Arc::new(Date64Array::from(vec![0])),
+            Arc::new(TimestampSecondArray::from(vec![0])),
+            Arc::new(TimestampMillisecondArray::from(vec![0])),
+            Arc::new(TimestampMicrosecondArray::from(vec![0])),
+            Arc::new(TimestampNanosecondArray::from(vec![0])),
+        ],
+    );
+
+    write_parquet(&path, &[batch], 1024);
+
+    let storage = open_storage(&dir);
+    let pq_str = path.to_str().unwrap();
+    let result = execute(&storage, &format!("SELECT * FROM '{}'", pq_str))
+        .expect("select from parquet with dates");
+
+    assert_eq!(result.rows.len(), 1);
+    let r0 = &result.rows[0];
+    assert_eq!(row_col(r0, "d32"), JsonValue::String("1970-01-01".to_string()));
+    assert_eq!(row_col(r0, "d64"), JsonValue::String("1970-01-01".to_string()));
+    assert_eq!(
+        row_col(r0, "ts_s"),
+        JsonValue::String("1970-01-01T00:00:00".to_string())
+    );
+    assert_eq!(
+        row_col(r0, "ts_ms"),
+        JsonValue::String("1970-01-01T00:00:00".to_string())
+    );
+    assert_eq!(
+        row_col(r0, "ts_us"),
+        JsonValue::String("1970-01-01T00:00:00".to_string())
+    );
+    assert_eq!(
+        row_col(r0, "ts_ns"),
+        JsonValue::String("1970-01-01T00:00:00".to_string())
+    );
+}
+
+#[test]
+fn test_select_file_parquet_end_to_end_sql() {
+    use arrow::array::{Float64Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let dir = setup();
+    let path = dir.path().join("people.parquet");
+
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+        Field::new("city", DataType::Utf8, false),
+        Field::new("salary", DataType::Float64, false),
+    ]);
+
+    let batch = make_batch(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(StringArray::from(vec![
+                "alice", "bob", "carol", "dave", "erin",
+            ])),
+            Arc::new(Int32Array::from(vec![30, 25, 35, 40, 28])),
+            Arc::new(StringArray::from(vec![
+                "NYC", "LA", "NYC", "SF", "LA",
+            ])),
+            Arc::new(Float64Array::from(vec![
+                100_000.0, 80_000.0, 120_000.0, 90_000.0, 75_000.0,
+            ])),
+        ],
+    );
+
+    write_parquet(&path, &[batch], 1024);
+
+    let storage = open_storage(&dir);
+    let pq_str = path.to_str().unwrap();
+
+    // WHERE on a parquet file.
+    let result = execute(
+        &storage,
+        &format!("SELECT name, age FROM '{}' WHERE age > 28 ORDER BY age DESC", pq_str),
+    )
+    .expect("select with where on parquet");
+    assert_eq!(result.rows.len(), 3); // alice (30), carol (35), dave (40).
+    let ages: Vec<i64> = result.rows.iter()
+        .filter_map(|r| row_col(r, "age").as_i64())
+        .collect();
+    assert_eq!(ages, vec![40, 35, 30]);
+
+    // GROUP BY on a parquet file.
+    let grouped = execute(
+        &storage,
+        &format!(
+            "SELECT city, COUNT(*), AVG(salary) FROM '{}' GROUP BY city",
+            pq_str
+        ),
+    )
+    .expect("group by on parquet");
+    assert_eq!(grouped.rows.len(), 3); // NYC, LA, SF.
+
+    // HAVING with bare AVG on a parquet file — NYC has alice + carol:
+    // avg = (100_000 + 120_000) / 2 = 110_000, which is > 100_000.
+    let having = execute(
+        &storage,
+        &format!(
+            "SELECT city FROM '{}' GROUP BY city HAVING AVG(salary) > 100000",
+            pq_str
+        ),
+    )
+    .expect("having avg on parquet");
+    let cities: Vec<String> = having.rows.iter()
+        .filter_map(|r| row_col(r, "city").as_str().map(|s| s.to_string()))
+        .collect();
+    assert_eq!(cities, vec!["NYC".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// HAVING with bare aggregates
+// ---------------------------------------------------------------------------
+
+/// Seed an `employees` collection: (id, dept, salary, amount).
+///
+///   eng:  alice 100, bob 90, carol 110   (3 rows, avg=100, sum=300)
+///   sales: dave 60, erin 70              (2 rows, avg=65, sum=130)
+///   hr:    frank 50                      (1 row,  avg=50, sum=50)
+fn seed_employees(storage: &UnifiedStorage) {
+    let sql = "INSERT INTO employees (id, dept, salary, amount) VALUES \
+               (1, 'eng', 100000, 500), \
+               (2, 'eng', 90000, 300), \
+               (3, 'eng', 110000, 200), \
+               (4, 'sales', 60000, 100), \
+               (5, 'sales', 70000, 50), \
+               (6, 'hr', 50000, 25)";
+    execute(storage, sql).expect("seed employees");
+}
+
+#[test]
+fn test_having_count_star() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_employees(&storage);
+
+    // HAVING COUNT(*) > 1 → eng (3) and sales (2) qualify; hr (1) does not.
+    let result = execute(
+        &storage,
+        "SELECT dept FROM employees GROUP BY dept HAVING COUNT(*) > 1",
+    )
+    .expect("having count");
+
+    assert_eq!(result.rows.len(), 2);
+    let mut depts: Vec<String> = result.rows.iter()
+        .filter_map(|r| row_col(r, "dept").as_str().map(|s| s.to_string()))
+        .collect();
+    depts.sort();
+    assert_eq!(depts, vec!["eng".to_string(), "sales".to_string()]);
+}
+
+#[test]
+fn test_having_count_star_eq_threshold() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_employees(&storage);
+
+    // HAVING COUNT(*) >= 3 → only eng qualifies.
+    let result = execute(
+        &storage,
+        "SELECT dept FROM employees GROUP BY dept HAVING COUNT(*) >= 3",
+    )
+    .expect("having count ge");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(row_col(&result.rows[0], "dept").as_str(), Some("eng"));
+}
+
+#[test]
+fn test_having_avg() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_employees(&storage);
+
+    // eng avg = 100_000; sales avg = 65_000; hr avg = 50_000.
+    // HAVING AVG(salary) > 80000 → only eng.
+    let result = execute(
+        &storage,
+        "SELECT dept FROM employees GROUP BY dept HAVING AVG(salary) > 80000",
+    )
+    .expect("having avg");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(row_col(&result.rows[0], "dept").as_str(), Some("eng"));
+
+    // HAVING AVG(salary) > 60000 → eng + sales.
+    let result = execute(
+        &storage,
+        "SELECT dept FROM employees GROUP BY dept HAVING AVG(salary) > 60000",
+    )
+    .expect("having avg 2");
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
+fn test_having_sum() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_employees(&storage);
+
+    // amount sums: eng=1000, sales=150, hr=25.
+    // HAVING SUM(amount) < 1000 → sales + hr.
+    let result = execute(
+        &storage,
+        "SELECT dept FROM employees GROUP BY dept HAVING SUM(amount) < 1000",
+    )
+    .expect("having sum");
+    assert_eq!(result.rows.len(), 2);
+    let mut depts: Vec<String> = result.rows.iter()
+        .filter_map(|r| row_col(r, "dept").as_str().map(|s| s.to_string()))
+        .collect();
+    depts.sort();
+    assert_eq!(depts, vec!["hr".to_string(), "sales".to_string()]);
+}
+
+#[test]
+fn test_having_with_aggregate_in_select() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_employees(&storage);
+
+    // The SELECT list computes COUNT(*) explicitly; HAVING references the
+    // same aggregate. Both should work — the executor resolves the
+    // HAVING aggregate from the group's rows even when it's already in
+    // the SELECT list.
+    let result = execute(
+        &storage,
+        "SELECT dept, COUNT(*) AS n FROM employees GROUP BY dept HAVING COUNT(*) > 1 ORDER BY n DESC",
+    )
+    .expect("having + select aggregate");
+
+    assert_eq!(result.rows.len(), 2);
+    // eng (3) before sales (2).
+    assert_eq!(row_col(&result.rows[0], "dept").as_str(), Some("eng"));
+    assert_eq!(row_col(&result.rows[0], "n").as_i64(), Some(3));
+    assert_eq!(row_col(&result.rows[1], "dept").as_str(), Some("sales"));
+    assert_eq!(row_col(&result.rows[1], "n").as_i64(), Some(2));
+}
+
+#[test]
+fn test_having_no_group_by() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_employees(&storage);
+
+    // HAVING without GROUP BY: the entire input is one group. COUNT(*) = 6.
+    let result = execute(
+        &storage,
+        "SELECT COUNT(*) FROM employees HAVING COUNT(*) > 5",
+    )
+    .expect("having no group by");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(row_col(&result.rows[0], "COUNT(*)").as_i64(), Some(6));
+
+    // HAVING that filters out the single group.
+    let result = execute(
+        &storage,
+        "SELECT COUNT(*) FROM employees HAVING COUNT(*) > 100",
+    )
+    .expect("having no group by filtered");
+    assert_eq!(result.rows.len(), 0);
 }

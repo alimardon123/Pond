@@ -368,6 +368,11 @@ fn apply_group_by(
         for a in &aggregates {
             out.insert(aggregate_output_name(a), compute_aggregate(a, &rows));
         }
+        // Resolve any bare aggregate references in HAVING (e.g.
+        // `HAVING COUNT(*) > 5` or `HAVING AVG(salary) > 50000`) that
+        // weren't already computed as SELECT items. The aggregate is
+        // computed from the group's rows (here, all input rows).
+        resolve_having_aggregates(having, &rows, &mut out);
         let row = JsonValue::Object(out);
         if having.eval(&row) {
             Ok(vec![row])
@@ -403,6 +408,9 @@ fn apply_group_by(
             for a in &aggregates {
                 out.insert(aggregate_output_name(a), compute_aggregate(a, group_rows));
             }
+            // Resolve any bare aggregate references in HAVING that weren't
+            // already computed as SELECT items.
+            resolve_having_aggregates(having, group_rows, &mut out);
             let row = JsonValue::Object(out);
             if having.eval(&row) {
                 result.push(row);
@@ -410,6 +418,92 @@ fn apply_group_by(
         }
         Ok(result)
     }
+}
+
+/// Walk the HAVING expression tree, find every column reference that looks
+/// like an aggregate function call (e.g. `COUNT(*)`, `SUM(salary)`,
+/// `AVG(salary)`), and — if it isn't already present in `out` — compute
+/// the aggregate from `group_rows` and insert it.
+///
+/// This is what makes `HAVING COUNT(*) > 5` work even when the SELECT list
+/// doesn't include `COUNT(*)` (or aliases it to something else).
+fn resolve_having_aggregates(
+    having: &WhereExpr,
+    group_rows: &[JsonValue],
+    out: &mut serde_json::Map<String, JsonValue>,
+) {
+    for name in collect_aggregate_refs(having) {
+        if out.contains_key(&name) {
+            continue;
+        }
+        if let Some(agg) = parse_aggregate_from_name(&name) {
+            out.insert(name, compute_aggregate(&agg, group_rows));
+        }
+    }
+}
+
+/// Collect every column reference in a WhereExpr tree that looks like an
+/// aggregate function call (matches `^(COUNT|SUM|AVG|MIN|MAX)\(...\)$`).
+fn collect_aggregate_refs(expr: &WhereExpr) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    collect_aggregate_refs_inner(expr, &mut out);
+    out
+}
+
+fn collect_aggregate_refs_inner(expr: &WhereExpr, out: &mut Vec<String>) {
+    match expr {
+        WhereExpr::True | WhereExpr::Subquery { .. } => {}
+        WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+            collect_aggregate_refs_inner(a, out);
+            collect_aggregate_refs_inner(b, out);
+        }
+        WhereExpr::Not(e) => collect_aggregate_refs_inner(e, out),
+        WhereExpr::Compare { col, .. }
+        | WhereExpr::In { col, .. }
+        | WhereExpr::Like { col, .. }
+        | WhereExpr::IsNull { col, .. } => {
+            if is_aggregate_name(col) {
+                if !out.iter().any(|s| s == col) {
+                    out.push(col.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Check whether `s` looks like an aggregate function call name, e.g.
+/// `COUNT(*)`, `SUM(salary)`, `AVG(amount)`. Case-insensitive on the
+/// function name.
+fn is_aggregate_name(s: &str) -> bool {
+    let upper = s.to_uppercase();
+    let prefixes = ["COUNT(", "SUM(", "AVG(", "MIN(", "MAX("];
+    upper.ends_with(')') && prefixes.iter().any(|p| upper.starts_with(p))
+}
+
+/// Parse a canonical aggregate name like `COUNT(*)` or `SUM(salary)` back
+/// into an `AggregateExpr` so it can be passed to `compute_aggregate`.
+fn parse_aggregate_from_name(name: &str) -> Option<AggregateExpr> {
+    let paren_pos = name.find('(')?;
+    let close_pos = name.rfind(')')?;
+    if close_pos <= paren_pos {
+        return None;
+    }
+    let func_str = name[..paren_pos].trim().to_uppercase();
+    let func = match func_str.as_str() {
+        "COUNT" => AggregateFunc::Count,
+        "SUM" => AggregateFunc::Sum,
+        "AVG" => AggregateFunc::Avg,
+        "MIN" => AggregateFunc::Min,
+        "MAX" => AggregateFunc::Max,
+        _ => return None,
+    };
+    let arg_str = name[paren_pos + 1..close_pos].trim();
+    let arg = if arg_str == "*" || arg_str.is_empty() {
+        None
+    } else {
+        Some(arg_str.to_string())
+    };
+    Some(AggregateExpr { func, arg, alias: None })
 }
 
 fn compute_aggregate(a: &AggregateExpr, rows: &[JsonValue]) -> JsonValue {
@@ -681,6 +775,13 @@ fn read_table_rows(storage: &UnifiedStorage, table: &TableRef) -> Result<Vec<Jso
 }
 
 fn read_file_rows(path: &str) -> Result<Vec<JsonValue>, String> {
+    // Parquet is a binary format — handle it before the read_to_string
+    // path used for the text-based formats (NDJSON / JSON / CSV / TSV),
+    // which would otherwise fail on non-UTF-8 bytes.
+    if path.ends_with(".parquet") {
+        return read_parquet_file(path);
+    }
+
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
 
@@ -739,10 +840,214 @@ fn read_file_rows(path: &str) -> Result<Vec<JsonValue>, String> {
             rows.push(JsonValue::Object(obj));
         }
         Ok(rows)
-    } else if path.ends_with(".parquet") {
-        Err("Parquet file reading not yet supported. Use CSV, TSV, JSON, or NDJSON.".to_string())
     } else {
         Err(format!("Unsupported file format: '{}'", path))
+    }
+}
+
+/// Read a Parquet file into a Vec of JSON row objects.
+///
+/// Opens the file with `ParquetRecordBatchReaderBuilder`, iterates over the
+/// record batches, and converts each row to a `serde_json::Value` object
+/// keyed by column names.
+///
+/// Supported Arrow data types:
+///   - Boolean
+///   - Int8 / Int16 / Int32 / Int64
+///   - UInt8 / UInt16 / UInt32 / UInt64
+///   - Float32 / Float64
+///   - Utf8 / LargeUtf8
+///   - Date32 / Date64            (rendered as ISO 8601 date strings)
+///   - Timestamp(Second | Millisecond | Microsecond | Nanosecond, _)
+///                                 (rendered as ISO 8601 datetime strings)
+///   - Null
+///
+/// Null cells (regardless of the underlying type) are returned as
+/// `JsonValue::Null`.
+fn read_parquet_file(path: &str) -> Result<Vec<JsonValue>, String> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+
+    let file = File::open(path)
+        .map_err(|e| format!("Failed to open parquet file '{}': {}", path, e))?;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("Failed to open parquet reader for '{}': {}", path, e))?;
+    let reader = builder
+        .build()
+        .map_err(|e| format!("Failed to build parquet reader for '{}': {}", path, e))?;
+
+    let mut rows: Vec<JsonValue> = Vec::new();
+    for batch in reader {
+        let batch = batch
+            .map_err(|e| format!("Failed to read parquet record batch: {}", e))?;
+        let schema = batch.schema();
+        let n_rows = batch.num_rows();
+        let columns = batch.columns();
+
+        for row_idx in 0..n_rows {
+            let mut obj = serde_json::Map::new();
+            for (col_idx, array) in columns.iter().enumerate() {
+                let field = schema.field(col_idx);
+                let name = field.name();
+                let val = arrow_cell_to_json(
+                    array.as_ref(),
+                    row_idx,
+                    field.data_type(),
+                );
+                obj.insert(name.clone(), val);
+            }
+            rows.push(JsonValue::Object(obj));
+        }
+    }
+
+    Ok(rows)
+}
+
+/// Convert a single cell of an Arrow array to a JSON value.
+///
+/// `array` is the column array, `idx` is the row index, `dt` is the
+/// arrow DataType (passed in to avoid re-fetching from the array).
+fn arrow_cell_to_json(
+    array: &dyn arrow::array::Array,
+    idx: usize,
+    dt: &arrow::datatypes::DataType,
+) -> JsonValue {
+    use arrow::array::{
+        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::TimeUnit;
+
+    if array.is_null(idx) {
+        return JsonValue::Null;
+    }
+    match dt {
+        arrow::datatypes::DataType::Boolean => {
+            let a = array.as_any().downcast_ref::<BooleanArray>().expect("BooleanArray");
+            JsonValue::Bool(a.value(idx))
+        }
+        arrow::datatypes::DataType::Int8 => {
+            let a = array.as_any().downcast_ref::<Int8Array>().expect("Int8Array");
+            JsonValue::Number(serde_json::Number::from(a.value(idx) as i64))
+        }
+        arrow::datatypes::DataType::Int16 => {
+            let a = array.as_any().downcast_ref::<Int16Array>().expect("Int16Array");
+            JsonValue::Number(serde_json::Number::from(a.value(idx) as i64))
+        }
+        arrow::datatypes::DataType::Int32 => {
+            let a = array.as_any().downcast_ref::<Int32Array>().expect("Int32Array");
+            JsonValue::Number(serde_json::Number::from(a.value(idx) as i64))
+        }
+        arrow::datatypes::DataType::Int64 => {
+            let a = array.as_any().downcast_ref::<Int64Array>().expect("Int64Array");
+            JsonValue::Number(serde_json::Number::from(a.value(idx)))
+        }
+        arrow::datatypes::DataType::UInt8 => {
+            let a = array.as_any().downcast_ref::<UInt8Array>().expect("UInt8Array");
+            JsonValue::Number(serde_json::Number::from(a.value(idx) as u64))
+        }
+        arrow::datatypes::DataType::UInt16 => {
+            let a = array.as_any().downcast_ref::<UInt16Array>().expect("UInt16Array");
+            JsonValue::Number(serde_json::Number::from(a.value(idx) as u64))
+        }
+        arrow::datatypes::DataType::UInt32 => {
+            let a = array.as_any().downcast_ref::<UInt32Array>().expect("UInt32Array");
+            JsonValue::Number(serde_json::Number::from(a.value(idx) as u64))
+        }
+        arrow::datatypes::DataType::UInt64 => {
+            let a = array.as_any().downcast_ref::<UInt64Array>().expect("UInt64Array");
+            JsonValue::Number(serde_json::Number::from(a.value(idx)))
+        }
+        arrow::datatypes::DataType::Float32 => {
+            let a = array.as_any().downcast_ref::<Float32Array>().expect("Float32Array");
+            serde_json::Number::from_f64(a.value(idx) as f64)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
+        }
+        arrow::datatypes::DataType::Float64 => {
+            let a = array.as_any().downcast_ref::<Float64Array>().expect("Float64Array");
+            serde_json::Number::from_f64(a.value(idx))
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
+        }
+        arrow::datatypes::DataType::Utf8 => {
+            let a = array.as_any().downcast_ref::<StringArray>().expect("StringArray");
+            JsonValue::String(a.value(idx).to_string())
+        }
+        arrow::datatypes::DataType::LargeUtf8 => {
+            let a = array.as_any().downcast_ref::<LargeStringArray>().expect("LargeStringArray");
+            JsonValue::String(a.value(idx).to_string())
+        }
+        arrow::datatypes::DataType::Date32 => {
+            let a = array.as_any().downcast_ref::<Date32Array>().expect("Date32Array");
+            let days = a.value(idx);
+            match chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .and_then(|epoch| epoch.checked_add_signed(chrono::Duration::days(days as i64)))
+            {
+                Some(date) => JsonValue::String(date.format("%Y-%m-%d").to_string()),
+                None => JsonValue::Null,
+            }
+        }
+        arrow::datatypes::DataType::Date64 => {
+            let a = array.as_any().downcast_ref::<Date64Array>().expect("Date64Array");
+            let ms = a.value(idx);
+            match chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms) {
+                Some(dt) => JsonValue::String(dt.format("%Y-%m-%d").to_string()),
+                None => JsonValue::Null,
+            }
+        }
+        arrow::datatypes::DataType::Timestamp(unit, _tz) => {
+            match unit {
+                TimeUnit::Second => {
+                    let a = array.as_any().downcast_ref::<TimestampSecondArray>()
+                        .expect("TimestampSecondArray");
+                    let s = a.value(idx);
+                    match chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0) {
+                        Some(dt) => JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string()),
+                        None => JsonValue::Null,
+                    }
+                }
+                TimeUnit::Millisecond => {
+                    let a = array.as_any().downcast_ref::<TimestampMillisecondArray>()
+                        .expect("TimestampMillisecondArray");
+                    let ms = a.value(idx);
+                    match chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms) {
+                        Some(dt) => JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string()),
+                        None => JsonValue::Null,
+                    }
+                }
+                TimeUnit::Microsecond => {
+                    let a = array.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                        .expect("TimestampMicrosecondArray");
+                    let us = a.value(idx);
+                    let secs = us / 1_000_000;
+                    let nsecs = ((us % 1_000_000) * 1_000) as u32;
+                    match chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsecs) {
+                        Some(dt) => JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string()),
+                        None => JsonValue::Null,
+                    }
+                }
+                TimeUnit::Nanosecond => {
+                    let a = array.as_any().downcast_ref::<TimestampNanosecondArray>()
+                        .expect("TimestampNanosecondArray");
+                    let ns = a.value(idx);
+                    let secs = ns / 1_000_000_000;
+                    let nsecs = (ns % 1_000_000_000) as u32;
+                    match chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsecs) {
+                        Some(dt) => JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string()),
+                        None => JsonValue::Null,
+                    }
+                }
+            }
+        }
+        arrow::datatypes::DataType::Null => JsonValue::Null,
+        // Unsupported types fall back to Null rather than failing the whole
+        // read. This keeps a query usable even when the parquet file has a
+        // column type the engine doesn't fully understand.
+        _ => JsonValue::Null,
     }
 }
 

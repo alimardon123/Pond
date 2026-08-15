@@ -317,6 +317,58 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 i += 1;
             }
             let upper = s.to_uppercase();
+
+            // Aggregate function call as a single token.
+            //
+            // When the identifier is one of COUNT/SUM/AVG/MIN/MAX (the
+            // aggregate functions supported by this engine) AND it is
+            // immediately followed by `(`, scan forward to the matching `)`
+            // and emit the entire function call as a single Ident token in
+            // its canonical form, e.g. `COUNT(*)` or `SUM(salary)`.
+            //
+            // This lets HAVING (and WHERE) treat `COUNT(*) > 5` as a regular
+            // `Compare { col: "COUNT(*)", op: ">", value: 5 }` expression.
+            // The executor resolves the aggregate during HAVING evaluation
+            // by computing it from the group's rows.
+            if matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                // Peek past whitespace for '('
+                let mut j = i;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == '(' {
+                    // Scan to the matching ')'.
+                    let mut depth: i32 = 1;
+                    let mut k = j + 1;
+                    let mut inner = String::new();
+                    while k < chars.len() && depth > 0 {
+                        match chars[k] {
+                            '(' => { depth += 1; inner.push(chars[k]); }
+                            ')' => {
+                                depth -= 1;
+                                if depth > 0 {
+                                    inner.push(chars[k]);
+                                }
+                            }
+                            other => inner.push(other),
+                        }
+                        k += 1;
+                    }
+                    if depth == 0 {
+                        // Canonical form: FUNC(inner) — uppercase the function
+                        // name, preserve the argument verbatim (case-sensitive
+                        // column names matter).
+                        let inner_trimmed = inner.trim();
+                        let canonical = format!("{}({})", upper, inner_trimmed);
+                        i = k;
+                        tokens.push(Token::Ident(canonical));
+                        continue;
+                    }
+                    // Unbalanced parens — fall through to normal keyword
+                    // handling so the parser surfaces a clear error.
+                }
+            }
+
             match upper.as_str() {
                 "AND" => tokens.push(Token::And),
                 "OR" => tokens.push(Token::Or),
