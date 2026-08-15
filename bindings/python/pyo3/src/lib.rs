@@ -3656,6 +3656,219 @@ impl Storage {
         let mut policies = self.rls_policies.lock().unwrap();
         policies.remove(collection).is_some()
     }
+
+    // ===================================================================
+    // VECTOR SEARCH — SIMD-accelerated k-NN over stored vectors
+    //
+    // Reads all rows, extracts the vector column (JSON array of floats),
+    // and calls pond_core::vector::search_vectors() which uses AVX2/NEON
+    // for the distance computation. Supports L2, cosine, and dot metrics.
+    // ===================================================================
+
+    /// Search stored vectors for the k closest to the query vector.
+    ///
+    /// Reads all rows from the collection (HEAD + shards, CRDT-merged),
+    /// extracts the vector from `vector_column` (expected to be a JSON
+    /// array of numbers), and uses SIMD-accelerated distance functions
+    /// to find the k nearest neighbors.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - vector_column: Column containing the vector (JSON array of floats)
+    ///   - query: Query vector (list of floats)
+    ///   - metric: "l2" (Euclidean), "cosine", or "dot"
+    ///   - k: Number of nearest neighbors to return
+    ///   - where_clause: Optional SQL WHERE filter (e.g., "category = 'sports'")
+    ///
+    /// Returns:
+    ///   List of (row_dict, distance) tuples sorted by distance ascending.
+    ///
+    /// Example:
+    ///   results = s.search_vectors('embeddings', 'vec', [0.1, 0.2, ...],
+    ///                              metric='cosine', k=10)
+    ///   for row, dist in results:
+    ///       print(dist, row['name'])
+    #[pyo3(signature = (collection, vector_column, query, metric, k, where_clause=None))]
+    fn search_vectors(
+        &self,
+        py: Python<'_>,
+        collection: &str,
+        vector_column: &str,
+        query: Vec<f32>,
+        metric: &str,
+        k: usize,
+        where_clause: Option<&str>,
+    ) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let kc: Vec<String> = vec!["_rowid".to_string()];
+        let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        let merged = crdt_merge_rows(all_rows);
+
+        // Optional WHERE filter (SQL string)
+        let where_expr: WhereExpr = match where_clause {
+            Some(s) if !s.trim().is_empty() => parse_where(s)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?,
+            _ => WhereExpr::True,
+        };
+
+        // Build (row, vector) pairs, filtering by WHERE and extracting vectors.
+        // Vectors may be stored as a JSON array (Variant column) or as a
+        // JSON-encoded string (String column from a VARIANT round-trip).
+        let mut rows_with_vectors: Vec<(JsonValue, Vec<f32>)> = Vec::new();
+        for row in merged {
+            if !where_expr.eval(&row) { continue; }
+            let vec_val = match row.get(vector_column) {
+                Some(v) => v,
+                None => continue,
+            };
+            let vector: Vec<f32> = match vec_val {
+                JsonValue::Array(arr) => arr.iter().filter_map(|x| {
+                    x.as_f64().map(|f| f as f32)
+                        .or_else(|| x.as_i64().map(|i| i as f32))
+                }).collect(),
+                JsonValue::String(s) => {
+                    // Variant columns store vectors as JSON-encoded strings
+                    serde_json::from_str::<Vec<JsonValue>>(s).ok()
+                        .map(|arr| arr.iter().filter_map(|x| {
+                            x.as_f64().map(|f| f as f32)
+                                .or_else(|| x.as_i64().map(|i| i as f32))
+                        }).collect())
+                        .unwrap_or_default()
+                }
+                _ => continue,
+            };
+            if vector.is_empty() { continue; }
+            rows_with_vectors.push((row, vector));
+        }
+
+        // Run the SIMD-accelerated search
+        let stored: Vec<Vec<f32>> = rows_with_vectors.iter()
+            .map(|(_, v)| v.clone())
+            .collect();
+        let results = pond_core::vector::search_vectors(&query, &stored, metric, k);
+
+        // Build Python result: [(row_dict, distance), ...] sorted by distance
+        let list = PyList::new_bound(py, results.iter().map(|(idx, dist)| {
+            let row_dict = json_value_to_py(py, &rows_with_vectors[*idx].0);
+            let dist_obj = (*dist).to_object(py);
+            PyTuple::new_bound(py, [row_dict, dist_obj]).into_any()
+        }));
+        Ok(list.into())
+    }
+
+    // ===================================================================
+    // STREAMING READS — batched iterator over rows
+    //
+    // Returns a RowBatchStream that yields List[Dict[str, Any]] batches.
+    // Useful for large collections where materializing all rows at once
+    // would blow memory — the consumer can process batch-by-batch.
+    // ===================================================================
+
+    /// Stream rows from a collection in batches.
+    ///
+    /// Reads HEAD + all shards (CRDT merge), then yields rows in batches
+    /// of `batch_size`. Each batch is a `List[Dict[str, Any]]`.
+    ///
+    /// Args:
+    ///   - collection: Collection name
+    ///   - batch_size: Number of rows per batch (last batch may be smaller)
+    ///
+    /// Returns:
+    ///   A `RowBatchStream` iterator. Use `for batch in s.read_rows_stream(...)`
+    ///   to iterate.
+    ///
+    /// Example:
+    ///   for batch in s.read_rows_stream('events', 1000):
+    ///       for row in batch:
+    ///           process(row)
+    fn read_rows_stream(&self, collection: &str, batch_size: usize) -> PyResult<RowBatchStream> {
+        if batch_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("batch_size must be > 0"));
+        }
+        let storage = self.storage.lock().unwrap();
+        let kc: Vec<String> = vec!["_rowid".to_string()];
+        let all_rows = read_collection_as_json_rows(&storage, collection, &kc)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        let merged = crdt_merge_rows(all_rows);
+
+        // Strip CRDT metadata columns (matches read_rows behavior — these
+        // are internal unless explicitly requested).
+        let crdt_cols: std::collections::HashSet<&str> = ["_rowid", "_version", "_deleted", "_tenant"]
+            .iter().cloned().collect();
+
+        let mut batches: Vec<Vec<JsonValue>> = Vec::new();
+        let mut chunk: Vec<JsonValue> = Vec::with_capacity(batch_size);
+        for row in merged {
+            let filtered = if let Some(obj) = row.as_object() {
+                let mut new_obj = serde_json::Map::new();
+                for (k, v) in obj {
+                    if !crdt_cols.contains(k.as_str()) {
+                        new_obj.insert(k.clone(), v.clone());
+                    }
+                }
+                JsonValue::Object(new_obj)
+            } else {
+                row
+            };
+            chunk.push(filtered);
+            if chunk.len() >= batch_size {
+                batches.push(std::mem::replace(&mut chunk, Vec::with_capacity(batch_size)));
+            }
+        }
+        if !chunk.is_empty() {
+            batches.push(chunk);
+        }
+
+        Ok(RowBatchStream {
+            batches: Mutex::new(batches.into_iter().collect()),
+        })
+    }
+}
+
+// ===========================================================================
+// RowBatchStream — Python iterator over row batches
+//
+// Created by Storage::read_rows_stream(). Each __next__ call returns a
+// List[Dict[str, Any]] batch. Raises StopIteration when exhausted.
+// ===========================================================================
+
+/// A Python iterator over row batches from a collection.
+///
+/// Created by `Storage.read_rows_stream(collection, batch_size)`. Each
+/// `__next__` call returns a `List[Dict[str, Any]]` of up to `batch_size`
+/// rows. Raises `StopIteration` when exhausted.
+///
+/// Example:
+///   for batch in s.read_rows_stream('users', 100):
+///       for row in batch:
+///           print(row['name'])
+#[pyclass]
+struct RowBatchStream {
+    /// Pre-materialized batches of JSON rows. Held under a Mutex so the
+    /// Python iterator protocol (which can be called from any thread under
+    /// the GIL) stays sound.
+    batches: Mutex<std::collections::VecDeque<Vec<JsonValue>>>,
+}
+
+#[pymethods]
+impl RowBatchStream {
+    /// Return self — iterators are their own iterables.
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// Return the next batch of rows, or raise StopIteration.
+    fn __next__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let next_batch = self.batches.lock().unwrap().pop_front();
+        match next_batch {
+            None => Err(pyo3::exceptions::PyStopIteration::new_err(())),
+            Some(rows) => {
+                let list = PyList::new_bound(py, rows.iter().map(|row| json_value_to_py(py, row)));
+                Ok(list.into())
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -5230,6 +5443,7 @@ fn pond(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_class::<Storage>()?;
+    m.add_class::<RowBatchStream>()?;
     m.add_class::<SemanticLayer>()?;
     Ok(())
 }
