@@ -1224,6 +1224,7 @@ dependencies = [
  "pond_s3",
  "pond_semantic",
  "pond_simple_index",
+ "pond_sql",
  "pond_storage",
  "pyo3",
  "rayon",
@@ -1257,6 +1258,18 @@ dependencies = [
 name = "pond_simple_index"
 version = "0.3.0"
 dependencies = [
+ "pond_kernel",
+ "pond_storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "pond_sql"
+version = "0.3.0"
+dependencies = [
+ "pond_core",
  "pond_kernel",
  "pond_storage",
  "serde",

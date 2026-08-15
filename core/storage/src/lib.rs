@@ -463,22 +463,25 @@ pub extern "C" fn pond_storage_data_free(data: *mut u8, len: usize) {
 // Layer 2b: Structured row operations (write_rows, read_rows)
 // =============================================================
 
-/// Write structured INT64 columns as a PND2 blob with column stats.
-///
-/// Args:
-///   handle: Storage handle
-///   collection: Collection name
-///   message: Commit message
-///   num_cols: Number of columns
-///   col_names: Array of column names (num_cols pointers)
-///   col_data: Array of pointers to column data arrays
-///   col_lens: Array of column lengths (must all be equal)
-///   col_types: Array of column type codes (0=i64, 1=f64, 2=str)
-///   str_data: For string columns, array of pointers to string arrays
-///             (each string column has col_lens[i] pointers to null-terminated strings)
-///
-/// Returns: commit hash (caller must free with pond_storage_string_free), or NULL on error.
-=======
+// (Legacy doc comment preserved for history — the actual write_rows function
+//  is documented below.)
+//
+// Write structured INT64 columns as a PND2 blob with column stats.
+//
+// Args:
+//   handle: Storage handle
+//   collection: Collection name
+//   message: Commit message
+//   num_cols: Number of columns
+//   col_names: Array of column names (num_cols pointers)
+//   col_data: Array of pointers to column data arrays
+//   col_lens: Array of column lengths (must all be equal)
+//   col_types: Array of column type codes (0=i64, 1=f64, 2=str)
+//   str_data: For string columns, array of pointers to string arrays
+//             (each string column has col_lens[i] pointers to null-terminated strings)
+//
+// Returns: commit hash (caller must free with pond_storage_string_free), or NULL on error.
+
 // ---------------------------------------------------------------------------
 // Structured row operations (write_rows / read_rows)
 // ---------------------------------------------------------------------------

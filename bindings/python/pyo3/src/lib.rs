@@ -12,11 +12,9 @@
 // This is the correct architecture: the decoder is implemented ONCE in
 // pure Rust, and both the C ABI (in bindings/python/core) and Python (here) use it.
 
-mod sql_where;
-mod sql_engine;
 mod simd;
-use sql_where::{parse_where, WhereExpr, json_values_equal};
-use sql_engine::{parse_sql, SqlStatement, MergeAction, TableRef, JoinType};
+use pond_sql::{parse_where, WhereExpr, json_values_equal};
+use pond_sql::{parse_sql, SqlStatement, MergeAction, TableRef, JoinType};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
@@ -587,6 +585,12 @@ fn where_expr_to_sql(expr: &WhereExpr) -> String {
         WhereExpr::IsNull { col, negate } => {
             if *negate { format!("{} IS NOT NULL", col) } else { format!("{} IS NULL", col) }
         }
+        WhereExpr::Subquery { col, query, negate } => {
+            // Re-emit the subquery as `col IN (SELECT ...)` — pond_sql will
+            // re-parse and evaluate it against storage at execution time.
+            let op = if *negate { "NOT IN" } else { "IN" };
+            format!("{} {} ({})", col, op, query)
+        }
     }
 }
 
@@ -598,6 +602,40 @@ fn json_to_sql_literal(v: &JsonValue) -> String {
         JsonValue::Null => "NULL".to_string(),
         _ => v.to_string(),
     }
+}
+
+/// Convert a `pond_sql::SqlResult` (row-oriented) to a Python dict of
+/// column_name → list of values (the columnar format Python callers expect).
+///
+/// Used by the `Storage.sql()` method when delegating SELECT execution to
+/// the pure-Rust `pond_sql` crate.
+fn sql_result_to_pydict(py: Python, result: pond_sql::SqlResult) -> PyObject {
+    use std::collections::HashMap;
+    let mut cols: HashMap<String, Vec<PyObject>> = HashMap::new();
+    let mut col_order: Vec<String> = Vec::new();
+    for name in &result.columns {
+        col_order.push(name.clone());
+        cols.insert(name.clone(), Vec::new());
+    }
+    for row in &result.rows {
+        if let Some(obj) = row.as_object() {
+            for (name, value) in obj {
+                if !cols.contains_key(name) {
+                    col_order.push(name.clone());
+                    cols.insert(name.clone(), Vec::new());
+                }
+                cols.get_mut(name).unwrap().push(json_value_to_py(py, value));
+            }
+        }
+    }
+    let dict = PyDict::new_bound(py);
+    for name in col_order {
+        if let Some(values) = cols.remove(&name) {
+            let list = PyList::new_bound(py, values.iter());
+            let _ = dict.set_item(&name, list);
+        }
+    }
+    dict.into()
 }
 
 /// Convert a JsonValue to a PyObject.
@@ -2130,10 +2168,21 @@ impl Storage {
         let stmt = parse_sql(&cleaned_sql).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
         match stmt {
-            SqlStatement::Select { table, alias, columns, joins, r#where } => {
+            SqlStatement::Select { table, alias, columns, joins, r#where, .. } => {
                 // Execute SELECT — read rows from table (collection or file),
                 // apply JOINs, apply WHERE, project columns
                 let storage = self.storage.lock().unwrap();
+
+                // Fast path: when no UDFs are active, delegate to the
+                // pure-Rust `pond_sql::execute` (supports GROUP BY, ORDER BY,
+                // LIMIT, HAVING, aggregates, subqueries, etc.) and convert
+                // the row-oriented result to the columnar dict that Python
+                // callers expect.
+                if udf_calls.is_empty() {
+                    let result = pond_sql::execute(&storage, &cleaned_sql)
+                        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+                    return Ok(sql_result_to_pydict(py, result));
+                }
 
                 // Read the base table
                 let mut result_rows = read_table_rows(&storage, &table)

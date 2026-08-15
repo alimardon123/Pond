@@ -1,0 +1,1288 @@
+// SQL executor — runs parsed SQL statements against a `UnifiedStorage`.
+//
+// This is the pure-Rust entry point used by the Go SDK, CLI, and MCP server
+// to execute SQL without going through PyO3 / Python.
+//
+// Public API:
+//   - `execute(storage, query) -> Result<SqlResult, String>`
+//   - `SqlResult { columns, rows }`
+//
+// Supported statements: SELECT (with JOIN, WHERE, GROUP BY, HAVING, ORDER BY,
+// LIMIT/OFFSET, aggregates), INSERT, UPDATE, DELETE, MERGE.
+
+use crate::parser::{
+    AggregateExpr, AggregateFunc, JoinClause, JoinType, MergeAction, OrderByItem, SelectItem,
+    SqlStatement, TableRef,
+};
+use crate::where_clause::WhereExpr;
+use pond_core::{pnd2_decode, PondColumn, TypedColumn, VT_BINARY, VT_FLOAT64, VT_INT64, VT_NULL,
+                VT_STRING, VT_VARIANT};
+use pond_kernel::crdt::{uuidv7, HLC};
+use pond_storage::shard;
+use pond_storage::{commit, manifest::CollectionManifest, write as storage_write, UnifiedStorage};
+use serde_json::{json, Value as JsonValue};
+
+/// Result of executing a SQL statement.
+///
+/// For SELECT: `columns` is the projected column list and `rows` is a
+/// vector of JSON objects (one per result row).
+///
+/// For INSERT/UPDATE/DELETE/MERGE: `columns` is `["status"]` (or similar)
+/// and `rows` contains a single status object with the affected-row count.
+#[derive(Debug, Clone)]
+pub struct SqlResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<JsonValue>,
+}
+
+impl SqlResult {
+    fn status(action: &str, count: usize) -> Self {
+        Self {
+            columns: vec![action.to_string()],
+            rows: vec![json!({ action: count })],
+        }
+    }
+
+    fn commit(commit_hash: &str) -> Self {
+        Self {
+            columns: vec!["commit".to_string()],
+            rows: vec![json!({ "commit": commit_hash })],
+        }
+    }
+}
+
+/// Execute a SQL statement against `storage`.
+///
+/// `storage` is borrowed for the duration of the call — the executor does
+/// not retain a reference.
+pub fn execute(storage: &UnifiedStorage, query: &str) -> Result<SqlResult, String> {
+    let stmt = parse_sql_internal(query)?;
+    execute_stmt(storage, &stmt)
+}
+
+/// Re-export of `crate::parser::parse_sql` so callers can parse without
+/// pulling in another `use`.
+pub fn parse_sql_internal(query: &str) -> Result<SqlStatement, String> {
+    crate::parser::parse_sql(query)
+}
+
+fn execute_stmt(storage: &UnifiedStorage, stmt: &SqlStatement) -> Result<SqlResult, String> {
+    match stmt {
+        SqlStatement::Select {
+            table,
+            alias,
+            columns,
+            select_items,
+            joins,
+            r#where,
+            groups,
+            having,
+            orders,
+            limit,
+            offset,
+        } => execute_select(
+            storage, table, alias, columns, select_items, joins, r#where,
+            groups, having, orders, *limit, *offset,
+        ),
+        SqlStatement::Update { collection, sets, r#where } => {
+            execute_update(storage, collection, sets, r#where)
+        }
+        SqlStatement::Delete { collection, r#where } => {
+            execute_delete(storage, collection, r#where)
+        }
+        SqlStatement::Insert { collection, columns, rows } => {
+            execute_insert(storage, collection, columns, rows)
+        }
+        SqlStatement::Merge {
+            target,
+            source_rows,
+            match_keys,
+            when_matched,
+            when_not_matched,
+        } => execute_merge(storage, target, source_rows, match_keys, when_matched, when_not_matched),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SELECT
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn execute_select(
+    storage: &UnifiedStorage,
+    table: &TableRef,
+    alias: &Option<String>,
+    columns: &[String],
+    select_items: &[SelectItem],
+    joins: &[JoinClause],
+    where_expr: &WhereExpr,
+    groups: &[String],
+    having: &WhereExpr,
+    orders: &[OrderByItem],
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<SqlResult, String> {
+    let mut result_rows = read_table_rows(storage, table)?;
+
+    // If there's an alias, prefix all columns with the alias.
+    if let Some(al) = alias {
+        prefix_rows_with_alias(&mut result_rows, al);
+    }
+
+    // Execute JOINs.
+    for join in joins {
+        let mut right_rows = read_table_rows(storage, &join.table)?;
+        if let Some(al) = &join.alias {
+            prefix_rows_with_alias(&mut right_rows, al);
+        }
+        result_rows = execute_join(result_rows, right_rows, &join.on, &join.join_type);
+    }
+
+    // Resolve subqueries in WHERE.
+    let where_resolved = where_expr.resolve_subqueries(|q| {
+        let sub = crate::parser::parse_sql(q)?;
+        if !matches!(sub, SqlStatement::Select { .. }) {
+            return Err("Subquery must be a SELECT".to_string());
+        }
+        let sub_result = execute_stmt(storage, &sub)?;
+        // Collect distinct values of the first column.
+        let first_col = sub_result.columns.first().cloned();
+        let first_col = match first_col {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
+        };
+        let mut seen: Vec<JsonValue> = Vec::new();
+        for row in &sub_result.rows {
+            if let Some(v) = row.get(&first_col) {
+                if !seen.iter().any(|s| s == v) {
+                    seen.push(v.clone());
+                }
+            }
+        }
+        Ok(seen)
+    });
+
+    // Apply WHERE filter.
+    let mut filtered: Vec<JsonValue> = result_rows
+        .into_iter()
+        .filter(|r| where_resolved.eval(r))
+        .collect();
+
+    // Aggregates / GROUP BY.
+    let has_aggregates = select_items.iter().any(|it| matches!(it, SelectItem::Aggregate(_)));
+    if has_aggregates || !groups.is_empty() {
+        filtered = apply_group_by(filtered, groups, select_items, having)?;
+    }
+
+    // ORDER BY.
+    if !orders.is_empty() {
+        apply_order_by(&mut filtered, orders);
+    }
+
+    // OFFSET + LIMIT.
+    if let Some(off) = offset {
+        let off = off.min(filtered.len());
+        filtered.drain(..off);
+    }
+    if let Some(lim) = limit {
+        filtered.truncate(lim);
+    }
+
+    // Projection.
+    let result_columns = compute_result_columns(select_items, &filtered);
+    let projected = project_rows(&filtered, select_items, columns);
+
+    Ok(SqlResult {
+        columns: result_columns,
+        rows: projected,
+    })
+}
+
+/// Prefix every column in every row with `alias.`. Used when a SELECT
+/// statement assigns an alias to a table (`FROM users u`).
+fn prefix_rows_with_alias(rows: &mut [JsonValue], alias: &str) {
+    for row in rows.iter_mut() {
+        if let Some(obj) = row.as_object_mut() {
+            let prefixed: Vec<(String, JsonValue)> = obj
+                .iter()
+                .map(|(k, v)| (format!("{}.{}", alias, k), v.clone()))
+                .collect();
+            obj.clear();
+            for (k, v) in prefixed {
+                obj.insert(k, v);
+            }
+        }
+    }
+}
+
+/// Compute the output column names for a SELECT result.
+fn compute_result_columns(items: &[SelectItem], rows: &[JsonValue]) -> Vec<String> {
+    let mut cols: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Star => {
+                // Collect from the first row, skipping CRDT metadata.
+                if let Some(row) = rows.first() {
+                    if let Some(obj) = row.as_object() {
+                        for k in obj.keys() {
+                            let base = k.rsplit('.').next().unwrap_or(k);
+                            if base == "_rowid" || base == "_version" || base == "_deleted" {
+                                continue;
+                            }
+                            cols.push(k.clone());
+                        }
+                    }
+                }
+            }
+            SelectItem::Column(c) => cols.push(c.clone()),
+            SelectItem::Aggregate(a) => cols.push(aggregate_output_name(a)),
+        }
+    }
+    cols
+}
+
+/// Determine the output column name for an aggregate.
+fn aggregate_output_name(a: &AggregateExpr) -> String {
+    if let Some(al) = &a.alias {
+        return al.clone();
+    }
+    match a.func {
+        AggregateFunc::Count if a.arg.is_none() => "COUNT(*)".to_string(),
+        _ => format!("{}({})", a.func.as_str(), a.arg.clone().unwrap_or_default()),
+    }
+}
+
+/// Project rows according to SELECT items.
+fn project_rows(rows: &[JsonValue], items: &[SelectItem], legacy_cols: &[String]) -> Vec<JsonValue> {
+    // Special case: SELECT * (single Star item, no aggregates, no GROUP BY).
+    // Return rows as-is but strip CRDT metadata.
+    let only_star = items.len() == 1 && matches!(items[0], SelectItem::Star);
+    if only_star {
+        return rows
+            .iter()
+            .map(|r| strip_crdt_meta(r))
+            .collect();
+    }
+
+    // Mixed: build a new row for each, keeping only the projected columns
+    // (in declared order). For aggregates that were computed by
+    // `apply_group_by`, the output column name is already in the row.
+    rows.iter()
+        .map(|r| {
+            let mut out = serde_json::Map::new();
+            for item in items {
+                match item {
+                    SelectItem::Star => {
+                        if let Some(obj) = r.as_object() {
+                            for (k, v) in obj {
+                                let base = k.rsplit('.').next().unwrap_or(k);
+                                if base == "_rowid" || base == "_version" || base == "_deleted" {
+                                    continue;
+                                }
+                                out.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    SelectItem::Column(c) => {
+                        let v = lookup_col(r, c).unwrap_or(JsonValue::Null);
+                        out.insert(c.clone(), v);
+                    }
+                    SelectItem::Aggregate(a) => {
+                        let name = aggregate_output_name(a);
+                        let v = r.get(&name).cloned().unwrap_or(JsonValue::Null);
+                        out.insert(name, v);
+                    }
+                }
+            }
+            // Also include legacy columns if not already present — this keeps
+            // backward compat with the PyO3 binding's old `columns` API.
+            for c in legacy_cols {
+                if !out.contains_key(c) {
+                    let v = lookup_col(r, c).unwrap_or(JsonValue::Null);
+                    out.insert(c.clone(), v);
+                }
+            }
+            JsonValue::Object(out)
+        })
+        .collect()
+}
+
+/// Look up a column in a row, supporting qualified (`alias.col`) and
+/// unqualified names.
+fn lookup_col(row: &JsonValue, col: &str) -> Option<JsonValue> {
+    if let Some(obj) = row.as_object() {
+        if let Some(v) = obj.get(col) {
+            return Some(v.clone());
+        }
+        // Try matching by suffix (`alias.col` → `col`).
+        for (k, v) in obj {
+            if k.ends_with(&format!(".{}", col)) || k.rsplit('.').next() == Some(col) {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Strip CRDT metadata (`_rowid`, `_version`, `_deleted`) from a row.
+fn strip_crdt_meta(row: &JsonValue) -> JsonValue {
+    if let Some(obj) = row.as_object() {
+        let mut out = serde_json::Map::new();
+        for (k, v) in obj {
+            let base = k.rsplit('.').next().unwrap_or(k);
+            if base == "_rowid" || base == "_version" || base == "_deleted" {
+                continue;
+            }
+            out.insert(k.clone(), v.clone());
+        }
+        JsonValue::Object(out)
+    } else {
+        row.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GROUP BY + aggregates
+// ---------------------------------------------------------------------------
+
+fn apply_group_by(
+    rows: Vec<JsonValue>,
+    groups: &[String],
+    select_items: &[SelectItem],
+    having: &WhereExpr,
+) -> Result<Vec<JsonValue>, String> {
+    use std::collections::HashMap;
+
+    // If no GROUP BY but aggregates present, treat the whole input as one group.
+    let aggregates: Vec<&AggregateExpr> = select_items
+        .iter()
+        .filter_map(|it| match it {
+            SelectItem::Aggregate(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+
+    if groups.is_empty() {
+        // Single aggregate row over all rows.
+        let mut out = serde_json::Map::new();
+        for a in &aggregates {
+            out.insert(aggregate_output_name(a), compute_aggregate(a, &rows));
+        }
+        let row = JsonValue::Object(out);
+        if having.eval(&row) {
+            Ok(vec![row])
+        } else {
+            Ok(vec![])
+        }
+    } else {
+        // Group by the listed columns.
+        let mut buckets: HashMap<Vec<String>, Vec<JsonValue>> = HashMap::new();
+        let mut order: Vec<Vec<String>> = Vec::new();
+        for row in &rows {
+            let key: Vec<String> = groups
+                .iter()
+                .map(|g| lookup_col(row, g).map(|v| v.to_string()).unwrap_or_default())
+                .collect();
+            if !buckets.contains_key(&key) {
+                order.push(key.clone());
+            }
+            buckets.entry(key).or_default().push(row.clone());
+        }
+
+        let mut result = Vec::new();
+        for key in &order {
+            let group_rows = buckets.get(key).unwrap();
+            let mut out = serde_json::Map::new();
+            // Include the GROUP BY columns.
+            for (_i, g) in groups.iter().enumerate() {
+                if let Some(v) = group_rows.first().and_then(|r| lookup_col(r, g)) {
+                    out.insert(g.clone(), v);
+                }
+            }
+            // Compute each aggregate.
+            for a in &aggregates {
+                out.insert(aggregate_output_name(a), compute_aggregate(a, group_rows));
+            }
+            let row = JsonValue::Object(out);
+            if having.eval(&row) {
+                result.push(row);
+            }
+        }
+        Ok(result)
+    }
+}
+
+fn compute_aggregate(a: &AggregateExpr, rows: &[JsonValue]) -> JsonValue {
+    match a.func {
+        AggregateFunc::Count => {
+            if a.arg.is_none() {
+                return JsonValue::Number(serde_json::Number::from(rows.len() as i64));
+            }
+            let arg = a.arg.as_ref().unwrap();
+            let n = rows
+                .iter()
+                .filter(|r| {
+                    let v = lookup_col(r, arg);
+                    v.is_some() && v != Some(JsonValue::Null)
+                })
+                .count();
+            JsonValue::Number(serde_json::Number::from(n as i64))
+        }
+        AggregateFunc::Sum => {
+            let arg = a.arg.as_ref().unwrap();
+            let mut sum = 0.0f64;
+            let mut is_int = true;
+            for r in rows {
+                if let Some(v) = lookup_col(r, arg) {
+                    if let Some(i) = v.as_i64() {
+                        sum += i as f64;
+                    } else if let Some(f) = v.as_f64() {
+                        sum += f;
+                        is_int = false;
+                    }
+                }
+            }
+            if is_int {
+                JsonValue::Number(serde_json::Number::from(sum as i64))
+            } else {
+                serde_json::Number::from_f64(sum)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null)
+            }
+        }
+        AggregateFunc::Avg => {
+            let arg = a.arg.as_ref().unwrap();
+            let mut sum = 0.0f64;
+            let mut n = 0u64;
+            for r in rows {
+                if let Some(v) = lookup_col(r, arg) {
+                    if let Some(i) = v.as_i64() {
+                        sum += i as f64;
+                        n += 1;
+                    } else if let Some(f) = v.as_f64() {
+                        sum += f;
+                        n += 1;
+                    }
+                }
+            }
+            if n == 0 {
+                JsonValue::Null
+            } else {
+                serde_json::Number::from_f64(sum / n as f64)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null)
+            }
+        }
+        AggregateFunc::Min => {
+            let arg = a.arg.as_ref().unwrap();
+            let mut best: Option<f64> = None;
+            for r in rows {
+                if let Some(v) = lookup_col(r, arg) {
+                    if let Some(f) = v.as_f64() {
+                        best = Some(best.map(|b| b.min(f)).unwrap_or(f));
+                    }
+                }
+            }
+            best.map(|f| serde_json::Number::from_f64(f).map(JsonValue::Number).unwrap_or(JsonValue::Null))
+                .unwrap_or(JsonValue::Null)
+        }
+        AggregateFunc::Max => {
+            let arg = a.arg.as_ref().unwrap();
+            let mut best: Option<f64> = None;
+            for r in rows {
+                if let Some(v) = lookup_col(r, arg) {
+                    if let Some(f) = v.as_f64() {
+                        best = Some(best.map(|b| b.max(f)).unwrap_or(f));
+                    }
+                }
+            }
+            best.map(|f| serde_json::Number::from_f64(f).map(JsonValue::Number).unwrap_or(JsonValue::Null))
+                .unwrap_or(JsonValue::Null)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ORDER BY
+// ---------------------------------------------------------------------------
+
+fn apply_order_by(rows: &mut [JsonValue], orders: &[OrderByItem]) {
+    rows.sort_by(|a, b| {
+        for ord in orders {
+            let av = lookup_col(a, &ord.col);
+            let bv = lookup_col(b, &ord.col);
+            let ord_val = cmp_json_values(av.as_ref(), bv.as_ref());
+            if ord_val != std::cmp::Ordering::Equal {
+                return if ord.desc { ord_val.reverse() } else { ord_val };
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+fn cmp_json_values(a: Option<&JsonValue>, b: Option<&JsonValue>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(av), Some(bv)) => {
+            if let (Some(an), Some(bn)) = (av.as_f64(), bv.as_f64()) {
+                return an.partial_cmp(&bn).unwrap_or(Ordering::Equal);
+            }
+            if let (Some(as_), Some(bs)) = (av.as_str(), bv.as_str()) {
+                return as_.cmp(bs);
+            }
+            av.to_string().cmp(&bv.to_string())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JOIN execution
+// ---------------------------------------------------------------------------
+
+fn execute_join(
+    left_rows: Vec<JsonValue>,
+    right_rows: Vec<JsonValue>,
+    on: &[(String, String)],
+    join_type: &JoinType,
+) -> Vec<JsonValue> {
+    use std::collections::HashMap;
+
+    // Build an index on right_rows: composite key → list of right rows.
+    let mut right_index: HashMap<String, Vec<&JsonValue>> = HashMap::new();
+    for right_row in &right_rows {
+        let mut composite_key = String::new();
+        for (_, right_col) in on {
+            let val = right_row.get(right_col).map(|v| v.to_string()).unwrap_or_default();
+            if !composite_key.is_empty() { composite_key.push('\x1f'); }
+            composite_key.push_str(&val);
+        }
+        right_index.entry(composite_key).or_default().push(right_row);
+    }
+
+    let mut result: Vec<JsonValue> = Vec::new();
+
+    for left_row in &left_rows {
+        let mut composite_key = String::new();
+        for (left_col, _) in on {
+            let val = left_row.get(left_col).map(|v| v.to_string()).unwrap_or_default();
+            if !composite_key.is_empty() { composite_key.push('\x1f'); }
+            composite_key.push_str(&val);
+        }
+
+        match right_index.get(&composite_key) {
+            Some(matches) => {
+                for right_row in matches {
+                    let mut merged = left_row.clone();
+                    if let (Some(merged_obj), Some(right_obj)) =
+                        (merged.as_object_mut(), right_row.as_object())
+                    {
+                        for (k, v) in right_obj {
+                            merged_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                    result.push(merged);
+                }
+            }
+            None => {
+                if *join_type == JoinType::Left || *join_type == JoinType::FullOuter {
+                    let mut merged = left_row.clone();
+                    if let Some(right_row) = right_rows.first() {
+                        if let Some(right_obj) = right_row.as_object() {
+                            if let Some(merged_obj) = merged.as_object_mut() {
+                                for k in right_obj.keys() {
+                                    if !merged_obj.contains_key(k) {
+                                        merged_obj.insert(k.clone(), JsonValue::Null);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    result.push(merged);
+                }
+            }
+        }
+    }
+
+    // For RIGHT/FULL OUTER: include unmatched right rows with null left cols.
+    if *join_type == JoinType::Right || *join_type == JoinType::FullOuter {
+        let left_keys: std::collections::HashSet<String> = left_rows
+            .iter()
+            .map(|l| {
+                let mut k = String::new();
+                for (left_col, _) in on {
+                    let v = l.get(left_col).map(|v| v.to_string()).unwrap_or_default();
+                    if !k.is_empty() { k.push('\x1f'); }
+                    k.push_str(&v);
+                }
+                k
+            })
+            .collect();
+        for right_row in &right_rows {
+            let mut composite_key = String::new();
+            for (_, right_col) in on {
+                let val = right_row.get(right_col).map(|v| v.to_string()).unwrap_or_default();
+                if !composite_key.is_empty() { composite_key.push('\x1f'); }
+                composite_key.push_str(&val);
+            }
+            if !left_keys.contains(&composite_key) {
+                let mut merged = right_row.clone();
+                if let Some(left_row) = left_rows.first() {
+                    if let Some(left_obj) = left_row.as_object() {
+                        if let Some(merged_obj) = merged.as_object_mut() {
+                            for k in left_obj.keys() {
+                                if !merged_obj.contains_key(k) {
+                                    merged_obj.insert(k.clone(), JsonValue::Null);
+                                }
+                            }
+                        }
+                    }
+                }
+                result.push(merged);
+            }
+        }
+    }
+
+    // CROSS JOIN: emit the cartesian product (on is empty).
+    if *join_type == JoinType::Cross && on.is_empty() {
+        let mut crossed: Vec<JsonValue> = Vec::new();
+        for l in &left_rows {
+            for r in &right_rows {
+                let mut merged = l.clone();
+                if let (Some(mo), Some(ro)) = (merged.as_object_mut(), r.as_object()) {
+                    for (k, v) in ro {
+                        mo.insert(k.clone(), v.clone());
+                    }
+                }
+                crossed.push(merged);
+            }
+        }
+        return crossed;
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Table reading
+// ---------------------------------------------------------------------------
+
+fn read_table_rows(storage: &UnifiedStorage, table: &TableRef) -> Result<Vec<JsonValue>, String> {
+    match table {
+        TableRef::Collection(name) => {
+            let kc = vec!["_rowid".to_string()];
+            let all_rows = read_collection_as_json_rows(storage, name, &kc)?;
+            Ok(crdt_merge_rows(all_rows))
+        }
+        TableRef::File(path) => read_file_rows(path),
+    }
+}
+
+fn read_file_rows(path: &str) -> Result<Vec<JsonValue>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+
+    if path.ends_with(".ndjson") {
+        let mut rows = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() { continue; }
+            let row: JsonValue = serde_json::from_str(line)
+                .map_err(|e| format!("Failed to parse NDJSON line: {}", e))?;
+            rows.push(row);
+        }
+        Ok(rows)
+    } else if path.ends_with(".json") {
+        let parsed: JsonValue = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+        match parsed {
+            JsonValue::Array(arr) => Ok(arr),
+            JsonValue::Object(obj) => Ok(vec![JsonValue::Object(obj)]),
+            _ => Err("JSON file must contain an array or object".to_string()),
+        }
+    } else if path.ends_with(".csv") || path.ends_with(".tsv") {
+        let delimiter = if path.ends_with(".tsv") { '\t' } else { ',' };
+        let mut rows = Vec::new();
+        let mut lines = content.lines();
+        let header_line = lines.next()
+            .ok_or_else(|| "CSV file is empty".to_string())?;
+        let headers: Vec<String> = header_line.split(delimiter)
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .collect();
+
+        for line in lines {
+            if line.trim().is_empty() { continue; }
+            let values: Vec<&str> = line.split(delimiter).collect();
+            let mut obj = serde_json::Map::new();
+            for (i, header) in headers.iter().enumerate() {
+                let val_str = values.get(i).unwrap_or(&"").trim().trim_matches('"');
+                let val = if let Ok(n) = val_str.parse::<i64>() {
+                    JsonValue::Number(serde_json::Number::from(n))
+                } else if let Ok(f) = val_str.parse::<f64>() {
+                    serde_json::Number::from_f64(f)
+                        .map(JsonValue::Number)
+                        .unwrap_or(JsonValue::String(val_str.to_string()))
+                } else if val_str.eq_ignore_ascii_case("true") {
+                    JsonValue::Bool(true)
+                } else if val_str.eq_ignore_ascii_case("false") {
+                    JsonValue::Bool(false)
+                } else if val_str.is_empty() {
+                    JsonValue::Null
+                } else {
+                    JsonValue::String(val_str.to_string())
+                };
+                obj.insert(header.clone(), val);
+            }
+            rows.push(JsonValue::Object(obj));
+        }
+        Ok(rows)
+    } else if path.ends_with(".parquet") {
+        Err("Parquet file reading not yet supported. Use CSV, TSV, JSON, or NDJSON.".to_string())
+    } else {
+        Err(format!("Unsupported file format: '{}'", path))
+    }
+}
+
+/// Read all rows from a collection as (rowid, JSON row) pairs.
+///
+/// Reads HEAD + shards, decodes PND2 blobs, converts each row to a JSON
+/// object. Sequential CRDT merge is then applied by the caller.
+fn read_collection_as_json_rows(
+    storage: &UnifiedStorage,
+    collection: &str,
+    key_fields: &[String],
+) -> Result<Vec<(String, JsonValue)>, String> {
+    let kernel = storage.kernel();
+    let mut rows: Vec<(String, JsonValue)> = Vec::new();
+
+    let active = storage.get_active_branch(collection);
+
+    // --- Read HEAD data ---
+    let head = kernel.resolve(&pond_storage::branch_ref(collection, &active));
+    if let Some(ref head_hash) = head {
+        let head_data = kernel.read_blob(head_hash)
+            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
+
+        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
+            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
+                .ok_or_else(|| "Failed to decode PondPack".to_string())?;
+            manifest_bytes
+        } else {
+            let commit = commit::read_commit(kernel, head_hash)
+                .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
+            if commit.manifest.is_empty() {
+                return Ok(rows);
+            }
+            kernel.read_blob(&commit.manifest)
+                .map_err(|e| format!("Failed to read manifest: {}", e))?
+        };
+
+        let manifest = CollectionManifest::decode(&manifest_bytes)
+            .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+        for rg in &manifest.row_groups {
+            let blob_data = kernel.read_blob(&rg.blob_hash)
+                .map_err(|e| format!("Failed to read data blob: {}", e))?;
+            let cols = pnd2_decode(&blob_data)
+                .map_err(|e| format!("Failed to decode PND2: {}", e))?;
+            rows.extend(decode_cols_to_rows(&cols, key_fields));
+        }
+    }
+
+    // --- Read shard data (CRDT) ---
+    let (_, shards) = shard::read_with_shards(kernel, collection, &active);
+    for (_, shard_hash) in shards {
+        if let Ok(data) = kernel.read_blob(&shard_hash) {
+            if let Ok(arr) = serde_json::from_slice::<Vec<JsonValue>>(&data) {
+                for row in arr {
+                    let rowid = determine_rowid(&row, key_fields);
+                    rows.push((rowid, row));
+                }
+            }
+        }
+    }
+
+    Ok(rows)
+}
+
+fn decode_cols_to_rows(cols: &[PondColumn], key_fields: &[String]) -> Vec<(String, JsonValue)> {
+    let mut rows = Vec::new();
+    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+
+    for row_idx in 0..n_rows {
+        let mut row_obj = serde_json::Map::new();
+        for col in cols {
+            let name = col.name.to_string_lossy().to_string();
+            let val = match col.vtype {
+                VT_INT64 => col
+                    .i64_data
+                    .get(row_idx)
+                    .map(|v| JsonValue::Number(serde_json::Number::from(*v)))
+                    .unwrap_or(JsonValue::Null),
+                VT_FLOAT64 => col
+                    .f64_data
+                    .get(row_idx)
+                    .and_then(|v| serde_json::Number::from_f64(*v))
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null),
+                VT_STRING => col
+                    .str_data
+                    .get(row_idx)
+                    .map(|v| JsonValue::String(v.to_string_lossy().to_string()))
+                    .unwrap_or(JsonValue::Null),
+                VT_BINARY => col
+                    .bin_data
+                    .get(row_idx)
+                    .map(|b| {
+                        JsonValue::String(format!("__bin_b64__:{}", simple_base64_encode(b)))
+                    })
+                    .unwrap_or(JsonValue::Null),
+                VT_VARIANT => col
+                    .str_data
+                    .get(row_idx)
+                    .and_then(|s| {
+                        let s_str = s.to_string_lossy();
+                        serde_json::from_str::<JsonValue>(&s_str).ok()
+                    })
+                    .unwrap_or(JsonValue::Null),
+                VT_NULL | _ => JsonValue::Null,
+            };
+            row_obj.insert(name, val);
+        }
+        let row = JsonValue::Object(row_obj);
+        let rowid = determine_rowid(&row, key_fields);
+        rows.push((rowid, row));
+    }
+    rows
+}
+
+fn determine_rowid(row: &JsonValue, key_fields: &[String]) -> String {
+    if let Some(r) = row.get("_rowid").and_then(|v| v.as_str()) {
+        return r.to_string();
+    }
+    for kf in key_fields {
+        if let Some(r) = row.get(kf).and_then(|v| v.as_str()) {
+            return r.to_string();
+        }
+        if let Some(r) = row.get(kf).and_then(|v| v.as_i64()) {
+            return r.to_string();
+        }
+    }
+    if let Some(r) = row.get("_key").and_then(|v| v.as_str()) {
+        return r.to_string();
+    }
+    if let Some(r) = row.get("id").and_then(|v| v.as_str()) {
+        return r.to_string();
+    }
+    if let Some(r) = row.get("id").and_then(|v| v.as_i64()) {
+        return r.to_string();
+    }
+    // Fallback: hash of the row's JSON.
+    let s = row.to_string();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("auto_{:x}", h)
+}
+
+/// Sequential CRDT merge — dedup by _rowid, latest _version wins.
+fn crdt_merge_rows(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
+    use std::collections::HashMap;
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: HashMap<String, (String, JsonValue)> = HashMap::new();
+    let mut no_rowid: Vec<JsonValue> = Vec::new();
+
+    for (rowid, row) in rows {
+        let effective_rowid = row
+            .get("_rowid")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or(rowid);
+
+        let is_deleted = row
+            .get("_deleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let version = row
+            .get("_version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        if effective_rowid.is_empty() {
+            if !is_deleted {
+                no_rowid.push(row);
+            }
+            continue;
+        }
+
+        match latest.get(&effective_rowid) {
+            Some((existing_ver, _)) => {
+                if version > *existing_ver {
+                    latest.insert(effective_rowid.clone(), (version, row));
+                }
+            }
+            None => {
+                order.push(effective_rowid.clone());
+                latest.insert(effective_rowid, (version, row));
+            }
+        }
+    }
+
+    let mut result: Vec<JsonValue> = no_rowid;
+    for rowid in &order {
+        if let Some((_, row)) = latest.get(rowid) {
+            let is_deleted = row
+                .get("_deleted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !is_deleted {
+                result.push(row.clone());
+            }
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Writes
+// ---------------------------------------------------------------------------
+
+fn execute_insert(
+    storage: &UnifiedStorage,
+    collection: &str,
+    columns: &[String],
+    rows: &[Vec<JsonValue>],
+) -> Result<SqlResult, String> {
+    let kernel = storage.kernel();
+    let active = storage.get_active_branch(collection);
+
+    // Build TypedColumns from the rows.
+    let typed_cols = build_typed_columns(columns, rows);
+
+    let col_refs: Vec<(&str, TypedColumn)> = typed_cols
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.clone()))
+        .collect();
+
+    let commit_hash = storage_write::write_rows(kernel, collection, &active, &col_refs, "INSERT")?;
+    Ok(SqlResult::commit(&commit_hash))
+}
+
+fn execute_update(
+    storage: &UnifiedStorage,
+    collection: &str,
+    sets: &[(String, JsonValue)],
+    where_expr: &WhereExpr,
+) -> Result<SqlResult, String> {
+    let kernel = storage.kernel();
+    let active = storage.get_active_branch(collection);
+
+    let kc = vec!["_rowid".to_string()];
+    let all_rows = read_collection_as_json_rows(storage, collection, &kc)?;
+
+    let mut matched: Vec<JsonValue> = Vec::new();
+    for (_rowid, row) in &all_rows {
+        if where_expr.eval(row) {
+            let mut updated = row.clone();
+            if let Some(obj) = updated.as_object_mut() {
+                for (col, val) in sets {
+                    obj.insert(col.clone(), val.clone());
+                }
+                // Bump _version.
+                let mut hlc = HLC::new();
+                obj.insert("_version".to_string(), json!(hlc.tick()));
+            }
+            matched.push(updated);
+        }
+    }
+
+    let count = matched.len();
+    if count == 0 {
+        return Ok(SqlResult::status("updated", 0));
+    }
+
+    // Observe existing versions, then write as a CRDT upsert shard.
+    let mut hlc = HLC::new();
+    for (_, row) in &all_rows {
+        if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+            hlc.observe(v);
+        }
+    }
+    let shard_name = format!("update_{}", chrono_like_id());
+    shard::upsert_shard(
+        kernel, collection, &active, &shard_name,
+        &matched, Some("_rowid"), &mut hlc,
+    )?;
+
+    Ok(SqlResult::status("updated", count))
+}
+
+fn execute_delete(
+    storage: &UnifiedStorage,
+    collection: &str,
+    where_expr: &WhereExpr,
+) -> Result<SqlResult, String> {
+    let kernel = storage.kernel();
+    let active = storage.get_active_branch(collection);
+
+    let kc = vec!["_rowid".to_string()];
+    let all_rows = read_collection_as_json_rows(storage, collection, &kc)?;
+
+    let mut tombstones: Vec<String> = Vec::new();
+    for (rowid, row) in &all_rows {
+        if where_expr.eval(row) {
+            if let Some(r) = row.get("_rowid").and_then(|v| v.as_str()) {
+                tombstones.push(r.to_string());
+            } else if !rowid.is_empty() && !rowid.starts_with("auto_") {
+                tombstones.push(rowid.clone());
+            }
+        }
+    }
+
+    let count = tombstones.len();
+    if count == 0 {
+        return Ok(SqlResult::status("deleted", 0));
+    }
+
+    let mut hlc = HLC::new();
+    for (_, row) in &all_rows {
+        if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+            hlc.observe(v);
+        }
+    }
+    let shard_name = format!("delete_{}", chrono_like_id());
+    shard::delete_shard(
+        kernel, collection, &active, &shard_name,
+        &tombstones, Some("_rowid"), &mut hlc,
+    )?;
+
+    Ok(SqlResult::status("deleted", count))
+}
+
+fn execute_merge(
+    storage: &UnifiedStorage,
+    target: &str,
+    source_rows: &[JsonValue],
+    match_keys: &[(String, String)],
+    when_matched: &MergeAction,
+    when_not_matched: &MergeAction,
+) -> Result<SqlResult, String> {
+    let kernel = storage.kernel();
+    let active = storage.get_active_branch(target);
+
+    let kc = vec!["_rowid".to_string()];
+    let target_rows = read_collection_as_json_rows(storage, target, &kc)?;
+
+    // Build an index of target rows by the composite key built from the
+    // FIRST match_key (target side). Multi-key match isn't fully supported
+    // here — kept simple for the v1 port.
+    use std::collections::HashMap;
+    let first_key = match_keys.first()
+        .ok_or_else(|| "MERGE requires at least one match key".to_string())?;
+    let target_key_col = &first_key.0;
+    let source_key_col = &first_key.1;
+
+    let mut target_index: HashMap<String, (String, JsonValue)> = HashMap::new();
+    for (rowid, row) in &target_rows {
+        let key = lookup_col(row, target_key_col)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        target_index.insert(key, (rowid.clone(), row.clone()));
+    }
+
+    let mut to_upsert: Vec<JsonValue> = Vec::new();
+    let mut to_delete: Vec<String> = Vec::new();
+    let mut inserted = 0usize;
+    let mut updated = 0usize;
+    let mut deleted = 0usize;
+    let mut skipped = 0usize;
+    let mut matched_total = 0usize;
+
+    let mut hlc = HLC::new();
+    for (_, row) in &target_rows {
+        if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+            hlc.observe(v);
+        }
+    }
+
+    for source in source_rows {
+        let key = lookup_col(source, source_key_col)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        if let Some((rowid, target_row)) = target_index.get(&key) {
+            matched_total += 1;
+            match when_matched {
+                MergeAction::Update => {
+                    let mut merged = target_row.clone();
+                    if let Some(obj) = merged.as_object_mut() {
+                        if let Some(src_obj) = source.as_object() {
+                            for (k, v) in src_obj {
+                                obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                        obj.insert("_version".to_string(), json!(hlc.tick()));
+                    }
+                    to_upsert.push(merged);
+                    updated += 1;
+                }
+                MergeAction::Delete => {
+                    if let Some(r) = target_row.get("_rowid").and_then(|v| v.as_str()) {
+                        to_delete.push(r.to_string());
+                    } else if !rowid.is_empty() && !rowid.starts_with("auto_") {
+                        to_delete.push(rowid.clone());
+                    }
+                    deleted += 1;
+                }
+                MergeAction::Skip => {
+                    skipped += 1;
+                }
+                MergeAction::Insert => {
+                    // INSERT on match is not valid — treat as skip.
+                    skipped += 1;
+                }
+            }
+        } else {
+            match when_not_matched {
+                MergeAction::Insert => {
+                    let mut new_row = source.clone();
+                    if let Some(obj) = new_row.as_object_mut() {
+                        if obj.get("_rowid").is_none() {
+                            obj.insert("_rowid".to_string(), json!(uuidv7()));
+                        }
+                        obj.insert("_version".to_string(), json!(hlc.tick()));
+                        obj.insert("_deleted".to_string(), json!(false));
+                    }
+                    to_upsert.push(new_row);
+                    inserted += 1;
+                }
+                MergeAction::Skip | MergeAction::Update | MergeAction::Delete => {
+                    skipped += 1;
+                }
+            }
+        }
+    }
+
+    if !to_upsert.is_empty() {
+        let shard_name = format!("merge_upsert_{}", chrono_like_id());
+        shard::upsert_shard(
+            kernel, target, &active, &shard_name,
+            &to_upsert, Some("_rowid"), &mut hlc,
+        )?;
+    }
+    if !to_delete.is_empty() {
+        let shard_name = format!("merge_delete_{}", chrono_like_id());
+        shard::delete_shard(
+            kernel, target, &active, &shard_name,
+            &to_delete, Some("_rowid"), &mut hlc,
+        )?;
+    }
+
+    let result = SqlResult {
+        columns: vec![
+            "matched".to_string(),
+            "updated".to_string(),
+            "deleted".to_string(),
+            "inserted".to_string(),
+            "skipped".to_string(),
+        ],
+        rows: vec![json!({
+            "matched": matched_total,
+            "updated": updated,
+            "deleted": deleted,
+            "inserted": inserted,
+            "skipped": skipped,
+        })],
+    };
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `Vec<(String, TypedColumn)>` from columnar input.
+fn build_typed_columns(
+    columns: &[String],
+    rows: &[Vec<JsonValue>],
+) -> Vec<(String, TypedColumn)> {
+    let mut result = Vec::new();
+    for (col_idx, col_name) in columns.iter().enumerate() {
+        let mut i64_vals: Vec<i64> = Vec::with_capacity(rows.len());
+        let mut f64_vals: Vec<f64> = Vec::with_capacity(rows.len());
+        let mut str_vals: Vec<String> = Vec::with_capacity(rows.len());
+        let mut col_type: u8 = 0; // 0=unknown, 1=i64, 2=f64, 3=str
+
+        for row in rows {
+            match row.get(col_idx) {
+                Some(JsonValue::Number(n)) => {
+                    if let Some(i) = n.as_i64() {
+                        i64_vals.push(i);
+                        if col_type == 0 || col_type == 1 { col_type = 1; }
+                    } else if let Some(f) = n.as_f64() {
+                        f64_vals.push(f);
+                        if col_type == 0 || col_type == 2 { col_type = 2; }
+                    }
+                }
+                Some(JsonValue::String(s)) => {
+                    str_vals.push(s.clone());
+                    if col_type == 0 || col_type == 3 { col_type = 3; }
+                }
+                _ => match col_type {
+                    1 => i64_vals.push(0),
+                    2 => f64_vals.push(0.0),
+                    3 => str_vals.push(String::new()),
+                    _ => { col_type = 3; str_vals.push(String::new()); }
+                },
+            }
+        }
+
+        let typed = match col_type {
+            1 => TypedColumn::Int64(i64_vals),
+            2 => TypedColumn::Float64(f64_vals),
+            _ => TypedColumn::String(str_vals),
+        };
+        result.push((col_name.clone(), typed));
+    }
+    result
+}
+
+/// Tiny base64 encoder (avoids pulling in a base64 crate dependency).
+fn simple_base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Generate a sortable, time-based identifier for shard names.
+fn chrono_like_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}", nanos)
+}
