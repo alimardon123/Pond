@@ -241,8 +241,11 @@ impl LakehouseLens {
             }
         }
 
-        // Convert to TypedColumn
+        // Convert to TypedColumn, filtering out CRDT metadata columns
+        // (_rowid, _version, _deleted) which are auto-added by write_rows
+        // for CRDT support but should not be visible to lens users.
         let mut result: Vec<(String, TypedColumn)> = result_cols.into_iter()
+            .filter(|(name, _)| name != "_rowid" && name != "_version" && name != "_deleted")
             .map(|(name, (vtype, i64_data, f64_data, str_data))| {
                 let col = match vtype {
                     VT_INT64 => TypedColumn::Int64(i64_data),
@@ -286,15 +289,14 @@ impl LakehouseLens {
                 let mut row = HashMap::new();
                 for (name, col) in &cols {
                     let val = match col {
-                        TypedColumn::Int64(v) => {
-                            v.get(idx).map(|x| serde_json::json!(x))
-                        }
-                        TypedColumn::Float64(v) => {
-                            v.get(idx).map(|x| serde_json::json!(x))
-                        }
-                        TypedColumn::String(v) => {
-                            v.get(idx).map(|x| serde_json::json!(x))
-                        }
+                        TypedColumn::Int64(v) => v.get(idx).map(|x| serde_json::json!(x)),
+                        TypedColumn::Float64(v) => v.get(idx).map(|x| serde_json::json!(x)),
+                        TypedColumn::String(v) => v.get(idx).map(|x| serde_json::json!(x)),
+                        TypedColumn::Binary(v) => v.get(idx).map(|b| serde_json::json!(format!("<{} bytes>", b.len()))),
+                        TypedColumn::Variant(v) => v.get(idx).and_then(|s| serde_json::from_str(s).ok()),
+                        TypedColumn::Boolean(v) => v.get(idx).map(|&b| serde_json::json!(b)),
+                        TypedColumn::Date(v) | TypedColumn::Timestamp(v) => v.get(idx).map(|x| serde_json::json!(x)),
+                        TypedColumn::Vector(v) => v.get(idx).map(|vec| serde_json::json!(vec)),
                     };
                     if let Some(v) = val {
                         row.insert(name.clone(), v);

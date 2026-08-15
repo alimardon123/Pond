@@ -191,7 +191,7 @@ pub fn decode_raw(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
             PondColumn {
                 name: CString::new("").unwrap(), vtype,
                 i64_data: vals, f64_data: vec![], str_data: vec![],
-                bin_data: vec![], n_values: n,
+                bin_data: vec![], n_values: n, null_bitmap: None,
             }
         }
         VT_FLOAT64 => {
@@ -207,7 +207,7 @@ pub fn decode_raw(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
             PondColumn {
                 name: CString::new("").unwrap(), vtype,
                 i64_data: vec![], f64_data: vals, str_data: vec![],
-                bin_data: vec![], n_values: n,
+                bin_data: vec![], n_values: n, null_bitmap: None,
             }
         }
         VT_STRING | VT_VARIANT => {
@@ -221,7 +221,7 @@ pub fn decode_raw(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
             PondColumn {
                 name: CString::new("").unwrap(), vtype,
                 i64_data: vec![], f64_data: vec![], str_data: vec![],
-                bin_data: vec![], n_values: n_rows,
+                bin_data: vec![], n_values: n_rows, null_bitmap: None,
             }
         }
         _ => PondColumn::empty_named("", vtype),
@@ -257,7 +257,7 @@ fn decode_raw_binary(payload: &[u8], n_rows: usize) -> PondColumn {
     PondColumn {
         name: CString::new("").unwrap(), vtype: VT_BINARY,
         i64_data: vec![], f64_data: vec![], str_data: vec![],
-        bin_data: vals, n_values: n,
+        bin_data: vals, n_values: n, null_bitmap: None,
     }
 }
 
@@ -348,7 +348,7 @@ fn build_string_or_binary_col(vtype: u8, vals: &[&[u8]], n_rows: usize) -> PondC
         PondColumn {
             name: CString::new("").unwrap(), vtype,
             i64_data: vec![], f64_data: vec![], str_data: strs,
-            bin_data: vec![], n_values: n,
+            bin_data: vec![], n_values: n, null_bitmap: None,
         }
     } else {
         // VT_BINARY
@@ -357,7 +357,7 @@ fn build_string_or_binary_col(vtype: u8, vals: &[&[u8]], n_rows: usize) -> PondC
         PondColumn {
             name: CString::new("").unwrap(), vtype,
             i64_data: vec![], f64_data: vec![], str_data: vec![],
-            bin_data: bins, n_values: n,
+            bin_data: bins, n_values: n, null_bitmap: None,
         }
     }
 }
@@ -407,7 +407,7 @@ pub fn decode_bitpack(payload: &[u8], n_rows: usize) -> PondColumn {
     PondColumn {
         name: CString::new("").unwrap(), vtype: VT_INT64,
         i64_data: vals, f64_data: vec![], str_data: vec![],
-        bin_data: vec![], n_values: n,
+        bin_data: vec![], n_values: n, null_bitmap: None,
     }
 }
 
@@ -535,7 +535,7 @@ pub fn decode_dict(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
     PondColumn {
         name: CString::new("").unwrap(), vtype: dict_vtype,
         i64_data: int_vals, f64_data: float_vals, str_data: str_vals,
-        bin_data: bin_vals, n_values: n,
+        bin_data: bin_vals, n_values: n, null_bitmap: None,
     }
 }
 
@@ -638,6 +638,6 @@ pub fn decode_rle(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
     PondColumn {
         name: CString::new("").unwrap(), vtype,
         i64_data: int_vals, f64_data: float_vals, str_data: str_vals,
-        bin_data: bin_vals, n_values: total_rows,
+        bin_data: bin_vals, n_values: total_rows, null_bitmap: None,
     }
 }

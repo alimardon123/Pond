@@ -324,13 +324,15 @@ impl<'a> GarbageCollector<'a> {
         let mut freed_bytes: i64 = 0;
 
         for hash in &dead {
+            let blob_size = self.kernel.read_blob(hash).map(|d| d.len() as i64).unwrap_or(0);
             if dry_run {
-                // Just count — don't delete
                 deleted += 1;
+                freed_bytes += blob_size;
             } else {
                 match self.kernel.delete_blob(hash) {
                     Ok(true) => {
                         deleted += 1;
+                        freed_bytes += blob_size;
                     }
                     Ok(false) => {
                         preserved += 1; // already gone

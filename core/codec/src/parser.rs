@@ -8,7 +8,7 @@
 // The struct and all its methods are `pub` so that the PyO3 wrapper crate
 // can reuse the same zero-copy reader.
 
-use crate::constants::{VT_BINARY, VT_FLOAT64, VT_INT64, VT_NULL, VT_STRING};
+use crate::constants::*;
 
 /// Zero-copy cursor over a PND2 inner-data byte slice.
 pub struct PND2Parser<'a> {
@@ -81,7 +81,7 @@ impl<'a> PND2Parser<'a> {
 
     pub fn skip_stat_value(&mut self, vtype: u8) {
         match vtype {
-            VT_INT64 | VT_FLOAT64 => { self.pos += 8; }
+            VT_INT64 | VT_FLOAT64 | VT_BOOLEAN | VT_DATE | VT_TIMESTAMP => { self.pos += 8; }
             VT_STRING | VT_BINARY => {
                 if let Some(len) = self.read_u32() {
                     self.pos += len as usize;

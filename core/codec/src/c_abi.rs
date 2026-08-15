@@ -32,6 +32,7 @@ use crate::types::PondColumn;
 /// `pond_result_free`.
 pub struct PondResult {
     columns: Vec<PondColumn>,
+    str_array_cache: std::cell::UnsafeCell<Vec<Option<Vec<*const c_char>>>>,
 }
 
 /// Decode a PND2 blob into a `PondResult` handle.
@@ -51,7 +52,7 @@ pub extern "C" fn pond_pnd2_decode(blob: *const u8, blob_len: usize) -> *mut Pon
     let data = unsafe { std::slice::from_raw_parts(blob, blob_len) };
 
     match pnd2_decode(data) {
-        Ok(columns) => Box::into_raw(Box::new(PondResult { columns })),
+        Ok(columns) => Box::into_raw(Box::new(PondResult { columns, str_array_cache: std::cell::UnsafeCell::new(Vec::new()) })),
         Err(_) => std::ptr::null_mut(),
     }
 }

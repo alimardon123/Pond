@@ -460,7 +460,6 @@ pub extern "C" fn pond_storage_data_free(data: *mut u8, len: usize) {
     }
 }
 
-// =============================================================
 // Layer 2b: Structured row operations (write_rows, read_rows)
 // =============================================================
 
@@ -479,188 +478,139 @@ pub extern "C" fn pond_storage_data_free(data: *mut u8, len: usize) {
 ///             (each string column has col_lens[i] pointers to null-terminated strings)
 ///
 /// Returns: commit hash (caller must free with pond_storage_string_free), or NULL on error.
+=======
+// ---------------------------------------------------------------------------
+// Structured row operations (write_rows / read_rows)
+// ---------------------------------------------------------------------------
+
+/// Write structured rows as a PND2 blob with CRDT metadata.
+///
+/// Args:
+///   - handle: storage handle
+///   - collection: collection name
+///   - message: commit message
+///   - n_columns: number of columns
+///   - col_names: array of column name strings (null-terminated)
+///   - col_types: array of column type codes (1=INT64, 2=FLOAT64, 3=STRING)
+///   - col_data: array of pointers to column data (i64*, f64*, or char**)
+///   - col_lens: array of column lengths (number of values per column)
+///
+/// Returns: commit hash string (caller must free with pond_storage_string_free),
+///          or NULL on error.
 #[no_mangle]
 pub extern "C" fn pond_storage_write_rows(
     handle: *mut PondStorageHandle,
     collection: *const c_char,
     message: *const c_char,
-    num_cols: usize,
+    n_columns: usize,
     col_names: *const *const c_char,
-    col_data: *const *const u8,
-    col_lens: *const usize,
     col_types: *const u8,
-    n_rows: usize,
+    col_data: *const *const std::ffi::c_void,
+    col_lens: *const usize,
 ) -> *mut c_char {
-    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return ptr::null_mut() }};
-    if collection.is_null() || num_cols == 0 { return ptr::null_mut(); }
+    let handle = unsafe { match handle.as_mut() { Some(h) => h, None => return ptr::null_mut() }};
+    if collection.is_null() || col_names.is_null() || col_types.is_null() || col_data.is_null() || col_lens.is_null() {
+        return ptr::null_mut();
+    }
 
     let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
     let msg = if message.is_null() { "" } else {
         match unsafe { CStr::from_ptr(message) }.to_str() { Ok(s) => s, Err(_) => "" }
     };
 
-    let active = handle.storage.get_active_branch(coll);
-
-    // Build typed columns from C arrays
     use pond_core::TypedColumn;
-    let mut typed_cols: Vec<(&str, TypedColumn)> = Vec::with_capacity(num_cols);
 
-    let names = unsafe { std::slice::from_raw_parts(col_names, num_cols) };
-    let data_ptrs = unsafe { std::slice::from_raw_parts(col_data, num_cols) };
-    let lens = unsafe { std::slice::from_raw_parts(col_lens, num_cols) };
-    let types = unsafe { std::slice::from_raw_parts(col_types, num_cols) };
+    let mut columns: Vec<(&str, TypedColumn)> = Vec::with_capacity(n_columns);
 
-    // We need to own the column data for the lifetime of typed_cols
-    let mut owned_strings: Vec<Vec<String>> = Vec::new();
-    let mut owned_i64: Vec<Vec<i64>> = Vec::new();
-    let mut owned_f64: Vec<Vec<f64>> = Vec::new();
+    for i in 0..n_columns {
+        let name_ptr = unsafe { *col_names.add(i) };
+        let vtype = unsafe { *col_types.add(i) };
+        let data_ptr = unsafe { *col_data.add(i) };
+        let len = unsafe { *col_lens.add(i) };
 
-    for i in 0..num_cols {
-        let name = match unsafe { CStr::from_ptr(names[i]) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
-        let vtype = types[i];
-        let len = lens[i];
+        if name_ptr.is_null() || data_ptr.is_null() || len == 0 {
+            continue;
+        }
+
+        let name = match unsafe { CStr::from_ptr(name_ptr) }.to_str() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Leak the name to get a 'static str (lifetime issue with C interop)
+        // This is acceptable for the duration of the write_rows call
+        let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
 
         match vtype {
-            0 => {
-                // INT64
-                let data_ptr = data_ptrs[i] as *const i64;
-                let vals = unsafe { std::slice::from_raw_parts(data_ptr, len) }.to_vec();
-                owned_i64.push(vals);
+            1 => { // VT_INT64
+                let ptr = data_ptr as *const i64;
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                columns.push((name_static, TypedColumn::Int64(slice.to_vec())));
             }
-            1 => {
-                // FLOAT64
-                let data_ptr = data_ptrs[i] as *const f64;
-                let vals = unsafe { std::slice::from_raw_parts(data_ptr, len) }.to_vec();
-                owned_f64.push(vals);
+            2 => { // VT_FLOAT64
+                let ptr = data_ptr as *const f64;
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                columns.push((name_static, TypedColumn::Float64(slice.to_vec())));
             }
-            2 => {
-                // STRING — col_data[i] points to an array of char* pointers
-                let str_ptrs = data_ptrs[i] as *const *const c_char;
-                let mut strs = Vec::with_capacity(len);
+            3 => { // VT_STRING
+                let ptr = data_ptr as *const *const c_char;
+                let mut vals = Vec::with_capacity(len);
                 for j in 0..len {
-                    let s = unsafe { CStr::from_ptr(*str_ptrs.add(j)) }
-                        .to_string_lossy()
-                        .to_string();
-                    strs.push(s);
+                    let s_ptr = unsafe { *ptr.add(j) };
+                    if s_ptr.is_null() {
+                        vals.push(String::new());
+                    } else {
+                        let s = unsafe { CStr::from_ptr(s_ptr) }.to_str().unwrap_or("").to_string();
+                        vals.push(s);
+                    }
                 }
-                owned_strings.push(strs);
+                columns.push((name_static, TypedColumn::String(vals)));
             }
-            _ => return ptr::null_mut(),
+            _ => continue,
         }
     }
 
-    // Now build typed_cols referencing owned data
-    let mut str_idx = 0;
-    let mut i64_idx = 0;
-    let mut f64_idx = 0;
-
-    for i in 0..num_cols {
-        let name = match unsafe { CStr::from_ptr(names[i]) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
-        let vtype = types[i];
-
-        let col = match vtype {
-            0 => {
-                let vals = &owned_i64[i64_idx];
-                i64_idx += 1;
-                TypedColumn::Int64(vals.clone())
-            }
-            1 => {
-                let vals = &owned_f64[f64_idx];
-                f64_idx += 1;
-                TypedColumn::Float64(vals.clone())
-            }
-            2 => {
-                let vals = &owned_strings[str_idx];
-                str_idx += 1;
-                TypedColumn::String(vals.clone())
-            }
-            _ => return ptr::null_mut(),
-        };
-
-        // Leak the name string so we have a &'static str (safe for the duration of this call)
-        let name_leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-        typed_cols.push((name_leaked, col));
+    if columns.is_empty() {
+        return ptr::null_mut();
     }
 
-    match write::write_rows(handle.storage.kernel(), coll, &active, &typed_cols, msg) {
+    let active = handle.storage.get_active_branch(coll);
+    match write::write_rows(handle.storage.kernel(), coll, &active, &columns, msg) {
         Ok(hash) => CString::new(hash).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut()),
         Err(_) => ptr::null_mut(),
     }
 }
 
-/// Read structured INT64 columns from a collection.
+/// Read structured rows from a collection's HEAD.
 ///
-/// Returns a PondResult (same as pond_pnd2_decode) that the caller
-/// must free with pond_result_free.
-///
-/// Args:
-///   handle: Storage handle
-///   collection: Collection name
-///
-/// Returns: PondResult*, or NULL on error.
+/// Returns a PND2 blob handle (caller must free with pond_storage_data_free),
+/// or NULL on error. The blob contains all columns from the HEAD manifest's
+/// first row group.
 #[no_mangle]
 pub extern "C" fn pond_storage_read_rows(
-    handle: *mut PondStorageHandle,
+    handle: *const PondStorageHandle,
     collection: *const c_char,
-) -> *mut pond_core::PondResult {
-    use pond_core::PondResult;
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return -1 }};
+    if collection.is_null() || out_data.is_null() || out_len.is_null() { return -1; }
 
-    let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return ptr::null_mut() }};
-    if collection.is_null() { return ptr::null_mut(); }
-
-    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
+    let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return -1 };
     let active = handle.storage.get_active_branch(coll);
 
-    // Read HEAD data
-    let head = handle.storage.kernel().resolve(&branch_ref(coll, &active));
-    let head_hash = match head {
-        Some(h) => h,
-        None => return ptr::null_mut(),
-    };
-
-    let head_data = match handle.storage.kernel().read_blob(&head_hash) {
-        Ok(d) => d,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    // Decode manifest
-    let manifest_bytes = if crate::pond_pack::is_pack(&head_data) {
-        let (_, manifest_bytes, _) = match crate::pond_pack::decode_pack(&head_data) {
-            Some(d) => d,
-            None => return ptr::null_mut(),
-        };
-        manifest_bytes
-    } else {
-        let commit = match crate::commit::read_commit(handle.storage.kernel(), &head_hash) {
-            Some(c) => c,
-            None => return ptr::null_mut(),
-        };
-        if commit.manifest.is_empty() { return ptr::null_mut(); }
-        match handle.storage.kernel().read_blob(&commit.manifest) {
-            Ok(d) => d,
-            Err(_) => return ptr::null_mut(),
+    match read::read(handle.storage.kernel(), coll, &active) {
+        Ok(data) => {
+            let len = data.len();
+            let boxed = data.into_boxed_slice();
+            let ptr = boxed.as_ptr() as *mut u8;
+            std::mem::forget(boxed);
+            unsafe {
+                *out_data = ptr;
+                *out_len = len;
+            }
+            0
         }
-    };
-
-    let manifest = match crate::manifest::CollectionManifest::decode(&manifest_bytes) {
-        Some(m) => m,
-        None => return ptr::null_mut(),
-    };
-
-    // Read first row group and decode as PND2
-    if let Some(rg) = manifest.row_groups.first() {
-        let blob_data = match handle.storage.kernel().read_blob(&rg.blob_hash) {
-            Ok(d) => d,
-            Err(_) => return ptr::null_mut(),
-        };
-
-        // Use the C ABI decode function — it returns a *mut PondResult
-        let result_ptr = pond_core::c_abi::pond_pnd2_decode(
-            blob_data.as_ptr(),
-            blob_data.len(),
-        );
-        result_ptr
-    } else {
-        ptr::null_mut()
+        Err(_) => -1,
     }
 }

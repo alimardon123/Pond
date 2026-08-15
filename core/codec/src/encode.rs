@@ -529,10 +529,11 @@ pub enum TypedColumn {
     Float64(Vec<f64>),
     String(Vec<String>),
     Binary(Vec<Vec<u8>>),
-    /// Mixed-type column — each value is a JSON-encoded string.
-    /// Stored as VT_VARIANT in PND2, encoded as length-prefixed JSON strings.
-    /// Examples: [42, 3.14, "hello", true, null, {"nested": "json"}]
     Variant(Vec<String>),
+    Boolean(Vec<bool>),
+    Date(Vec<i64>),
+    Timestamp(Vec<i64>),
+    Vector(Vec<Vec<f32>>),
 }
 
 impl TypedColumn {
@@ -543,6 +544,10 @@ impl TypedColumn {
             TypedColumn::String(_) => VT_STRING,
             TypedColumn::Binary(_) => VT_BINARY,
             TypedColumn::Variant(_) => VT_VARIANT,
+            TypedColumn::Boolean(_) => VT_BOOLEAN,
+            TypedColumn::Date(_) => VT_DATE,
+            TypedColumn::Timestamp(_) => VT_TIMESTAMP,
+            TypedColumn::Vector(_) => VT_VECTOR,
         }
     }
 
@@ -553,6 +558,10 @@ impl TypedColumn {
             TypedColumn::String(v) => v.len(),
             TypedColumn::Binary(v) => v.len(),
             TypedColumn::Variant(v) => v.len(),
+            TypedColumn::Boolean(v) => v.len(),
+            TypedColumn::Date(v) => v.len(),
+            TypedColumn::Timestamp(v) => v.len(),
+            TypedColumn::Vector(v) => v.len(),
         }
     }
 
@@ -568,26 +577,32 @@ impl TypedColumn {
                 encode_raw_str_payload(&refs)
             }
             TypedColumn::Binary(v) => {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for data in v {
-                    let len = data.len() as u32;
-                    payload.extend_from_slice(&len.to_le_bytes());
-                    payload.extend_from_slice(data);
-                }
-                payload
+                let mut p = Vec::new();
+                p.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for d in v { p.extend_from_slice(&(d.len() as u32).to_le_bytes()); p.extend_from_slice(d); }
+                p
             }
             TypedColumn::Variant(v) => {
-                // Variant: same format as STRING RAW (VT_VARIANT byte + length-prefixed strings)
-                // The decode path handles VT_VARIANT the same as VT_STRING
-                let mut payload = Vec::new();
-                payload.push(VT_VARIANT); // value_type byte (same as STRING's VT_STRING byte)
-                for s in v {
-                    let bytes = s.as_bytes();
-                    payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                    payload.extend_from_slice(bytes);
+                let mut p = Vec::new();
+                p.push(VT_VARIANT);
+                for s in v { let b = s.as_bytes(); p.extend_from_slice(&(b.len() as u32).to_le_bytes()); p.extend_from_slice(b); }
+                p
+            }
+            TypedColumn::Boolean(v) => {
+                let i64s: Vec<i64> = v.iter().map(|&b| if b { 1 } else { 0 }).collect();
+                let (_, p) = encode_i64_auto(&i64s); p
+            }
+            TypedColumn::Date(v) => { let (_, p) = encode_i64_auto(v); p }
+            TypedColumn::Timestamp(v) => { let (_, p) = encode_i64_auto(v); p }
+            TypedColumn::Vector(v) => {
+                let mut p = Vec::new();
+                p.push(VT_VECTOR);
+                p.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for vec in v {
+                    p.extend_from_slice(&(vec.len() as u32).to_le_bytes());
+                    for &f in vec { p.extend_from_slice(&f.to_le_bytes()); }
                 }
-                payload
+                p
             }
         }
     }
@@ -599,6 +614,10 @@ impl TypedColumn {
             TypedColumn::String(_) => ENC_RAW,
             TypedColumn::Binary(_) => ENC_RAW,
             TypedColumn::Variant(_) => ENC_RAW,
+            TypedColumn::Boolean(v) => { let i64s: Vec<i64> = v.iter().map(|&b| if b {1} else {0}).collect(); encode_i64_auto(&i64s).0 }
+            TypedColumn::Date(v) => encode_i64_auto(v).0,
+            TypedColumn::Timestamp(v) => encode_i64_auto(v).0,
+            TypedColumn::Vector(_) => ENC_RAW,
         }
     }
 
@@ -614,7 +633,17 @@ impl TypedColumn {
                 let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 Some((min.to_le_bytes().to_vec(), max.to_le_bytes().to_vec()))
             }
-            _ => None, // No stats for strings, binary, variant, or empty columns
+            TypedColumn::Boolean(v) if !v.is_empty() => {
+                let has_true = v.iter().any(|&b| b);
+                Some((0i64.to_le_bytes().to_vec(), (if has_true { 1i64 } else { 0i64 }).to_le_bytes().to_vec()))
+            }
+            TypedColumn::Date(v) if !v.is_empty() => {
+                Some(((*v.iter().min().unwrap()).to_le_bytes().to_vec(), (*v.iter().max().unwrap()).to_le_bytes().to_vec()))
+            }
+            TypedColumn::Timestamp(v) if !v.is_empty() => {
+                Some(((*v.iter().min().unwrap()).to_le_bytes().to_vec(), (*v.iter().max().unwrap()).to_le_bytes().to_vec()))
+            }
+            _ => None,
         }
     }
 }

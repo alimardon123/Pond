@@ -17,13 +17,7 @@ use pond_kernel::PondKernel;
 /// Begin a transaction. Returns a transaction ID (UUID).
 /// No storage operation — just generates an ID.
 pub fn begin_tx() -> String {
-    // Generate a simple unique ID (timestamp + random)
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("tx_{:016x}", ts)
+    pond_kernel::crdt::uuidv7()
 }
 
 /// Commit a transaction. Writes a commit marker at transactions/{tx_id}.
@@ -37,6 +31,7 @@ pub fn commit_tx(
     tx_id: &str,
     message: &str,
 ) -> Result<String, String> {
+    if is_tx_aborted(kernel, tx_id) { return Err(format!("Transaction '{}' was already aborted", tx_id)); }
     // Write a commit marker blob
     let marker_data = format!(r#"{{"tx_id":"{}","message":"{}","status":"committed"}}"#,
                               tx_id, message);
@@ -56,9 +51,28 @@ pub fn commit_tx(
 /// This is honest about the limitation: there is no real rollback.
 /// The shards remain on storage but are invisible to readers (because
 /// the commit marker doesn't exist). GC will eventually delete them.
-pub fn abort_tx(_kernel: &PondKernel, _tx_id: &str) {
-    // No-op — tentative shards are orphaned until GC.
-    // This is documented as a known limitation.
+pub fn abort_tx(kernel: &PondKernel, tx_id: &str) -> Result<String, String> {
+    if is_tx_committed(kernel, tx_id) { return Err(format!("Transaction '{}' was already committed", tx_id)); }
+    let marker = serde_json::json!({"tx_id": tx_id, "status": "aborted", "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)});
+    let bytes = serde_json::to_vec(&marker).map_err(|e| format!("Failed to serialize: {}", e))?;
+    let hash = kernel.write(&bytes).map_err(|e| format!("Failed to write abort marker: {}", e))?;
+    kernel.reference(&format!("transactions/{}_aborted", tx_id), &hash).map_err(|e| format!("Failed to reference: {}", e))?;
+    Ok(hash)
+}
+
+pub fn is_tx_aborted(kernel: &PondKernel, tx_id: &str) -> bool {
+    if let Some(hash) = kernel.resolve(&format!("transactions/{}_aborted", tx_id)) {
+        if let Ok(data) = kernel.read_blob(&hash) {
+            if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
+                return m.get("status").and_then(|s| s.as_str()) == Some("aborted");
+            }
+        }
+    }
+    false
+}
+
+pub fn tx_status(kernel: &PondKernel, tx_id: &str) -> &'static str {
+    if is_tx_committed(kernel, tx_id) { "committed" } else if is_tx_aborted(kernel, tx_id) { "aborted" } else { "pending" }
 }
 
 /// Check if a transaction has been committed.
@@ -79,8 +93,9 @@ mod tests {
     fn test_begin_tx_returns_unique_id() {
         let tx1 = begin_tx();
         let tx2 = begin_tx();
-        assert_ne!(tx1, tx2);
-        assert!(tx1.starts_with("tx_"));
+        assert_ne!(tx1, tx2, "tx IDs must be unique");
+        // begin_tx now returns UUIDv7 (36 chars with dashes)
+        assert_eq!(tx1.len(), 36, "tx ID should be UUIDv7 format");
     }
 
     #[test]

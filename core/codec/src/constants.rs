@@ -32,7 +32,11 @@ pub const VT_FLOAT64: u8 = 2;
 pub const VT_STRING: u8 = 3;
 pub const VT_NULL: u8 = 4;
 pub const VT_BINARY: u8 = 5;
-pub const VT_VARIANT: u8 = 6;  // Mixed-type column — each value is a JSON-encoded string
+pub const VT_VARIANT: u8 = 6;
+pub const VT_BOOLEAN: u8 = 7;
+pub const VT_DATE: u8 = 8;
+pub const VT_TIMESTAMP: u8 = 9;
+pub const VT_VECTOR: u8 = 10;
 
 // ---------------------------------------------------------------------------
 // Encodings (stored in the schema section, 1 byte per column)

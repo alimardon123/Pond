@@ -286,14 +286,17 @@ pub fn merge_rows_by_rowid(rows: &[Value], key_col: Option<&str>) -> Vec<Value> 
         result.extend(legacy_rows);
     }
 
-    // Add CRDT rows that are NOT tombstoned
+    // Add CRDT rows (INCLUDING tombstones for associativity — readers call filter_live_rows)
     for row in latest.values() {
-        if !row.get("_deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
-            result.push(row.clone());
-        }
+        result.push(row.clone());
     }
 
     result
+}
+
+/// Filter out tombstoned rows (_deleted: true).
+pub fn filter_live_rows(rows: &[Value]) -> Vec<Value> {
+    rows.iter().filter(|r| !r.get("_deleted").and_then(|v| v.as_bool()).unwrap_or(false)).cloned().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -420,8 +423,12 @@ mod tests {
             json!({"_rowid": rowid, "_version": "00000000000000030000000000000001", "name": "alive", "_deleted": true}),
         ];
 
+        // merge_rows_by_rowid now KEEPS tombstones for associativity.
+        // Readers call filter_live_rows to get only visible rows.
         let merged = merge_rows_by_rowid(&rows, Some("name"));
-        assert_eq!(merged.len(), 0, "tombstone with latest version should suppress the row");
+        assert_eq!(merged.len(), 1, "tombstone kept in merge output for associativity");
+        let live = filter_live_rows(&merged);
+        assert_eq!(live.len(), 0, "tombstone suppresses row in live output");
     }
 
     #[test]

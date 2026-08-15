@@ -155,13 +155,19 @@ pub fn merge(
         }
     }
 
-    // For conflicting keys: row-group-level last-writer-wins (source wins)
-    // TODO: when CRDT columns (_rowid/_version) are detected, decode only
-    // conflicting row groups and apply row-level CRDT merge.
-    // For now, source wins (matches the pre-fix Python behavior for non-CRDT data).
+    // Determine key_col for CRDT merge
+    let key_col = source_manifest.as_ref()
+        .or(target_manifest.as_ref())
+        .map(|m| m.key_col.clone())
+        .unwrap_or_default();
+
+    // For conflicting keys: attempt row-level CRDT merge.
     for key in &conflicting_keys {
-        if let Some(rg) = source_rgs.get(key) {
-            merged_entries.push((*rg).clone());
+        if let (Some(trg), Some(srg)) = (target_rgs.get(key), source_rgs.get(key)) {
+            match try_crdt_merge_row_groups(kernel, trg, srg, &key_col) {
+                Some(merged_rg) => merged_entries.push(merged_rg),
+                None => merged_entries.push((*srg).clone()), // LWW fallback
+            }
         }
     }
 
@@ -170,12 +176,8 @@ pub fn merge(
         .or(target_manifest.as_ref())
         .map(|m| m.columns.clone())
         .unwrap_or_default();
-    let key_col = source_manifest.as_ref()
-        .or(target_manifest.as_ref())
-        .map(|m| m.key_col.clone())
-        .unwrap_or_default();
 
-    let mut new_manifest = CollectionManifest::new(schema, key_col);
+    let mut new_manifest = CollectionManifest::new(schema, key_col.clone());
     for entry in merged_entries {
         new_manifest.add_row_group(entry);
     }
@@ -281,6 +283,166 @@ pub fn revert(
 fn load_manifest(kernel: &PondKernel, manifest_hash: &str) -> Option<CollectionManifest> {
     let data = kernel.read_blob(manifest_hash).ok()?;
     CollectionManifest::decode(&data)
+}
+
+// ---------------------------------------------------------------------------
+// Row-level CRDT merge for branch merge
+// ---------------------------------------------------------------------------
+
+/// Attempt to row-level CRDT merge two conflicting row groups.
+/// Returns None if CRDT merge is not possible (non-CRDT data, decode failure).
+fn try_crdt_merge_row_groups(
+    kernel: &PondKernel,
+    target_rg: &crate::manifest::RowGroupEntry,
+    source_rg: &crate::manifest::RowGroupEntry,
+    _key_col: &str,
+) -> Option<crate::manifest::RowGroupEntry> {
+    // Read both blobs
+    let target_data = kernel.read_blob(&target_rg.blob_hash).ok()?;
+    let source_data = kernel.read_blob(&source_rg.blob_hash).ok()?;
+
+    // Decode both to JSON rows (handles PND2 and JSON formats)
+    let target_rows = decode_blob_to_json_rows(&target_data)?;
+    let source_rows = decode_blob_to_json_rows(&source_data)?;
+
+    // Verify both have CRDT columns
+    if !has_crdt_columns(&target_rows) || !has_crdt_columns(&source_rows) {
+        return None;
+    }
+
+    // Concatenate and merge
+    let mut all_rows: Vec<serde_json::Value> = Vec::with_capacity(target_rows.len() + source_rows.len());
+    all_rows.extend(target_rows);
+    all_rows.extend(source_rows);
+
+    let merged_rows = crate::shard::merge_rows_by_rowid(&all_rows, None);
+    let live_rows = crate::shard::filter_live_rows(&merged_rows);
+
+    // Re-encode as PND2 using simple type inference
+    let (blob, col_stats) = encode_json_rows_to_pnd2(&live_rows, &target_rg.columns)?;
+    let new_hash = kernel.write(&blob).ok()?;
+
+    Some(crate::manifest::RowGroupEntry {
+        key: target_rg.key.clone(),
+        blob_hash: new_hash,
+        n_rows: live_rows.len() as u32,
+        columns: col_stats,
+    })
+}
+
+/// Check if rows have CRDT columns (_rowid and _version).
+fn has_crdt_columns(rows: &[serde_json::Value]) -> bool {
+    if rows.is_empty() { return false; }
+    let first = &rows[0];
+    first.get("_rowid").is_some() && first.get("_version").is_some()
+}
+
+/// Decode a blob into JSON rows (PND2 or JSON array).
+fn decode_blob_to_json_rows(data: &[u8]) -> Option<Vec<serde_json::Value>> {
+    if data.len() >= 4 && &data[0..4] == b"PND2" {
+        let cols = pond_core::pnd2_decode(data).ok()?;
+        Some(pnd2_columns_to_json_rows(&cols))
+    } else if data.first() == Some(&b'[') {
+        serde_json::from_slice::<Vec<serde_json::Value>>(data).ok()
+    } else {
+        None
+    }
+}
+
+/// Transpose PND2 columns into JSON rows.
+fn pnd2_columns_to_json_rows(cols: &[pond_core::PondColumn]) -> Vec<serde_json::Value> {
+    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+    let mut rows = Vec::with_capacity(n_rows);
+    for i in 0..n_rows {
+        let mut row = serde_json::Map::new();
+        for col in cols {
+            let name = col.name.to_str().unwrap_or("").to_string();
+            if name.is_empty() { continue; }
+            let val = match col.vtype {
+                1 => col.i64_data.get(i).map(|x| serde_json::json!(x)), // VT_INT64
+                2 => col.f64_data.get(i).map(|x| serde_json::json!(x)), // VT_FLOAT64
+                3 | 6 => col.str_data.get(i).map(|s| serde_json::json!(s.to_str().unwrap_or(""))), // VT_STRING/VT_VARIANT
+                _ => None,
+            };
+            if let Some(v) = val { row.insert(name, v); }
+        }
+        rows.push(serde_json::Value::Object(row));
+    }
+    rows
+}
+
+/// Encode JSON rows into a PND2 blob with type inference.
+fn encode_json_rows_to_pnd2(
+    rows: &[serde_json::Value],
+    _ref_stats: &[crate::manifest::ColumnStatsEntry],
+) -> Option<(Vec<u8>, Vec<crate::manifest::ColumnStatsEntry>)> {
+    if rows.is_empty() { return None; }
+
+    // Collect column names
+    let mut col_names: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in rows {
+        if let Some(obj) = row.as_object() {
+            for k in obj.keys() {
+                if seen.insert(k.clone()) {
+                    col_names.push(k.clone());
+                }
+            }
+        }
+    }
+
+    // Build typed columns with type inference
+    use pond_core::TypedColumn;
+    let mut typed_cols: Vec<(&str, TypedColumn)> = Vec::new();
+    let mut col_stats: Vec<crate::manifest::ColumnStatsEntry> = Vec::new();
+
+    for name in &col_names {
+        // Infer type: check if all values are i64, f64, or string
+        let mut has_i64 = false;
+        let mut has_f64 = false;
+        let mut has_string = false;
+        for row in rows {
+            match row.get(name) {
+                Some(serde_json::Value::Number(n)) if n.is_i64() => has_i64 = true,
+                Some(serde_json::Value::Number(n)) if n.is_f64() => has_f64 = true,
+                Some(serde_json::Value::Number(_)) => has_f64 = true,
+                Some(serde_json::Value::String(_)) => has_string = true,
+                _ => {}
+            }
+        }
+
+        let (typed_col, vtype) = if has_string {
+            let vals: Vec<String> = rows.iter().map(|r| {
+                r.get(name).and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default()
+            }).collect();
+            (TypedColumn::String(vals), 3u8)
+        } else if has_f64 {
+            let vals: Vec<f64> = rows.iter().map(|r| {
+                r.get(name).and_then(|v| v.as_f64()).unwrap_or(0.0)
+            }).collect();
+            (TypedColumn::Float64(vals), 2u8)
+        } else if has_i64 {
+            let vals: Vec<i64> = rows.iter().map(|r| {
+                r.get(name).and_then(|v| v.as_i64()).unwrap_or(0)
+            }).collect();
+            (TypedColumn::Int64(vals), 1u8)
+        } else {
+            let vals: Vec<String> = rows.iter().map(|_| String::new()).collect();
+            (TypedColumn::String(vals), 3u8)
+        };
+
+        typed_cols.push((name.as_str(), typed_col));
+        col_stats.push(crate::manifest::ColumnStatsEntry {
+            name: name.clone(),
+            value_type: vtype,
+            min: None,
+            max: None,
+            null_count: 0,
+        });
+    }
+
+    let blob = pond_core::pnd2_encode_multi_typed(&typed_cols);
+    Some((blob, col_stats))
 }
 
 // ---------------------------------------------------------------------------

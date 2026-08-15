@@ -26,6 +26,8 @@ pub use object_store::{ObjectStore, LocalFSObjectStore, StoreStats};
 
 use std::io;
 use std::sync::Mutex;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 
 use sha2::{Digest, Sha256};
 

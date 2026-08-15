@@ -56,6 +56,7 @@ pub mod decode;
 pub mod encode;
 pub mod parser;
 pub mod types;
+pub mod vector;
 
 // Re-export the public API at the crate root so downstream callers (and the
 // existing test module) can keep using `pond_core::pnd2_decode` etc. without

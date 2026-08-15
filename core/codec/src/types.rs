@@ -38,6 +38,7 @@ pub struct PondColumn {
     pub str_data: Vec<CString>,
     pub bin_data: Vec<Vec<u8>>,
     pub n_values: usize,
+    pub null_bitmap: Option<Vec<u8>>,
 }
 
 impl PondColumn {
@@ -53,12 +54,26 @@ impl PondColumn {
             str_data: vec![],
             bin_data: vec![],
             n_values: 0,
+            null_bitmap: None,
         }
     }
 
     /// Same as `empty` but takes a `&str` for ergonomic callers.
     pub fn empty_named(name: &str, vtype: u8) -> Self {
         Self::empty(name.as_bytes(), vtype)
+    }
+
+    /// Check if a row is null (using the null bitmap if present).
+    pub fn is_null(&self, row: usize) -> bool {
+        if row >= self.n_values { return true; }
+        match &self.null_bitmap {
+            Some(bitmap) => {
+                let byte_idx = row / 8;
+                let bit_idx = row % 8;
+                if byte_idx < bitmap.len() { bitmap[byte_idx] & (1 << bit_idx) != 0 } else { false }
+            }
+            None => false,
+        }
     }
 }
 

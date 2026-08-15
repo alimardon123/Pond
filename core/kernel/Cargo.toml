@@ -17,6 +17,7 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 # zero-dependency principle. This is critical for the single-binary
 # distribution model (no transitive crate dependencies to satisfy).
 sha2 = "0.10"
+lru = "0.12"
 
 [dev-dependencies]
 tempfile = { workspace = true }

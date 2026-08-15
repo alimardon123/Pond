@@ -258,12 +258,16 @@ fn build_authorization_header(
 ///
 /// Thread-safe: the inner HTTP client (ureq) is sync and thread-safe. Stats
 /// are behind a Mutex.
+pub const MULTIPART_THRESHOLD: usize = 100 * 1024 * 1024;
+pub const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
+
 pub struct S3ObjectStore {
     bucket: String,
     prefix: String,
     region: String,
     endpoint: String,
     credentials: S3Credentials,
+    agent: ureq::Agent,
     stats: Mutex<StoreStats>,
 }
 
@@ -295,6 +299,7 @@ impl S3ObjectStore {
         region: impl Into<String>,
         endpoint: impl Into<String>,
         credentials: S3Credentials,
+    agent: ureq::Agent,
     ) -> Self {
         let prefix = prefix.into();
         let prefix = prefix.trim_matches('/').to_string();
@@ -304,6 +309,7 @@ impl S3ObjectStore {
             region: region.into(),
             endpoint: endpoint.into(),
             credentials,
+            agent,
             stats: Mutex::new(StoreStats::default()),
         }
     }
@@ -339,7 +345,7 @@ impl S3ObjectStore {
             )
         })?;
 
-        Ok(Self::new(bucket, prefix, region, endpoint, credentials))
+        Ok(Self::new(bucket, prefix, region, endpoint, credentials, ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(10)).timeout_read(std::time::Duration::from_secs(120)).timeout_write(std::time::Duration::from_secs(120)).build()))
     }
 
     // --- Key helpers ---
@@ -1068,6 +1074,7 @@ mod tests {
                 secret_key: "test".to_string(),
                 session_token: None,
             },
+            ureq::Agent::new(),
         );
         assert_eq!(store.blob_key("abcdef1234567890"), "prod/blobs/ab/abcdef1234567890");
 
@@ -1078,6 +1085,7 @@ mod tests {
                 secret_key: "test".to_string(),
                 session_token: None,
             },
+            ureq::Agent::new(),
         );
         assert_eq!(store_no_prefix.blob_key("abcdef1234567890"), "blobs/ab/abcdef1234567890");
     }

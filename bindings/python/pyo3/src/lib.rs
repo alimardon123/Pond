@@ -1350,6 +1350,12 @@ fn build_s3_url(
 #[pyclass]
 struct Storage {
     storage: Arc<Mutex<UnifiedStorage>>,
+    /// User-defined functions for SQL WHERE pushdown.
+    /// Maps UDF name → Python callable.
+    udfs: Mutex<std::collections::HashMap<String, PyObject>>,
+    /// Row-Level Security policies for multi-tenant isolation.
+    /// Maps collection name → tenant_id.
+    rls_policies: Mutex<std::collections::HashMap<String, String>>,
 }
 
 #[pymethods]
@@ -1390,7 +1396,11 @@ impl Storage {
                     .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
                 let kernel = PondKernel::new_with_store(Box::new(store));
                 let storage = UnifiedStorage::new(kernel);
-                Ok(Self { storage: Arc::new(Mutex::new(storage)) })
+                Ok(Self {
+                    storage: Arc::new(Mutex::new(storage)),
+                    udfs: Mutex::new(std::collections::HashMap::new()),
+                    rls_policies: Mutex::new(std::collections::HashMap::new()),
+                })
             }
             #[cfg(not(feature = "s3"))]
             {
@@ -1403,7 +1413,11 @@ impl Storage {
             let path = location.strip_prefix("file://").unwrap_or(location);
             let storage = UnifiedStorage::new_local(path)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-            Ok(Self { storage: Arc::new(Mutex::new(storage)) })
+            Ok(Self {
+                storage: Arc::new(Mutex::new(storage)),
+                udfs: Mutex::new(std::collections::HashMap::new()),
+                rls_policies: Mutex::new(std::collections::HashMap::new()),
+            })
         }
     }
 
@@ -1418,7 +1432,11 @@ impl Storage {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let kernel = PondKernel::new_with_store(Box::new(store));
         let storage = UnifiedStorage::new(kernel);
-        Ok(Self { storage: Arc::new(Mutex::new(storage)) })
+        Ok(Self {
+            storage: Arc::new(Mutex::new(storage)),
+            udfs: Mutex::new(std::collections::HashMap::new()),
+            rls_policies: Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     /// Write data to a collection on the active branch.
@@ -1501,7 +1519,7 @@ impl Storage {
             .collect();
 
         // If where= is provided, filter rows before writing
-        let final_cols: Vec<(String, TypedColumn)> = if let Some(ref w) = r#where {
+        let mut final_cols: Vec<(String, TypedColumn)> = if let Some(ref w) = r#where {
             let where_expr = parse_where_param(w)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
@@ -1528,6 +1546,23 @@ impl Storage {
         } else {
             typed_cols
         };
+
+        // === RLS: auto-add _tenant column ===
+        // If an RLS policy is active for this collection, inject a _tenant
+        // column with the tenant_id value for every row (unless the user
+        // already provided one).
+        let rls_tenant: Option<String> = {
+            let policies = self.rls_policies.lock().unwrap();
+            policies.get(collection).cloned()
+        };
+        if let Some(ref tenant) = rls_tenant {
+            let n_rows = final_cols.first().map(|(_, c)| c.len()).unwrap_or(0);
+            let has_tenant = final_cols.iter().any(|(name, _)| name == "_tenant");
+            if !has_tenant && n_rows > 0 {
+                let tenant_vals: Vec<String> = (0..n_rows).map(|_| tenant.clone()).collect();
+                final_cols.push(("_tenant".to_string(), TypedColumn::String(tenant_vals)));
+            }
+        }
 
         let col_refs: Vec<(&str, TypedColumn)> = final_cols.iter()
             .map(|(name, col)| (name.as_str(), col.clone()))
@@ -2074,7 +2109,25 @@ impl Storage {
     ///   # MERGE
     ///   s.sql("MERGE INTO users USING [{\"id\":1,\"name\":\"alice\"}] ON id = id WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT")
     fn sql(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
-        let stmt = parse_sql(sql).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        // === UDF pushdown: extract function calls from WHERE ===
+        // If the SQL is a SELECT and there are registered UDFs, scan the SQL
+        // for `func_name(col)` patterns and replace them with marker comparisons
+        // that the WHERE parser can handle. The UDFs are evaluated separately
+        // during row filtering.
+        let udf_names: Vec<String> = {
+            let udfs = self.udfs.lock().unwrap();
+            udfs.keys().cloned().collect()
+        };
+        let is_select = sql.trim_start()
+            .to_lowercase()
+            .starts_with("select");
+        let (cleaned_sql, udf_calls) = if is_select && !udf_names.is_empty() {
+            extract_udf_calls_from_sql(sql, &udf_names)
+        } else {
+            (sql.to_string(), Vec::new())
+        };
+
+        let stmt = parse_sql(&cleaned_sql).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
         match stmt {
             SqlStatement::Select { table, alias, columns, joins, r#where } => {
@@ -2126,9 +2179,43 @@ impl Storage {
                     result_rows = execute_join(result_rows, right_rows_prefixed, &join.on, &join.join_type);
                 }
 
-                // Apply WHERE filter
+                // Pre-fetch UDF functions (clone_ref requires py token)
+                let udf_funcs: Vec<(String, Vec<String>, Option<PyObject>)> = {
+                    let udfs = self.udfs.lock().unwrap();
+                    udf_calls.iter()
+                        .map(|(name, args)| {
+                            let func = udfs.get(name).map(|f| f.clone_ref(py));
+                            (name.clone(), args.clone(), func)
+                        })
+                        .collect()
+                };
+
+                // Apply WHERE filter (with UDF marker injection if UDFs are active)
                 let filtered: Vec<&JsonValue> = result_rows.iter()
-                    .filter(|row| r#where.eval(row))
+                    .filter(|row| {
+                        if udf_funcs.is_empty() {
+                            return r#where.eval(row);
+                        }
+
+                        // Clone the row and inject UDF markers
+                        let mut row_with_markers = (*row).clone();
+                        if let Some(obj) = row_with_markers.as_object_mut() {
+                            for (idx, (_, args, func)) in udf_funcs.iter().enumerate() {
+                                let passes = if let Some(f) = func {
+                                    evaluate_udf(py, f, row, args)
+                                } else {
+                                    false
+                                };
+                                let marker_val = if passes {
+                                    JsonValue::Number(serde_json::Number::from(1i64))
+                                } else {
+                                    JsonValue::Number(serde_json::Number::from(0i64))
+                                };
+                                obj.insert(format!("_udf_marker_{}", idx), marker_val);
+                            }
+                        }
+                        r#where.eval(&row_with_markers)
+                    })
                     .collect();
 
                 // Build columnar result — handle qualified column names
@@ -2144,9 +2231,10 @@ impl Storage {
                                 });
                                 if !matches { continue; }
                             }
-                            // Skip CRDT metadata
+                            // Skip CRDT metadata + RLS _tenant + UDF marker columns
                             let base_name = name.rsplit('.').next().unwrap_or(name);
-                            if base_name == "_rowid" || base_name == "_version" || base_name == "_deleted" {
+                            if base_name == "_rowid" || base_name == "_version" || base_name == "_deleted"
+                                || base_name == "_tenant" || base_name.starts_with("_udf_marker_") {
                                 continue;
                             }
                             let entry = result_cols.entry(name.clone()).or_insert_with(Vec::new);
@@ -2355,6 +2443,21 @@ impl Storage {
         // CRDT merge: dedup by _rowid, latest _version wins, tombstones suppress
         let merged = crdt_merge_rows(all_rows);
 
+        // === RLS: filter rows by _tenant ===
+        // If an RLS policy is active for this collection, only keep rows
+        // where the _tenant column matches the policy's tenant_id.
+        let rls_tenant: Option<String> = {
+            let policies = self.rls_policies.lock().unwrap();
+            policies.get(collection).cloned()
+        };
+        let merged: Vec<JsonValue> = if let Some(ref tenant) = rls_tenant {
+            merged.into_iter().filter(|row| {
+                row.get("_tenant").and_then(|v| v.as_str()) == Some(tenant.as_str())
+            }).collect()
+        } else {
+            merged
+        };
+
         // Build projection set
         let projection: Option<std::collections::HashSet<String>> = columns.map(|cols| {
             cols.into_iter().collect()
@@ -2464,9 +2567,9 @@ impl Storage {
         }
 
         // Convert to Python dict — filter out CRDT metadata columns
-        // (_rowid, _version, _deleted) unless the user explicitly requested
-        // them via the columns= parameter.
-        let crdt_cols: std::collections::HashSet<&str> = ["_rowid", "_version", "_deleted"]
+        // (_rowid, _version, _deleted, _tenant) unless the user explicitly
+        // requested them via the columns= parameter.
+        let crdt_cols: std::collections::HashSet<&str> = ["_rowid", "_version", "_deleted", "_tenant"]
             .iter().cloned().collect();
         let explicit_columns = projection.is_some();
 
@@ -3094,10 +3197,10 @@ impl Storage {
     /// Tentative shards are orphaned until GC cleans them up. There is
     /// no real rollback — the shards remain on storage but are invisible
     /// to readers (because the commit marker doesn't exist).
-    fn abort_tx(&self, tx_id: &str) {
+    fn abort_tx(&self, tx_id: &str) -> PyResult<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        pond_storage::transaction::abort_tx(kernel, tx_id)
+        pond_storage::transaction::abort_tx(kernel, tx_id).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
     }
 
     /// Check if a transaction has been committed.
@@ -3403,6 +3506,106 @@ impl Storage {
                 Some(layer_name.to_string())
             })
             .collect()
+    }
+
+    // ===================================================================
+    // UDF Pushdown — register Python functions for SQL WHERE filtering
+    //
+    // UDFs allow users to push arbitrary Python predicates into the SQL
+    // WHERE clause:
+    //
+    //   storage.register_udf("is_adult", lambda age: age >= 18)
+    //   storage.sql("SELECT * FROM users WHERE is_adult(age)")
+    //
+    // The UDF is called once per row with the column value(s) as args.
+    // Rows where the UDF returns a truthy value are included in the result.
+    // ===================================================================
+
+    /// Register a user-defined function (UDF) for SQL WHERE pushdown.
+    ///
+    /// The UDF is a Python callable that takes one or more column values
+    /// as arguments and returns a boolean (or truthy value).
+    ///
+    /// Args:
+    ///   - name: The function name (used in SQL WHERE, e.g. `name(col)`)
+    ///   - func: The Python callable
+    ///
+    /// Example:
+    ///   s.register_udf("is_adult", lambda age: age >= 18)
+    ///   s.sql("SELECT * FROM users WHERE is_adult(age)")
+    fn register_udf(&self, name: &str, func: PyObject) -> PyResult<()> {
+        let mut udfs = self.udfs.lock().unwrap();
+        udfs.insert(name.to_string(), func);
+        Ok(())
+    }
+
+    /// Unregister a previously-registered UDF by name.
+    ///
+    /// Returns True if the UDF was found and removed, False otherwise.
+    fn unregister_udf(&self, name: &str) -> bool {
+        let mut udfs = self.udfs.lock().unwrap();
+        udfs.remove(name).is_some()
+    }
+
+    /// List all registered UDF names.
+    fn list_udfs(&self) -> Vec<String> {
+        let udfs = self.udfs.lock().unwrap();
+        let mut names: Vec<String> = udfs.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    // ===================================================================
+    // Row-Level Security (RLS) — multi-tenant isolation
+    //
+    // RLS policies ensure that each tenant only sees their own data.
+    // When a policy is set on a collection:
+    //   - write_rows auto-adds a `_tenant` column with the tenant_id
+    //   - read_rows filters out rows where `_tenant` doesn't match
+    //
+    // This is transparent to the user — they write and read normally,
+    // and RLS is enforced automatically.
+    // ===================================================================
+
+    /// Set a Row-Level Security policy for a collection.
+    ///
+    /// After calling this:
+    ///   - write_rows() auto-adds `_tenant=<tenant_id>` to every row
+    ///   - read_rows() only returns rows where `_tenant` matches
+    ///
+    /// Args:
+    ///   - collection: The collection name
+    ///   - tenant_id: The tenant identifier (e.g. "tenant_123")
+    ///
+    /// Example:
+    ///   s.set_rls_policy("users", "tenant_123")
+    ///   s.write_rows("users", [("name", ["alice", "bob"])], "init")
+    ///   # → rows are stored with _tenant="tenant_123"
+    ///   s.read_rows("users")
+    ///   # → only returns rows where _tenant="tenant_123"
+    fn set_rls_policy(&self, collection: &str, tenant_id: &str) -> PyResult<()> {
+        let mut policies = self.rls_policies.lock().unwrap();
+        policies.insert(collection.to_string(), tenant_id.to_string());
+        Ok(())
+    }
+
+    /// Get the RLS tenant_id for a collection, if a policy is set.
+    ///
+    /// Returns None if no RLS policy is active for this collection.
+    fn get_rls_policy(&self, collection: &str) -> Option<String> {
+        let policies = self.rls_policies.lock().unwrap();
+        policies.get(collection).cloned()
+    }
+
+    /// Clear the RLS policy for a collection.
+    ///
+    /// After clearing, read_rows() returns all rows (regardless of
+    /// _tenant) and write_rows() no longer auto-adds _tenant.
+    ///
+    /// Returns True if a policy was cleared, False if none was set.
+    fn clear_rls_policy(&self, collection: &str) -> bool {
+        let mut policies = self.rls_policies.lock().unwrap();
+        policies.remove(collection).is_some()
     }
 }
 
@@ -4000,66 +4203,30 @@ fn python_values_to_typed_column(values: &[PyObject]) -> TypedColumn {
 /// Extract a single cell from a TypedColumn at a given row index as a JSON value.
 fn extract_cell(col: &TypedColumn, idx: usize) -> JsonValue {
     match col {
-        TypedColumn::Int64(v) => {
-            v.get(idx).map(|i| JsonValue::Number(serde_json::Number::from(*i)))
-                .unwrap_or(JsonValue::Null)
-        }
-        TypedColumn::Float64(v) => {
-            v.get(idx).and_then(|f| serde_json::Number::from_f64(*f))
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null)
-        }
-        TypedColumn::String(v) => {
-            v.get(idx).map(|s| JsonValue::String(s.clone()))
-                .unwrap_or(JsonValue::Null)
-        }
-        TypedColumn::Binary(v) => {
-            v.get(idx)
-                .map(|b| JsonValue::String(format!("__bin_b64__:{}", base64_encode(b))))
-                .unwrap_or(JsonValue::Null)
-        }
-        TypedColumn::Variant(v) => {
-            // Variant: JSON-encoded string — parse back to JSON value
-            v.get(idx)
-                .and_then(|s| serde_json::from_str::<JsonValue>(s).ok())
-                .unwrap_or(JsonValue::Null)
-        }
+        TypedColumn::Int64(v) => v.get(idx).map(|i| JsonValue::Number(serde_json::Number::from(*i))).unwrap_or(JsonValue::Null),
+        TypedColumn::Float64(v) => v.get(idx).and_then(|f| serde_json::Number::from_f64(*f)).map(JsonValue::Number).unwrap_or(JsonValue::Null),
+        TypedColumn::String(v) => v.get(idx).map(|s| JsonValue::String(s.clone())).unwrap_or(JsonValue::Null),
+        TypedColumn::Binary(v) => v.get(idx).map(|b| JsonValue::String(format!("<{} bytes>", b.len()))).unwrap_or(JsonValue::Null),
+        TypedColumn::Variant(v) => v.get(idx).and_then(|s| serde_json::from_str(s).ok()).unwrap_or(JsonValue::Null),
+        TypedColumn::Boolean(v) => v.get(idx).map(|&b| JsonValue::Bool(b)).unwrap_or(JsonValue::Null),
+        TypedColumn::Date(v) | TypedColumn::Timestamp(v) => v.get(idx).map(|i| JsonValue::Number(serde_json::Number::from(*i))).unwrap_or(JsonValue::Null),
+        TypedColumn::Vector(v) => v.get(idx).map(|vec| { JsonValue::Array(vec.iter().map(|&f| serde_json::Number::from_f64(f as f64).map(JsonValue::Number).unwrap_or(JsonValue::Null)).collect()) }).unwrap_or(JsonValue::Null),
     }
 }
 
 /// Filter a TypedColumn to only rows where keep_mask[idx] is true.
 fn filter_column(col: TypedColumn, keep_mask: &[bool]) -> TypedColumn {
+    let m = |i: &usize| keep_mask.get(*i).copied().unwrap_or(false);
     match col {
-        TypedColumn::Int64(v) => {
-            TypedColumn::Int64(v.into_iter().enumerate()
-                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
-                .map(|(_, v)| v)
-                .collect())
-        }
-        TypedColumn::Float64(v) => {
-            TypedColumn::Float64(v.into_iter().enumerate()
-                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
-                .map(|(_, v)| v)
-                .collect())
-        }
-        TypedColumn::String(v) => {
-            TypedColumn::String(v.into_iter().enumerate()
-                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
-                .map(|(_, v)| v)
-                .collect())
-        }
-        TypedColumn::Binary(v) => {
-            TypedColumn::Binary(v.into_iter().enumerate()
-                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
-                .map(|(_, v)| v)
-                .collect())
-        }
-        TypedColumn::Variant(v) => {
-            TypedColumn::Variant(v.into_iter().enumerate()
-                .filter(|(i, _)| keep_mask.get(*i).copied().unwrap_or(false))
-                .map(|(_, v)| v)
-                .collect())
-        }
+        TypedColumn::Int64(v) => TypedColumn::Int64(v.into_iter().enumerate().filter(|(i,_)| m(i)).map(|(_,v)| v).collect()),
+        TypedColumn::Float64(v) => TypedColumn::Float64(v.into_iter().enumerate().filter(|(i,_)| m(i)).map(|(_,v)| v).collect()),
+        TypedColumn::String(v) => TypedColumn::String(v.into_iter().enumerate().filter(|(i,_)| m(i)).map(|(_,v)| v).collect()),
+        TypedColumn::Binary(v) => TypedColumn::Binary(v.into_iter().enumerate().filter(|(i,_)| m(i)).map(|(_,v)| v).collect()),
+        TypedColumn::Variant(v) => TypedColumn::Variant(v.into_iter().enumerate().filter(|(i,_)| m(i)).map(|(_,v)| v).collect()),
+        TypedColumn::Boolean(v) => TypedColumn::Boolean(v.into_iter().enumerate().filter(|(i,_)| m(i)).map(|(_,v)| v).collect()),
+        TypedColumn::Date(v) => TypedColumn::Date(v.into_iter().enumerate().filter(|(i,_)| m(i)).map(|(_,v)| v).collect()),
+        TypedColumn::Timestamp(v) => TypedColumn::Timestamp(v.into_iter().enumerate().filter(|(i,_)| m(i)).map(|(_,v)| v).collect()),
+        TypedColumn::Vector(v) => TypedColumn::Vector(v.into_iter().enumerate().filter(|(i,_)| m(i)).map(|(_,v)| v).collect()),
     }
 }
 
@@ -4882,6 +5049,130 @@ fn determine_rowid(row: &JsonValue, key_fields: &[String]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// UDF pushdown helpers
+// ---------------------------------------------------------------------------
+
+/// Extract UDF function calls from a SQL string and replace them with
+/// marker comparisons that the WHERE parser can handle.
+///
+/// For each `func_name(col1, col2, ...)` found in the SQL where `func_name`
+/// is a registered UDF, this function:
+///   1. Records the call as (udf_name, Vec<column_args>)
+///   2. Replaces the call text with `_udf_marker_<idx> = 1`
+///
+/// At evaluation time, each row gets `_udf_marker_<idx>` set to 1 (if the
+/// UDF returns truthy) or 0 (if falsy), so the marker comparison evaluates
+/// correctly within AND/OR/NOT expressions.
+///
+/// Returns (cleaned_sql, list_of_udf_calls).
+fn extract_udf_calls_from_sql(
+    sql: &str,
+    udf_names: &[String],
+) -> (String, Vec<(String, Vec<String>)>) {
+    if udf_names.is_empty() {
+        return (sql.to_string(), Vec::new());
+    }
+
+    let mut result = sql.to_string();
+    let mut calls: Vec<(String, Vec<String>)> = Vec::new();
+
+    for udf_name in udf_names {
+        let pattern = format!("{}(", udf_name);
+        loop {
+            // Find the next occurrence of "udf_name(" with a word boundary
+            // before it (so "my_is_adult(" doesn't match UDF "is_adult").
+            let mut search_from = 0;
+            let pos = loop {
+                match result[search_from..].find(&pattern) {
+                    Some(p) => {
+                        let abs_pos = search_from + p;
+                        let before_ok = abs_pos == 0 || {
+                            let prev = result.as_bytes()[abs_pos - 1] as char;
+                            !prev.is_alphanumeric() && prev != '_'
+                        };
+                        if before_ok {
+                            break abs_pos;
+                        }
+                        search_from = abs_pos + pattern.len();
+                    }
+                    None => break usize::MAX,
+                }
+            };
+
+            if pos == usize::MAX {
+                break;
+            }
+
+            // Find the matching close paren
+            let start = pos + pattern.len();
+            let mut depth: i32 = 1;
+            let mut end = start;
+            let bytes = result.as_bytes();
+            while end < bytes.len() && depth > 0 {
+                match bytes[end] as char {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                if depth > 0 {
+                    end += 1;
+                }
+            }
+            if depth != 0 {
+                break; // unbalanced parens — skip
+            }
+
+            // Extract and parse args (comma-separated column names)
+            let args_str = &result[start..end];
+            let args: Vec<String> = args_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            // Record the call and replace with a marker comparison
+            let call_idx = calls.len();
+            calls.push((udf_name.clone(), args));
+            let marker = format!("_udf_marker_{} = 1", call_idx);
+            result.replace_range(pos..=end, &marker);
+        }
+    }
+
+    (result, calls)
+}
+
+/// Evaluate a UDF against a single row.
+///
+/// Calls the Python function with the values of the specified columns
+/// from the row. Returns `true` if the function returns a truthy value,
+/// `false` otherwise (including on error).
+fn evaluate_udf(
+    py: Python,
+    func: &PyObject,
+    row: &JsonValue,
+    args: &[String],
+) -> bool {
+    let arg_values: Vec<PyObject> = args
+        .iter()
+        .map(|col| {
+            let val = row.get(col).unwrap_or(&JsonValue::Null);
+            json_to_pyobject(py, val)
+        })
+        .collect();
+
+    // Build a Python tuple from the arg values (Vec<PyObject> converts to
+    // a Python list, not a tuple, so we must wrap explicitly).
+    let args_tuple = PyTuple::new_bound(py, arg_values);
+    match func.call1(py, args_tuple) {
+        Ok(result) => result.is_truthy(py).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+// (fetch_udf_functions removed — UDF funcs are fetched inline in sql()
+// where the `py` token is available for clone_ref.)
+
+// ---------------------------------------------------------------------------
 // Python module definition
 // ---------------------------------------------------------------------------
 
@@ -4892,4 +5183,593 @@ fn pond(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Storage>()?;
     m.add_class::<SemanticLayer>()?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests — UDF pushdown + RLS
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a unique temp directory for test storage.
+    fn make_temp_dir() -> String {
+        let dir = format!("/tmp/pond_test_{}", chrono_like_id());
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Remove a temp directory (best-effort).
+    fn cleanup_dir(dir: &str) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Extract a Vec<String> from a Python dict result by key.
+    fn extract_string_vec(py: Python, obj: &PyObject, key: &str) -> Vec<String> {
+        let dict = obj.bind(py).downcast::<PyDict>().unwrap();
+        let val = dict.get_item(key).unwrap().unwrap();
+        val.extract::<Vec<String>>().unwrap()
+    }
+
+    /// Extract a Vec<i64> from a Python dict result by key.
+    fn extract_i64_vec(py: Python, obj: &PyObject, key: &str) -> Vec<i64> {
+        let dict = obj.bind(py).downcast::<PyDict>().unwrap();
+        let val = dict.get_item(key).unwrap().unwrap();
+        val.extract::<Vec<i64>>().unwrap()
+    }
+
+    // ===================================================================
+    // Pure Rust tests — extract_udf_calls_from_sql (no Python needed)
+    // ===================================================================
+
+    #[test]
+    fn test_extract_udf_calls_simple() {
+        let udfs = vec!["is_adult".to_string()];
+        let (cleaned, calls) =
+            extract_udf_calls_from_sql("SELECT * FROM users WHERE is_adult(age)", &udfs);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "is_adult");
+        assert_eq!(calls[0].1, vec!["age".to_string()]);
+        assert!(cleaned.contains("_udf_marker_0 = 1"));
+        assert!(!cleaned.contains("is_adult(age)"));
+    }
+
+    #[test]
+    fn test_extract_udf_calls_multiple() {
+        let udfs = vec!["is_adult".to_string(), "starts_with_a".to_string()];
+        let (cleaned, calls) = extract_udf_calls_from_sql(
+            "SELECT * FROM users WHERE is_adult(age) AND starts_with_a(name)",
+            &udfs,
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "is_adult");
+        assert_eq!(calls[0].1, vec!["age".to_string()]);
+        assert_eq!(calls[1].0, "starts_with_a");
+        assert_eq!(calls[1].1, vec!["name".to_string()]);
+        assert!(cleaned.contains("_udf_marker_0 = 1"));
+        assert!(cleaned.contains("_udf_marker_1 = 1"));
+    }
+
+    #[test]
+    fn test_extract_udf_calls_multi_col() {
+        let udfs = vec!["validate".to_string()];
+        let (cleaned, calls) =
+            extract_udf_calls_from_sql("SELECT * FROM t WHERE validate(a, b, c)", &udfs);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "validate");
+        assert_eq!(calls[0].1, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert!(cleaned.contains("_udf_marker_0 = 1"));
+    }
+
+    #[test]
+    fn test_extract_udf_calls_word_boundary() {
+        // "my_is_adult(age)" should NOT match UDF "is_adult"
+        let udfs = vec!["is_adult".to_string()];
+        let (cleaned, calls) = extract_udf_calls_from_sql(
+            "SELECT * FROM users WHERE my_is_adult(age)",
+            &udfs,
+        );
+        assert_eq!(calls.len(), 0);
+        assert!(cleaned.contains("my_is_adult(age)"));
+    }
+
+    #[test]
+    fn test_extract_udf_calls_no_udfs_registered() {
+        let (cleaned, calls) =
+            extract_udf_calls_from_sql("SELECT * FROM users WHERE age >= 18", &[]);
+        assert_eq!(calls.len(), 0);
+        assert_eq!(cleaned, "SELECT * FROM users WHERE age >= 18");
+    }
+
+    #[test]
+    fn test_extract_udf_calls_with_or() {
+        let udfs = vec!["is_adult".to_string()];
+        let (cleaned, calls) = extract_udf_calls_from_sql(
+            "SELECT * FROM users WHERE is_adult(age) OR city = 'NYC'",
+            &udfs,
+        );
+        assert_eq!(calls.len(), 1);
+        assert!(cleaned.contains("_udf_marker_0 = 1 OR city = 'NYC'"));
+    }
+
+    #[test]
+    fn test_extract_udf_calls_preserves_non_udf_sql() {
+        let udfs = vec!["is_adult".to_string()];
+        let (cleaned, calls) = extract_udf_calls_from_sql(
+            "SELECT name, age FROM users WHERE age >= 18 AND city = 'NYC'",
+            &udfs,
+        );
+        // No UDF calls in this SQL
+        assert_eq!(calls.len(), 0);
+        assert_eq!(cleaned, "SELECT name, age FROM users WHERE age >= 18 AND city = 'NYC'");
+    }
+
+    // ===================================================================
+    // UDF pushdown tests — require Python (register_udf + sql)
+    // ===================================================================
+
+    #[test]
+    fn test_udf_is_adult() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            // Write test data: alice(25), bob(15), carol(30)
+            storage
+                .write_rows(
+                    "users",
+                    vec![
+                        (
+                            "name".to_string(),
+                            vec![
+                                "alice".to_object(py),
+                                "bob".to_object(py),
+                                "carol".to_object(py),
+                            ],
+                        ),
+                        (
+                            "age".to_string(),
+                            vec![25.to_object(py), 15.to_object(py), 30.to_object(py)],
+                        ),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            // Register UDF: is_adult(age) → age >= 18
+            let func = py
+                .eval_bound("lambda age: age >= 18", None, None)
+                .unwrap()
+                .unbind();
+            storage.register_udf("is_adult", func).unwrap();
+            assert_eq!(storage.list_udfs(), vec!["is_adult".to_string()]);
+
+            // Query with UDF in WHERE
+            let result = storage
+                .sql(py, "SELECT * FROM users WHERE is_adult(age)")
+                .unwrap();
+
+            // Should return alice(25) and carol(30), but NOT bob(15)
+            let names = extract_string_vec(py, &result, "name");
+            assert_eq!(names.len(), 2, "Expected 2 adult rows, got {:?}", names);
+            assert!(names.contains(&"alice".to_string()));
+            assert!(names.contains(&"carol".to_string()));
+            assert!(!names.contains(&"bob".to_string()));
+
+            // Unregister and verify list is empty
+            assert!(storage.unregister_udf("is_adult"));
+            assert!(storage.list_udfs().is_empty());
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn test_udf_starts_with_a() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            // Write test data with various names
+            storage
+                .write_rows(
+                    "users",
+                    vec![
+                        (
+                            "name".to_string(),
+                            vec![
+                                "alice".to_object(py),
+                                "bob".to_object(py),
+                                "aaron".to_object(py),
+                                "charlie".to_object(py),
+                            ],
+                        ),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            // Register UDF: starts_with_a(name) → name.startswith('a')
+            let func = py
+                .eval_bound("lambda name: name.startswith('a')", None, None)
+                .unwrap()
+                .unbind();
+            storage.register_udf("starts_with_a", func).unwrap();
+
+            // Query with UDF in WHERE
+            let result = storage
+                .sql(py, "SELECT * FROM users WHERE starts_with_a(name)")
+                .unwrap();
+
+            // Should return alice and aaron
+            let names = extract_string_vec(py, &result, "name");
+            assert_eq!(names.len(), 2, "Expected 2 names starting with 'a', got {:?}", names);
+            assert!(names.contains(&"alice".to_string()));
+            assert!(names.contains(&"aaron".to_string()));
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn test_udf_multiple_columns() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            // Write test data
+            storage
+                .write_rows(
+                    "users",
+                    vec![
+                        (
+                            "name".to_string(),
+                            vec![
+                                "alice".to_object(py),
+                                "bob".to_object(py),
+                                "carol".to_object(py),
+                            ],
+                        ),
+                        (
+                            "age".to_string(),
+                            vec![25.to_object(py), 30.to_object(py), 20.to_object(py)],
+                        ),
+                        (
+                            "score".to_string(),
+                            vec![85.to_object(py), 90.to_object(py), 95.to_object(py)],
+                        ),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            // Register UDF: is_eligible(age, score) → age >= 21 AND score >= 90
+            let func = py
+                .eval_bound("lambda age, score: age >= 21 and score >= 90", None, None)
+                .unwrap()
+                .unbind();
+            storage.register_udf("is_eligible", func).unwrap();
+
+            // Query with UDF in WHERE (multiple columns)
+            let result = storage
+                .sql(py, "SELECT * FROM users WHERE is_eligible(age, score)")
+                .unwrap();
+
+            // Should return bob(30, 90) and carol... wait carol is 20, not >= 21
+            // Only bob(30, 90) qualifies: age >= 21 AND score >= 90
+            let names = extract_string_vec(py, &result, "name");
+            assert_eq!(names.len(), 1, "Expected 1 eligible row, got {:?}", names);
+            assert!(names.contains(&"bob".to_string()));
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn test_udf_combined_with_sql_condition() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            storage
+                .write_rows(
+                    "users",
+                    vec![
+                        (
+                            "name".to_string(),
+                            vec![
+                                "alice".to_object(py),
+                                "bob".to_object(py),
+                                "carol".to_object(py),
+                            ],
+                        ),
+                        (
+                            "age".to_string(),
+                            vec![25.to_object(py), 30.to_object(py), 20.to_object(py)],
+                        ),
+                        (
+                            "city".to_string(),
+                            vec!["NYC".to_object(py), "LA".to_object(py), "NYC".to_object(py)],
+                        ),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            // Register UDF
+            let func = py
+                .eval_bound("lambda age: age >= 21", None, None)
+                .unwrap()
+                .unbind();
+            storage.register_udf("is_adult", func).unwrap();
+
+            // Query: is_adult(age) AND city = 'NYC'
+            // alice(25, NYC) ✓, bob(30, LA) ✗ (wrong city), carol(20, NYC) ✗ (not adult)
+            let result = storage
+                .sql(py, "SELECT * FROM users WHERE is_adult(age) AND city = 'NYC'")
+                .unwrap();
+
+            let names = extract_string_vec(py, &result, "name");
+            assert_eq!(names.len(), 1, "Expected 1 row, got {:?}", names);
+            assert!(names.contains(&"alice".to_string()));
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    // ===================================================================
+    // RLS tests — set_rls_policy, read_rows filtering, write_rows auto-add
+    // ===================================================================
+
+    #[test]
+    fn test_rls_policy_management() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            // No policy initially
+            assert_eq!(storage.get_rls_policy("users"), None);
+
+            // Set policy
+            storage.set_rls_policy("users", "tenant_123").unwrap();
+            assert_eq!(storage.get_rls_policy("users"), Some("tenant_123".to_string()));
+
+            // Clear policy
+            assert!(storage.clear_rls_policy("users"));
+            assert_eq!(storage.get_rls_policy("users"), None);
+
+            // Clear again → false (not found)
+            assert!(!storage.clear_rls_policy("users"));
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn test_rls_write_auto_adds_tenant() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            // Set RLS policy
+            storage.set_rls_policy("users", "tenant_A").unwrap();
+
+            // Write rows — _tenant should be auto-added
+            storage
+                .write_rows(
+                    "users",
+                    vec![
+                        (
+                            "name".to_string(),
+                            vec!["alice".to_object(py), "bob".to_object(py)],
+                        ),
+                        (
+                            "age".to_string(),
+                            vec![25.to_object(py), 30.to_object(py)],
+                        ),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            // Read with explicit _tenant column to verify it was auto-added
+            let result = storage
+                .read_rows(py, "users", Some(vec!["_tenant".to_string()]), None)
+                .unwrap();
+
+            let tenants = extract_string_vec(py, &result, "_tenant");
+            assert_eq!(tenants.len(), 2);
+            assert!(tenants.iter().all(|t| t == "tenant_A"));
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn test_rls_read_filters_by_tenant() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            // Write rows with explicit _tenant values (no policy → no auto-add,
+            // we provide _tenant manually)
+            storage
+                .write_rows(
+                    "users",
+                    vec![
+                        (
+                            "name".to_string(),
+                            vec![
+                                "alice".to_object(py),
+                                "bob".to_object(py),
+                                "carol".to_object(py),
+                            ],
+                        ),
+                        (
+                            "_tenant".to_string(),
+                            vec![
+                                "tenant_A".to_object(py),
+                                "tenant_A".to_object(py),
+                                "tenant_B".to_object(py),
+                            ],
+                        ),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            // Set RLS policy for tenant_A → should only see alice, bob
+            storage.set_rls_policy("users", "tenant_A").unwrap();
+            let result = storage.read_rows(py, "users", None, None).unwrap();
+            let names = extract_string_vec(py, &result, "name");
+            assert_eq!(names.len(), 2, "Expected 2 rows for tenant_A, got {:?}", names);
+            assert!(names.contains(&"alice".to_string()));
+            assert!(names.contains(&"bob".to_string()));
+
+            // Switch to tenant_B → should only see carol
+            storage.set_rls_policy("users", "tenant_B").unwrap();
+            let result = storage.read_rows(py, "users", None, None).unwrap();
+            let names = extract_string_vec(py, &result, "name");
+            assert_eq!(names.len(), 1, "Expected 1 row for tenant_B, got {:?}", names);
+            assert!(names.contains(&"carol".to_string()));
+
+            // Clear RLS policy → should see all rows
+            storage.clear_rls_policy("users");
+            let result = storage.read_rows(py, "users", None, None).unwrap();
+            let names = extract_string_vec(py, &result, "name");
+            assert_eq!(names.len(), 3, "Expected 3 rows after clearing RLS, got {:?}", names);
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn test_rls_multiple_tenants_isolation() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            // Write all rows at once with explicit _tenant values
+            storage
+                .write_rows(
+                    "orders",
+                    vec![
+                        (
+                            "id".to_string(),
+                            vec![
+                                1.to_object(py),
+                                2.to_object(py),
+                                3.to_object(py),
+                                4.to_object(py),
+                            ],
+                        ),
+                        (
+                            "product".to_string(),
+                            vec![
+                                "widget".to_object(py),
+                                "gadget".to_object(py),
+                                "widget".to_object(py),
+                                "gizmo".to_object(py),
+                            ],
+                        ),
+                        (
+                            "_tenant".to_string(),
+                            vec![
+                                "t1".to_object(py),
+                                "t1".to_object(py),
+                                "t2".to_object(py),
+                                "t2".to_object(py),
+                            ],
+                        ),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            // Tenant t1 sees only orders 1, 2
+            storage.set_rls_policy("orders", "t1").unwrap();
+            let result = storage.read_rows(py, "orders", None, None).unwrap();
+            let ids = extract_i64_vec(py, &result, "id");
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains(&1));
+            assert!(ids.contains(&2));
+
+            // Tenant t2 sees only orders 3, 4
+            storage.set_rls_policy("orders", "t2").unwrap();
+            let result = storage.read_rows(py, "orders", None, None).unwrap();
+            let ids = extract_i64_vec(py, &result, "id");
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains(&3));
+            assert!(ids.contains(&4));
+
+            // Clear policy → all 4 orders visible
+            storage.clear_rls_policy("orders");
+            let result = storage.read_rows(py, "orders", None, None).unwrap();
+            let ids = extract_i64_vec(py, &result, "id");
+            assert_eq!(ids.len(), 4);
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    #[test]
+    fn test_rls_tenant_column_hidden_by_default() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            // Set policy and write
+            storage.set_rls_policy("users", "tenant_X").unwrap();
+            storage
+                .write_rows(
+                    "users",
+                    vec![(
+                        "name".to_string(),
+                        vec!["alice".to_object(py), "bob".to_object(py)],
+                    )],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            // Read without specifying columns → _tenant should be hidden
+            let result = storage.read_rows(py, "users", None, None).unwrap();
+            let dict = result.bind(py).downcast::<PyDict>().unwrap();
+
+            // _tenant should NOT be in the result (hidden like _rowid, _version)
+            assert!(
+                dict.get_item("_tenant").unwrap().is_none(),
+                "_tenant should be hidden by default in read_rows"
+            );
+            // name should be present
+            assert!(dict.get_item("name").unwrap().is_some());
+
+            cleanup_dir(&dir);
+        });
+    }
 }
