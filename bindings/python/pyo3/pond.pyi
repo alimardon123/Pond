@@ -407,6 +407,18 @@ class Storage:
         """Check if a transaction has been committed."""
         ...
 
+    def is_tx_aborted(self, tx_id: str) -> bool:
+        """Check if a transaction has been aborted."""
+        ...
+
+    def tx_status(self, tx_id: str) -> str:
+        """Get transaction status: 'committed', 'aborted', or 'pending'."""
+        ...
+
+    def read_at_snapshot(self, commit_hash: str) -> bytes:
+        """Read data at a specific commit (snapshot isolation)."""
+        ...
+
     # --- Optimize ---
 
     def optimize(self, collection: Optional[str] = None) -> OptimizeResult:
@@ -486,6 +498,64 @@ class Storage:
 
     def clear_rls_policy(self, collection: str) -> bool:
         """Clear the RLS policy. Returns True if a policy was cleared."""
+        ...
+
+    # --- Vector search ---
+
+    def search_vectors(
+        self,
+        collection: str,
+        vector_column: str,
+        query: list[float],
+        metric: str = "l2",
+        k: int = 10,
+        where_clause: Optional[str] = None,
+    ) -> list[tuple[dict[str, Any], float]]:
+        """Brute-force SIMD vector search. Returns [(row_dict, distance), ...]."""
+        ...
+
+    def hybrid_search(
+        self,
+        collection: str,
+        vector_column: Optional[str] = None,
+        query_vector: Optional[list[float]] = None,
+        text_columns: Optional[list[str]] = None,
+        query_text: Optional[str] = None,
+        where_clause: Optional[str] = None,
+        metric: str = "l2",
+        k: int = 10,
+        vector_weight: float = 1.0,
+        text_weight: float = 1.0,
+    ) -> list[tuple[dict[str, Any], float, Optional[float], Optional[float]]]:
+        """Hybrid search: vector + BM25 text + filter with weighted RRF fusion.
+
+        Returns [(row_dict, score, vector_distance, text_score), ...].
+        """
+        ...
+
+    # --- Streaming reads ---
+
+    def read_rows_stream(
+        self,
+        collection: str,
+        batch_size: int = 1000,
+    ) -> "RowBatchStream":
+        """Stream rows in batches. Returns an iterator yielding List[Dict]."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# SemanticLayer — handle for cross-collection semantic layer operations
+# ---------------------------------------------------------------------------
+
+class RowBatchStream:
+    """Iterator over row batches from read_rows_stream()."""
+
+    def __iter__(self) -> "RowBatchStream":
+        ...
+
+    def __next__(self) -> list[dict[str, Any]]:
+        """Return the next batch of rows. Raises StopIteration when exhausted."""
         ...
 
 
