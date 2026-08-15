@@ -3259,6 +3259,32 @@ impl Storage {
         pond_storage::transaction::is_tx_committed(kernel, tx_id)
     }
 
+    /// Check if a transaction has been aborted.
+    fn is_tx_aborted(&self, tx_id: &str) -> bool {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        pond_storage::transaction::is_tx_aborted(kernel, tx_id)
+    }
+
+    /// Get transaction status: "committed", "aborted", or "pending".
+    fn tx_status(&self, tx_id: &str) -> String {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        pond_storage::transaction::tx_status(kernel, tx_id).to_string()
+    }
+
+    /// Read data at a specific commit (snapshot isolation).
+    ///
+    /// Reads ONLY the manifest at the given commit, ignoring any shards
+    /// written after that commit. Provides a consistent snapshot for
+    /// long-running analytical queries.
+    fn read_at_snapshot(&self, commit_hash: &str) -> PyResult<Vec<u8>> {
+        let storage = self.storage.lock().unwrap();
+        let kernel = storage.kernel();
+        pond_storage::read::read_at_snapshot(kernel, commit_hash)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+    }
+
     // ===================================================================
     // Optimize — compact shards + flatten delta manifests
     //
@@ -3755,6 +3781,109 @@ impl Storage {
             PyTuple::new_bound(py, [row_dict, dist_obj]).into_any()
         }));
         Ok(list.into())
+    }
+
+    /// Hybrid search combining vector similarity, BM25 text scoring, and
+    /// metadata filtering via weighted Reciprocal Rank Fusion (RRF).
+    ///
+    /// Combines three search signals:
+    ///   1. Vector: SIMD-accelerated L2/cosine/dot distance
+    ///   2. Text: BM25 scoring over specified text columns
+    ///   3. Filter: metadata WHERE clause (exact match boost)
+    ///
+    /// Results are fused using weighted RRF (k=60) and returned sorted by
+    /// fused score descending.
+    ///
+    /// # Arguments
+    ///   - collection: the collection to search
+    ///   - vector_column: name of the VECTOR column (None = skip vector search)
+    ///   - query_vector: the query embedding
+    ///   - text_columns: columns to search with BM25 (None = skip text search)
+    ///   - query_text: the text query
+    ///   - where_clause: SQL WHERE filter (None = skip filter boost)
+    ///   - metric: "l2", "cosine", or "dot"
+    ///   - k: number of results to return
+    ///   - vector_weight: weight for vector signal (default 1.0)
+    ///   - text_weight: weight for text signal (default 1.0)
+    #[pyo3(signature = (
+        collection,
+        vector_column=None,
+        query_vector=None,
+        text_columns=None,
+        query_text=None,
+        where_clause=None,
+        metric="l2",
+        k=10,
+        vector_weight=1.0,
+        text_weight=1.0,
+    ))]
+    fn hybrid_search(
+        &self,
+        py: Python<'_>,
+        collection: &str,
+        vector_column: Option<&str>,
+        query_vector: Option<Vec<f32>>,
+        text_columns: Option<Vec<String>>,
+        query_text: Option<&str>,
+        where_clause: Option<&str>,
+        metric: &str,
+        k: usize,
+        vector_weight: f64,
+        text_weight: f64,
+    ) -> PyResult<PyObject> {
+        use pond_core::search::{self, SearchWeights};
+
+        // Read all rows
+        let rows_py = self.read_rows(py, collection, None, None)?;
+        let rows_json = python_to_json(&rows_py);
+        let rows: Vec<JsonValue> = rows_json.as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        if rows.is_empty() {
+            return Ok(PyList::empty_bound(py).into());
+        }
+
+        // Extract parameters
+        let vc = vector_column.unwrap_or("");
+        let qv: &[f32] = query_vector.as_deref().unwrap_or(&[]);
+        let tc_owned: Vec<String> = text_columns.unwrap_or_default();
+        let tc: Vec<&str> = tc_owned.iter().map(|s| s.as_str()).collect();
+        let qt = query_text.unwrap_or("");
+
+        // Parse WHERE clause if present
+        let where_closure: Option<Box<dyn Fn(&JsonValue) -> bool>> = if let Some(w) = where_clause.filter(|s| !s.is_empty()) {
+            match parse_where(w) {
+                Ok(expr) => Some(Box::new(move |row: &JsonValue| expr.eval(row))),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // Execute hybrid search
+        let hits = search::hybrid_search(
+            &rows,
+            vc,
+            qv,
+            &tc,
+            qt,
+            where_closure.as_ref().map(|f| f as &dyn Fn(&JsonValue) -> bool),
+            SearchWeights { vector: vector_weight, text: text_weight },
+            k,
+            metric,
+        );
+
+        // Build result list of (row_dict, score, vector_distance, text_score) tuples
+        let result_list = PyList::new_bound(py, hits.iter().map(|hit| {
+            let row_dict = json_to_pyobject(py, &hit.row);
+            let score = hit.score.to_object(py);
+            let vdist = hit.vector_distance.map(|d| d.to_object(py)).unwrap_or_else(|| py.None());
+            let tscore = hit.text_score.map(|s| s.to_object(py)).unwrap_or_else(|| py.None());
+            PyTuple::new_bound(py, [row_dict, score, vdist, tscore]).into_any()
+        }));
+
+        Ok(result_list.into())
     }
 
     // ===================================================================
