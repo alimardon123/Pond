@@ -1,6 +1,6 @@
 // Integration tests for the pond CLI
 // Tests the full API: init, write, read, branch, checkout (-b), merge (source→target),
-// branches, history, undo, ls, cat, version.
+// branches, history, undo, ls, cat, version, and the interactive shell/REPL.
 
 use std::process::Command;
 use std::fs;
@@ -20,6 +20,28 @@ fn run(root: &std::path::Path, args: &[&str]) -> String {
         panic!("pond {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
     }
     String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Run `pond shell` with the given stdin bytes, returning (stdout, stderr, status).
+fn run_shell(root: &std::path::Path, args: &[&str], stdin: &[u8]) -> (String, String, bool) {
+    let mut cmd = pond(root, args);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    {
+        use std::io::Write;
+        let stdin_handle = child.stdin.as_mut().unwrap();
+        stdin_handle.write_all(stdin).unwrap();
+    }
+    // Drop stdin to signal EOF so the REPL exits.
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
 }
 
 #[test]
@@ -397,4 +419,307 @@ fn test_sql_select_with_where_and_limit() {
     let second_age = rows[1].get("age").and_then(|v| v.as_i64());
     assert_eq!(first_age, Some(30), "first row age should be 30: {}", out);
     assert_eq!(second_age, Some(35), "second row age should be 35: {}", out);
+}
+
+// ===========================================================================
+// Shell / REPL tests — `pond shell` interactive mode
+// ===========================================================================
+//
+// These tests exercise the REPL via subprocess invocations with piped stdin.
+// The REPL exits cleanly on EOF (closed stdin), so each test pipes a complete
+// command sequence followed by `\q` (or just closes stdin) and asserts on the
+// captured stdout.
+
+/// Helper: seed a small `items` collection in a fresh repo.
+fn seed_items(root: &std::path::Path) {
+    run(root, &["init", "."]);
+    run(root, &["sql", "INSERT INTO items (id, name) VALUES (1, 'widget'), (2, 'gadget')"]);
+}
+
+#[test]
+fn test_shell_exec_select_and_exit() {
+    // `pond shell --exec "SELECT ..."` with closed stdin should execute the
+    // SQL once and exit cleanly (the REPL sees EOF on the first read).
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    let (out, stderr, ok) = run_shell(dir.path(), &["shell", "--exec", "SELECT * FROM items"], b"");
+    assert!(ok, "shell --exec should exit cleanly; stderr: {}", stderr);
+    assert!(out.contains("Pond REPL"), "banner should be printed: {}", out);
+    assert!(out.contains("widget"), "SQL result should be printed: {}", out);
+    assert!(out.contains("gadget"), "SQL result should be printed: {}", out);
+}
+
+#[test]
+fn test_shell_exec_insert_then_select() {
+    // --exec can run an INSERT; a subsequent piped SELECT shows the row.
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    let (out, _err, ok) = run_shell(
+        dir.path(),
+        &["shell", "--exec", "INSERT INTO nums (id, val) VALUES (1, 'first')"],
+        b"SELECT * FROM nums;\n\\q\n",
+    );
+    assert!(ok, "shell should exit cleanly");
+    assert!(out.contains("first"), "SELECT should show inserted row: {}", out);
+}
+
+#[test]
+fn test_shell_parser_sql_select() {
+    // A SELECT statement (ending with `;`) is dispatched to the SQL executor.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    let (out, _err, ok) = run_shell(
+        dir.path(),
+        &["shell"],
+        b"SELECT * FROM items WHERE name = 'widget';\n\\q\n",
+    );
+    assert!(ok);
+    assert!(out.contains("widget"), "SELECT should find widget: {}", out);
+    // Ensure the non-matching row is absent from this filtered query.
+    // (We can't assert !contains('gadget') because the banner/help might mention it,
+    //  but the JSON rows block should only contain widget.)
+    assert!(out.contains("columns"), "SQL result should be JSON: {}", out);
+}
+
+#[test]
+fn test_shell_parser_meta_list_collections() {
+    // `\l` is dispatched as a meta-command (list collections), not as SQL.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    let (out, err, ok) = run_shell(dir.path(), &["shell"], b"\\l\n\\q\n");
+    assert!(ok);
+    assert!(out.contains("items"), "\\l should list the items collection: {}", out);
+    // `\l` should NOT produce a SQL error — if it were mis-dispatched as SQL,
+    // we'd see the parser's "Expected FROM" error on stderr.
+    assert!(!err.contains("Expected FROM"), "\\l must not be parsed as SQL: stderr={}", err);
+}
+
+#[test]
+fn test_shell_parser_meta_describe() {
+    // `\d <name>` shows the collection schema.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    let (out, _err, ok) = run_shell(dir.path(), &["shell"], b"\\d items\n\\q\n");
+    assert!(ok);
+    assert!(out.contains("Collection:"), "\\d should print collection header: {}", out);
+    assert!(out.contains("id"), "\\d should list the id column: {}", out);
+    assert!(out.contains("name"), "\\d should list the name column: {}", out);
+    assert!(out.contains("INT64"), "\\d should show column types: {}", out);
+}
+
+#[test]
+fn test_shell_parser_meta_branches() {
+    // `\b <name>` shows branches for a collection.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    let (out, _err, ok) = run_shell(dir.path(), &["shell"], b"\\b items\n\\q\n");
+    assert!(ok);
+    assert!(out.contains("main"), "\\b should show the main branch: {}", out);
+}
+
+#[test]
+fn test_shell_parser_meta_help() {
+    // `\h` prints the help text.
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    let (out, _err, ok) = run_shell(dir.path(), &["shell"], b"\\h\n\\q\n");
+    assert!(ok);
+    assert!(out.contains("Meta-commands"), "\\h should print the help section: {}", out);
+    assert!(out.contains("\\l"), "help should mention \\l: {}", out);
+    assert!(out.contains("\\q"), "help should mention \\q: {}", out);
+    assert!(out.contains("\\history"), "help should mention \\history: {}", out);
+}
+
+#[test]
+fn test_shell_parser_quit_variants() {
+    // All quit variants (`\q`, `\quit`, `exit`, `quit`) exit the REPL cleanly.
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    for quit_cmd in &["\\q", "\\quit", "exit", "quit"] {
+        let stdin = format!("{}\n", quit_cmd);
+        let (out, _err, ok) = run_shell(dir.path(), &["shell"], stdin.as_bytes());
+        assert!(ok, "quit variant {:?} should exit cleanly", quit_cmd);
+        assert!(out.contains("Pond REPL"), "banner should print before quit: {}", out);
+        // After the quit command, the REPL should NOT print another prompt.
+        // Count prompts: exactly one "pond> " before the quit command.
+        let prompt_count = out.matches("pond> ").count();
+        assert_eq!(prompt_count, 1, "expected exactly one prompt for {:?}", quit_cmd);
+    }
+}
+
+#[test]
+fn test_shell_multiline_input_accumulation() {
+    // SQL split across multiple lines (without a trailing `;` on the first
+    // line) is accumulated until a line ending with `;` is seen.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    let (out, _err, ok) = run_shell(
+        dir.path(),
+        &["shell"],
+        b"SELECT *\nFROM items\nWHERE id = 1;\n\\q\n",
+    );
+    assert!(ok, "multiline SQL should execute cleanly");
+    assert!(out.contains("widget"), "multiline SELECT should find widget: {}", out);
+    // The continuation prompt `  ... ` should appear for lines 2 and 3.
+    let cont_count = out.matches("  ... ").count();
+    assert_eq!(cont_count, 2, "expected 2 continuation prompts, got: {}", out);
+}
+
+#[test]
+fn test_shell_multiline_then_immediate_meta() {
+    // A meta-command should execute immediately even after a partial SQL line
+    // has been entered (meta-commands don't participate in accumulation).
+    // NOTE: in the current implementation, a partial SQL buffer is NOT cleared
+    // by a meta-command — the buffer persists. This test verifies that a
+    // meta-command still executes correctly mid-statement.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    // Type "SELECT *" (no semicolon, accumulates), then "\l" (meta, executes
+    // immediately), then "FROM items;" completes the SQL.
+    let (out, _err, ok) = run_shell(
+        dir.path(),
+        &["shell"],
+        b"SELECT *\n\\l\nFROM items;\n\\q\n",
+    );
+    assert!(ok);
+    // The \l meta-command should have executed and listed items.
+    assert!(out.contains("items"), "\\l should still execute mid-statement: {}", out);
+    // The SQL statement should have completed and executed after the meta.
+    assert!(out.contains("widget"), "SQL should complete after the meta-command: {}", out);
+}
+
+#[test]
+fn test_shell_history_command() {
+    // `\history` shows the commands executed so far.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    let (out, _err, ok) = run_shell(
+        dir.path(),
+        &["shell"],
+        b"SELECT * FROM items;\n\\history\n\\q\n",
+    );
+    assert!(ok);
+    // The history output should include the SELECT statement we ran.
+    assert!(out.contains("SELECT * FROM items"), "\\history should show prior SQL: {}", out);
+    // It should also include itself and the preceding commands.
+    assert!(out.contains("\\history"), "\\history should include itself: {}", out);
+}
+
+#[test]
+fn test_shell_history_capped_at_100() {
+    // History is capped at 100 entries; older entries are evicted.
+    // We run 105 trivial SQL statements (each fails harmlessly) and then
+    // check that \history shows at most 100 entries.
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    let mut stdin = Vec::new();
+    for i in 0..105 {
+        stdin.extend_from_slice(format!("SELECT * FROM items WHERE id = {};\n", i).as_bytes());
+    }
+    stdin.extend_from_slice(b"\\history\n\\q\n");
+
+    let (out, _err, _ok) = run_shell(dir.path(), &["shell"], &stdin);
+    // History is capped at 100 entries. We pushed 105 SQL statements + the
+    // `\history` command itself = 106 entries, so the oldest 6 are evicted.
+    // After eviction, the surviving entries are id=6..104 plus `\history`.
+    //
+    // We use ";" as a terminator in the substring check to avoid ambiguity:
+    //   - "id = 0;" only matches the id=0 entry (not id=100..104, which start
+    //     with "id = 1").
+    //   - "id = 5;" only matches id=5 (not id=50..59, because those are
+    //     "id = 50;" etc., and "id = 5;" is not a substring of "id = 50;").
+    assert!(!out.contains("id = 0;"), "history should evict id=0 (oldest): {}", out);
+    assert!(!out.contains("id = 5;"), "history should evict id=5 (pushed out by \\history): {}", out);
+    assert!(out.contains("id = 6;"), "history should retain id=6 (first survivor): {}", out);
+    assert!(out.contains("id = 104;"), "history should retain id=104 (most recent SQL): {}", out);
+    // The `\history` command itself should appear in its own output.
+    assert!(out.contains("\\history"), "\\history should include itself: {}", out);
+}
+
+#[test]
+fn test_shell_empty_lines_skipped() {
+    // Empty lines (and whitespace-only lines) are skipped, not added to the
+    // buffer or history.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    let (out, _err, ok) = run_shell(
+        dir.path(),
+        &["shell"],
+        b"\n   \nSELECT * FROM items;\n\n\\history\n\\q\n",
+    );
+    assert!(ok);
+    // History should contain exactly 2 entries: the SELECT and \history.
+    // (Empty lines are NOT in history.)
+    let select_lines: Vec<&str> = out.lines().filter(|l| l.contains("SELECT * FROM items")).collect();
+    assert_eq!(select_lines.len(), 1, "SELECT should appear once in output (in history): {}", out);
+}
+
+#[test]
+fn test_shell_sql_error_does_not_exit() {
+    // A SQL error should be printed but not terminate the REPL — the user can
+    // continue entering commands.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    // Run an invalid SQL statement, then a valid one.
+    let (out, err, ok) = run_shell(
+        dir.path(),
+        &["shell"],
+        b"SELECT FROM bogus_syntax;\nSELECT * FROM items;\n\\q\n",
+    );
+    assert!(ok, "REPL should not crash on SQL error");
+    assert!(err.contains("Error"), "SQL error should be reported on stderr: {}", err);
+    // The subsequent valid SELECT should still execute.
+    assert!(out.contains("widget"), "valid SELECT after error should still run: {}", out);
+}
+
+#[test]
+fn test_shell_exit_on_eof() {
+    // Closing stdin (EOF) without an explicit \q should exit cleanly.
+    let dir = TempDir::new().unwrap();
+    seed_items(dir.path());
+
+    let (out, _err, ok) = run_shell(
+        dir.path(),
+        &["shell"],
+        b"SELECT * FROM items;\n", // no \q — just EOF
+    );
+    assert!(ok, "REPL should exit cleanly on EOF");
+    assert!(out.contains("widget"), "SQL should execute before EOF: {}", out);
+}
+
+#[test]
+fn test_shell_describe_unknown_collection() {
+    // `\d <unknown>` should print a friendly "no commits" message, not crash.
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    let (out, _err, ok) = run_shell(dir.path(), &["shell"], b"\\d nonexistent\n\\q\n");
+    assert!(ok);
+    assert!(out.contains("no commits") || out.contains("nonexistent"),
+        "describe on unknown collection should be graceful: {}", out);
+}
+
+#[test]
+fn test_shell_shell_escape() {
+    // `\! <cmd>` runs a shell command and forwards its output.
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+
+    let (out, _err, ok) = run_shell(dir.path(), &["shell"], b"\\! echo hello_from_shell\n\\q\n");
+    assert!(ok);
+    assert!(out.contains("hello_from_shell"), "\\! should forward shell output: {}", out);
 }

@@ -146,6 +146,20 @@ enum Commands {
         /// SQL query string.
         query: String,
     },
+    /// Start interactive REPL (read-eval-print loop) mode.
+    ///
+    /// Enters an interactive shell where you can run SQL statements and
+    /// meta-commands. SQL statements accumulate until a line ending with `;`
+    /// is entered. Meta-commands (starting with `\`) execute immediately.
+    ///
+    /// Example:
+    ///   pond shell
+    ///   pond shell --exec "SELECT * FROM users"
+    Shell {
+        /// Execute a SQL query on startup, then enter the REPL.
+        #[arg(long)]
+        exec: Option<String>,
+    },
     Version,
 }
 
@@ -218,6 +232,11 @@ fn main() {
                 }
                 Commands::Sql { query } => {
                     cmd_sql(&storage, &query);
+                }
+                Commands::Shell { exec } => {
+                    // Shell takes ownership of storage — it's the only command
+                    // in this dispatch arm that runs a long-lived REPL loop.
+                    cmd_shell(storage, exec);
                 }
                 _ => unreachable!(),
             }
@@ -1456,5 +1475,381 @@ fn print_rows(rows: &[JsonValue], format: &str) {
             eprintln!("Error: unknown format '{}' (use 'json' or 'table')", other);
             std::process::exit(1);
         }
+    }
+}
+
+// ===========================================================================
+// Shell / REPL mode — interactive read-eval-print loop
+// ===========================================================================
+
+/// Maximum number of commands retained in REPL history (in-memory only).
+const REPL_HISTORY_LIMIT: usize = 100;
+
+/// Classification of a single REPL input line.
+///
+/// Used by `parse_repl_command` to decide how to dispatch a line. SQL lines
+/// are not parsed here — they're passed verbatim to `pond_sql::execute`.
+enum ReplCommand {
+    /// A SQL statement (SELECT/INSERT/UPDATE/DELETE/MERGE, or any
+    /// unrecognized input that we'll attempt as SQL).
+    Sql(String),
+    /// `\l` or `\list` — list collections.
+    ListCollections,
+    /// `\d <name>` or `\describe <name>` — show collection schema.
+    Describe(String),
+    /// `\b <name>` — show branches for a collection.
+    Branches(String),
+    /// `\h`, `\help`, or `\?` — show help.
+    Help,
+    /// `\history` — show command history.
+    History,
+    /// `\! <cmd>` — execute a shell command.
+    Shell(String),
+    /// `\q`, `\quit`, or `exit` — quit the REPL.
+    Quit,
+    /// Empty/whitespace-only line — no-op.
+    Empty,
+}
+
+/// Parse a single REPL input line into a [`ReplCommand`].
+///
+/// Classification rules:
+///   - Empty/whitespace-only → [`ReplCommand::Empty`]
+///   - Starts with `\` → meta-command (split on first whitespace)
+///   - Exactly `exit` or `quit` (case-insensitive) → [`ReplCommand::Quit`]
+///   - Otherwise → [`ReplCommand::Sql`] (attempted as SQL)
+///
+/// Unknown meta-commands fall through to `Sql` so the user sees a SQL error
+/// rather than a silent no-op.
+fn parse_repl_command(line: &str) -> ReplCommand {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return ReplCommand::Empty;
+    }
+
+    // Meta-commands start with a backslash.
+    if trimmed.starts_with('\\') {
+        // Split into command + rest on the first whitespace run.
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("");
+        let arg = parts.next().map(|s| s.trim().to_string()).unwrap_or_default();
+        return match cmd {
+            "\\l" | "\\list" => ReplCommand::ListCollections,
+            "\\d" | "\\describe" => ReplCommand::Describe(arg),
+            "\\b" => ReplCommand::Branches(arg),
+            "\\h" | "\\help" | "\\?" => ReplCommand::Help,
+            "\\history" => ReplCommand::History,
+            "\\!" => ReplCommand::Shell(arg),
+            "\\q" | "\\quit" => ReplCommand::Quit,
+            // Unknown meta-command — pass through to SQL so the user gets a
+            // visible error rather than a silent drop.
+            _ => ReplCommand::Sql(trimmed.to_string()),
+        };
+    }
+
+    // Plain `exit` or `quit` (case-insensitive, single word).
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "exit" || lower == "quit" {
+        return ReplCommand::Quit;
+    }
+
+    // Everything else is treated as SQL.
+    ReplCommand::Sql(trimmed.to_string())
+}
+
+/// Start the interactive REPL.
+///
+/// Behavior:
+///   1. Print a welcome banner with available commands.
+///   2. If `--exec` is provided, execute that SQL query first.
+///   3. Enter a read-eval-print loop:
+///      - Read a line from stdin.
+///      - Meta-commands (start with `\`) execute immediately, no `;` needed.
+///      - `exit`/`quit`/`\q` exit the REPL.
+///      - SQL lines accumulate until a line ending with `;` is seen.
+///      - Empty lines are skipped.
+///   4. On EOF (Ctrl+D) or read error, exit cleanly.
+///
+/// Ctrl+C relies on the default SIGINT disposition (terminate the process).
+/// This is intentional — no external signal-handling crates are pulled in,
+/// keeping the CLI dependency-light. The process exits with the conventional
+/// SIGINT exit code (130).
+fn cmd_shell(storage: UnifiedStorage, exec: Option<String>) {
+    println!("Pond REPL v{}", env!("CARGO_PKG_VERSION"));
+    println!("Type \\h for help, \\q to quit.");
+
+    let mut history: Vec<String> = Vec::with_capacity(REPL_HISTORY_LIMIT + 1);
+
+    // Execute --exec SQL first, before entering the read loop.
+    if let Some(sql) = exec {
+        execute_repl_line(&storage, &sql, &mut history);
+    }
+
+    let stdin = io::stdin();
+    let mut buffer = String::new();
+
+    loop {
+        // Print the prompt: `pond> ` for a fresh statement, `  ... ` for a
+        // multi-line continuation.
+        if buffer.is_empty() {
+            print!("pond> ");
+        } else {
+            print!("  ... ");
+        }
+        io::stdout().flush().ok();
+
+        // Read a line from stdin.
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break, // EOF (Ctrl+D)
+            Ok(_) => {}
+            Err(_) => break, // Read error — bail out.
+        }
+
+        // Strip trailing CR/LF.
+        let line = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let trimmed = line.trim();
+
+        // Skip empty lines (don't add to buffer or history).
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Meta-commands execute immediately (no semicolon needed).
+        if trimmed.starts_with('\\') {
+            let was_quit = matches!(parse_repl_command(trimmed), ReplCommand::Quit);
+            execute_repl_line(&storage, trimmed, &mut history);
+            if was_quit {
+                break;
+            }
+            continue;
+        }
+
+        // Plain `exit`/`quit` (case-insensitive, single word) — exit now.
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "exit" || lower == "quit" {
+            break;
+        }
+
+        // SQL accumulation: append to buffer with a separating space.
+        if !buffer.is_empty() {
+            buffer.push(' ');
+        }
+        buffer.push_str(trimmed);
+
+        // Execute when the buffer ends with `;`.
+        if buffer.ends_with(';') {
+            let cmd = buffer.clone();
+            execute_repl_line(&storage, &cmd, &mut history);
+            buffer.clear();
+        }
+    }
+}
+
+/// Execute a single REPL line (already classified by [`parse_repl_command`]).
+///
+/// Records the line in `history` (capped at [`REPL_HISTORY_LIMIT`] entries),
+/// then dispatches to the appropriate handler. Errors are printed to stderr
+/// and do not terminate the REPL.
+fn execute_repl_line(storage: &UnifiedStorage, line: &str, history: &mut Vec<String>) {
+    // Record in history (skip pure-empty lines).
+    let entry = line.trim().to_string();
+    if !entry.is_empty() {
+        history.push(entry.clone());
+        if history.len() > REPL_HISTORY_LIMIT {
+            history.remove(0);
+        }
+    }
+
+    match parse_repl_command(line) {
+        ReplCommand::Empty => {}
+        ReplCommand::Quit => {
+            // Handled by the caller (`cmd_shell` breaks out of the loop).
+        }
+        ReplCommand::Help => print_repl_help(),
+        ReplCommand::History => print_history(history),
+        ReplCommand::ListCollections => {
+            cmd_ls(storage);
+        }
+        ReplCommand::Describe(name) => {
+            if name.is_empty() {
+                eprintln!("Usage: \\d <collection>");
+            } else {
+                describe_collection(storage, &name);
+            }
+        }
+        ReplCommand::Branches(name) => {
+            if name.is_empty() {
+                eprintln!("Usage: \\b <collection>");
+            } else {
+                cmd_branches(storage, &name);
+            }
+        }
+        ReplCommand::Shell(cmd) => {
+            execute_shell_escape(&cmd);
+        }
+        ReplCommand::Sql(query) => {
+            // Strip trailing semicolons — the SQL executor expects a single
+            // statement without the terminator.
+            let q = query.trim().trim_end_matches(';').trim();
+            if q.is_empty() {
+                return;
+            }
+            match pond_sql::execute(storage, q) {
+                Ok(result) => print_sql_result(&result),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+    }
+}
+
+/// Print the REPL help text.
+fn print_repl_help() {
+    println!("Pond REPL commands:");
+    println!("  SQL statements execute when a line ends with ';'.");
+    println!("  Multi-line SQL is accumulated until ';' is seen.");
+    println!();
+    println!("Meta-commands (no ';' needed):");
+    println!("  \\l, \\list              List collections");
+    println!("  \\d <name>,              Show schema for a collection");
+    println!("  \\describe <name>");
+    println!("  \\b <name>               Show branches for a collection");
+    println!("  \\history                Show command history (last {})", REPL_HISTORY_LIMIT);
+    println!("  \\! <cmd>                Execute a shell command");
+    println!("  \\h, \\help, \\?           Show this help");
+    println!("  \\q, \\quit, exit         Quit the REPL");
+    println!();
+    println!("SQL keywords: SELECT, INSERT, UPDATE, DELETE, MERGE");
+}
+
+/// Print the command history (oldest first, most recent last).
+fn print_history(history: &[String]) {
+    if history.is_empty() {
+        println!("(no history yet)");
+        return;
+    }
+    for (i, cmd) in history.iter().enumerate() {
+        println!("{:>4}  {}", i + 1, cmd);
+    }
+}
+
+/// Execute a shell escape: `\! <cmd>`.
+///
+/// Runs the rest of the line via `sh -c`. Stdout/stderr of the child process
+/// are forwarded to the REPL's stdout/stderr. On Unix only — `sh` must be on
+/// PATH.
+fn execute_shell_escape(cmd: &str) {
+    if cmd.is_empty() {
+        eprintln!("Usage: \\! <command>");
+        return;
+    }
+    match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+        Ok(output) => {
+            io::stdout().write_all(&output.stdout).ok();
+            io::stderr().write_all(&output.stderr).ok();
+        }
+        Err(e) => eprintln!("Error: failed to execute '{}': {}", cmd, e),
+    }
+}
+
+/// Print a SQL result as JSON (same format as `pond sql`).
+fn print_sql_result(result: &pond_sql::SqlResult) {
+    let out = json!({
+        "columns": result.columns,
+        "rows": result.rows,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+/// Describe a collection's schema (columns, types, row groups, branches).
+///
+/// Loads the active branch's HEAD, decodes the manifest, and prints:
+///   - Collection name and active branch
+///   - Key column
+///   - Row-group count and total rows
+///   - Column schema (name + type)
+fn describe_collection(storage: &UnifiedStorage, collection: &str) {
+    let kernel = storage.kernel();
+    let active = storage.get_active_branch(collection);
+    let head = kernel
+        .resolve(&pond_storage::branch_ref(collection, &active))
+        .or_else(|| kernel.resolve(collection));
+
+    let head = match head {
+        Some(h) => h,
+        None => {
+            println!("Collection '{}' has no commits.", collection);
+            return;
+        }
+    };
+
+    let head_data = match kernel.read_blob(&head) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error reading HEAD: {}", e);
+            return;
+        }
+    };
+
+    // The HEAD blob may be a raw commit or a PondPack (commit + manifest + data).
+    let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
+        match pond_storage::pond_pack::decode_pack(&head_data) {
+            Some((_, mb, _)) => mb,
+            None => {
+                eprintln!("Error: failed to decode PondPack");
+                return;
+            }
+        }
+    } else {
+        let commit = match commit::read_commit(kernel, &head) {
+            Some(c) => c,
+            None => {
+                eprintln!("Error: failed to read commit");
+                return;
+            }
+        };
+        if commit.manifest.is_empty() {
+            println!("Collection '{}' has no manifest (empty commit).", collection);
+            return;
+        }
+        match kernel.read_blob(&commit.manifest) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Error reading manifest: {}", e);
+                return;
+            }
+        }
+    };
+
+    let manifest = match CollectionManifest::decode(&manifest_bytes) {
+        Some(m) => m,
+        None => {
+            eprintln!("Error: failed to decode manifest");
+            return;
+        }
+    };
+
+    println!("Collection:    {}", collection);
+    println!("Active branch: {}", active);
+    println!("Key column:    {}", manifest.key_col);
+    println!("Row groups:    {}", manifest.row_groups.len());
+    let total_rows: u32 = manifest.row_groups.iter().map(|rg| rg.n_rows).sum();
+    println!("Total rows:    {}", total_rows);
+    println!();
+    println!("Schema:");
+    println!("  {:<24} {:<10}", "Column", "Type");
+    println!("  {:<24} {:<10}", "------", "----");
+    for (name, vtype) in &manifest.columns {
+        let type_str = match *vtype {
+            VT_INT64 => "INT64",
+            VT_FLOAT64 => "FLOAT64",
+            VT_STRING => "STRING",
+            VT_BOOLEAN => "BOOLEAN",
+            _ => "OTHER",
+        };
+        println!("  {:<24} {:<10}", name, type_str);
     }
 }

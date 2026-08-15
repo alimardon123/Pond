@@ -704,19 +704,21 @@ fn read_file_rows(path: &str) -> Result<Vec<JsonValue>, String> {
     } else if path.ends_with(".csv") || path.ends_with(".tsv") {
         let delimiter = if path.ends_with(".tsv") { '\t' } else { ',' };
         let mut rows = Vec::new();
-        let mut lines = content.lines();
-        let header_line = lines.next()
-            .ok_or_else(|| "CSV file is empty".to_string())?;
-        let headers: Vec<String> = header_line.split(delimiter)
-            .map(|s| s.trim().trim_matches('"').to_string())
-            .collect();
 
-        for line in lines {
-            if line.trim().is_empty() { continue; }
-            let values: Vec<&str> = line.split(delimiter).collect();
+        // Use a proper CSV parser that handles quoted fields, embedded delimiters,
+        // and embedded newlines (RFC 4180 compliant).
+        let records = parse_csv(&content, delimiter);
+        if records.is_empty() {
+            return Err("CSV file is empty".to_string());
+        }
+
+        let headers: Vec<String> = records[0].iter().cloned().collect();
+
+        for record in records.iter().skip(1) {
+            if record.is_empty() { continue; }
             let mut obj = serde_json::Map::new();
             for (i, header) in headers.iter().enumerate() {
-                let val_str = values.get(i).unwrap_or(&"").trim().trim_matches('"');
+                let val_str = record.get(i).map_or("", |v| v.as_str());
                 let val = if let Ok(n) = val_str.parse::<i64>() {
                     JsonValue::Number(serde_json::Number::from(n))
                 } else if let Ok(f) = val_str.parse::<f64>() {
@@ -1285,4 +1287,128 @@ fn chrono_like_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{:x}", nanos)
+}
+
+/// RFC 4180 compliant CSV parser.
+///
+/// Handles:
+///   - Quoted fields: "hello, world" → hello, world
+///   - Embedded quotes: "He said ""hi""" → He said "hi"
+///   - Embedded newlines: "line1\nline2" → line1\nline2
+///   - Empty fields: ,, → empty string
+///   - Trailing newlines: ignores empty last line
+///
+/// Returns a Vec of records, each record is a Vec of field strings.
+fn parse_csv(content: &str, delimiter: char) -> Vec<Vec<String>> {
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut current_record: Vec<String> = Vec::new();
+    let mut current_field = String::new();
+    let mut in_quotes = false;
+    let mut chars = content.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                // Check for escaped quote ""
+                if chars.peek() == Some(&'"') {
+                    chars.next(); // consume the second "
+                    current_field.push('"');
+                } else {
+                    // End of quoted field
+                    in_quotes = false;
+                }
+            } else {
+                current_field.push(c);
+            }
+        } else {
+            if c == '"' {
+                in_quotes = true;
+            } else if c == delimiter {
+                current_record.push(std::mem::take(&mut current_field));
+            } else if c == '\n' {
+                current_record.push(std::mem::take(&mut current_field));
+                // Only add non-empty records (skip trailing newline)
+                if !current_record.is_empty() && !(current_record.len() == 1 && current_record[0].is_empty()) {
+                    records.push(std::mem::take(&mut current_record));
+                } else {
+                    current_record.clear();
+                }
+            } else if c == '\r' {
+                // Handle \r\n line endings — skip \r, let \n handle the record end
+                continue;
+            } else {
+                current_field.push(c);
+            }
+        }
+    }
+
+    // Don't forget the last field/record if there's no trailing newline
+    if !current_field.is_empty() || !current_record.is_empty() {
+        current_record.push(current_field);
+        records.push(current_record);
+    }
+
+    records
+}
+
+#[cfg(test)]
+mod csv_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_csv_basic() {
+        let csv = "name,age,city\nAlice,30,NYC\nBob,25,SF";
+        let records = parse_csv(csv, ',');
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0], vec!["name", "age", "city"]);
+        assert_eq!(records[1], vec!["Alice", "30", "NYC"]);
+        assert_eq!(records[2], vec!["Bob", "25", "SF"]);
+    }
+
+    #[test]
+    fn test_parse_csv_quoted_fields() {
+        let csv = "name,description\n\"Alice\",\"Hello, World\"\n\"Bob\",\"He said \"\"hi\"\"\"";
+        let records = parse_csv(csv, ',');
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1], vec!["Alice", "Hello, World"]);
+        assert_eq!(records[2], vec!["Bob", "He said \"hi\""]);
+    }
+
+    #[test]
+    fn test_parse_csv_embedded_newline() {
+        let csv = "name,text\n\"Alice\",\"Line 1\nLine 2\"";
+        let records = parse_csv(csv, ',');
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1][1], "Line 1\nLine 2");
+    }
+
+    #[test]
+    fn test_parse_csv_empty_fields() {
+        let csv = "a,b,c\n1,,3";
+        let records = parse_csv(csv, ',');
+        assert_eq!(records[1], vec!["1", "", "3"]);
+    }
+
+    #[test]
+    fn test_parse_csv_tsv() {
+        let tsv = "name\tage\nAlice\t30";
+        let records = parse_csv(tsv, '\t');
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1], vec!["Alice", "30"]);
+    }
+
+    #[test]
+    fn test_parse_csv_trailing_newline() {
+        let csv = "a,b\n1,2\n";
+        let records = parse_csv(csv, ',');
+        assert_eq!(records.len(), 2); // trailing newline doesn't create empty record
+    }
+
+    #[test]
+    fn test_parse_csv_crlf() {
+        let csv = "a,b\r\n1,2\r\n3,4";
+        let records = parse_csv(csv, ',');
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1], vec!["1", "2"]);
+    }
 }

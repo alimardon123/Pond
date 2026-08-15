@@ -111,7 +111,86 @@ The `.pond/` marker directory contains a `config` file:
 | `revert <collection> <commit_hash>` | Revert to a specific commit |
 | `ls` | List collections |
 | `cat <hash>` | Print a blob by hash |
+| `sql "<query>"` | Execute a SQL statement (one-shot) |
+| `shell [--exec "<sql>"]` | Start the interactive REPL |
 | `version` | Print version |
+
+## Shell / REPL Mode
+
+`pond shell` starts an interactive read-eval-print loop for exploring data
+and running SQL without the per-invocation startup cost.
+
+```bash
+$ pond shell
+Pond REPL v0.3.0
+Type \h for help, \q to quit.
+pond> SELECT * FROM users WHERE age > 30;
+{
+  "columns": ["id", "name", "age"],
+  "rows": [ ... ]
+}
+pond> \l                          # list collections
+pond> \d users                    # describe schema
+pond> \b users                    # show branches
+pond> \history                    # show last 100 commands
+pond> \! ls -la                   # run a shell command
+pond> \q                          # quit (or Ctrl+D / `exit`)
+```
+
+### `--exec` (startup SQL)
+
+`--exec` runs a SQL statement on startup, then enters the REPL:
+
+```bash
+pond shell --exec "SELECT * FROM users"
+```
+
+When stdin is closed (EOF), the REPL exits after running the `--exec` query —
+useful for piping:
+
+```bash
+pond shell --exec "SELECT * FROM users" < /dev/null
+```
+
+### Meta-commands
+
+| Command | Action |
+|---|---|
+| `\l`, `\list` | List collections |
+| `\d <name>`, `\describe <name>` | Show collection schema (columns, types, row groups) |
+| `\b <name>` | Show branches for a collection |
+| `\history` | Show command history (last 100 entries, in-memory only) |
+| `\! <cmd>` | Execute a shell command (via `sh -c`) |
+| `\h`, `\help`, `\?` | Show help |
+| `\q`, `\quit`, `exit`, `quit` | Exit the REPL |
+
+### Multi-line SQL
+
+SQL statements accumulate across lines until a line ending with `;` is seen.
+The prompt changes to `  ... ` for continuation lines:
+
+```
+pond> SELECT *
+  ... FROM users
+  ... WHERE age > 30;
+{ "columns": [...], "rows": [...] }
+pond>
+```
+
+Meta-commands (starting with `\`) execute immediately — no `;` needed. They do
+not interfere with any in-progress SQL buffer.
+
+### Ctrl+C / Ctrl+D
+
+- **Ctrl+D** (EOF) exits the REPL cleanly.
+- **Ctrl+C** terminates the process via the default SIGINT disposition
+  (exit code 130). No external signal-handling crates are pulled in — the
+  CLI stays dependency-light.
+
+### History
+
+Command history is kept in-memory only (a `Vec<String>` capped at 100
+entries). It is not persisted to disk. Use `\history` to view it.
 
 ## S3 Support
 
@@ -128,12 +207,17 @@ See [`../.env.example`](../.env.example) for the full configuration format.
 
 ## Tests
 
-17 integration tests in `tests/cli_integration.rs`:
+39 integration tests in `tests/cli_integration.rs`:
 - init, write/read JSON, write from file, write from stdin
 - dedup, ls, branch+merge, cat by prefix
 - version, persistence across invocations
 - **auto-discovery from subdirectory** (git-style)
 - **auto-discovery creates .pond/ marker**
+- write-rows / read-rows round-trips (WHERE filter, column projection)
+- SQL: SELECT *, SELECT with WHERE + LIMIT
+- **shell/REPL**: `--exec` SQL + exit, meta-commands (`\l`, `\d`, `\b`, `\h`,
+  `\history`, `\!`, `\q`), multi-line SQL accumulation, history cap at 100,
+  SQL errors don't crash the REPL, EOF exit, shell escape
 
 ```bash
 cargo test -p pond_cli
