@@ -1536,6 +1536,9 @@ dependencies = [
 name = "pond_index"
 version = "0.3.0"
 dependencies = [
+ "pond_cache",
+ "pond_kernel",
+ "pond_record",
  "sha2",
  "tempfile",
 ]

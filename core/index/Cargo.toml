@@ -15,3 +15,8 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# End-to-end tests only: verify the index, record model, cache and kernel
+# actually compose. Dev-only, so the index crate stays dependency-light.
+pond_record = { path = "../record" }
+pond_cache = { path = "../cache" }
+pond_kernel = { path = "../kernel" }
