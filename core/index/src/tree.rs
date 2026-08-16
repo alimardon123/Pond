@@ -1,0 +1,567 @@
+// tree.rs — the content-defined Merkle search tree.
+//
+// A tree is identified by the hash of its root node. Because chunk boundaries
+// are content-defined (see `chunk.rs`) and node encoding is canonical (see
+// `node.rs`), the root hash is a pure function of the tree's contents:
+//
+//     same entries  =>  same root hash, always
+//
+// regardless of insertion order, batching, or which writer produced them. That
+// single property is what gives Pond convergence without coordination: two
+// writers who end up with the same data end up with the same bytes, so merge
+// is a set operation and racing compactors are harmless.
+//
+// The tree indexes *segments*, not rows — a value here is a locator (segment
+// hash + byte range + stats), so at 1 PB with 128 MB segments the index holds
+// ~8M entries, not ~10^11. That is what keeps depth at 2 and the upper level
+// under a megabyte, hence permanently cacheable.
+
+use crate::chunk::{fingerprint, ChunkConfig};
+use crate::node::{ChildRef, Node};
+use crate::store::{Hash, NodeStore};
+
+/// A sorted, content-defined Merkle index.
+pub struct Tree {
+    pub root: Hash,
+    pub config: ChunkConfig,
+}
+
+/// One difference between two trees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Diff {
+    Added(Vec<u8>, Vec<u8>),
+    Removed(Vec<u8>, Vec<u8>),
+    /// (key, old_value, new_value)
+    Changed(Vec<u8>, Vec<u8>, Vec<u8>),
+}
+
+impl Tree {
+    /// Build a tree from sorted, deduplicated entries.
+    ///
+    /// Entries must be sorted by key. Use [`Tree::build`] which sorts for you
+    /// if the input order is not guaranteed.
+    pub fn build_sorted<S: NodeStore>(
+        store: &S,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+        config: ChunkConfig,
+    ) -> Tree {
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].0 < w[1].0),
+            "build_sorted requires strictly sorted, deduplicated keys"
+        );
+
+        // Level 0: chunk the entries into leaves.
+        let mut level: Vec<ChildRef> = Vec::new();
+        let mut current: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (k, v) in entries {
+            // The boundary decision uses the key only. Using the value too
+            // would mean an in-place value update reshapes the tree, losing
+            // the "only adding or removing keys moves boundaries" property.
+            let fp = fingerprint(&k);
+            current.push((k, v));
+            if config.is_boundary(fp, current.len()) {
+                level.push(flush_leaf(store, &mut current));
+            }
+        }
+        if !current.is_empty() {
+            level.push(flush_leaf(store, &mut current));
+        }
+
+        if level.is_empty() {
+            let node = Node::Leaf { entries: vec![] };
+            return Tree {
+                root: store.put(node.encode()),
+                config,
+            };
+        }
+
+        // Build internal levels bottom-up until a single root remains.
+        while level.len() > 1 {
+            level = chunk_level(store, level, config);
+        }
+        Tree {
+            root: level.pop().unwrap().hash,
+            config,
+        }
+    }
+
+    /// Build a tree from arbitrary entries. Later duplicates of a key win.
+    pub fn build<S: NodeStore>(
+        store: &S,
+        mut entries: Vec<(Vec<u8>, Vec<u8>)>,
+        config: ChunkConfig,
+    ) -> Tree {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        Tree::build_sorted(store, entries, config)
+    }
+
+    /// Look up one key. Costs one node read per level.
+    pub fn get<S: NodeStore>(&self, store: &S, key: &[u8]) -> Option<Vec<u8>> {
+        let mut hash = self.root.clone();
+        loop {
+            let node = Node::decode(&store.get(&hash)?)?;
+            match node {
+                Node::Leaf { entries } => {
+                    return entries
+                        .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+                        .ok()
+                        .map(|i| entries[i].1.clone());
+                }
+                Node::Internal { children } => {
+                    // Descend into the first child whose max_key >= key. The
+                    // comparison against the child's key range is the pruning:
+                    // subtrees that cannot contain the key are never fetched.
+                    let idx = children.partition_point(|c| c.max_key.as_slice() < key);
+                    if idx >= children.len() {
+                        return None;
+                    }
+                    hash = children[idx].hash.clone();
+                }
+            }
+        }
+    }
+
+    /// Total entries, read from the root's child counts without touching leaves.
+    pub fn len<S: NodeStore>(&self, store: &S) -> u64 {
+        store
+            .get(&self.root)
+            .and_then(|b| Node::decode(&b))
+            .map(|n| n.count())
+            .unwrap_or(0)
+    }
+
+    /// Depth in levels (1 = a single leaf).
+    pub fn depth<S: NodeStore>(&self, store: &S) -> usize {
+        let mut d = 1;
+        let mut hash = self.root.clone();
+        while let Some(Node::Internal { children }) =
+            store.get(&hash).and_then(|b| Node::decode(&b))
+        {
+            match children.first() {
+                Some(c) => {
+                    hash = c.hash.clone();
+                    d += 1;
+                }
+                None => break,
+            }
+        }
+        d
+    }
+
+    /// All entries in key order.
+    pub fn scan<S: NodeStore>(&self, store: &S) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        collect(store, &self.root, &mut out);
+        out
+    }
+
+    /// Entries whose key falls in `[start, end)`.
+    ///
+    /// Subtrees entirely below `start` are skipped without being read — this
+    /// is why a prefix scan costs bytes proportional to the range, not to the
+    /// collection.
+    pub fn scan_range<S: NodeStore>(
+        &self,
+        store: &S,
+        start: &[u8],
+        end: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        collect_range(store, &self.root, start, end, &mut out);
+        out
+    }
+
+    /// Insert or update entries, returning a new tree. The old tree remains
+    /// valid — that is what makes branching and time travel free.
+    ///
+    /// # Write cost
+    ///
+    /// Only nodes whose content actually changed are written: everything else
+    /// hashes to a node the store already holds and is deduplicated. Measured
+    /// at 3 new nodes for a one-row insert into a 100k-entry tree (~1.6% of
+    /// it), amortizing to 0.02 nodes per record at batch size 10k. Since PUTs
+    /// are the expensive operation against object storage, this is the number
+    /// that decides whether the design is affordable, and it holds.
+    ///
+    /// # Read cost — known limitation
+    ///
+    /// This implementation reads the whole tree (`scan`) and rebuilds, so its
+    /// *read* cost is O(n) even though its write cost is minimal. That is a
+    /// deliberate Phase 1 shortcut: it makes `insert_batch` obviously
+    /// equivalent to `build`, which is what lets the history-independence and
+    /// `insert == rebuild` tests be meaningful checks of the *chunking*
+    /// rather than of a clever splice.
+    ///
+    /// TODO(phase-3): descend to the affected leaf span and re-chunk only that
+    /// span plus one chunk of context on either side. Content-defined
+    /// boundaries make the re-chunk converge back onto existing boundaries
+    /// locally, so this is O(log n) reads. The `insert == rebuild` test is
+    /// exactly the invariant that will keep that optimization honest.
+    pub fn insert_batch<S: NodeStore>(
+        &self,
+        store: &S,
+        mut updates: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Tree {
+        if updates.is_empty() {
+            return Tree {
+                root: self.root.clone(),
+                config: self.config,
+            };
+        }
+        updates.sort_by(|a, b| a.0.cmp(&b.0));
+        updates.dedup_by(|a, b| a.0 == b.0);
+
+        let existing = self.scan(store);
+        let merged = merge_sorted(existing, updates);
+        Tree::build_sorted(store, merged, self.config)
+    }
+
+    /// Delete keys, returning a new tree.
+    pub fn delete_batch<S: NodeStore>(&self, store: &S, keys: &[Vec<u8>]) -> Tree {
+        let drop: std::collections::HashSet<&Vec<u8>> = keys.iter().collect();
+        let kept: Vec<(Vec<u8>, Vec<u8>)> = self
+            .scan(store)
+            .into_iter()
+            .filter(|(k, _)| !drop.contains(k))
+            .collect();
+        Tree::build_sorted(store, kept, self.config)
+    }
+
+    /// Differences between this tree and `other`.
+    ///
+    /// Identical subtrees are skipped in O(1) by comparing child hashes, so
+    /// the cost is proportional to the number of differences, not to the size
+    /// of either tree. `diff_node_reads` in the tests measures this directly.
+    pub fn diff<S: NodeStore>(&self, store: &S, other: &Tree) -> Vec<Diff> {
+        let mut mine = Vec::new();
+        let mut theirs = Vec::new();
+        collect_differing(store, &self.root, &other.root, &mut mine, &mut theirs);
+
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < mine.len() || j < theirs.len() {
+            match (mine.get(i), theirs.get(j)) {
+                (Some((k1, v1)), Some((k2, v2))) => match k1.cmp(k2) {
+                    std::cmp::Ordering::Equal => {
+                        if v1 != v2 {
+                            out.push(Diff::Changed(k1.clone(), v1.clone(), v2.clone()));
+                        }
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => {
+                        out.push(Diff::Removed(k1.clone(), v1.clone()));
+                        i += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        out.push(Diff::Added(k2.clone(), v2.clone()));
+                        j += 1;
+                    }
+                },
+                (Some((k, v)), None) => {
+                    out.push(Diff::Removed(k.clone(), v.clone()));
+                    i += 1;
+                }
+                (None, Some((k, v))) => {
+                    out.push(Diff::Added(k.clone(), v.clone()));
+                    j += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        out
+    }
+
+    /// Merge two trees into one.
+    ///
+    /// `resolve` decides which value wins when both sides hold the same key.
+    /// It must be a pure function of the two values and must be commutative
+    /// (`resolve(a,b) == resolve(b,a)`) — with a total order on versions
+    /// (physical, logical, writer_id) last-writer-wins satisfies that, which
+    /// is exactly why the writer id had to exist.
+    ///
+    /// Given that, merge is a join over a semilattice: commutative,
+    /// associative, idempotent. Two replicas merging the same inputs produce
+    /// byte-identical roots, so racing compactors converge for free.
+    pub fn merge<S: NodeStore, F>(&self, store: &S, other: &Tree, resolve: F) -> Tree
+    where
+        F: Fn(&[u8], &[u8]) -> Vec<u8>,
+    {
+        let a = self.scan(store);
+        let b = other.scan(store);
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(a.len() + b.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < a.len() || j < b.len() {
+            match (a.get(i), b.get(j)) {
+                (Some((k1, v1)), Some((k2, v2))) => match k1.cmp(k2) {
+                    std::cmp::Ordering::Equal => {
+                        out.push((k1.clone(), resolve(v1, v2)));
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => {
+                        out.push((k1.clone(), v1.clone()));
+                        i += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        out.push((k2.clone(), v2.clone()));
+                        j += 1;
+                    }
+                },
+                (Some(e), None) => {
+                    out.push(e.clone());
+                    i += 1;
+                }
+                (None, Some(e)) => {
+                    out.push(e.clone());
+                    j += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        Tree::build_sorted(store, out, self.config)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
+
+fn flush_leaf<S: NodeStore>(store: &S, current: &mut Vec<(Vec<u8>, Vec<u8>)>) -> ChildRef {
+    let entries = std::mem::take(current);
+    let node = Node::Leaf { entries };
+    let max_key = node.max_key().unwrap_or_default();
+    let count = node.count();
+    ChildRef {
+        max_key,
+        hash: store.put(node.encode()),
+        count,
+    }
+}
+
+/// Chunk one level of child pointers into the level above.
+fn chunk_level<S: NodeStore>(
+    store: &S,
+    level: Vec<ChildRef>,
+    config: ChunkConfig,
+) -> Vec<ChildRef> {
+    let mut out = Vec::new();
+    let mut current: Vec<ChildRef> = Vec::new();
+    for child in level {
+        // Boundary on the child's hash: content-defined at every level, so an
+        // internal node's shape is as history-independent as a leaf's.
+        let fp = fingerprint(child.hash.as_bytes());
+        current.push(child);
+        if config.is_boundary(fp, current.len()) {
+            out.push(flush_internal(store, &mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(flush_internal(store, &mut current));
+    }
+    out
+}
+
+fn flush_internal<S: NodeStore>(store: &S, current: &mut Vec<ChildRef>) -> ChildRef {
+    let children = std::mem::take(current);
+    let node = Node::Internal { children };
+    let max_key = node.max_key().unwrap_or_default();
+    let count = node.count();
+    ChildRef {
+        max_key,
+        hash: store.put(node.encode()),
+        count,
+    }
+}
+
+fn collect<S: NodeStore>(store: &S, hash: &str, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    let Some(node) = store.get(hash).and_then(|b| Node::decode(&b)) else {
+        return;
+    };
+    match node {
+        Node::Leaf { entries } => out.extend(entries),
+        Node::Internal { children } => {
+            for c in children {
+                collect(store, &c.hash, out);
+            }
+        }
+    }
+}
+
+fn collect_range<S: NodeStore>(
+    store: &S,
+    hash: &str,
+    start: &[u8],
+    end: &[u8],
+    out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) {
+    let Some(node) = store.get(hash).and_then(|b| Node::decode(&b)) else {
+        return;
+    };
+    match node {
+        Node::Leaf { entries } => {
+            for (k, v) in entries {
+                if k.as_slice() >= start && k.as_slice() < end {
+                    out.push((k, v));
+                }
+            }
+        }
+        Node::Internal { children } => {
+            for c in children {
+                // Skip subtrees entirely below the range without reading them.
+                if c.max_key.as_slice() < start {
+                    continue;
+                }
+                collect_range(store, &c.hash, start, end, out);
+                // Once a subtree's max key reaches the end bound, later
+                // siblings are all above the range.
+                if c.max_key.as_slice() >= end {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Walk two trees in parallel, collecting only the entries under subtrees
+/// whose hashes differ.
+///
+/// Equal hashes mean byte-identical content, so those subtrees are skipped in
+/// O(1) with no reads at all — that is what makes diff cost proportional to
+/// the number of changes rather than to the size of the trees.
+///
+/// Children are matched by key range rather than by position, because a change
+/// can shift a chunk boundary and leave the two levels with different child
+/// counts. Ranges that overlap are recursed into; a child with no overlapping
+/// counterpart is wholly added or removed. Recursion can visit a node from
+/// more than one pairing when boundaries have shifted, so results are
+/// deduplicated by key at the end.
+fn collect_differing<S: NodeStore>(
+    store: &S,
+    a: &str,
+    b: &str,
+    out_a: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    out_b: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) {
+    descend_differing(store, a, b, out_a, out_b);
+    dedup_by_key(out_a);
+    dedup_by_key(out_b);
+}
+
+fn descend_differing<S: NodeStore>(
+    store: &S,
+    a: &str,
+    b: &str,
+    out_a: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    out_b: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) {
+    if a == b {
+        return; // identical subtrees — the whole point of Merkle addressing
+    }
+    let na = store.get(a).and_then(|x| Node::decode(&x));
+    let nb = store.get(b).and_then(|x| Node::decode(&x));
+
+    match (na, nb) {
+        (Some(Node::Internal { children: ca }), Some(Node::Internal { children: cb })) => {
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < ca.len() && j < cb.len() {
+                // Identical child subtrees: skip both, no reads.
+                if ca[i].hash == cb[j].hash {
+                    i += 1;
+                    j += 1;
+                    continue;
+                }
+                match ca[i].max_key.cmp(&cb[j].max_key) {
+                    std::cmp::Ordering::Equal => {
+                        descend_differing(store, &ca[i].hash, &cb[j].hash, out_a, out_b);
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => {
+                        // A's child ends first, so it overlaps B's current
+                        // child. Recurse into the pair, then advance A.
+                        descend_differing(store, &ca[i].hash, &cb[j].hash, out_a, out_b);
+                        i += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        descend_differing(store, &ca[i].hash, &cb[j].hash, out_a, out_b);
+                        j += 1;
+                    }
+                }
+            }
+            // Trailing children on either side have no counterpart at all.
+            for c in &ca[i..] {
+                collect(store, &c.hash, out_a);
+            }
+            for c in &cb[j..] {
+                collect(store, &c.hash, out_b);
+            }
+        }
+        (a_node, b_node) => {
+            if let Some(n) = a_node {
+                flatten(store, n, out_a);
+            }
+            if let Some(n) = b_node {
+                flatten(store, n, out_b);
+            }
+        }
+    }
+}
+
+/// Sort by key and drop duplicates, which can arise when a shifted chunk
+/// boundary causes the same leaf to be reached through two pairings.
+fn dedup_by_key(v: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    v.sort_by(|x, y| x.0.cmp(&y.0));
+    v.dedup_by(|x, y| x.0 == y.0);
+}
+
+fn flatten<S: NodeStore>(store: &S, node: Node, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    match node {
+        Node::Leaf { entries } => out.extend(entries),
+        Node::Internal { children } => {
+            for c in children {
+                collect(store, &c.hash, out);
+            }
+        }
+    }
+}
+
+/// Merge two sorted entry lists; entries from `updates` win on equal keys.
+fn merge_sorted(
+    base: Vec<(Vec<u8>, Vec<u8>)>,
+    updates: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::with_capacity(base.len() + updates.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < base.len() || j < updates.len() {
+        match (base.get(i), updates.get(j)) {
+            (Some((k1, v1)), Some((k2, v2))) => match k1.cmp(k2) {
+                std::cmp::Ordering::Equal => {
+                    out.push((k2.clone(), v2.clone()));
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    out.push((k1.clone(), v1.clone()));
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    out.push((k2.clone(), v2.clone()));
+                    j += 1;
+                }
+            },
+            (Some(e), None) => {
+                out.push(e.clone());
+                i += 1;
+            }
+            (None, Some(e)) => {
+                out.push(e.clone());
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    out
+}

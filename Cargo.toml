@@ -7,6 +7,7 @@ members = [
     "core/arrow",
     "core/s3",
     "core/sql",
+    "core/index",
     "cli",
     "bindings/python/pyo3",
     "lenses/keyvalue/rust",

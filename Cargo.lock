@@ -1525,6 +1525,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond_index"
+version = "0.3.0"
+dependencies = [
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "pond_ivf_index"
 version = "0.3.0"
 dependencies = [

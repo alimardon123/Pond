@@ -1,0 +1,17 @@
+[package]
+name = "pond_index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond index — content-defined Merkle search tree over segments (history-independent, mergeable, constant-depth)"
+
+[lib]
+name = "pond_index"
+
+[dependencies]
+# Only a hash. The index is deliberately dependency-light: it is the piece
+# every workload and every backend goes through.
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }
