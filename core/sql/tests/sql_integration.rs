@@ -483,7 +483,7 @@ fn test_select_file_parquet_basic_types() {
             Arc::new(UInt32Array::from(vec![4_000_000_000u32, 3_999_999_999u32])),
             Arc::new(UInt64Array::from(vec![18_000_000_000_000_000_000u64, 1u64])),
             Arc::new(Float32Array::from(vec![1.5f32, 2.5f32])),
-            Arc::new(Float64Array::from(vec![3.14f64, 6.28f64])),
+            Arc::new(Float64Array::from(vec![3.25f64, 6.5f64])),
             Arc::new(StringArray::from(vec!["alice", "bob"])),
             Arc::new(LargeStringArray::from(vec!["alpha", "beta"])),
         ],
@@ -509,7 +509,7 @@ fn test_select_file_parquet_basic_types() {
     assert_eq!(row_col(r0, "u32"), JsonValue::Number(serde_json::Number::from(4_000_000_000u64)));
     assert_eq!(row_col(r0, "u64"), JsonValue::Number(serde_json::Number::from(18_000_000_000_000_000_000u64)));
     assert_eq!(row_col(r0, "f32").as_f64(), Some(1.5));
-    assert_eq!(row_col(r0, "f64").as_f64(), Some(3.14));
+    assert_eq!(row_col(r0, "f64").as_f64(), Some(3.25));
     assert_eq!(row_col(r0, "s"), JsonValue::String("alice".to_string()));
     assert_eq!(row_col(r0, "ls"), JsonValue::String("alpha".to_string()));
 
@@ -518,7 +518,7 @@ fn test_select_file_parquet_basic_types() {
     assert_eq!(row_col(r1, "i8"), JsonValue::Number(serde_json::Number::from(-2)));
     assert_eq!(row_col(r1, "i32"), JsonValue::Number(serde_json::Number::from(-100_001)));
     assert_eq!(row_col(r1, "u64"), JsonValue::Number(serde_json::Number::from(1u64)));
-    assert_eq!(row_col(r1, "f64").as_f64(), Some(6.28));
+    assert_eq!(row_col(r1, "f64").as_f64(), Some(6.5));
     assert_eq!(row_col(r1, "s"), JsonValue::String("bob".to_string()));
     assert_eq!(row_col(r1, "ls"), JsonValue::String("beta".to_string()));
 }

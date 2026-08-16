@@ -482,12 +482,11 @@ impl S3ObjectStore {
     ) -> Result<ureq::Response, io::Error> {
         let signed = self.build_signed_request(method, key, query, body, extra_headers)?;
 
-        // Build the ureq request. Each call builds a fresh agent (matches
-        // pre-refactor behavior — the struct's `self.agent` field is unused
-        // for this path; it's preserved for back-compat).
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(30))
-            .build();
+        // Use the agent owned by this store rather than building a fresh one
+        // per request. `ureq::Agent` owns the connection pool, so a per-request
+        // agent meant a new TCP + TLS handshake on every single GET/PUT — the
+        // dominant cost against S3. The agent is configured once in `new()`.
+        let agent = &self.agent;
 
         let req = match signed.method.as_str() {
             "GET" => agent.get(&signed.url),
@@ -523,13 +522,12 @@ impl S3ObjectStore {
                 ureq::Error::Status(code, resp) => {
                     let status_text = resp.status_text().to_string();
                     let body = resp.into_string().unwrap_or_default();
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("S3 returned {}: {} — {}", code, status_text, body),
                     )
                 }
                 ureq::Error::Transport(t) => {
-                    io::Error::new(io::ErrorKind::Other, format!("transport error: {}", t))
+                    io::Error::other(format!("transport error: {}", t))
                 }
             }
         })
@@ -624,7 +622,7 @@ impl ObjectStore for S3ObjectStore {
         let mut body = Vec::new();
         resp.into_reader()
             .read_to_end(&mut body)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         let mut s = self.stats.lock().unwrap();
         s.gets += 1;
         s.bytes_read += body.len() as u64;
@@ -674,17 +672,15 @@ impl ObjectStore for S3ObjectStore {
                     .collect();
 
                 threads.into_iter()
-                    .map(|t| t.join().unwrap_or_else(|_| Some(io::Error::new(
-                        io::ErrorKind::Other, "thread panicked"
+                    .map(|t| t.join().unwrap_or_else(|_| Some(io::Error::other(
+                        "thread panicked"
                     ))))
                     .collect()
             });
 
             // Return the first error if any
-            for e in errors {
-                if let Some(e) = e {
-                    return Err(e);
-                }
+            if let Some(e) = errors.into_iter().flatten().next() {
+                return Err(e);
             }
         }
 
@@ -730,7 +726,7 @@ impl ObjectStore for S3ObjectStore {
                                     let mut body = Vec::new();
                                     match resp.into_reader().read_to_end(&mut body) {
                                         Ok(_) => Ok((global_idx, body)),
-                                        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+                                        Err(e) => Err(io::Error::other(e)),
                                     }
                                 }
                                 Err(e) => Err(e),
@@ -740,8 +736,8 @@ impl ObjectStore for S3ObjectStore {
                     .collect();
 
                 threads.into_iter()
-                    .map(|t| t.join().unwrap_or_else(|_| Err(io::Error::new(
-                        io::ErrorKind::Other, "thread panicked"
+                    .map(|t| t.join().unwrap_or_else(|_| Err(io::Error::other(
+                        "thread panicked"
                     ))))
                     .collect()
             });
@@ -767,8 +763,7 @@ impl ObjectStore for S3ObjectStore {
         let mut results = Vec::with_capacity(n);
         let mut total_bytes: u64 = 0;
         for opt in slot_map {
-            let body = opt.ok_or_else(|| io::Error::new(
-                io::ErrorKind::Other,
+            let body = opt.ok_or_else(|| io::Error::other(
                 "missing result from parallel batch (should not happen)"
             ))?;
             total_bytes += body.len() as u64;
@@ -836,7 +831,7 @@ impl ObjectStore for S3ObjectStore {
 
             let resp = self.s3_request("GET", "", Some(&query), None, &[])?;
             let body = resp.into_string()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
 
             // Simple XML extraction: find all <Key>...</Key> values.
             // S3 ListObjectsV2 XML wraps keys in <Contents><Key>...</Key></Contents>.
@@ -1220,6 +1215,11 @@ fn hex_digit(b: u8) -> Option<u8> {
 // ---------------------------------------------------------------------------
 // C ABI — extern "C" wrappers for cross-language SDKs
 // ---------------------------------------------------------------------------
+//
+// `clippy::not_unsafe_ptr_arg_deref` is allowed for these two entry points:
+// both are C ABI functions that by definition dereference a caller-supplied
+// pointer. Marking them `unsafe fn` would not change the emitted C ABI (no
+// Rust caller invokes them). Nulls are checked on entry.
 
 use std::ffi::{c_char, CStr};
 
@@ -1235,6 +1235,7 @@ use std::ffi::{c_char, CStr};
 /// The returned pointer can be passed to `pond_kernel_new_with_store()` (in pond_kernel's
 /// C ABI) to create a kernel backed by S3.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn pond_s3_store_new(url: *const c_char) -> *mut std::ffi::c_void {
     if url.is_null() {
         return std::ptr::null_mut();
@@ -1275,6 +1276,7 @@ pub extern "C" fn pond_s3_store_free(store: *mut std::ffi::c_void) {
 /// handle type, just backed by S3 instead of local FS. Link against
 /// `libpond_s3.a` (in addition to `libpond_storage.a`) to use this.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn pond_storage_new_s3(url: *const c_char) -> *mut pond_storage::PondStorageHandle {
     if url.is_null() {
         return std::ptr::null_mut();

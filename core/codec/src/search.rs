@@ -421,7 +421,7 @@ pub fn hybrid_search(
 
     // Apply the optional WHERE filter up-front.
     let filtered: Vec<(usize, &JsonValue)> = match where_expr {
-        Some(f) => rows.iter().enumerate().filter(|(_, r)| f(*r)).collect(),
+        Some(f) => rows.iter().enumerate().filter(|(_, r)| f(r)).collect(),
         None => rows.iter().enumerate().collect(),
     };
     if filtered.is_empty() {

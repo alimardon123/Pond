@@ -20,7 +20,10 @@
 
 use pond_kernel::PondKernel;
 use pond_storage::maintenance;
-use serde_json::{Value, json};
+// `json!` is used by the test module below; clippy's autofix does not see
+// macro uses behind `#[cfg(test)]` when the lib target is checked alone.
+#[allow(unused_imports)]
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 /// Collection-level indexer. Operates on any collection via the kernel.
@@ -42,11 +45,11 @@ impl<'a> SimpleIndex<'a> {
     ///   - collection: Collection name
     ///   - index_name: Name for this index (e.g., "by_name", "by_email")
     ///   - rows: The rows to index (Vec<(rowid, row_data)>)
-    ///   - extractor: Function that extracts index key(s) from a row.
-    ///                Can return a single key or multiple keys (multi-key index).
-    ///   - key_fields: The field name(s) being indexed. Single field: ["name"].
-    ///                 Composite key: ["status", "city"]. Stored as metadata
-    ///                 for automatic index acceleration.
+    ///   - extractor: Function that extracts index key(s) from a row. Can
+    ///     return a single key or multiple keys (multi-key index).
+    ///   - key_fields: The field name(s) being indexed. Single field:
+    ///     `["name"]`. Composite key: `["status", "city"]`. Stored as
+    ///     metadata for automatic index acceleration.
     ///
     /// Returns: index blob hash
     pub fn build_index(

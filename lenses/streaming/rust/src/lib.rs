@@ -170,7 +170,7 @@ impl StreamingLens {
             }
 
             // Calculate the overlap
-            let copy_start = if start > seg_start { start - seg_start } else { 0 };
+            let copy_start = start.saturating_sub(seg_start);
             let copy_end = if end < seg_end { end - seg_start } else { seg_len };
 
             if copy_start < copy_end && copy_end <= segment.len() {
@@ -267,7 +267,7 @@ impl StreamingLens {
 const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(data: &[u8]) -> String {
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= data.len() {
         let b0 = data[i] as u32;

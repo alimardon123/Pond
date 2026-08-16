@@ -6,7 +6,10 @@ use std::process::Command;
 use std::fs;
 use tempfile::TempDir;
 
-const POND_BIN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/release/pond");
+// Cargo builds the `pond` binary for integration tests and exports its path
+// here. Using CARGO_BIN_EXE_pond (rather than a hardcoded target/release path)
+// means `cargo test` works in debug and release without a separate build step.
+const POND_BIN: &str = env!("CARGO_BIN_EXE_pond");
 
 fn pond(root: &std::path::Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(POND_BIN);
@@ -244,7 +247,7 @@ fn test_auto_discovery_from_subdir() {
     fs::create_dir_all(&subdir).unwrap();
 
     let mut cmd = Command::new(POND_BIN);
-    cmd.current_dir(&subdir).args(&["read", "users"]);
+    cmd.current_dir(&subdir).args(["read", "users"]);
     let output = cmd.output().unwrap();
     assert!(output.status.success(),
         "auto-discovery failed: {}", String::from_utf8_lossy(&output.stderr));
@@ -253,7 +256,7 @@ fn test_auto_discovery_from_subdir() {
 
     // Also test `ls` from the subdirectory
     let mut cmd = Command::new(POND_BIN);
-    cmd.current_dir(&subdir).args(&["ls"]);
+    cmd.current_dir(&subdir).args(["ls"]);
     let output = cmd.output().unwrap();
     assert!(output.status.success());
     let out = String::from_utf8_lossy(&output.stdout);

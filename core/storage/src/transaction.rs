@@ -118,7 +118,8 @@ mod tests {
         let kernel = storage.kernel();
 
         let tx_id = begin_tx();
-        abort_tx(kernel, &tx_id);
+        abort_tx(kernel, &tx_id).expect("abort of a pending tx should succeed");
         assert!(!is_tx_committed(kernel, &tx_id)); // not committed
+        assert!(is_tx_aborted(kernel, &tx_id), "abort must be observable");
     }
 }

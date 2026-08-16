@@ -31,9 +31,9 @@
 //   let results = lens.search("vectors", &[0.15, 0.25, 0.35], 5).unwrap();
 //   // → [(distance, id), ...]
 
-use pond_core::{TypedColumn, VT_FLOAT64, VT_INT64};
+use pond_core::{TypedColumn, VT_INT64};
 use pond_storage::UnifiedStorage;
-use pond_storage::{write as storage_write, read as storage_read};
+use pond_storage::write as storage_write;
 use pond_storage::manifest::CollectionManifest;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -71,7 +71,7 @@ impl VectorLens {
     pub fn insert(&self, collection: &str, id: &str, vector: &[f64], metadata: Option<&str>) {
         let should_flush = {
             let mut buf = self.buffer.lock().unwrap();
-            let entry = buf.entry(collection.to_string()).or_insert_with(Vec::new);
+            let entry = buf.entry(collection.to_string()).or_default();
             entry.push((id.to_string(), vector.to_vec(), metadata.unwrap_or("{}").to_string()));
             entry.len() >= 10000
         };

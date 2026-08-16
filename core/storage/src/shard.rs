@@ -11,7 +11,7 @@
 //   - delete_shard: writes tombstone shards (_deleted=True + _version)
 //   - merge_rows_by_rowid: CRDT merge — latest _version wins, tombstones suppress
 
-use crate::{branch_ref, manifest_ref, shards_prefix};
+use crate::{branch_ref, shards_prefix};
 use pond_kernel::crdt::{uuidv7, HLC};
 use pond_kernel::PondKernel;
 use serde_json::{json, Value};
@@ -113,7 +113,7 @@ pub fn clear_shards(
         // is responsible for passing protected_hashes if needed.
         // For simple clear_shards (after merge), all shards are absorbed
         // into HEAD, so their blobs are safe to delete.
-        let _ = delete_blob(kernel, hash);
+        delete_blob(kernel, hash);
     }
     Ok(count)
 }
@@ -159,7 +159,7 @@ pub fn upsert_shard(
     branch: &str,
     shard_name: &str,
     rows: &[Value],
-    key_col: Option<&str>,
+    _key_col: Option<&str>,
     hlc: &mut HLC,
 ) -> Result<String, String> {
     let mut crdt_rows = Vec::with_capacity(rows.len());
@@ -253,9 +253,8 @@ pub fn merge_rows_by_rowid(rows: &[Value], key_col: Option<&str>) -> Vec<Value> 
 
     let mut result: Vec<Value> = Vec::new();
 
-    if has_crdt && key_col.is_some() {
+    if let (true, Some(kc)) = (has_crdt, key_col) {
         // CRDT mode with key_col: build a set of key_col values claimed by CRDT rows
-        let kc = key_col.unwrap();
         let mut crdt_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for row in latest.values() {
             if !row.get("_deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -316,7 +315,7 @@ mod tests {
 
         // Append two shards
         let h1 = append_shard(kernel, "events", "main", "shardA", b"shard A data").unwrap();
-        let h2 = append_shard(kernel, "events", "main", "shardB", b"shard B data").unwrap();
+        let _h2 = append_shard(kernel, "events", "main", "shardB", b"shard B data").unwrap();
 
         // List shards
         let shards = list_shards(kernel, "events", "main");

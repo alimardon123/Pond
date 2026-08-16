@@ -6,6 +6,14 @@
 //
 // All heap allocations across the FFI boundary are explicitly owned by the
 // caller; every `*_free` function documents its contract.
+//
+// `clippy::not_unsafe_ptr_arg_deref` is allowed module-wide: every function
+// here is a C ABI entry point that, by definition, dereferences pointers its
+// caller supplied. Marking them `unsafe fn` would not change the emitted C ABI
+// (no Rust caller invokes them) and would not add a check a C caller can see.
+// The safety contract each one requires is documented in `pond_core.h` and in
+// the per-function doc comments; null pointers are checked at every entry.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 // `c_char` is used directly in many `*const c_char` signatures below. `CString`
 // and `ptr` are imported (per the crate's documented FFI surface) even when

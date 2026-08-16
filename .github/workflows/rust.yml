@@ -1,0 +1,66 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: build · test · clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The CLI integration tests spawn the `pond` binary and resolve it via
+      # CARGO_BIN_EXE_pond, which cargo sets for integration tests — no
+      # separate release build is needed.
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # pond_python is included: `extension-module` is opt-in (maturin enables
+      # it via pyproject.toml), so the test harness links against libpython
+      # normally instead of failing on undefined Py* symbols.
+      - name: Test
+        run: cargo test --workspace
+
+      # Style-only lints are allowed for now so the gate can be enforced today.
+      # Ratchet these down over time rather than leaving clippy off entirely.
+      #
+      # pond_python is excluded from clippy only (it IS built and tested above).
+      # It carries ~120 lints including 9 never-used functions — real dead code
+      # worth removing, but that file is 6k lines and is slated for rework, so
+      # it is tracked separately rather than blocking this gate.
+      - name: Clippy
+        run: |
+          cargo clippy --workspace --exclude pond_python --all-targets -- \
+            -D warnings \
+            -A clippy::too_many_arguments \
+            -A clippy::type_complexity \
+            -A clippy::needless_range_loop \
+            -A clippy::large_enum_variant \
+            -A clippy::len_without_is_empty \
+            -A clippy::manual_range_contains \
+            -A clippy::manual_strip \
+            -A clippy::doc_lazy_continuation
+
+  # Formatting is not enforced yet: `cargo fmt` would rewrite ~1100 hunks
+  # across the existing tree. Run it as one dedicated commit, then promote
+  # this to a required check.
+  #
+  # fmt:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #       with: { components: rustfmt }
+  #     - run: cargo fmt --all --check

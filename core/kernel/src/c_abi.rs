@@ -7,6 +7,13 @@
 //   - Strings returned are heap-allocated. Caller MUST free with pond_string_free().
 //   - Data returned via out-params is heap-allocated. Caller MUST free with pond_data_free().
 //   - Handles must be freed with pond_kernel_free().
+//
+// `clippy::not_unsafe_ptr_arg_deref` is allowed module-wide: every function
+// here is a C ABI entry point that, by definition, dereferences pointers its
+// caller supplied. Marking them `unsafe fn` would not change the emitted C ABI
+// (no Rust caller invokes them) and would not add a check a C caller can see.
+// The safety contract is documented per function; nulls are checked on entry.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
@@ -67,7 +74,7 @@ pub extern "C" fn pond_kernel_read(
     };
     match handle.kernel.read(key) {
         Ok(data) => {
-            let mut boxed = data.into_boxed_slice();
+            let boxed = data.into_boxed_slice();
             let ptr = boxed.as_ptr();
             let len = boxed.len();
             std::mem::forget(boxed);

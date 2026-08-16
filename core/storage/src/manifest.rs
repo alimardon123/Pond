@@ -21,7 +21,6 @@
 //   Optional: bloom_filter_ref (u32 LE length + string)
 //   Optional: parent_manifest (u32 LE length + string)
 
-use std::io::{self, Read, Write};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -30,12 +29,12 @@ use std::io::{self, Read, Write};
 const PMAN_MAGIC: &[u8] = b"PMAN";
 const PMAN_VERSION: u8 = 1;
 
-// Value types (match pond_core)
-const VT_INT64: u8 = 1;
-const VT_FLOAT64: u8 = 2;
-const VT_STRING: u8 = 3;
-const VT_NULL: u8 = 4;
-const VT_BINARY: u8 = 5;
+// Value types. Imported from pond_core rather than redefined so the two can
+// never drift apart — pond_core is the single source of truth for the wire
+// format's type codes.
+use pond_core::{VT_FLOAT64, VT_INT64};
+#[cfg(test)]
+use pond_core::VT_STRING;
 
 // ---------------------------------------------------------------------------
 // ColumnStatsEntry — per-column statistics for a row group

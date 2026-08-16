@@ -28,8 +28,6 @@ pub use object_store::AsyncObjectStore;
 
 use std::io;
 use std::sync::{Arc, Mutex};
-use lru::LruCache;
-use std::num::NonZeroUsize;
 
 use sha2::{Digest, Sha256};
 

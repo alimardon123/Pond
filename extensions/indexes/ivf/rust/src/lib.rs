@@ -38,7 +38,6 @@
 
 use pond_kernel::PondKernel;
 use pond_storage::manifest::CollectionManifest;
-use std::collections::HashMap;
 
 const PIVF_MAGIC: &[u8; 4] = b"PIVF";
 const PIVF_VERSION: u8 = 2;

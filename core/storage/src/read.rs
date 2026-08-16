@@ -4,7 +4,6 @@
 
 use crate::branch_ref;
 use crate::commit;
-use crate::commit::Commit;
 use crate::manifest::CollectionManifest;
 use crate::shard;
 use pond_kernel::PondKernel;
@@ -289,7 +288,7 @@ pub fn read_rows_i64(
 
             // Only collect INT64 columns
             if col.vtype == pond_core::VT_INT64 {
-                let entry = result_cols.entry(name.clone()).or_insert_with(Vec::new);
+                let entry = result_cols.entry(name.clone()).or_default();
                 entry.extend_from_slice(&col.i64_data);
             }
         }

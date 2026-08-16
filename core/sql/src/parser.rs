@@ -171,18 +171,15 @@ pub enum SqlStatement {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum MergeAction {
     Update,
     Delete,
+    #[default]
     Skip,
     Insert,
 }
 
-impl Default for MergeAction {
-    fn default() -> Self {
-        MergeAction::Skip
-    }
-}
 
 /// Parse a SQL statement string.
 pub fn parse_sql(sql: &str) -> Result<SqlStatement, String> {
@@ -276,7 +273,7 @@ fn parse_select(sql: &str) -> Result<SqlStatement, String> {
     let orders = if order_str.is_empty() {
         Vec::new()
     } else {
-        parse_order_by(&order_str)?
+        parse_order_by(order_str)?
     };
 
     let limit: Option<usize> = if limit_str.is_empty() {

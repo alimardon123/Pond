@@ -694,7 +694,7 @@ fn cmd_ls(storage: &UnifiedStorage) {
 fn cmd_cat(storage: &UnifiedStorage, hash: &str) {
     let kernel = storage.kernel();
     match kernel.read_blob(hash) {
-        Ok(data) => { io::stdout().write_all(&data).unwrap(); return; }
+        Ok(data) => { io::stdout().write_all(&data).unwrap();}
         Err(_) if hash.len() < 64 => {
             let matches = kernel.list_blobs_prefix(hash);
             if matches.len() == 1 {
@@ -711,7 +711,6 @@ fn cmd_cat(storage: &UnifiedStorage, hash: &str) {
     }
 }
 
-use std::fs;
 
 /// Garbage collect — analyze reachability and optionally delete dead blobs.
 fn cmd_gc(storage: &UnifiedStorage, compute_size: bool, dry_run: bool) {
@@ -1168,10 +1167,7 @@ fn read_rows_as_json(
     if let Some(w) = where_filter {
         if !w.trim().is_empty() {
             let predicates = parse_where_clause(w)?;
-            all_rows = all_rows
-                .into_iter()
-                .filter(|r| predicates.iter().all(|(c, op, v)| eval_predicate(r, c, op, v)))
-                .collect();
+            all_rows.retain(|r| predicates.iter().all(|(c, op, v)| eval_predicate(r, c, op, v)));
         }
     }
 
@@ -1236,7 +1232,7 @@ fn parse_where_clause(s: &str) -> Result<Vec<(String, String, JsonValue)>, Strin
             let prefix = &s[start..i];
             let single_q = prefix.matches('\'').count();
             let double_q = prefix.matches('"').count();
-            if single_q % 2 == 0 && double_q % 2 == 0 {
+            if single_q.is_multiple_of(2) && double_q.is_multiple_of(2) {
                 parts.push(&s[start..i]);
                 start = i + 5;
                 i = start;
@@ -1607,7 +1603,7 @@ fn cmd_shell(storage: UnifiedStorage, exec: Option<String>) {
         }
 
         // Strip trailing CR/LF.
-        let line = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let line = line.trim_end_matches(['\n', '\r']);
         let trimmed = line.trim();
 
         // Skip empty lines (don't add to buffer or history).

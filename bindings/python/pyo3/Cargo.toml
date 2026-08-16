@@ -7,12 +7,21 @@ description = "Pond — PyO3 bindings to Rust core (Python module name: pond)"
 
 [lib]
 name = "pond"                # import pond from Python
-crate-type = ["cdylib"]      # produces pond.so / .pyd / .dylib
+# `rlib` alongside `cdylib` so `cargo test` can build a test harness against
+# this crate. `cdylib` alone produces only pond.so / .pyd / .dylib.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["s3", "zstd"]
 s3 = ["dep:pond_s3"]
 zstd = ["pond_core/zstd"]
+# `extension-module` tells PyO3 not to link libpython — correct when building
+# the .so that CPython dlopens, but it makes any standalone binary (including
+# the `cargo test` harness) fail to link with undefined Py* symbols. It is
+# therefore NOT enabled by default; maturin turns it on via pyproject.toml's
+# `[tool.maturin] features`. This is what lets `cargo test --workspace`
+# include this crate instead of having to exclude it.
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 pond_core = { path = "../../../core/codec", features = ["zstd"] }
@@ -25,6 +34,6 @@ pond_hnsw_index = { path = "../../../extensions/indexes/hnsw/rust" }
 pond_simple_index = { path = "../../../extensions/indexes/simple/rust" }
 pond_semantic = { path = "../../../extensions/semantic/base/rust" }
 pond_ossie_adapter = { path = "../../../extensions/semantic/ossie/rust" }
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22" }
 serde_json = "1"
 rayon = "1"
