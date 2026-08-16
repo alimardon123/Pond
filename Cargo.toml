@@ -8,6 +8,7 @@ members = [
     "core/s3",
     "core/sql",
     "core/index",
+    "core/cache",
     "cli",
     "bindings/python/pyo3",
     "lenses/keyvalue/rust",

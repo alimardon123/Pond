@@ -129,6 +129,17 @@ impl PondKernel {
         Ok(data)
     }
 
+    /// Read `len` bytes of a blob starting at `offset`.
+    ///
+    /// Ranged reads are what let a reader fetch exactly the bytes it needs —
+    /// one index chunk, one column chunk inside a segment — instead of pulling
+    /// whole objects. Available identically on every backend.
+    pub fn read_blob_range(&self, h: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let data = self.store.get_blob_range(h, offset, len)?;
+        self.stats.lock().unwrap().reads += 1;
+        Ok(data)
+    }
+
     pub fn read_blob_batch(&self, hashes: &[String]) -> io::Result<Vec<Vec<u8>>> {
         let results = self.store.get_blob_batch(hashes)?;
         self.stats.lock().unwrap().reads += results.len() as u64;
@@ -553,6 +564,74 @@ mod tests {
         assert_eq!(store.get_path("../pwned"), None);
         assert!(!store.delete_path("../pwned").unwrap());
         assert!(!outer.path().join("pwned").exists());
+    }
+
+    /// Ranged reads must return exactly the requested window, and must agree
+    /// with slicing the whole blob — otherwise a reader that ranges into an
+    /// index chunk or a column chunk gets different bytes than one that reads
+    /// the object whole.
+    #[test]
+    fn test_read_blob_range_matches_full_read() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let h = kernel.write(&data).unwrap();
+
+        for (offset, len) in [
+            (0u64, 1usize),
+            (0, 10_000),
+            (1, 100),
+            (4096, 4096),
+            (9_999, 1),
+            (5_000, 123),
+        ] {
+            let got = kernel.read_blob_range(&h, offset, len).unwrap();
+            let want = &data[offset as usize..(offset as usize + len).min(data.len())];
+            assert_eq!(got, want, "range({}, {}) mismatch", offset, len);
+        }
+    }
+
+    /// Out-of-bounds ranges truncate rather than error, matching HTTP Range
+    /// semantics — so the local and S3 backends behave identically.
+    #[test]
+    fn test_read_blob_range_edges() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let h = kernel.write(b"0123456789").unwrap();
+
+        // Past the end → empty.
+        assert!(kernel.read_blob_range(&h, 10, 5).unwrap().is_empty());
+        assert!(kernel.read_blob_range(&h, 999, 5).unwrap().is_empty());
+        // Straddling the end → truncated.
+        assert_eq!(kernel.read_blob_range(&h, 8, 100).unwrap(), b"89");
+        // Zero length → empty.
+        assert!(kernel.read_blob_range(&h, 0, 0).unwrap().is_empty());
+        // Missing blob → NotFound, same as a full read.
+        let missing = "f".repeat(64);
+        assert_eq!(
+            kernel.read_blob_range(&missing, 0, 1).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    /// The trait's default implementation (used by any backend that has not
+    /// specialized) must agree with the native LocalFS one.
+    #[test]
+    fn test_default_range_impl_matches_native() {
+        use crate::object_store::slice_range;
+        let data: Vec<u8> = (0..200u8).collect();
+        for (offset, len) in [(0u64, 5usize), (10, 20), (195, 100), (500, 1), (0, 0)] {
+            let dir = tempdir().unwrap();
+            let store = LocalFSObjectStore::new(dir.path()).unwrap();
+            let h = store.put_blob(&data).unwrap();
+            assert_eq!(
+                store.get_blob_range(&h, offset, len).unwrap(),
+                slice_range(&data, offset, len),
+                "native and default range impls disagree at ({}, {})",
+                offset,
+                len
+            );
+        }
     }
 
     /// Concurrent writers to the same ref must never yield a torn read, and

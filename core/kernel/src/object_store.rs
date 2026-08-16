@@ -35,6 +35,32 @@ pub trait ObjectStore: Send + Sync {
     /// Read bytes by content hash.
     fn get_blob(&self, hash: &str) -> io::Result<Vec<u8>>;
 
+    /// Read a byte range of a blob: `len` bytes starting at `offset`.
+    ///
+    /// This is the primitive that makes object-storage-native design possible.
+    /// Without it every read is a whole-object GET, which rules out a
+    /// range-readable index, column chunks addressed inside a larger segment,
+    /// and a byte-range cache — i.e. most of the reason to store big objects
+    /// at all.
+    ///
+    /// It is also, deliberately, available on *every* backend: `seek`+`read`
+    /// on a local file, a `Range:` header on S3/GCS/Azure, a slice in memory.
+    /// That keeps the backend contract to four operations
+    /// (put / get(range) / list / delete) with identical semantics everywhere
+    /// — unlike conditional writes or append, which exist only on some
+    /// backends and would fork the correctness argument in two.
+    ///
+    /// A read that starts at or past the end of the blob returns empty. A read
+    /// that runs past the end is truncated to what exists, matching HTTP Range
+    /// semantics rather than erroring.
+    ///
+    /// The default implementation fetches the whole blob and slices, so every
+    /// backend is correct immediately; backends that can do better override it.
+    fn get_blob_range(&self, hash: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let data = self.get_blob(hash)?;
+        Ok(slice_range(&data, offset, len))
+    }
+
     /// Write a batch of blobs. Default: sequential. Backends can override
     /// with parallel implementation (S3 uses a thread pool).
     fn put_blob_batch(&self, items: &[Vec<u8>]) -> io::Result<Vec<String>> {
@@ -253,6 +279,42 @@ impl ObjectStore for LocalFSObjectStore {
         Ok(data)
     }
 
+    /// Seek to `offset` and read at most `len` bytes — never loads the whole
+    /// blob, which is the point of having a ranged read at all.
+    fn get_blob_range(&self, hash: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let path = self.blob_path(hash);
+        let mut f = fs::File::open(&path).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Blob '{}' not found", hash),
+                )
+            } else {
+                e
+            }
+        })?;
+
+        let size = f.metadata()?.len();
+        if offset >= size {
+            return Ok(Vec::new());
+        }
+        // Truncate the request to what the file actually holds, so a caller
+        // asking for more than exists gets a short read rather than an error
+        // (and so `len` can never drive an unbounded allocation).
+        let readable = (size - offset).min(len as u64) as usize;
+
+        f.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; readable];
+        f.read_exact(&mut buf)?;
+
+        let mut s = self.stats.lock().unwrap();
+        s.gets += 1;
+        s.bytes_read += buf.len() as u64;
+        Ok(buf)
+    }
+
     fn put_path(&self, path: &str, hash: &str) -> io::Result<()> {
         let file = self.path_file(path).ok_or_else(|| {
             io::Error::new(
@@ -325,6 +387,21 @@ impl ObjectStore for LocalFSObjectStore {
             Ok(false)
         }
     }
+}
+
+/// Clamp a byte range to what a buffer actually holds.
+///
+/// Shared by every backend so range semantics cannot drift between them:
+/// an offset at or past the end yields empty, and a length running past the
+/// end is truncated. This matches HTTP Range behaviour, which is what the S3
+/// implementation gets from the server anyway.
+pub fn slice_range(data: &[u8], offset: u64, len: usize) -> Vec<u8> {
+    let start = match usize::try_from(offset) {
+        Ok(s) if s < data.len() => s,
+        _ => return Vec::new(),
+    };
+    let end = start.saturating_add(len).min(data.len());
+    data[start..end].to_vec()
 }
 
 /// Walk a directory recursively, collecting file paths relative to root.

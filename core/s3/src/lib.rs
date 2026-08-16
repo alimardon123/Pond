@@ -258,8 +258,112 @@ fn build_authorization_header(
 ///
 /// Thread-safe: the inner HTTP client (ureq) is sync and thread-safe. Stats
 /// are behind a Mutex.
+/// Objects at or above this size are uploaded with multipart.
+///
+/// S3 caps a single PUT at 5 GiB, and a large single PUT has no resume point:
+/// one dropped connection re-sends everything. Multipart splits the object so
+/// only the failed part is retried, and lets parts go in parallel.
 pub const MULTIPART_THRESHOLD: usize = 100 * 1024 * 1024;
+/// Size of each multipart part. S3 requires >= 5 MiB for all but the last.
 pub const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
+/// How many parts to upload concurrently.
+pub const MULTIPART_PARALLELISM: usize = 4;
+
+// S3's own limits, checked at compile time so a careless edit to the constants
+// above fails the build rather than a live upload.
+const _: () = assert!(
+    MULTIPART_PART_SIZE >= 5 * 1024 * 1024,
+    "S3 requires every part except the last to be at least 5 MiB"
+);
+const _: () = assert!(
+    MULTIPART_THRESHOLD < 5 * 1024 * 1024 * 1024,
+    "objects at or above 5 GiB cannot use a single PUT, so the multipart \
+     threshold must be below that limit"
+);
+
+/// Retry attempts after the initial try, for retryable failures.
+const MAX_RETRIES: u32 = 5;
+/// Base unit for exponential backoff.
+const RETRY_BASE_DELAY_MS: u64 = 50;
+/// Ceiling on any single backoff sleep.
+const RETRY_MAX_DELAY_MS: u64 = 2_000;
+
+/// An S3 failure that remembers its HTTP status.
+///
+/// Retry classification needs the status code, and stuffing it into a
+/// formatted string would mean parsing English back out. This keeps the
+/// decision typed and directly testable.
+#[derive(Debug)]
+struct S3Error {
+    status: Option<u16>,
+    message: String,
+}
+
+impl std::fmt::Display for S3Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for S3Error {}
+
+impl From<S3Error> for io::Error {
+    fn from(e: S3Error) -> io::Error {
+        // NotFound must survive as NotFound: callers (and the ObjectStore
+        // contract) distinguish "missing" from "failed".
+        let kind = match e.status {
+            Some(404) => io::ErrorKind::NotFound,
+            _ => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, e)
+    }
+}
+
+/// Recover the HTTP status from an error produced by this client.
+fn status_of(e: &io::Error) -> Option<u16> {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<S3Error>())
+        .and_then(|s3| s3.status)
+}
+
+/// Is this failure worth retrying?
+///
+/// Retryable: throttling and server-side faults (429, 500, 502, 503, 504),
+/// and transport errors (connection reset, timeout, DNS blip) which carry no
+/// status. Not retryable: anything the request itself got wrong — 400, 403,
+/// 404, 412, 416 — since repeating it produces the same answer.
+fn is_retryable(e: &io::Error) -> bool {
+    match status_of(e) {
+        Some(code) => matches!(code, 429 | 500 | 502 | 503 | 504),
+        // No status means the response never arrived: transport-level, retry.
+        None => e
+            .get_ref()
+            .map(|inner| inner.downcast_ref::<S3Error>().is_some())
+            .unwrap_or(false),
+    }
+}
+
+/// 416 means the requested range starts past the end of the object.
+fn is_range_not_satisfiable(e: &io::Error) -> bool {
+    status_of(e) == Some(416)
+}
+
+/// Exponential backoff with full jitter: `random(0, min(cap, base * 2^n))`.
+///
+/// Full jitter rather than plain exponential because the failure that makes
+/// retries necessary — a shared throttle — hits many clients at once. Without
+/// jitter they all wake together and re-collide; with it they spread out.
+fn backoff_delay(attempt: u32) -> std::time::Duration {
+    let exp = RETRY_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(16));
+    let ceiling = exp.min(RETRY_MAX_DELAY_MS);
+    // Cheap jitter source: no RNG dependency needed for scheduling noise.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jittered = if ceiling == 0 { 0 } else { nanos % (ceiling + 1) };
+    std::time::Duration::from_millis(jittered)
+}
 
 pub struct S3ObjectStore {
     bucket: String,
@@ -472,7 +576,49 @@ impl S3ObjectStore {
     }
 
     /// Make a signed S3 request and return the response.
+    /// Execute a signed request, retrying failures that S3 documents as
+    /// retryable.
+    ///
+    /// S3 sheds load: 503 SlowDown, 500, and 429 are normal under
+    /// concurrency, and connections get reset. Treating any of those as fatal
+    /// means a single hiccup fails a whole write — not acceptable for a
+    /// storage system, and previously the behaviour, since there was no retry
+    /// anywhere in this client.
+    ///
+    /// Backoff is exponential with full jitter (`random(0, base * 2^n)`),
+    /// which is what keeps many concurrent clients from re-colliding in
+    /// lockstep after a shared throttle. Requests are re-signed on each
+    /// attempt because SigV4 signatures cover a timestamp and expire.
+    ///
+    /// Only idempotent operations are retried. Every operation this client
+    /// performs is idempotent by construction: blob PUTs are
+    /// content-addressed (same bytes, same key), ref PUTs are
+    /// last-writer-wins, GETs and DELETEs are naturally so.
     fn s3_request(
+        &self,
+        method: &str,
+        key: &str,
+        query: Option<&str>,
+        body: Option<&[u8]>,
+        extra_headers: &[(String, String)],
+    ) -> Result<ureq::Response, io::Error> {
+        let mut attempt = 0u32;
+        loop {
+            match self.s3_request_once(method, key, query, body, extra_headers) {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    if attempt >= MAX_RETRIES || !is_retryable(&e) {
+                        return Err(e);
+                    }
+                    std::thread::sleep(backoff_delay(attempt));
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// One attempt, without retry.
+    fn s3_request_once(
         &self,
         method: &str,
         key: &str,
@@ -493,6 +639,8 @@ impl S3ObjectStore {
             "PUT" => agent.put(&signed.url),
             "DELETE" => agent.delete(&signed.url),
             "HEAD" => agent.head(&signed.url),
+            // POST is used by multipart upload (create / complete).
+            "POST" => agent.post(&signed.url),
             _ => return Err(io::Error::new(io::ErrorKind::InvalidInput,
                 format!("unsupported method: {}", signed.method))),
         };
@@ -503,8 +651,11 @@ impl S3ObjectStore {
             req = req.set(k, v);
         }
 
-        // Execute
-        let response = if signed.method == "PUT" {
+        // Execute. PUT and POST always send a body (possibly empty — S3's
+        // CreateMultipartUpload is a POST with no body but a signed empty
+        // payload hash, so it must still go through send_bytes for the
+        // Content-Length to match what was signed).
+        let response = if signed.method == "PUT" || signed.method == "POST" {
             req.send_bytes(&signed.body)
         } else if signed.method == "GET" || signed.method == "HEAD" || signed.method == "DELETE" {
             if signed.body.is_empty() {
@@ -517,18 +668,24 @@ impl S3ObjectStore {
         };
 
         response.map_err(|e| {
-            // Convert ureq errors to io::Error
+            // Convert ureq errors to io::Error, preserving the HTTP status so
+            // retry classification is a typed decision rather than a string
+            // match on the message.
             match e {
                 ureq::Error::Status(code, resp) => {
                     let status_text = resp.status_text().to_string();
                     let body = resp.into_string().unwrap_or_default();
-                    io::Error::other(
-                        format!("S3 returned {}: {} — {}", code, status_text, body),
-                    )
+                    S3Error {
+                        status: Some(code),
+                        message: format!("S3 returned {}: {} — {}", code, status_text, body),
+                    }
+                    .into()
                 }
-                ureq::Error::Transport(t) => {
-                    io::Error::other(format!("transport error: {}", t))
+                ureq::Error::Transport(t) => S3Error {
+                    status: None,
+                    message: format!("transport error: {}", t),
                 }
+                .into(),
             }
         })
     }
@@ -601,6 +758,159 @@ struct SignedS3Request {
 }
 
 // ---------------------------------------------------------------------------
+// Multipart upload
+// ---------------------------------------------------------------------------
+
+impl S3ObjectStore {
+    /// Upload a large object in parts.
+    ///
+    /// Three reasons this exists rather than one big PUT: S3 rejects a single
+    /// PUT over 5 GiB outright; a large PUT has no resume point, so one
+    /// dropped connection re-sends the whole object; and parts can go in
+    /// parallel, which is the only way to saturate bandwidth on a big write.
+    ///
+    /// Each part is retried independently by `s3_request`. If the upload
+    /// cannot be completed, it is aborted so S3 does not keep billing for the
+    /// orphaned parts — the failure mode people discover months later on an
+    /// invoice.
+    fn put_multipart(&self, key: &str, data: &[u8]) -> io::Result<()> {
+        let upload_id = self.create_multipart_upload(key)?;
+
+        match self.upload_parts(key, &upload_id, data) {
+            Ok(parts) => self.complete_multipart_upload(key, &upload_id, &parts),
+            Err(e) => {
+                // Best-effort abort: the upload already failed, so a failure
+                // here must not mask the original error.
+                let _ = self.abort_multipart_upload(key, &upload_id);
+                Err(e)
+            }
+        }
+    }
+
+    fn create_multipart_upload(&self, key: &str) -> io::Result<String> {
+        let resp = self.s3_request("POST", key, Some("uploads="), Some(&[]), &[])?;
+        let body = resp.into_string().map_err(io::Error::other)?;
+        extract_xml_tag(&body, "UploadId").ok_or_else(|| {
+            io::Error::other(format!(
+                "multipart: no UploadId in CreateMultipartUpload response: {}",
+                body
+            ))
+        })
+    }
+
+    /// Upload all parts, up to `MULTIPART_PARALLELISM` at a time.
+    ///
+    /// Returns (part_number, etag) pairs in part order, which is what
+    /// CompleteMultipartUpload requires.
+    fn upload_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+        data: &[u8],
+    ) -> io::Result<Vec<(usize, String)>> {
+        let chunks: Vec<(usize, &[u8])> = data
+            .chunks(MULTIPART_PART_SIZE)
+            .enumerate()
+            .map(|(i, c)| (i + 1, c)) // S3 part numbers are 1-based
+            .collect();
+
+        let mut parts: Vec<(usize, String)> = Vec::with_capacity(chunks.len());
+
+        for window in chunks.chunks(MULTIPART_PARALLELISM) {
+            let results: Vec<io::Result<(usize, String)>> = std::thread::scope(|s| {
+                let handles: Vec<_> = window
+                    .iter()
+                    .map(|(n, bytes)| {
+                        let n = *n;
+                        let bytes = *bytes;
+                        s.spawn(move || self.upload_one_part(key, upload_id, n, bytes))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(io::Error::other("multipart: upload thread panicked"))
+                        })
+                    })
+                    .collect()
+            });
+            for r in results {
+                parts.push(r?);
+            }
+        }
+
+        parts.sort_by_key(|(n, _)| *n);
+        Ok(parts)
+    }
+
+    fn upload_one_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: usize,
+        body: &[u8],
+    ) -> io::Result<(usize, String)> {
+        let query = format!("partNumber={}&uploadId={}", part_number, upload_id);
+        let resp = self.s3_request("PUT", key, Some(&query), Some(body), &[])?;
+        let etag = resp.header("etag").or_else(|| resp.header("ETag")).ok_or_else(|| {
+            io::Error::other(format!("multipart: part {} returned no ETag", part_number))
+        })?;
+        Ok((part_number, etag.to_string()))
+    }
+
+    fn complete_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[(usize, String)],
+    ) -> io::Result<()> {
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (n, etag) in parts {
+            // ETags come back quoted; S3 accepts them either way, but the
+            // quotes must be balanced, so pass them through verbatim.
+            xml.push_str(&format!(
+                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                n, etag
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+
+        let query = format!("uploadId={}", upload_id);
+        let resp = self.s3_request("POST", key, Some(&query), Some(xml.as_bytes()), &[])?;
+
+        // S3 can return 200 with an error document in the body for this call,
+        // so a status check alone is not enough.
+        let body = resp.into_string().unwrap_or_default();
+        if body.contains("<Error>") {
+            return Err(io::Error::other(format!(
+                "multipart: CompleteMultipartUpload failed: {}",
+                body
+            )));
+        }
+        Ok(())
+    }
+
+    fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> io::Result<()> {
+        let query = format!("uploadId={}", upload_id);
+        self.s3_request("DELETE", key, Some(&query), None, &[])?;
+        Ok(())
+    }
+}
+
+/// Extract the text content of the first `<tag>...</tag>` in an XML document.
+///
+/// S3's multipart responses are small and fixed-shape, so a full XML parser
+/// is not warranted here; this handles exactly the shape AWS returns.
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].trim().to_string())
+}
+
+// ---------------------------------------------------------------------------
 // ObjectStore trait implementation
 // ---------------------------------------------------------------------------
 
@@ -608,8 +918,12 @@ impl ObjectStore for S3ObjectStore {
     fn put_blob(&self, data: &[u8]) -> io::Result<String> {
         let h = pond_kernel::hash_bytes(data);
         let key = self.blob_key(&h);
-        // S3 PUT is idempotent for same content — no need for HEAD first
-        let _resp = self.s3_request("PUT", &key, None, Some(data), &[])?;
+        // S3 PUT is idempotent for same content — no need for HEAD first.
+        if data.len() >= MULTIPART_THRESHOLD {
+            self.put_multipart(&key, data)?;
+        } else {
+            let _resp = self.s3_request("PUT", &key, None, Some(data), &[])?;
+        }
         let mut s = self.stats.lock().unwrap();
         s.puts += 1;
         s.bytes_written += data.len() as u64;
@@ -619,6 +933,49 @@ impl ObjectStore for S3ObjectStore {
     fn get_blob(&self, hash: &str) -> io::Result<Vec<u8>> {
         let key = self.blob_key(hash);
         let resp = self.s3_request("GET", &key, None, None, &[])?;
+        let mut body = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut body)
+            .map_err(io::Error::other)?;
+        let mut s = self.stats.lock().unwrap();
+        s.gets += 1;
+        s.bytes_read += body.len() as u64;
+        Ok(body)
+    }
+
+    /// Ranged GET via the HTTP `Range` header — S3 transfers only the
+    /// requested bytes, which is what makes a range-readable index and
+    /// per-column-chunk reads affordable.
+    ///
+    /// Semantics match the local backend: a range at or past the end returns
+    /// empty (S3 answers 416, which is not an error here), and a range running
+    /// past the end is truncated by the server.
+    fn get_blob_range(&self, hash: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let key = self.blob_key(hash);
+        // HTTP ranges are inclusive on both ends.
+        let end = offset.saturating_add(len as u64).saturating_sub(1);
+        let range = format!("bytes={}-{}", offset, end);
+
+        let resp = match self.s3_request(
+            "GET",
+            &key,
+            None,
+            None,
+            &[("range".to_string(), range)],
+        ) {
+            Ok(r) => r,
+            // 416 Range Not Satisfiable means the offset is at or past the end
+            // of the object. The local backend returns empty for that, so this
+            // one does too — otherwise callers would need backend-specific
+            // error handling, which is exactly what the uniform contract is
+            // meant to avoid.
+            Err(e) if is_range_not_satisfiable(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
         let mut body = Vec::new();
         resp.into_reader()
             .read_to_end(&mut body)
@@ -1302,6 +1659,103 @@ pub extern "C" fn pond_storage_new_s3(url: *const c_char) -> *mut pond_storage::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn s3_err(status: Option<u16>) -> io::Error {
+        S3Error {
+            status,
+            message: "test".into(),
+        }
+        .into()
+    }
+
+    /// Throttling and server faults are retryable; client mistakes are not.
+    /// Getting this backwards either hammers S3 with requests that can never
+    /// succeed, or gives up on a transient 503 that a single retry would fix.
+    #[test]
+    fn test_retry_classification() {
+        for code in [429, 500, 502, 503, 504] {
+            assert!(is_retryable(&s3_err(Some(code))), "{} should retry", code);
+        }
+        for code in [400, 401, 403, 404, 412, 416] {
+            assert!(
+                !is_retryable(&s3_err(Some(code))),
+                "{} must not retry — the request itself is wrong",
+                code
+            );
+        }
+        // Transport failure: no response arrived, so retry.
+        assert!(is_retryable(&s3_err(None)));
+        // An unrelated io::Error is not ours and is not retried.
+        assert!(!is_retryable(&io::Error::other("something else")));
+    }
+
+    /// A 404 must still surface as NotFound — the ObjectStore contract
+    /// distinguishes "missing" from "failed", and callers branch on it.
+    #[test]
+    fn test_not_found_kind_is_preserved() {
+        assert_eq!(s3_err(Some(404)).kind(), io::ErrorKind::NotFound);
+        assert_eq!(s3_err(Some(503)).kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn test_range_not_satisfiable_detected() {
+        assert!(is_range_not_satisfiable(&s3_err(Some(416))));
+        assert!(!is_range_not_satisfiable(&s3_err(Some(404))));
+    }
+
+    /// Backoff must stay inside its ceiling and never be negative or absurd.
+    /// Full jitter means each delay is random in [0, cap], so the assertion is
+    /// on the bound, not on a specific value.
+    #[test]
+    fn test_backoff_respects_ceiling() {
+        for attempt in 0..20 {
+            let d = backoff_delay(attempt).as_millis() as u64;
+            assert!(
+                d <= RETRY_MAX_DELAY_MS,
+                "attempt {} produced {}ms, above the {}ms ceiling",
+                attempt,
+                d,
+                RETRY_MAX_DELAY_MS
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_xml_tag() {
+        let body = r#"<?xml version="1.0"?>
+            <InitiateMultipartUploadResult>
+              <Bucket>b</Bucket><Key>k</Key><UploadId>abc-123</UploadId>
+            </InitiateMultipartUploadResult>"#;
+        assert_eq!(extract_xml_tag(body, "UploadId").as_deref(), Some("abc-123"));
+        assert_eq!(extract_xml_tag(body, "Bucket").as_deref(), Some("b"));
+        assert!(extract_xml_tag(body, "Missing").is_none());
+        assert!(extract_xml_tag("<Open>no close", "Open").is_none());
+    }
+
+    /// Part splitting must match S3's rules: 1-based numbering, every part
+    /// but the last exactly PART_SIZE, and the whole object covered.
+    #[test]
+    fn test_multipart_part_layout() {
+        let size = MULTIPART_PART_SIZE * 3 + 1234;
+        let data = vec![0u8; size];
+        let chunks: Vec<(usize, &[u8])> = data
+            .chunks(MULTIPART_PART_SIZE)
+            .enumerate()
+            .map(|(i, c)| (i + 1, c))
+            .collect();
+
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0].0, 1, "S3 part numbers start at 1");
+        for (_, c) in &chunks[..3] {
+            assert_eq!(c.len(), MULTIPART_PART_SIZE);
+        }
+        assert_eq!(chunks[3].1.len(), 1234, "last part carries the remainder");
+        assert_eq!(
+            chunks.iter().map(|(_, c)| c.len()).sum::<usize>(),
+            size,
+            "parts must cover the object exactly"
+        );
+    }
 
     #[test]
     fn test_hmac_sha256_known_vector() {

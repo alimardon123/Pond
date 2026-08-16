@@ -1490,6 +1490,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond_cache"
+version = "0.3.0"
+dependencies = [
+ "pond_kernel",
+ "tempfile",
+]
+
+[[package]]
 name = "pond_cli"
 version = "0.3.0"
 dependencies = [

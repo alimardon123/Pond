@@ -1,0 +1,15 @@
+[package]
+name = "pond_cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond cache — hash-keyed two-tier (memory + local disk) read-through cache for content-addressed blobs"
+
+[lib]
+name = "pond_cache"
+
+[dependencies]
+pond_kernel = { path = "../kernel" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
