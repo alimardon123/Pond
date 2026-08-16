@@ -1641,6 +1641,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond_record"
+version = "0.3.0"
+dependencies = [
+ "pond_kernel",
+ "tempfile",
+]
+
+[[package]]
 name = "pond_s3"
 version = "0.3.0"
 dependencies = [

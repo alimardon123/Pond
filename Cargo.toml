@@ -9,6 +9,7 @@ members = [
     "core/sql",
     "core/index",
     "core/cache",
+    "core/record",
     "cli",
     "bindings/python/pyo3",
     "lenses/keyvalue/rust",

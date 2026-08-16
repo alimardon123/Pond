@@ -1,0 +1,15 @@
+[package]
+name = "pond_record"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond record model — typed fields with per-field versions and a convergent per-field merge"
+
+[lib]
+name = "pond_record"
+
+[dependencies]
+pond_kernel = { path = "../kernel" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
