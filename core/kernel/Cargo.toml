@@ -22,11 +22,12 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 async = ["dep:tokio", "dep:async-trait"]
 
 [dependencies]
-# NONE — the kernel is pure Rust with no external deps, matching pond-core's
-# zero-dependency principle. This is critical for the single-binary
-# distribution model (no transitive crate dependencies to satisfy).
+# The kernel keeps its dependency set deliberately tiny — every crate here has
+# to be satisfiable by every consumer of the single-binary distribution.
 sha2 = "0.10"
-lru = "0.12"
+# OS CSPRNG for UUIDv7 randomness. Already present transitively (ring/TLS),
+# so this adds no new third-party surface.
+getrandom = "0.3"
 
 # Optional async I/O. Only pulled in with `--features async`.
 tokio = { version = "1", features = ["rt", "fs", "io-util"], optional = true }

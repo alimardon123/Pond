@@ -59,8 +59,42 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
     }
 
     let inner = &blob[13..];
+    check_row_count(n_rows, inner.len())?;
     let mut parser = PND2Parser::new(inner);
     decode_inner(inner, &mut parser, n_rows, n_columns, has_stats)
+}
+
+/// Reject a header row count that the payload could not possibly hold.
+///
+/// `n_rows` is attacker-controlled: it is a u32 read straight from the blob
+/// header and then handed to every per-encoding decoder. The densest encoding
+/// Pond emits is BITPACK at one bit per value, so a payload of N bytes can
+/// describe at most 8*N values. A blob claiming more than that is malformed —
+/// previously it was believed, and a single corrupted byte could ask for a
+/// 28 GB allocation, which aborts the process (allocation failure is not a
+/// catchable panic).
+fn check_row_count(n_rows: usize, payload_len: usize) -> Result<(), String> {
+    let max_possible = payload_len.saturating_mul(8);
+    if n_rows > max_possible {
+        return Err(format!(
+            "malformed PND2: header claims {} rows but the {}-byte payload can hold at most {}",
+            n_rows, payload_len, max_possible
+        ));
+    }
+    Ok(())
+}
+
+/// Capacity to pre-allocate for a count that came from untrusted bytes.
+///
+/// `Vec::with_capacity` on a header-supplied count is an unbounded allocation
+/// primitive. Pre-allocating is only an optimization — growth is amortized
+/// O(1) — so we cap the up-front reservation and let legitimately large
+/// columns grow into it. Hostile counts then cost a bounded allocation
+/// instead of aborting the process.
+#[inline]
+fn safe_capacity(requested: usize) -> usize {
+    const MAX_PREALLOC: usize = 64 * 1024;
+    requested.min(MAX_PREALLOC)
 }
 
 /// Decompress zstd data using ruzstd (pure-Rust, no C deps).
@@ -87,7 +121,7 @@ fn decode_inner(
 ) -> Result<Vec<PondColumn>, String> {
 
     // Parse schema
-    let mut schema: Vec<(CString, u8, u8)> = Vec::with_capacity(n_columns);
+    let mut schema: Vec<(CString, u8, u8)> = Vec::with_capacity(safe_capacity(n_columns));
     for _ in 0..n_columns {
         let name_len = match parser.read_u8() { Some(v) => v as usize, None => break };
         let name_bytes = match parser.read_bytes(name_len) { Some(v) => v, None => break };
@@ -110,7 +144,7 @@ fn decode_inner(
     }
 
     // Record payload positions (defer decode for projection pushdown)
-    let mut payloads: Vec<(CString, u8, u8, usize, usize)> = Vec::with_capacity(n_columns);
+    let mut payloads: Vec<(CString, u8, u8, usize, usize)> = Vec::with_capacity(safe_capacity(n_columns));
     for (name, vtype, enc) in &schema {
         let plen = match parser.read_u32() { Some(v) => v as usize, None => break };
         let pstart = parser.pos;
@@ -180,7 +214,7 @@ pub fn decode_raw(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
     match vtype {
         VT_INT64 => {
             let n = (data.len() / 8).min(n_rows);
-            let mut vals = Vec::with_capacity(n);
+            let mut vals = Vec::with_capacity(safe_capacity(n));
             for i in 0..n {
                 let o = i * 8;
                 vals.push(i64::from_le_bytes([
@@ -196,7 +230,7 @@ pub fn decode_raw(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
         }
         VT_FLOAT64 => {
             let n = (data.len() / 8).min(n_rows);
-            let mut vals = Vec::with_capacity(n);
+            let mut vals = Vec::with_capacity(safe_capacity(n));
             for i in 0..n {
                 let o = i * 8;
                 vals.push(f64::from_le_bytes([
@@ -235,7 +269,7 @@ fn decode_raw_binary(payload: &[u8], n_rows: usize) -> PondColumn {
         return PondColumn::empty_named("", VT_BINARY);
     }
     let n_values = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(n_values);
+    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(safe_capacity(n_values));
     let mut off = 4;
     for _ in 0..n_values {
         if off + 4 > payload.len() { break; }
@@ -265,7 +299,7 @@ fn decode_raw_binary(payload: &[u8], n_rows: usize) -> PondColumn {
 /// stripped). Tries without null bitmap first, then with bitmap.
 fn decode_raw_string_or_binary(data: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
     // Try parsing as length-prefixed values (no bitmap)
-    let mut vals: Vec<&[u8]> = Vec::with_capacity(n_rows);
+    let mut vals: Vec<&[u8]> = Vec::with_capacity(safe_capacity(n_rows));
     let mut off = 0;
     while off + 4 <= data.len() && vals.len() < n_rows {
         let slen = u32::from_le_bytes([
@@ -296,7 +330,7 @@ fn decode_raw_string_or_binary(data: &[u8], vtype: u8, n_rows: usize) -> PondCol
             let bitmap = &data[..bitmap_size];
             let vals_data = &data[bitmap_size..];
 
-            let mut vals2: Vec<&[u8]> = Vec::with_capacity(n_rows);
+            let mut vals2: Vec<&[u8]> = Vec::with_capacity(safe_capacity(n_rows));
             let mut off2 = 0;
             while off2 + 4 <= vals_data.len() && vals2.len() < n_rows {
                 let slen = u32::from_le_bytes([
@@ -315,7 +349,7 @@ fn decode_raw_string_or_binary(data: &[u8], vtype: u8, n_rows: usize) -> PondCol
             }
 
             // Walk the bitmap: null rows get empty, valid rows get next val.
-            let mut final_vals: Vec<&[u8]> = Vec::with_capacity(n_rows);
+            let mut final_vals: Vec<&[u8]> = Vec::with_capacity(safe_capacity(n_rows));
             let mut val_idx = 0;
             for i in 0..n_rows {
                 if bitmap[i / 8] & (1 << (i % 8)) != 0 {
@@ -383,7 +417,7 @@ pub fn decode_bitpack(payload: &[u8], n_rows: usize) -> PondColumn {
         return PondColumn::empty_named("", VT_INT64);
     }
 
-    let mut vals = Vec::with_capacity(n_rows);
+    let mut vals = Vec::with_capacity(safe_capacity(n_rows));
     let mut bit_pos = 0usize;
 
     for _ in 0..n_rows {
@@ -484,10 +518,10 @@ pub fn decode_dict(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
 
     // Walk the packed codes and look up each value in the dictionary.
     let mut bit_pos = 0usize;
-    let mut int_vals: Vec<i64> = Vec::with_capacity(n_rows);
-    let mut float_vals: Vec<f64> = Vec::with_capacity(n_rows);
-    let mut str_vals: Vec<CString> = Vec::with_capacity(n_rows);
-    let mut bin_vals: Vec<Vec<u8>> = Vec::with_capacity(n_rows);
+    let mut int_vals: Vec<i64> = Vec::with_capacity(safe_capacity(n_rows));
+    let mut float_vals: Vec<f64> = Vec::with_capacity(safe_capacity(n_rows));
+    let mut str_vals: Vec<CString> = Vec::with_capacity(safe_capacity(n_rows));
+    let mut bin_vals: Vec<Vec<u8>> = Vec::with_capacity(safe_capacity(n_rows));
     let mut n = 0usize;
 
     for _ in 0..n_rows {
@@ -561,10 +595,10 @@ pub fn decode_rle(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
     let n_runs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     let mut off = 4;
 
-    let mut int_vals: Vec<i64> = Vec::with_capacity(n_rows);
-    let mut float_vals: Vec<f64> = Vec::with_capacity(n_rows);
-    let mut str_vals: Vec<CString> = Vec::with_capacity(n_rows);
-    let mut bin_vals: Vec<Vec<u8>> = Vec::with_capacity(n_rows);
+    let mut int_vals: Vec<i64> = Vec::with_capacity(safe_capacity(n_rows));
+    let mut float_vals: Vec<f64> = Vec::with_capacity(safe_capacity(n_rows));
+    let mut str_vals: Vec<CString> = Vec::with_capacity(safe_capacity(n_rows));
+    let mut bin_vals: Vec<Vec<u8>> = Vec::with_capacity(safe_capacity(n_rows));
     let mut total_rows = 0usize;
 
     for _ in 0..n_runs {

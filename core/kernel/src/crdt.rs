@@ -145,26 +145,20 @@ fn format_uuid(bytes: &[u8; 16]) -> String {
     )
 }
 
-/// Fill a buffer with random bytes (uses /dev/urandom on Unix).
+/// Fill a buffer with cryptographically secure random bytes.
+///
+/// UUIDv7's random bits are what keep row IDs unique across machines that
+/// generate them in the same millisecond, so they must not be predictable or
+/// correlated. The previous implementation was an xorshift64 re-seeded on
+/// every call from `now_nanos + pid` — two calls within the same clock tick
+/// produced identical bytes, and the sequence was trivially predictable.
+///
+/// `getrandom` is the OS CSPRNG: `getrandom(2)`/`/dev/urandom` on Linux,
+/// `getentropy` on macOS/BSD, `BCryptGenRandom` on Windows. It is already in
+/// the dependency tree (via ring, through the S3 backend's TLS stack), so this
+/// adds no new third-party surface.
 fn fill_random(buf: &mut [u8]) {
-    // Use a simple PRNG seeded from system time + thread ID.
-    // For production, this should use the `rand` crate or /dev/urandom.
-    // For now, this is sufficient — the random bits only need to be
-    // unique within the same millisecond, not cryptographically secure.
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        .wrapping_add(std::process::id() as u64);
-
-    let mut state = seed;
-    for byte in buf.iter_mut() {
-        // xorshift64
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        *byte = state as u8;
-    }
+    getrandom::fill(buf).expect("OS CSPRNG unavailable — cannot generate unique row IDs");
 }
 
 fn current_time_ms() -> u64 {
@@ -175,14 +169,69 @@ fn current_time_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Shard naming
+// ---------------------------------------------------------------------------
+
+/// Generate a shard-name suffix that is unique across writers.
+///
+/// Shards are the coordination-free write path: every writer PUTs its own
+/// shard object and readers union them. That is only safe as long as two
+/// writers never choose the same shard name — a collision means one writer's
+/// ref silently overwrites the other's, and those rows are lost with no error.
+///
+/// This used to be a bare nanosecond timestamp in two separate copies (the SQL
+/// executor and the Python binding), which does not carry that guarantee: two
+/// processes writing in the same nanosecond produced the same name, and coarse
+/// platform clocks make that far likelier than nanosecond resolution suggests.
+///
+/// The suffix is `{timestamp}-{writer_id}-{counter}`:
+///   - timestamp keeps names roughly time-ordered, so listings stay readable
+///     and compaction can work oldest-first;
+///   - writer_id is drawn once per process from the OS CSPRNG, so no two
+///     writers share it;
+///   - counter disambiguates writes within one process, which can easily emit
+///     several shards inside a single clock tick.
+pub fn shard_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    static WRITER_ID: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let writer = *WRITER_ID.get_or_init(|| {
+        let mut b = [0u8; 8];
+        fill_random(&mut b);
+        u64::from_be_bytes(b)
+    });
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}-{:016x}-{:08x}", ts, writer, seq)
+}
+
+// ---------------------------------------------------------------------------
 // HLC — Hybrid Logical Clock for clock-skew-safe _version
 // ---------------------------------------------------------------------------
 
-/// Hybrid Logical Clock — monotonic under clock skew.
+/// Hybrid Logical Clock — monotonic under clock skew, totally ordered
+/// across writers.
 ///
-/// Each process has its own HLC instance. The clock advances on every
-/// tick (before each write). The logical counter increments when the
-/// physical clock hasn't advanced.
+/// Each process has its own HLC instance. The clock advances on every tick
+/// (before each write). The logical counter increments when the physical
+/// clock hasn't advanced.
+///
+/// # Why there is a writer id
+///
+/// `(physical, logical)` alone does **not** give a total order across
+/// machines: two nodes ticking in the same millisecond, each with logical=0,
+/// emit *byte-identical* versions. Last-writer-wins then has a tie it cannot
+/// break, so the winner depends on iteration order and `merge(A,B)` stops
+/// agreeing with `merge(B,A)` — the convergence property the whole CRDT
+/// design rests on. A per-writer id makes the order total: ties fall back to
+/// comparing writer ids, which is arbitrary but *deterministic and identical
+/// on every replica*.
 ///
 /// Usage:
 ///   let mut clock = HLC::new();
@@ -192,17 +241,40 @@ fn current_time_ms() -> u64 {
 pub struct HLC {
     physical: u64,
     logical: u64,
+    writer: u64,
 }
 
 impl HLC {
+    /// Create a clock with a random writer id drawn from the OS CSPRNG.
+    ///
+    /// Random (rather than, say, pid) because the id must be distinct across
+    /// machines, not just across processes on one host.
     pub fn new() -> Self {
-        Self { physical: 0, logical: 0 }
+        let mut bytes = [0u8; 8];
+        fill_random(&mut bytes);
+        Self { physical: 0, logical: 0, writer: u64::from_be_bytes(bytes) }
+    }
+
+    /// Create a clock with an explicit writer id.
+    ///
+    /// Use this when a node has a stable identity that should persist across
+    /// restarts, so its versions keep tie-breaking the same way.
+    pub fn with_writer_id(writer: u64) -> Self {
+        Self { physical: 0, logical: 0, writer }
+    }
+
+    /// This clock's writer id.
+    pub fn writer_id(&self) -> u64 {
+        self.writer
     }
 
     /// Advance the clock and return the current HLC value as a hex string.
     ///
-    /// Format: 32 hex chars (16 bytes): 8 bytes physical_ms big-endian
-    /// + 8 bytes logical big-endian. Sorts lexicographically = chronologically.
+    /// Format: 48 hex chars — 16 physical_ms + 16 logical + 16 writer id, all
+    /// big-endian, so lexicographic order == (physical, logical, writer)
+    /// order. Values written before writer ids existed are 32 chars; they
+    /// compare correctly against 48-char values because a prefix sorts before
+    /// any longer string sharing it.
     pub fn tick(&mut self) -> String {
         let now = current_time_ms();
         if now > self.physical {
@@ -237,14 +309,18 @@ impl HLC {
         }
     }
 
-    /// Encode the current HLC state as a 32-char hex string.
+    /// Encode the current HLC state as a 48-char hex string.
     fn encode(&self) -> String {
-        format!("{:016x}{:016x}", self.physical, self.logical)
+        format!("{:016x}{:016x}{:016x}", self.physical, self.logical, self.writer)
     }
 
-    /// Decode a 32-char hex string into (physical, logical).
+    /// Decode an HLC string into (physical, logical).
+    ///
+    /// Accepts both the current 48-char form and the legacy 32-char form
+    /// (physical + logical, no writer id) so collections written before
+    /// writer ids existed keep resolving.
     fn decode(s: &str) -> Option<(u64, u64)> {
-        if s.len() != 32 {
+        if s.len() != 32 && s.len() != 48 {
             return None;
         }
         let physical = u64::from_str_radix(&s[0..16], 16).ok()?;
@@ -253,8 +329,10 @@ impl HLC {
     }
 
     /// Check if a string is a valid HLC value.
+    /// Check if a string is a valid HLC value (48-char current form, or the
+    /// legacy 32-char form without a writer id).
     pub fn is_valid(s: &str) -> bool {
-        s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+        (s.len() == 48 || s.len() == 32) && s.chars().all(|c| c.is_ascii_hexdigit())
     }
 }
 
@@ -334,8 +412,85 @@ mod tests {
     fn test_hlc_format() {
         let mut clock = HLC::new();
         let v = clock.tick();
-        assert_eq!(v.len(), 32, "HLC must be 32 hex chars");
+        assert_eq!(v.len(), 48, "HLC is physical + logical + writer id");
         assert!(HLC::is_valid(&v), "HLC must be valid");
+        // Legacy 32-char values (written before writer ids) stay valid.
+        assert!(HLC::is_valid(&"0".repeat(32)));
+    }
+
+    /// Shard names must be unique even when generated in a tight loop, where
+    /// the clock does not advance between calls.
+    ///
+    /// Regression: the previous generator was a bare nanosecond timestamp, so
+    /// two writers in the same tick produced the same shard name and one
+    /// silently overwrote the other's rows.
+    #[test]
+    fn test_shard_id_unique_within_a_clock_tick() {
+        let ids: std::collections::HashSet<String> =
+            (0..10_000).map(|_| shard_id()).collect();
+        assert_eq!(ids.len(), 10_000, "shard ids must not collide");
+    }
+
+    /// Shard ids from concurrent threads are distinct.
+    #[test]
+    fn test_shard_id_unique_across_threads() {
+        let ids = std::sync::Mutex::new(std::collections::HashSet::new());
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let batch: Vec<String> = (0..1000).map(|_| shard_id()).collect();
+                    let mut guard = ids.lock().unwrap();
+                    for id in batch {
+                        assert!(guard.insert(id), "duplicate shard id across threads");
+                    }
+                });
+            }
+        });
+        assert_eq!(ids.into_inner().unwrap().len(), 8000);
+    }
+
+    /// Two clocks on different nodes must never emit the same version, even
+    /// when they tick in the same millisecond with the same logical counter.
+    ///
+    /// Regression: without a writer id these were byte-identical, so
+    /// last-writer-wins had an unbreakable tie and merge order decided the
+    /// winner — `merge(A,B) != merge(B,A)`.
+    #[test]
+    fn test_hlc_distinct_across_writers_in_same_millisecond() {
+        let mut a = HLC::with_writer_id(1);
+        let mut b = HLC::with_writer_id(2);
+        let va = a.tick();
+        let vb = b.tick();
+        assert_ne!(va, vb, "two writers must not produce identical versions");
+
+        // And the order is total and deterministic: whichever compares
+        // greater does so consistently, on every replica.
+        assert!(va < vb, "ties break by writer id, lower id sorts first");
+    }
+
+    /// A 1000-node burst inside one millisecond yields 1000 distinct versions.
+    #[test]
+    fn test_hlc_no_collisions_across_many_writers() {
+        let mut seen = std::collections::HashSet::new();
+        for id in 0..1000u64 {
+            let mut c = HLC::with_writer_id(id);
+            assert!(seen.insert(c.tick()), "version collision at writer {}", id);
+        }
+        assert_eq!(seen.len(), 1000);
+    }
+
+    /// Ordering still works between legacy 32-char and current 48-char values.
+    #[test]
+    fn test_hlc_legacy_values_still_order() {
+        let mut c = HLC::with_writer_id(7);
+        let new = c.tick();
+        let legacy_same_instant = &new[..32];
+        assert!(
+            legacy_same_instant < new.as_str(),
+            "a legacy value sorts before a writer-tagged one at the same instant"
+        );
+        assert!(HLC::decode(&new).is_some());
+        assert!(HLC::decode(legacy_same_instant).is_some());
     }
 
     #[test]

@@ -77,6 +77,68 @@ pub use types::*;
 mod tests {
     use super::*;
 
+    /// A corrupted blob must produce an error, never an unbounded allocation.
+    ///
+    /// Regression: `n_rows` is a u32 read straight from the header and was
+    /// handed to `Vec::with_capacity` in every per-encoding decoder. Flipping
+    /// one byte of a 193-byte blob could request ~28 GB, and allocation
+    /// failure aborts the process — it is not a catchable panic, so no caller
+    /// could defend against it. Reachable from anything that decodes bytes it
+    /// did not write: the MCP server, S3 reads, another writer's shard.
+    #[test]
+    fn test_decode_survives_corrupted_blobs() {
+        let good = pnd2_encode_multi_typed(&[
+            ("id", TypedColumn::Int64(vec![1, 2, 3, 4, 5])),
+            (
+                "name",
+                TypedColumn::String(
+                    ["alpha", "beta", "gamma", "d", "e"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+            ),
+            ("f", TypedColumn::Float64(vec![1.0, 2.0, 3.0, 4.0, 5.0])),
+        ]);
+
+        // Deterministic xorshift so a failure is reproducible from the seed.
+        let mut state: u64 = 0x1234_5678;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for i in 0..20_000u32 {
+            let mut b = good.clone();
+            for _ in 0..(1 + next() % 4) {
+                let pos = (next() as usize) % b.len();
+                b[pos] = (next() >> 11) as u8;
+            }
+            if i % 7 == 0 {
+                let l = (next() as usize) % b.len();
+                b.truncate(l.max(1));
+            }
+            // Must return Ok or Err — never abort, never hang.
+            let _ = pnd2_decode(&b);
+        }
+    }
+
+    /// The header's row count is bounded by what the payload could hold.
+    #[test]
+    fn test_decode_rejects_impossible_row_count() {
+        let mut blob = pnd2_encode_i64(&[1, 2, 3]);
+        // n_rows lives at bytes 6..10. Claim ~4 billion rows.
+        blob[6..10].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = pnd2_decode(&blob).expect_err("impossible row count must be rejected");
+        assert!(
+            err.contains("malformed PND2"),
+            "expected a malformed-blob error, got: {}",
+            err
+        );
+    }
+
     #[test]
     fn test_encode_decode_i64_roundtrip() {
         let input: Vec<i64> = vec![1, 2, 3, 100, -50, 999999, 0, -1];

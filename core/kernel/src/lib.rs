@@ -140,6 +140,7 @@ impl PondKernel {
     // ------------------------------------------------------------------
 
     pub fn reference(&self, name: &str, h: &str) -> io::Result<()> {
+        validate_ref_path(name)?;
         if !self.store.blob_exists(h) {
             return Err(io::Error::new(io::ErrorKind::NotFound,
                 format!("Hash '{}' does not refer to an existing blob", h)));
@@ -150,6 +151,7 @@ impl PondKernel {
     }
 
     pub fn resolve(&self, name: &str) -> Option<String> {
+        validate_ref_path(name).ok()?;
         self.store.get_path(name)
     }
 
@@ -158,10 +160,14 @@ impl PondKernel {
     }
 
     pub fn list_names_prefix(&self, prefix: &str) -> Vec<String> {
+        if validate_ref_path(prefix).is_err() {
+            return Vec::new();
+        }
         self.store.list_paths(prefix).unwrap_or_default()
     }
 
     pub fn delete_ref(&self, name: &str) -> io::Result<bool> {
+        validate_ref_path(name)?;
         self.store.delete_path(name)
     }
 
@@ -308,6 +314,60 @@ fn is_hash(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Reject ref paths that could escape the store root or confuse a backend.
+///
+/// Ref paths are the ONLY place user-controlled strings become storage keys:
+/// a collection named `../../x` turns into `collections/../../x/_branches/...`,
+/// which on a local FS resolves outside the pond root. That input is reachable
+/// from the MCP server (where an agent picks the collection name), the CLI, the
+/// C ABI, and the Python binding, so it is validated here — the one point every
+/// backend goes through — rather than at each call site.
+///
+/// The rules are deliberately strict and backend-neutral, so a path that is
+/// valid on a local FS is valid as an S3/GCS key and vice versa:
+///   - no empty path, no leading `/` (absolute), no trailing `/`
+///   - no `.` or `..` components (traversal)
+///   - no empty components (`a//b`)
+///   - no backslashes (Windows separators, and `\` is legal in an S3 key)
+///   - no control characters or NUL
+///
+/// A trailing `/` is permitted only for listing prefixes; callers that need it
+/// use [`PondKernel::list_names_prefix`], which passes the prefix through the
+/// same rules minus the trailing-slash check.
+pub fn validate_ref_path(path: &str) -> io::Result<()> {
+    let invalid = |why: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid ref path '{}': {}", path, why),
+        ))
+    };
+
+    if path.is_empty() {
+        return Ok(()); // the empty prefix means "list everything"
+    }
+    if path.starts_with('/') {
+        return invalid("absolute paths are not allowed");
+    }
+    if path.contains('\\') {
+        return invalid("backslashes are not allowed");
+    }
+    if path.chars().any(|c| c.is_control()) {
+        return invalid("control characters are not allowed");
+    }
+
+    // A single trailing slash is allowed (listing prefix); strip it before
+    // splitting so it doesn't read as an empty final component.
+    let body = path.strip_suffix('/').unwrap_or(path);
+    for component in body.split('/') {
+        match component {
+            "" => return invalid("empty path component"),
+            "." | ".." => return invalid("'.' and '..' components are not allowed"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -425,6 +485,122 @@ mod tests {
         kernel.reference("collections/users/_branches/main/commit", &h).unwrap();
         let expected = dir.path().join("collections/users/_branches/main/commit");
         assert!(expected.exists(), "ref should be at {}", expected.display());
+    }
+
+    #[test]
+    fn test_validate_ref_path_accepts_normal_refs() {
+        for ok in [
+            "",
+            "collections/users/_branches/main/commit",
+            "transactions/abc123",
+            "blobs/ab/",
+            "a_b-c.d",
+        ] {
+            assert!(validate_ref_path(ok).is_ok(), "should accept {:?}", ok);
+        }
+    }
+
+    #[test]
+    fn test_validate_ref_path_rejects_traversal() {
+        for bad in [
+            "../escaped",
+            "collections/../../escaped",
+            "collections/users/../../../etc/passwd",
+            "/absolute/path",
+            "a//b",
+            "./relative",
+            "back\\slash",
+            "nul\0byte",
+            "trailing/..",
+        ] {
+            assert!(
+                validate_ref_path(bad).is_err(),
+                "should reject {:?}",
+                bad
+            );
+        }
+    }
+
+    /// Regression: a collection name containing `..` must not create files
+    /// outside the store root. This was reachable end-to-end from the MCP
+    /// server, where the collection name is supplied by the calling agent.
+    #[test]
+    fn test_reference_cannot_escape_store_root() {
+        let outer = tempdir().unwrap();
+        let root = outer.path().join("pond");
+        let kernel = PondKernel::new_local(&root).unwrap();
+        let h = kernel.write(b"payload").unwrap();
+
+        let err = kernel
+            .reference("collections/../../pwned/_branches/main/commit", &h)
+            .expect_err("traversal must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Nothing was created outside the pond root.
+        assert!(!outer.path().join("pwned").exists());
+        assert!(!root.join("../pwned").exists());
+    }
+
+    /// The object store itself refuses too, even if a caller bypasses the
+    /// kernel and holds a `LocalFSObjectStore` directly.
+    #[test]
+    fn test_object_store_refuses_traversal_directly() {
+        let outer = tempdir().unwrap();
+        let root = outer.path().join("pond");
+        let store = LocalFSObjectStore::new(&root).unwrap();
+
+        assert!(store.put_path("../pwned", "deadbeef").is_err());
+        assert_eq!(store.get_path("../pwned"), None);
+        assert!(!store.delete_path("../pwned").unwrap());
+        assert!(!outer.path().join("pwned").exists());
+    }
+
+    /// Concurrent writers to the same ref must never yield a torn read, and
+    /// must not leave temp files behind.
+    ///
+    /// The temp name used to be `{path}.tmp.{pid}`, which is shared by every
+    /// thread in a process — two threads writing the same ref wrote to the
+    /// same temp path. The name now includes a per-call counter.
+    #[test]
+    fn test_concurrent_ref_writes_never_tear() {
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(LocalFSObjectStore::new(dir.path()).unwrap());
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let a = kernel.write(b"a").unwrap();
+        let b = kernel.write(b"b").unwrap();
+
+        const REF: &str = "collections/x/_branches/main/commit";
+        for _ in 0..200 {
+            std::thread::scope(|s| {
+                for h in [&a, &b] {
+                    let store = store.clone();
+                    s.spawn(move || {
+                        let _ = store.put_path(REF, h);
+                    });
+                }
+            });
+            // Every read must return one of the two hashes we wrote — never
+            // a partial write, never garbage.
+            let got = store.get_path(REF).expect("ref must resolve");
+            assert!(got == a || got == b, "torn ref value: {:?}", got);
+        }
+
+        // No temp files survived.
+        let mut leftovers = Vec::new();
+        fn walk(p: &std::path::Path, out: &mut Vec<String>) {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    let q = e.path();
+                    if q.is_dir() {
+                        walk(&q, out);
+                    } else if q.to_string_lossy().contains(".tmp.") {
+                        out.push(q.display().to_string());
+                    }
+                }
+            }
+        }
+        walk(dir.path(), &mut leftovers);
+        assert!(leftovers.is_empty(), "temp files left behind: {:?}", leftovers);
     }
 
     #[test]

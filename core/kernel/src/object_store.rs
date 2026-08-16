@@ -160,26 +160,79 @@ impl LocalFSObjectStore {
         self.base_dir.join("blobs").join(&hash[..2]).join(hash)
     }
 
-    fn path_file(&self, path: &str) -> PathBuf {
-        self.base_dir.join(path)
+    /// Resolve a ref path to a file under `base_dir`.
+    ///
+    /// Returns `None` for any path that fails [`crate::validate_ref_path`].
+    /// The kernel validates too; this is the last line of defense, on the one
+    /// backend where a bad path escapes into the real filesystem.
+    fn path_file(&self, path: &str) -> Option<PathBuf> {
+        crate::validate_ref_path(path).ok()?;
+        Some(self.base_dir.join(path))
     }
+}
+
+/// Write `data` to `path` durably: temp file → fsync(file) → rename →
+/// fsync(parent dir).
+///
+/// `rename` is atomic with respect to *ordering* — a reader sees either the
+/// old file or the new one — but on its own it says nothing about durability.
+/// Without fsync of the file, a crash can leave the rename visible while the
+/// contents are still in page cache, so a ref points at a zero-length or
+/// partially written object. Without fsync of the parent directory, the
+/// rename itself can be lost. Both matter here because the whole model
+/// assumes a blob, once written, is immutable and complete.
+///
+/// The temp name includes a per-call counter as well as the pid so two
+/// threads in one process cannot collide on it.
+fn write_file_durably(path: &std::path::Path, data: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    // Scope the file handle so it is closed before the rename.
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+
+    match fs::rename(&tmp, path) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = fs::remove_file(&tmp); // don't leak the temp file
+            return Err(e);
+        }
+    }
+
+    // fsync the directory so the rename itself survives a crash. Not all
+    // platforms support opening a directory for this; where they don't, the
+    // failure is not fatal — the data is already durable, only the rename's
+    // durability is best-effort.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 impl ObjectStore for LocalFSObjectStore {
     fn put_blob(&self, data: &[u8]) -> io::Result<String> {
         let h = hash_bytes(data);
         let path = self.blob_path(&h);
-        // Dedup: skip if exists
+        // Dedup: skip if exists. Blobs are content-addressed, so an existing
+        // file at this path already holds exactly these bytes.
         if !path.exists() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            // Write to temp file, then rename (POSIX atomic).
-            // Use process ID + counter for unique temp name (avoids
-            // collisions between concurrent writers).
-            let tmp = format!("{}.tmp.{}", path.display(), std::process::id());
-            fs::write(&tmp, data)?;
-            fs::rename(&tmp, &path)?;
+            write_file_durably(&path, data)?;
         }
         let mut s = self.stats.lock().unwrap();
         s.puts += 1;
@@ -201,25 +254,30 @@ impl ObjectStore for LocalFSObjectStore {
     }
 
     fn put_path(&self, path: &str, hash: &str) -> io::Result<()> {
-        let file = self.path_file(path);
+        let file = self.path_file(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to write ref outside the store root: '{}'", path),
+            )
+        })?;
         if let Some(parent) = file.parent() {
             fs::create_dir_all(parent)?;
         }
         // Store JSON {"hash":"..."} — same format as S3ObjectStore.
         // This makes `aws s3 sync` / `rsync` a straight copy.
         let body = format!(r#"{{"hash":"{}"}}"#, hash);
-        // Write temp → rename (POSIX atomic on local FS).
-        // On S3, put_path just does PUT (S3 is already idempotent).
-        let tmp = format!("{}.tmp.{}", file.display(), std::process::id());
-        fs::write(&tmp, &body)?;
-        fs::rename(&tmp, &file)?;
+        // Refs are the only mutable state in the store, so their durability is
+        // what a crash actually threatens: an un-synced rename can leave a
+        // branch pointing at nothing. On S3 this is a plain PUT (already
+        // atomic and durable); locally it needs the full temp→fsync→rename.
+        write_file_durably(&file, body.as_bytes())?;
         let mut s = self.stats.lock().unwrap();
         s.puts += 1;
         Ok(())
     }
 
     fn get_path(&self, path: &str) -> Option<String> {
-        let file = self.path_file(path);
+        let file = self.path_file(path)?;
         match fs::read_to_string(&file) {
             Ok(body) => {
                 // Parse JSON {"hash":"..."} — minimal parser
@@ -230,7 +288,10 @@ impl ObjectStore for LocalFSObjectStore {
     }
 
     fn delete_path(&self, path: &str) -> io::Result<bool> {
-        let file = self.path_file(path);
+        let file = match self.path_file(path) {
+            Some(f) => f,
+            None => return Ok(false),
+        };
         if file.exists() {
             fs::remove_file(&file)?;
             Ok(true)

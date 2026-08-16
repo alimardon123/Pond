@@ -1584,14 +1584,13 @@ fn simple_base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Generate a sortable, time-based identifier for shard names.
+/// Generate a sortable, writer-unique identifier for shard names.
+///
+/// Delegates to `pond_kernel::crdt::shard_id` so the SQL executor and the
+/// Python binding cannot drift apart on the one property that makes
+/// coordination-free shard writes safe: distinct writers never collide.
 fn chrono_like_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{:x}", nanos)
+    pond_kernel::crdt::shard_id()
 }
 
 /// RFC 4180 compliant CSV parser.
