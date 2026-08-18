@@ -139,6 +139,30 @@ million.
 
 ---
 
+## Claim 5 — round trips per write
+
+The design's own metric, applied to the code paths that ship today.
+
+| path | round trips for one row |
+|---|---|
+| legacy `write` (what every binding calls) | **8** — 6 PUT, 2 GET |
+| engine `publish` (any number of collections) | **1** |
+
+The legacy path's eight are structural: separate writes for the data, the
+manifest, the commit, and three refs — and because a commit spans three refs,
+it cannot be atomic on a store that only promises single-object atomicity.
+
+It used to be eleven. Three of those were `HEAD` requests from
+`kernel.reference`, which verified a blob existed before binding a name to it —
+a full round trip to confirm something the caller had written moments earlier.
+The kernel now remembers its own writes and probes only for hashes it did not
+produce, which keeps the guarantee and drops the round trips.
+
+Recorded as a test (`core/storage/tests/round_trip_cost.rs`) rather than a
+note, so the number cannot drift unobserved.
+
+---
+
 ## What this run also exercised
 
 Several code paths had never executed against a real endpoint before. All pass
