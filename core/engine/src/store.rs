@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pond_index::NodeStore;
+use pond_index::{Hash, NodeStore};
 use pond_kernel::ObjectStore;
 
 /// Adapts any [`ObjectStore`] to the index's [`NodeStore`], counting requests.
@@ -66,5 +66,18 @@ impl<S: ObjectStore> NodeStore for EngineStore<S> {
     fn get(&self, hash: &str) -> Option<Vec<u8>> {
         self.gets.fetch_add(1, Ordering::Relaxed);
         self.inner.get_blob(hash).ok()
+    }
+
+    /// Routes to the backend's batch API, which S3 implements with parallel
+    /// requests. This is what keeps bulk load from being bounded by round-trip
+    /// latency — the single biggest cost in building a large index.
+    fn put_batch(&self, items: Vec<Vec<u8>>) -> Vec<Hash> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        self.puts.fetch_add(items.len() as u64, Ordering::Relaxed);
+        self.inner
+            .put_blob_batch(&items)
+            .expect("batch node write failed — storage is unavailable or full")
     }
 }

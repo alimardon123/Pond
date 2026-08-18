@@ -42,6 +42,21 @@ pub fn hash_bytes(data: &[u8]) -> Hash {
 pub trait NodeStore {
     fn put(&self, bytes: Vec<u8>) -> Hash;
     fn get(&self, hash: &str) -> Option<Vec<u8>>;
+
+    /// Write many nodes, returning their hashes in the same order.
+    ///
+    /// Building a tree produces every node of a level before any of the next
+    /// level is known, so a level can be written all at once. On object
+    /// storage that is the difference between one PUT round trip per node and
+    /// one per level: at ~100 ms per PUT, a 2000-node index goes from minutes
+    /// to seconds.
+    ///
+    /// The default is the obvious sequential loop, so every store is correct
+    /// without implementing this; backends that can issue requests in
+    /// parallel override it.
+    fn put_batch(&self, items: Vec<Vec<u8>>) -> Vec<Hash> {
+        items.into_iter().map(|b| self.put(b)).collect()
+    }
 }
 
 /// In-memory store with I/O counters, for tests and measurement.

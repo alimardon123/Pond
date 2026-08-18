@@ -51,7 +51,12 @@ impl Tree {
         );
 
         // Level 0: chunk the entries into leaves.
-        let mut level: Vec<ChildRef> = Vec::new();
+        //
+        // Nodes are collected before being written so the whole level goes out
+        // in one batch. On object storage that turns one PUT round trip per
+        // node into one per level, which is the difference between minutes and
+        // seconds when bulk-loading a large index.
+        let mut pending: Vec<Node> = Vec::new();
         let mut current: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for (k, v) in entries {
             // The boundary decision uses the key only. Using the value too
@@ -60,12 +65,15 @@ impl Tree {
             let fp = fingerprint(&k);
             current.push((k, v));
             if config.is_boundary(fp, current.len()) {
-                level.push(flush_leaf(store, &mut current));
+                pending.push(Node::Leaf {
+                    entries: std::mem::take(&mut current),
+                });
             }
         }
         if !current.is_empty() {
-            level.push(flush_leaf(store, &mut current));
+            pending.push(Node::Leaf { entries: current });
         }
+        let mut level = write_level(store, pending);
 
         if level.is_empty() {
             let node = Node::Leaf { entries: vec![] };
@@ -289,18 +297,21 @@ impl Tree {
         // the span's first entry, which is where a chunk started in the
         // original build too, so the boundary decisions line up.
         let merged = merge_sorted(span_entries, updates);
-        let mut rechunked: Vec<ChildRef> = Vec::new();
+        let mut pending: Vec<Node> = Vec::new();
         let mut current: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for (k, val) in merged {
             let fp = fingerprint(&k);
             current.push((k, val));
             if self.config.is_boundary(fp, current.len()) {
-                rechunked.push(flush_leaf(store, &mut current));
+                pending.push(Node::Leaf {
+                    entries: std::mem::take(&mut current),
+                });
             }
         }
         if !current.is_empty() {
-            rechunked.push(flush_leaf(store, &mut current));
+            pending.push(Node::Leaf { entries: current });
         }
+        let rechunked = write_level(store, pending);
 
         // Splice the new leaves in place of the old span. Leaves outside it
         // are reused by hash: not read, not rewritten, and deduplicated by the
@@ -443,25 +454,13 @@ impl Tree {
 // Internals
 // ---------------------------------------------------------------------------
 
-fn flush_leaf<S: NodeStore>(store: &S, current: &mut Vec<(Vec<u8>, Vec<u8>)>) -> ChildRef {
-    let entries = std::mem::take(current);
-    let node = Node::Leaf { entries };
-    let max_key = node.max_key().unwrap_or_default();
-    let count = node.count();
-    ChildRef {
-        max_key,
-        hash: store.put(node.encode()),
-        count,
-    }
-}
-
 /// Chunk one level of child pointers into the level above.
 fn chunk_level<S: NodeStore>(
     store: &S,
     level: Vec<ChildRef>,
     config: ChunkConfig,
 ) -> Vec<ChildRef> {
-    let mut out = Vec::new();
+    let mut pending: Vec<Node> = Vec::new();
     let mut current: Vec<ChildRef> = Vec::new();
     for child in level {
         // Boundary on the child's hash: content-defined at every level, so an
@@ -469,25 +468,40 @@ fn chunk_level<S: NodeStore>(
         let fp = fingerprint(child.hash.as_bytes());
         current.push(child);
         if config.is_boundary(fp, current.len()) {
-            out.push(flush_internal(store, &mut current));
+            pending.push(Node::Internal {
+                children: std::mem::take(&mut current),
+            });
         }
     }
     if !current.is_empty() {
-        out.push(flush_internal(store, &mut current));
+        pending.push(Node::Internal { children: current });
     }
-    out
+    write_level(store, pending)
 }
 
-fn flush_internal<S: NodeStore>(store: &S, current: &mut Vec<ChildRef>) -> ChildRef {
-    let children = std::mem::take(current);
-    let node = Node::Internal { children };
-    let max_key = node.max_key().unwrap_or_default();
-    let count = node.count();
-    ChildRef {
-        max_key,
-        hash: store.put(node.encode()),
-        count,
+/// Encode a whole level and write it in one batch, returning the pointers.
+///
+/// Splitting "build the nodes" from "write the nodes" is what allows the write
+/// to be batched at all: every node of a level is known before any node of the
+/// level above, so there is no dependency forcing them out one at a time.
+fn write_level<S: NodeStore>(store: &S, nodes: Vec<Node>) -> Vec<ChildRef> {
+    if nodes.is_empty() {
+        return Vec::new();
     }
+    let meta: Vec<(Vec<u8>, u64)> = nodes
+        .iter()
+        .map(|n| (n.max_key().unwrap_or_default(), n.count()))
+        .collect();
+    let encoded: Vec<Vec<u8>> = nodes.iter().map(|n| n.encode()).collect();
+    let hashes = store.put_batch(encoded);
+    meta.into_iter()
+        .zip(hashes)
+        .map(|((max_key, count), hash)| ChildRef {
+            max_key,
+            hash,
+            count,
+        })
+        .collect()
 }
 
 /// Collect the leaf-level child pointers, reading internal nodes only.
