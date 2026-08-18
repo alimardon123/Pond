@@ -1733,7 +1733,10 @@ version = "0.3.0"
 dependencies = [
  "criterion",
  "pond_core",
+ "pond_engine",
+ "pond_index",
  "pond_kernel",
+ "pond_record",
  "serde_json",
  "sha2",
  "tempfile",

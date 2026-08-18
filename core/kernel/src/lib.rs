@@ -216,6 +216,41 @@ impl PondKernel {
         self.store.get_path(name)
     }
 
+    /// A handle to the underlying store.
+    ///
+    /// Exposed so a layer above can hand the same store to another component —
+    /// the engine, for instance — rather than opening a second connection to
+    /// it. Sharing the handle means sharing the connection pool and the cache;
+    /// two independent stores over one bucket would double both.
+    pub fn store_handle(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// Write bytes under a name, replacing whatever was there.
+    ///
+    /// The companion to `reference`, and the more primitive of the two:
+    /// `reference` binds a name to a *hash*, which costs a blob write plus a
+    /// name write and a read back through the indirection. For state that is
+    /// small, mutable, and owned by one writer — a head, a collection
+    /// definition — that indirection buys nothing and costs a round trip in
+    /// each direction.
+    ///
+    /// Content addressing remains the default for everything large or shared.
+    pub fn write_named(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        validate_ref_path(name)?;
+        self.store.put_object(name, bytes)?;
+        self.stats.lock().unwrap().references += 1;
+        Ok(())
+    }
+
+    /// Read bytes written by [`write_named`](Self::write_named).
+    pub fn read_named(&self, name: &str) -> Option<Vec<u8>> {
+        validate_ref_path(name).ok()?;
+        let bytes = self.store.get_object(name)?;
+        self.stats.lock().unwrap().reads += 1;
+        Some(bytes)
+    }
+
     pub fn list_names(&self) -> Vec<String> {
         self.store.list_paths("").unwrap_or_default()
     }

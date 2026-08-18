@@ -193,6 +193,65 @@ pub trait ObjectStore: Send + Sync {
     }
 }
 
+/// A shared handle to a store is a store.
+///
+/// Without this, a layer holding an `Arc<dyn ObjectStore>` cannot hand it to
+/// anything generic over `ObjectStore` — it has to open a second store over
+/// the same bucket, which means a second connection pool and a second cache
+/// for the same data. Every method is delegated explicitly rather than left to
+/// the trait defaults, so a backend's optimised `put_blob_batch` or
+/// `delete_blob_batch` is still the one that runs.
+impl<T: ObjectStore + ?Sized> ObjectStore for std::sync::Arc<T> {
+    fn put_blob(&self, data: &[u8]) -> io::Result<String> {
+        (**self).put_blob(data)
+    }
+    fn get_blob(&self, hash: &str) -> io::Result<Vec<u8>> {
+        (**self).get_blob(hash)
+    }
+    fn get_blob_range(&self, hash: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        (**self).get_blob_range(hash, offset, len)
+    }
+    fn put_blob_batch(&self, items: &[Vec<u8>]) -> io::Result<Vec<String>> {
+        (**self).put_blob_batch(items)
+    }
+    fn get_blob_batch(&self, hashes: &[String]) -> io::Result<Vec<Vec<u8>>> {
+        (**self).get_blob_batch(hashes)
+    }
+    fn put_path(&self, path: &str, hash: &str) -> io::Result<()> {
+        (**self).put_path(path, hash)
+    }
+    fn get_path(&self, path: &str) -> Option<String> {
+        (**self).get_path(path)
+    }
+    fn put_object(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
+        (**self).put_object(path, bytes)
+    }
+    fn get_object(&self, path: &str) -> Option<Vec<u8>> {
+        (**self).get_object(path)
+    }
+    fn get_object_batch(&self, paths: &[String]) -> Vec<Option<Vec<u8>>> {
+        (**self).get_object_batch(paths)
+    }
+    fn delete_path(&self, path: &str) -> io::Result<bool> {
+        (**self).delete_path(path)
+    }
+    fn delete_path_batch(&self, paths: &[String]) -> io::Result<usize> {
+        (**self).delete_path_batch(paths)
+    }
+    fn list_paths(&self, prefix: &str) -> io::Result<Vec<String>> {
+        (**self).list_paths(prefix)
+    }
+    fn blob_exists(&self, hash: &str) -> bool {
+        (**self).blob_exists(hash)
+    }
+    fn delete_blob(&self, hash: &str) -> io::Result<bool> {
+        (**self).delete_blob(hash)
+    }
+    fn delete_blob_batch(&self, hashes: &[String]) -> io::Result<usize> {
+        (**self).delete_blob_batch(hashes)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AsyncObjectStore trait — async version, behind `feature = "async"`
 // ---------------------------------------------------------------------------

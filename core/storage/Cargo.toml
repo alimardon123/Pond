@@ -19,6 +19,9 @@ async = ["pond_kernel/async"]
 [dependencies]
 pond_kernel = { path = "../kernel" }
 pond_core = { path = "../codec" }
+pond_engine = { path = "../engine" }
+pond_record = { path = "../record" }
+pond_index = { path = "../index" }
 serde_json = "1"
 sha2 = "0.10"
 

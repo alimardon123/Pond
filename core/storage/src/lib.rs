@@ -30,6 +30,9 @@
 // pond_core, so this allow can be scoped to the module instead of the crate.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+pub mod engine_path;
+pub mod columnar;
+pub mod definition;
 pub mod manifest;
 pub mod commit;
 pub mod branch;

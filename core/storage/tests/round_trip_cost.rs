@@ -175,3 +175,61 @@ fn legacy_commit_updates_several_refs_and_so_cannot_be_atomic() {
         touched
     );
 }
+
+/// The same row, through the engine path.
+///
+/// This is the number the cutover exists for. The legacy path spends its
+/// round trips on structure — a manifest, a commit, three refs — none of which
+/// the engine needs, because publishing is a single object write and the index
+/// is reached from it directly.
+#[test]
+fn engine_write_costs_far_fewer_round_trips() {
+    use pond_core::encode::TypedColumn;
+
+    let dir = tempfile::tempdir().unwrap();
+    let c = Arc::new(Counters::default());
+    let store = Counting {
+        inner: LocalFSObjectStore::new(dir.path()).unwrap(),
+        c: c.clone(),
+    };
+    let kernel = PondKernel::new_with_store(Box::new(store));
+
+    pond_storage::engine_path::create(&kernel, "users").unwrap();
+    let columns: Vec<(&str, TypedColumn)> = vec![
+        ("id", TypedColumn::Int64(vec![1])),
+        ("name", TypedColumn::String(vec!["ada".into()])),
+    ];
+
+    // Warm: write once so the steady-state cost is what gets measured, the
+    // same way the legacy comparison does.
+    pond_storage::engine_path::write_rows(&kernel, "users", &columns, 1).unwrap();
+
+    c.reset();
+    pond_storage::engine_path::write_rows(&kernel, "users", &columns, 1).unwrap();
+    let total = c.total();
+    let heads = c.heads.load(Ordering::Relaxed);
+
+    println!(
+        "engine write: {} round trips ({} PUT, {} GET, {} HEAD, {} LIST)",
+        total,
+        c.puts.load(Ordering::Relaxed),
+        c.gets.load(Ordering::Relaxed),
+        heads,
+        c.lists.load(Ordering::Relaxed),
+    );
+
+    assert_eq!(heads, 0, "the engine path must never probe for existence");
+    assert!(
+        total <= 6,
+        "engine write cost {} round trips against the legacy path's 8",
+        total
+    );
+    // The comparison that matters economically. On S3 a PUT costs roughly
+    // twelve times a GET, so trading writes for reads is a win even at equal
+    // counts — and here the counts are not equal.
+    assert!(
+        c.puts.load(Ordering::Relaxed) <= 3,
+        "the engine commits with {} writes; the legacy path uses 6",
+        c.puts.load(Ordering::Relaxed)
+    );
+}

@@ -161,7 +161,12 @@ fn fill_random(buf: &mut [u8]) {
     getrandom::fill(buf).expect("OS CSPRNG unavailable — cannot generate unique row IDs");
 }
 
-fn current_time_ms() -> u64 {
+/// Milliseconds since the Unix epoch.
+///
+/// Exposed because the physical component of a version has to come from
+/// somewhere, and every caller agreeing on one clock reading is what makes
+/// versions comparable across writers.
+pub fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
