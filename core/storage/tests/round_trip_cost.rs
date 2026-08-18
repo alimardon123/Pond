@@ -87,7 +87,7 @@ impl ObjectStore for Counting {
 ///
 /// The number itself is the point. At an object-storage round trip of ~50 ms,
 /// each one is ~50 ms of commit latency that no amount of caching removes,
-/// because these are writes and a HEAD against a key that was just written.
+/// because these are writes.
 ///
 /// The bound is deliberately loose — this test exists to record the cost and
 /// to catch it growing, not to freeze an implementation detail.
@@ -119,21 +119,26 @@ fn legacy_write_round_trip_cost_is_recorded() {
         total, puts, gets, heads
     );
 
-    // Three facts worth pinning, each of which the engine path avoids.
     assert!(
         puts >= 6,
         "a legacy write issues several independent writes ({} seen)",
         puts
     );
-    assert!(
-        heads >= 3,
-        "every `reference` HEADs the blob first, so each ref update costs two \
-         round trips instead of one ({} seen)",
+    // `reference` used to HEAD the blob before binding a name to it, adding a
+    // round trip per ref — three per commit — to verify something the caller
+    // had just written. The kernel now remembers its own writes.
+    assert_eq!(
+        heads, 0,
+        "binding a name to a blob this kernel just wrote must not cost a \
+         round trip ({} seen)",
         heads
     );
+    // The remaining cost is structural, not incidental: separate writes for
+    // the data, the manifest, the commit, and three refs. Only the engine's
+    // single-object publish removes those.
     assert!(
-        total >= 10,
-        "the measured cost of one legacy write ({} round trips)",
+        total <= 9,
+        "one legacy write should now cost ~8 round trips, saw {}",
         total
     );
 }

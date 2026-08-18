@@ -68,7 +68,32 @@ pub struct PondKernel {
     // (`new_with_store`) still accepts `Box<dyn ObjectStore>` for back-compat.
     store: Arc<dyn ObjectStore>,
     stats: Mutex<KernelStats>,
+    /// Hashes this kernel has written itself.
+    ///
+    /// `reference` refuses to bind a name to a blob that does not exist, which
+    /// is worth keeping — a dangling ref is unrecoverable corruption. But the
+    /// check is a HEAD request, and on object storage that is a full round
+    /// trip. In the overwhelmingly common case the caller wrote the blob
+    /// moments ago and holds the hash `write` just returned, so the round trip
+    /// asks the network to confirm something already known locally.
+    ///
+    /// Remembering what we wrote turns that case into a set lookup and leaves
+    /// the check intact for the case it actually guards: a hash that came from
+    /// somewhere else. One legacy write does three `reference` calls, so this
+    /// is three round trips off every commit.
+    ///
+    /// Bounded, because a writer that runs for weeks would otherwise
+    /// accumulate every hash it ever wrote. Forgetting is always safe — it
+    /// costs one HEAD, which is exactly what happened before this existed.
+    written: Mutex<std::collections::HashSet<String>>,
 }
+
+/// How many recently written hashes to remember.
+///
+/// The access pattern this serves is "write a blob, bind a name to it moments
+/// later", so a small window catches essentially all of it. At 64 hex chars
+/// plus overhead this caps the set at a few megabytes.
+const RECENT_WRITES_CAPACITY: usize = 65_536;
 
 #[derive(Debug, Default, Clone)]
 pub struct KernelStats {
@@ -84,6 +109,7 @@ impl PondKernel {
         Ok(Self {
             store: Arc::new(store),
             stats: Mutex::new(KernelStats::default()),
+            written: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -92,6 +118,7 @@ impl PondKernel {
         Self {
             store: Arc::from(store),
             stats: Mutex::new(KernelStats::default()),
+            written: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -102,13 +129,30 @@ impl PondKernel {
     pub fn write(&self, data: &[u8]) -> io::Result<String> {
         let h = self.store.put_blob(data)?;
         self.stats.lock().unwrap().writes += 1;
+        self.remember_written(std::iter::once(h.clone()));
         Ok(h)
     }
 
     pub fn write_batch(&self, items: &[Vec<u8>]) -> io::Result<Vec<String>> {
         let hashes = self.store.put_blob_batch(items)?;
         self.stats.lock().unwrap().writes += hashes.len() as u64;
+        self.remember_written(hashes.iter().cloned());
         Ok(hashes)
+    }
+
+    /// Record hashes this kernel wrote, discarding the whole set if it grows
+    /// past its cap.
+    ///
+    /// Dropping everything rather than evicting one entry keeps this to a
+    /// single branch on the hot path. The cost of being wrong is one HEAD
+    /// request on a later `reference`, so an occasional full reset is a better
+    /// trade than maintaining eviction order on every write.
+    fn remember_written(&self, hashes: impl Iterator<Item = String>) {
+        let mut written = self.written.lock().unwrap();
+        if written.len() >= RECENT_WRITES_CAPACITY {
+            written.clear();
+        }
+        written.extend(hashes);
     }
 
     // ------------------------------------------------------------------
@@ -154,7 +198,11 @@ impl PondKernel {
 
     pub fn reference(&self, name: &str, h: &str) -> io::Result<()> {
         validate_ref_path(name)?;
-        if !self.store.blob_exists(h) {
+        // Skip the existence probe for blobs this kernel wrote: the write
+        // already proved they exist, and re-proving it costs a round trip on
+        // the commit path. Anything else is still checked.
+        let known = self.written.lock().unwrap().contains(h);
+        if !known && !self.store.blob_exists(h) {
             return Err(io::Error::new(io::ErrorKind::NotFound,
                 format!("Hash '{}' does not refer to an existing blob", h)));
         }
@@ -609,6 +657,74 @@ mod tests {
         // And the kernel's prefix lookup, which is built on it, finds it.
         let kernel = PondKernel::new_local(dir.path()).unwrap();
         assert!(kernel.list_blobs_prefix(&hash[..4]).contains(&hash));
+    }
+
+    /// Binding a name to a blob is free of extra round trips when this kernel
+    /// wrote the blob — and still refuses a hash that names nothing.
+    ///
+    /// The optimisation is only sound because it narrows *when* the check
+    /// runs, never what it guarantees: a dangling ref is unrecoverable
+    /// corruption, so the check has to survive. What it must not do is ask the
+    /// network to confirm a fact the process already established.
+    #[test]
+    fn test_reference_skips_probe_for_own_writes_but_still_validates() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+
+        let h = kernel.write(b"payload").unwrap();
+        kernel.reference("collections/users", &h).unwrap();
+        assert_eq!(kernel.resolve("collections/users"), Some(h));
+
+        // A hash this kernel never wrote, and which does not exist, is still
+        // rejected — the guarantee is unchanged.
+        let err = kernel
+            .reference("collections/bad", &"0".repeat(64))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(kernel.resolve("collections/bad"), None);
+
+        // And a hash written by a *different* kernel over the same store is
+        // accepted, because the fallback probe finds it.
+        let other = PondKernel::new_local(dir.path()).unwrap();
+        let foreign = other.write(b"written elsewhere").unwrap();
+        kernel.reference("collections/foreign", &foreign).unwrap();
+        assert_eq!(kernel.resolve("collections/foreign"), Some(foreign));
+    }
+
+    /// The memory of recent writes is bounded, and forgetting is safe.
+    ///
+    /// A writer that runs for weeks must not accumulate every hash it ever
+    /// wrote. When the cap is reached the set is dropped, and the only
+    /// consequence is that the next `reference` pays the HEAD it would have
+    /// paid anyway — correctness never depended on remembering.
+    #[test]
+    fn test_recent_write_memory_is_bounded_and_forgetting_is_safe() {
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+
+        let first = kernel.write(b"the first blob").unwrap();
+        assert!(kernel.written.lock().unwrap().contains(&first));
+
+        // Drive the set past its cap directly. Writing that many real blobs
+        // would test the filesystem, not the bound.
+        let filler: Vec<String> = (0..super::RECENT_WRITES_CAPACITY)
+            .map(|i| format!("{:064x}", i))
+            .collect();
+        kernel.remember_written(filler.into_iter());
+        kernel.remember_written(std::iter::once("deadbeef".repeat(8)));
+
+        let remembered = kernel.written.lock().unwrap().len();
+        assert!(
+            remembered < super::RECENT_WRITES_CAPACITY,
+            "the set must be dropped once it reaches the cap, held {}",
+            remembered
+        );
+
+        // `first` has been forgotten — and referencing it still works, via the
+        // fallback probe against the store.
+        assert!(!kernel.written.lock().unwrap().contains(&first));
+        kernel.reference("collections/first", &first).unwrap();
+        assert_eq!(kernel.resolve("collections/first"), Some(first));
     }
 
     /// Named bytes round-trip, replace in place, and refuse to escape the
