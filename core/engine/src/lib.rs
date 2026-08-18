@@ -328,14 +328,28 @@ impl<S: ObjectStore> Reader<S> {
 
         // One LIST to discover writers. This is the only place the engine
         // lists anything, and its cost is O(writers), never O(data).
+        //
+        // The error is propagated rather than defaulted away: a failed listing
+        // and an empty store are indistinguishable in the result, and treating
+        // the first as the second means a transient backend fault presents as
+        // "your data is gone" — then a subsequent publish writes on top of a
+        // history the reader never saw.
+        let paths = store.inner().list_paths(HEADS_PREFIX)?;
+
+        // Resolve every head ref, then fetch all of them in one batch. Heads
+        // are independent of each other, so there is no reason to pay a round
+        // trip per writer in sequence — S3 issues the batch in parallel.
+        let hashes: Vec<String> = paths
+            .iter()
+            .filter_map(|p| store.inner().get_path(p))
+            .collect();
+        let bodies = store.inner().get_blob_batch(&hashes).unwrap_or_default();
+
         let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for path in store.inner().list_paths(HEADS_PREFIX).unwrap_or_default() {
-            let Some(hash) = store.inner().get_path(&path) else {
-                continue;
-            };
-            let Ok(bytes) = store.inner().get_blob(&hash) else {
-                continue;
-            };
+        for bytes in bodies {
+            // A head that does not decode is skipped, not fatal: one writer
+            // publishing a corrupt head must not make every other writer's
+            // data unreadable.
             let Some(head) = pond_record::decode_head(&bytes) else {
                 continue;
             };

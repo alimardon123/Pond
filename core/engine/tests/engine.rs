@@ -361,3 +361,65 @@ fn page_lookup_cost_is_flat_as_database_grows() {
         costs
     );
 }
+
+/// A backend whose listing fails, to prove the reader does not confuse
+/// "I could not ask" with "there is nothing".
+struct FailingList<S: ObjectStore>(S);
+
+impl<S: ObjectStore> ObjectStore for FailingList<S> {
+    fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
+        self.0.put_blob(data)
+    }
+    fn get_blob(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        self.0.get_blob(hash)
+    }
+    fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
+        self.0.put_path(path, hash)
+    }
+    fn get_path(&self, path: &str) -> Option<String> {
+        self.0.get_path(path)
+    }
+    fn delete_path(&self, path: &str) -> std::io::Result<bool> {
+        self.0.delete_path(path)
+    }
+    fn blob_exists(&self, hash: &str) -> bool {
+        self.0.blob_exists(hash)
+    }
+    fn delete_blob(&self, hash: &str) -> std::io::Result<bool> {
+        self.0.delete_blob(hash)
+    }
+    fn list_paths(&self, _prefix: &str) -> std::io::Result<Vec<String>> {
+        Err(std::io::Error::other("backend unavailable"))
+    }
+}
+
+/// A backend fault during head discovery must surface as an error.
+///
+/// The failure mode this guards against is the dangerous one: if a failed
+/// listing returned an empty reader, a transient fault would present as "the
+/// collection is empty", and a writer acting on that reading would publish on
+/// top of history it never saw.
+#[test]
+fn reader_open_fails_loudly_when_listing_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = Engine::open(store(dir.path()), 1).unwrap();
+    e.write_records(
+        "users",
+        vec![(
+            user(1),
+            Record::new().with_field("name", Value::Str("alice".into()), v(100, 1)),
+        )],
+    )
+    .unwrap();
+    e.publish().unwrap();
+
+    // Sanity: the data really is there through a healthy backend.
+    let mut ok = Reader::open(store(dir.path())).unwrap();
+    assert!(ok.get("users", &user(1)).unwrap().is_some());
+
+    let err = Reader::open(FailingList(store(dir.path())));
+    assert!(
+        err.is_err(),
+        "a failed head listing must not be reported as an empty store"
+    );
+}
