@@ -35,10 +35,11 @@ core/storage  4 310 lines   consumed by: 13 crates (CLI, MCP, PyO3, SQL, all len
 core/codec    4 233 lines   consumed by: the same 13
 ```
 
-**3 650 lines of validated architecture are used by nothing that ships.** The
-old path — the one with non-deterministic merge, the column-dropping JSON
-round-trip, and the O(N) flat manifest — is what every binding still calls.
-Until that changes, the new work is a science project with good measurements.
+**This was the problem, and it is now half solved.** `core/storage` dispatches
+to the engine per collection, and the CLI reaches it end to end. What still
+calls the legacy path directly: the lens crates, the SQL executor, and the
+PyO3 bindings. Until those route through the dispatch too, engine collections
+are reachable from the CLI and the Rust API but not from every surface.
 
 ---
 
@@ -197,15 +198,31 @@ warm is microseconds, and *no tier in between needs operating*.
 
 ## 5. Next steps, in priority order
 
-### P0 — The cutover (nothing else matters until this is done)
+### P0 — The cutover — **done**
 
-3 650 validated lines are consumed only by benchmarks. Build `core/engine`
-composing index + record + cache, and dispatch in `core/storage` on a
-per-collection format marker: existing collections keep the old path, new ones
-use the engine. Delete `manifest.rs` only once the engine has run in anger.
+`core/engine` exists and `core/storage` dispatches to it per collection. The
+marker is a definition object at `collections/{name}/definition`, and its
+*absence* means legacy — so every collection written before the engine existed
+keeps its old path with nothing migrated.
 
-**Acceptance:** a differential test proving the two paths agree on the same
-operations, and the CLI writing an engine-backed collection end to end.
+Both acceptance criteria are met. `core/storage/tests/cutover.rs` runs the same
+operations through both paths and compares the rows; the CLI creates, writes,
+and reads an engine-backed collection alongside a legacy one in the same
+repository.
+
+Measured on the same harness, same row:
+
+| | round trips | writes | atomic? |
+|---|---|---|---|
+| legacy | 8 | 6 | no — spans 3 refs |
+| engine | 5 | 2 | yes — one object |
+
+PUTs are ~12× a GET on S3 pricing, so the 3× drop in writes matters more than
+the round-trip count suggests.
+
+**Still to do here:** the lens crates, SQL executor and PyO3 bindings still
+call the legacy path directly rather than going through the dispatch, so they
+cannot yet read engine collections. `manifest.rs` stays until they do.
 
 ### P1 — Parallel bulk load — **done**
 
