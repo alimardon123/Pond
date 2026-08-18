@@ -27,6 +27,23 @@ use crate::hash_bytes;
 ///
 /// The ref path IS the key — no "refs/" prefix. This matches S3's flat
 /// key space and allows `aws s3 sync` / `rsync` for migration.
+/// Is this relative key part of the content-addressed blob tree rather than a
+/// named ref?
+///
+/// `list_paths` enumerates *refs*, so blob keys have to be excluded — but only
+/// when the caller did not ask for them. Both backends use this one rule, which
+/// is the point: a listing that returns different things on local disk and on
+/// S3 makes every layer above it backend-specific, and the whole design rests
+/// on the two being interchangeable.
+pub fn is_blob_key(rel: &str) -> bool {
+    rel == "blobs" || rel.starts_with("blobs/")
+}
+
+/// Did the caller explicitly ask to list inside the blob tree?
+pub fn prefix_targets_blobs(prefix: &str) -> bool {
+    is_blob_key(prefix.trim_start_matches('/'))
+}
+
 pub trait ObjectStore: Send + Sync {
     /// Write bytes, content-addressed. Returns the hash.
     /// Idempotent: same bytes → same hash → same key. Overwriting is safe.
@@ -105,6 +122,28 @@ pub trait ObjectStore: Send + Sync {
     /// Best-effort: if the store doesn't support deletion, this is a no-op.
     /// The blob becomes unreachable (orphaned) but the system is still correct.
     fn delete_blob(&self, hash: &str) -> io::Result<bool>;
+
+    /// Delete many blobs, returning how many existed and were removed.
+    ///
+    /// Reclamation is the one maintenance operation whose size scales with the
+    /// data rather than with the change, so a per-object round trip makes it
+    /// impractical at the scale this store targets: dropping a million dead
+    /// nodes at one request each is a million requests. S3 exposes a bulk
+    /// delete that takes 1000 keys per request, which is three orders of
+    /// magnitude fewer round trips for the same work.
+    ///
+    /// The default is the sequential loop, so every backend is correct without
+    /// implementing it; a local filesystem has nothing to gain from batching
+    /// because its "round trip" is a syscall.
+    fn delete_blob_batch(&self, hashes: &[String]) -> io::Result<usize> {
+        let mut removed = 0usize;
+        for h in hashes {
+            if self.delete_blob(h)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +406,9 @@ impl ObjectStore for LocalFSObjectStore {
         let mut paths = Vec::new();
         if prefix_dir.is_dir() {
             walk_dir(&prefix_dir, &self.base_dir, &mut paths);
+        }
+        if !prefix_targets_blobs(prefix) {
+            paths.retain(|p| !is_blob_key(p));
         }
         paths.sort();
         Ok(paths)

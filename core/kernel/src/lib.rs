@@ -22,7 +22,9 @@ pub mod crdt;
 pub mod object_store;
 pub mod c_abi;
 
-pub use object_store::{ObjectStore, LocalFSObjectStore, StoreStats};
+pub use object_store::{
+    is_blob_key, prefix_targets_blobs, LocalFSObjectStore, ObjectStore, StoreStats,
+};
 #[cfg(feature = "async")]
 pub use object_store::AsyncObjectStore;
 
@@ -564,6 +566,76 @@ mod tests {
         assert_eq!(store.get_path("../pwned"), None);
         assert!(!store.delete_path("../pwned").unwrap());
         assert!(!outer.path().join("pwned").exists());
+    }
+
+    /// `list_paths` enumerates refs, not blobs — and `list_blobs_prefix`
+    /// reaches the blob tree through the same call.
+    ///
+    /// Both halves matter. The first keeps `pond ls` from printing thousands
+    /// of content hashes; the second is what makes prefix lookup and any form
+    /// of garbage collection possible at all. The S3 backend used to get this
+    /// wrong in a way that depended on whether a store prefix was configured,
+    /// so the two backends disagreed about what a listing contains.
+    #[test]
+    fn test_list_paths_separates_refs_from_blobs() {
+        let dir = tempdir().unwrap();
+        let store = LocalFSObjectStore::new(dir.path()).unwrap();
+
+        let hash = store.put_blob(b"payload").unwrap();
+        store.put_path("collections/users", "cafebabe").unwrap();
+
+        let refs = store.list_paths("").unwrap();
+        assert!(
+            refs.contains(&"collections/users".to_string()),
+            "refs must be listed: {:?}",
+            refs
+        );
+        assert!(
+            refs.iter().all(|p| !is_blob_key(p)),
+            "blob keys must not appear in a ref listing: {:?}",
+            refs
+        );
+
+        // Asking for the blob tree explicitly returns it.
+        let shard = &hash[..2];
+        let blobs = store.list_paths(&format!("blobs/{}/", shard)).unwrap();
+        assert!(
+            blobs.iter().any(|p| p.ends_with(&hash)),
+            "listing blobs/{}/ must return the blob: {:?}",
+            shard,
+            blobs
+        );
+
+        // And the kernel's prefix lookup, which is built on it, finds it.
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        assert!(kernel.list_blobs_prefix(&hash[..4]).contains(&hash));
+    }
+
+    /// Deleting a batch must remove exactly the named blobs and report how
+    /// many existed, whether the backend has a bulk API or falls back to the
+    /// sequential default.
+    #[test]
+    fn test_delete_blob_batch() {
+        let dir = tempdir().unwrap();
+        let store = LocalFSObjectStore::new(dir.path()).unwrap();
+
+        let hashes: Vec<String> = (0..5)
+            .map(|i| store.put_blob(format!("blob-{}", i).as_bytes()).unwrap())
+            .collect();
+        let keep = store.put_blob(b"survivor").unwrap();
+
+        // A hash that was never written must not be counted as removed.
+        let mut targets = hashes.clone();
+        targets.push("0".repeat(64));
+
+        let removed = store.delete_blob_batch(&targets).unwrap();
+        assert_eq!(removed, hashes.len(), "only existing blobs count as removed");
+        for h in &hashes {
+            assert!(!store.blob_exists(h), "{} should be gone", h);
+        }
+        assert!(store.blob_exists(&keep), "untargeted blobs must survive");
+
+        assert_eq!(store.delete_blob_batch(&[]).unwrap(), 0);
     }
 
     /// Ranged reads must return exactly the requested window, and must agree

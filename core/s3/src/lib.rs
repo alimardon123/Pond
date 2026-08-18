@@ -174,7 +174,7 @@ fn build_canonical_request(
     )
 }
 
-/// Canonicalize a query string for SigV4.
+/// Canonicalize a query string for SigV4 — and for the request URL.
 ///
 /// Per AWS spec, the canonical query string is:
 /// 1. Split into (key, value) pairs
@@ -184,6 +184,16 @@ fn build_canonical_request(
 ///
 /// Input: `"list-type=2&prefix=pond/"`
 /// Output: `"list-type=2&prefix=pond%2F"`
+///
+/// **Values passed in must be raw, not pre-encoded.** This function is the
+/// single place query encoding happens, and its output is used both to sign
+/// the request and to build the URL that is sent. That is deliberate: when a
+/// caller pre-encoded a value, this function encoded it a second time, so the
+/// signature covered `%253D` while the wire carried `%3D` and S3 answered
+/// `SignatureDoesNotMatch`. It only bit on values that actually contain
+/// reserved characters — in practice the `NextContinuationToken`, which is
+/// base64 and ends in `==`, so listing worked until a bucket crossed 1000
+/// objects and pagination kicked in.
 fn canonicalize_query(query: &str) -> String {
     if query.is_empty() {
         return String::new();
@@ -280,6 +290,10 @@ const _: () = assert!(
     "objects at or above 5 GiB cannot use a single PUT, so the multipart \
      threshold must be below that limit"
 );
+
+/// Keys per `DeleteObjects` request. S3's documented maximum is 1000, and
+/// exceeding it is rejected outright rather than truncated.
+pub const DELETE_BATCH_LIMIT: usize = 1000;
 
 /// Retry attempts after the initial try, for retryable failures.
 const MAX_RETRIES: u32 = 5;
@@ -605,18 +619,21 @@ impl S3ObjectStore {
         let payload = body.unwrap_or(&[]);
         let payload_hash = sha256_hex(payload);
 
+        // Canonicalize the query string once (URL-encode values, sort by key)
+        // and use that same string for both the signature and the URL. Any
+        // other arrangement lets the signed bytes drift from the sent bytes.
+        let canonical_query = canonicalize_query(query.unwrap_or(""));
+
         // Build the URL
-        let url = if let Some(q) = query {
-            format!("{}/{}/{}?{}", self.endpoint, self.bucket, key, q)
-        } else {
+        let url = if canonical_query.is_empty() {
             format!("{}/{}/{}", self.endpoint, self.bucket, key)
+        } else {
+            format!("{}/{}/{}?{}", self.endpoint, self.bucket, key, canonical_query)
         };
 
         // Canonical URI is the path (URL-encoded, but for S3 keys we keep them as-is
         // since S3 expects the un-encoded form in the canonical request)
         let canonical_uri = format!("/{}/{}", self.bucket, key);
-        // Canonicalize the query string for SigV4 (URL-encode values, sort by key)
-        let canonical_query = canonicalize_query(query.unwrap_or(""));
 
         // Build headers (must include host, x-amz-content-sha256, x-amz-date)
         let host = url::Url::parse(&url)
@@ -1005,12 +1022,138 @@ impl S3ObjectStore {
         self.s3_request("DELETE", key, Some(&query), None, &[])?;
         Ok(())
     }
+
+    /// `POST /?delete` with up to [`DELETE_BATCH_LIMIT`] keys.
+    ///
+    /// Returns how many keys were actually removed. S3 reports per-key results
+    /// in the response body and answers 200 even when some keys failed, so the
+    /// body has to be read — a status check alone would report success for a
+    /// request that deleted nothing.
+    ///
+    /// `Quiet` mode is deliberately *not* used: it suppresses the `<Deleted>`
+    /// entries, which are exactly what makes the count trustworthy.
+    fn delete_objects(&self, keys: &[String]) -> io::Result<usize> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        if keys.len() > DELETE_BATCH_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "DeleteObjects accepts at most {} keys, got {}",
+                    DELETE_BATCH_LIMIT,
+                    keys.len()
+                ),
+            ));
+        }
+
+        let mut xml = String::from("<Delete>");
+        for k in keys {
+            xml.push_str("<Object><Key>");
+            xml.push_str(&xml_escape(k));
+            xml.push_str("</Key></Object>");
+        }
+        xml.push_str("</Delete>");
+        let body = xml.as_bytes();
+
+        // S3 requires an integrity header on this operation. `Content-MD5` is
+        // the historical one; the checksum headers are the modern replacement
+        // and use SHA-256, which is already computed here for SigV4 — so this
+        // costs nothing and avoids taking an MD5 dependency for one call.
+        let digest = {
+            let mut h = Sha256::new();
+            h.update(body);
+            h.finalize()
+        };
+        let checksum = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest);
+        let extra = vec![
+            ("x-amz-sdk-checksum-algorithm".to_string(), "SHA256".to_string()),
+            ("x-amz-checksum-sha256".to_string(), checksum),
+        ];
+
+        let resp = self.s3_request("POST", "", Some("delete="), Some(body), &extra)?;
+        let body = resp.into_string().map_err(io::Error::other)?;
+
+        // A key that did not exist is reported as deleted, matching the
+        // idempotent semantics of a single DELETE.
+        let deleted = body.matches("<Deleted>").count();
+        if let Some(err) = extract_xml_tag(&body, "Error") {
+            // Per-key failures do not fail the whole batch — the caller is
+            // reclaiming space, and a key that could not be removed is an
+            // orphan, not a correctness problem. But it must not be silent.
+            let _ = err;
+            let failed = body.matches("<Error>").count();
+            if deleted == 0 {
+                return Err(io::Error::other(format!(
+                    "DeleteObjects removed nothing and reported {} errors: {}",
+                    failed, body
+                )));
+            }
+        }
+        Ok(deleted)
+    }
+}
+
+/// Escape the five XML metacharacters. Object keys are user-controlled, and an
+/// unescaped `&` or `<` in a key would produce a malformed request body — at
+/// best an error, at worst a request that deletes something else.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Extract the text content of the first `<tag>...</tag>` in an XML document.
 ///
 /// S3's multipart responses are small and fixed-shape, so a full XML parser
 /// is not warranted here; this handles exactly the shape AWS returns.
+/// Extract every `<Key>` from a ListObjectsV2 response body.
+///
+/// Keys are returned exactly as S3 wrote them, still percent-encoded if the
+/// request asked for `encoding-type=url`; the caller decodes.
+///
+/// This is string searching rather than an XML parse on purpose: the response
+/// shape is fixed by the S3 API and `<Key>` never nests, so a parser would buy
+/// nothing but a dependency.
+fn list_response_keys(body: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut from = 0usize;
+    while from < body.len() {
+        let start = match body[from..].find("<Key>") {
+            Some(p) => from + p + 5,
+            None => break,
+        };
+        let end = match body[start..].find("</Key>") {
+            Some(p) => start + p,
+            None => break,
+        };
+        keys.push(body[start..end].to_string());
+        from = end + 6;
+    }
+    keys
+}
+
+/// The continuation token for the next page, or `None` when this is the last.
+///
+/// A list that ignores this silently returns the first 1000 objects and calls
+/// it the whole bucket — which is a wrong answer, not a slow one, and the kind
+/// that only shows up once a deployment is large enough to matter.
+fn list_response_next_token(body: &str) -> Option<String> {
+    if !body.contains("<IsTruncated>true</IsTruncated>") {
+        return None;
+    }
+    extract_xml_tag(body, "NextContinuationToken")
+}
+
 fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
@@ -1290,52 +1433,24 @@ impl ObjectStore for S3ObjectStore {
 
         let mut cont: Option<String> = None;
         loop {
-            let mut query = format!("list-type=2&prefix={}", urlencoding::encode(&list_prefix));
+            // Raw values: `build_signed_request` does the one and only
+            // encoding pass, for both the signature and the URL.
+            let mut query = format!("list-type=2&prefix={}", list_prefix);
             if let Some(ref token) = cont {
-                query.push_str(&format!("&continuation-token={}", urlencoding::encode(token)));
+                query.push_str(&format!("&continuation-token={}", token));
             }
 
             let resp = self.s3_request("GET", "", Some(&query), None, &[])?;
             let body = resp.into_string()
                 .map_err(io::Error::other)?;
 
-            // Simple XML extraction: find all <Key>...</Key> values.
-            // S3 ListObjectsV2 XML wraps keys in <Contents><Key>...</Key></Contents>.
-            // We use string searching — simpler and more robust than a hand-rolled XML parser.
-            let mut search_from = 0;
-            let mut next_token: Option<String> = None;
-            while search_from < body.len() {
-                // Find next <Key> tag
-                let key_start = match body[search_from..].find("<Key>") {
-                    Some(p) => search_from + p + 5, // skip "<Key>"
-                    None => break,
-                };
-                let key_end = match body[key_start..].find("</Key>") {
-                    Some(p) => key_start + p,
-                    None => break,
-                };
-                let key = &body[key_start..key_end];
-                // URL-decode the key (S3 may return URL-encoded keys if encoding-type=url was used)
-                let key = url_decode(key);
-                all_keys.push(key);
-                search_from = key_end + 6; // skip "</Key>"
-            }
+            // S3 may return URL-encoded keys if encoding-type=url was used.
+            all_keys.extend(list_response_keys(&body).iter().map(|k| url_decode(k)));
 
-            // Check for pagination — look for <IsTruncated>true</IsTruncated>
-            // and <NextContinuationToken>...</NextContinuationToken>
-            if let Some(start) = body.find("<IsTruncated>true</IsTruncated>") {
-                let _ = start; // IsTruncated is true
-                if let Some(tok_start) = body.find("<NextContinuationToken>") {
-                    if let Some(tok_end) = body[tok_start..].find("</NextContinuationToken>") {
-                        next_token = Some(body[tok_start + 23..tok_start + tok_end].to_string());
-                    }
-                }
+            match list_response_next_token(&body) {
+                Some(token) => cont = Some(token),
+                None => break,
             }
-
-            if next_token.is_none() {
-                break;
-            }
-            cont = next_token;
         }
 
         // Strip the prefix from keys to return relative paths
@@ -1344,17 +1459,23 @@ impl ObjectStore for S3ObjectStore {
         } else {
             self.prefix.len() + 1 // +1 for the '/'
         };
+        // Blob keys are excluded from ref listings, but only when the caller
+        // did not ask for them — `list_blobs_prefix` lists `blobs/<shard>/`
+        // through this same method. The test has to run on the *relative* key:
+        // matching the substring "/blobs/" against the absolute key silently
+        // returned nothing whenever a store prefix was configured, and
+        // everything when one was not.
+        let want_blobs = pond_kernel::prefix_targets_blobs(prefix);
         let mut result: Vec<String> = all_keys.iter()
             .filter_map(|k| {
-                // Skip blob keys (they're content-addressed, not named refs)
-                if k.contains("/blobs/") {
-                    return None;
-                }
                 let rel = if k.len() > strip_len {
                     &k[strip_len..]
                 } else {
-                    k
+                    k.as_str()
                 };
+                if !want_blobs && pond_kernel::is_blob_key(rel) {
+                    return None;
+                }
                 Some(rel.to_string())
             })
             .collect();
@@ -1391,6 +1512,25 @@ impl ObjectStore for S3ObjectStore {
                 }
             }
         }
+    }
+
+    /// Bulk delete via S3 `DeleteObjects`: up to
+    /// [`DELETE_BATCH_LIMIT`] keys in a single request.
+    ///
+    /// This is the widest gap between the naive and the correct implementation
+    /// of any operation in this client. Reclaiming a million dead nodes is a
+    /// million round trips one at a time and a thousand this way — and unlike
+    /// reads, deletes cannot be cached or amortised by a tree, so the request
+    /// count *is* the cost.
+    fn delete_blob_batch(&self, hashes: &[String]) -> io::Result<usize> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        for chunk in hashes.chunks(DELETE_BATCH_LIMIT) {
+            removed += self.delete_objects(&chunk.iter().map(|h| self.blob_key(h)).collect::<Vec<_>>())?;
+        }
+        Ok(removed)
     }
 }
 
@@ -1496,51 +1636,54 @@ impl S3ObjectStore {
             format!("{}/blobs/{}/", self.prefix, shard)
         };
 
-        // ListObjectsV2 query — same as sync `list_paths` but only one shard.
-        let query = format!(
-            "list-type=2&prefix={}",
-            urlencoding::encode(&list_prefix)
-        );
-
-        let resp = match self.s3_request_async("GET", "", Some(&query), None, &[]).await {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        if !resp.status().is_success() {
-            return Vec::new();
-        }
-        let body = match resp.text().await {
-            Ok(b) => b,
-            Err(_) => return Vec::new(),
-        };
-
-        // Extract <Key>...</Key> values from the XML response.
         // The key shape is: {our_prefix/}blobs/{shard}/{hash}
         // We want just the {hash} portion, filtered by the caller's prefix.
         let strip_len = list_prefix.len(); // includes trailing '/'
         let mut hashes = Vec::new();
-        let mut search_from = 0;
-        while search_from < body.len() {
-            let key_start = match body[search_from..].find("<Key>") {
-                Some(p) => search_from + p + 5,
-                None => break,
-            };
-            let key_end = match body[key_start..].find("</Key>") {
-                Some(p) => key_start + p,
-                None => break,
-            };
-            let key = &body[key_start..key_end];
-            // Strip the list prefix to get just the hash.
-            let hash = if key.len() >= strip_len {
-                &key[strip_len..]
-            } else {
-                key
-            };
-            if hash.starts_with(prefix) {
-                hashes.push(hash.to_string());
+        let mut cont: Option<String> = None;
+
+        loop {
+            // ListObjectsV2 query — same as sync `list_paths` but only one
+            // shard. Values are raw; `build_signed_request` encodes them once.
+            let mut query = format!("list-type=2&prefix={}", list_prefix);
+            if let Some(ref token) = cont {
+                query.push_str(&format!("&continuation-token={}", token));
             }
-            search_from = key_end + 6;
+
+            let resp = match self.s3_request_async("GET", "", Some(&query), None, &[]).await {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            if !resp.status().is_success() {
+                return Vec::new();
+            }
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(_) => return Vec::new(),
+            };
+
+            for key in list_response_keys(&body) {
+                let key = url_decode(&key);
+                let hash = if key.len() >= strip_len {
+                    &key[strip_len..]
+                } else {
+                    key.as_str()
+                };
+                if hash.starts_with(prefix) {
+                    hashes.push(hash.to_string());
+                }
+            }
+
+            // One shard holds 1/256th of the blobs, so it crosses the 1000-key
+            // page limit at ~256k blobs — well inside the range this store is
+            // meant for. Without this loop, GC and recovery would quietly see
+            // only the first page.
+            match list_response_next_token(&body) {
+                Some(token) => cont = Some(token),
+                None => break,
+            }
         }
+
         hashes.sort();
         hashes.dedup();
         hashes
@@ -1599,31 +1742,14 @@ fn extract_hash_from_json(json: &str) -> Option<String> {
     None
 }
 
-// Minimal URL-encoding helpers (avoid pulling in the `urlencoding` crate)
+// Minimal URL-encoding helper (avoids pulling in the `urlencoding` crate).
+//
+// There is deliberately only one encoder. Query values are encoded in exactly
+// one place — `canonicalize_query`, whose output is both signed and sent — so
+// no caller can pre-encode a value and have it encoded a second time.
 mod urlencoding {
-    /// Encode a string for use in a URL PATH component.
-    /// Forward slashes are kept literal (S3 keys contain slashes).
-    pub fn encode_path(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() * 3);
-        for b in s.bytes() {
-            match b {
-                // Unreserved characters (RFC 3986)
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                    out.push(b as char);
-                }
-                // Forward slash is kept literal for S3 path components
-                b'/' => out.push('/'),
-                _ => {
-                    out.push_str(&format!("%{:02X}", b));
-                }
-            }
-        }
-        out
-    }
-
-    /// Encode a string for use in a URL QUERY parameter value.
+    /// Encode a string for use in a URL QUERY parameter name or value.
     /// Forward slashes ARE encoded as %2F (required by SigV4 canonical query).
-    /// This is also used for query parameter VALUES (not the key=value separator).
     pub fn encode_query(s: &str) -> String {
         let mut out = String::with_capacity(s.len() * 3);
         for b in s.bytes() {
@@ -1638,12 +1764,6 @@ mod urlencoding {
             }
         }
         out
-    }
-
-    /// Backward-compat alias: `encode` = `encode_path`.
-    /// (Most callers encode path components, not query values.)
-    pub fn encode(s: &str) -> String {
-        encode_path(s)
     }
 }
 
@@ -1918,9 +2038,117 @@ mod tests {
 
     #[test]
     fn test_urlencoding() {
-        assert_eq!(urlencoding::encode("abc123"), "abc123");
-        assert_eq!(urlencoding::encode("a b/c"), "a%20b/c");
-        assert_eq!(urlencoding::encode("blobs/ab/abcdef"), "blobs/ab/abcdef");
+        assert_eq!(urlencoding::encode_query("abc123"), "abc123");
+        assert_eq!(urlencoding::encode_query("a b/c"), "a%20b%2Fc");
+        assert_eq!(
+            urlencoding::encode_query("blobs/ab/abcdef"),
+            "blobs%2Fab%2Fabcdef"
+        );
+        // Unreserved characters must survive untouched (RFC 3986).
+        assert_eq!(urlencoding::encode_query("-._~"), "-._~");
+    }
+
+
+    /// A store pointing at a fake endpoint — enough to exercise signing,
+    /// which is pure computation over the credentials and the request.
+    fn fake_store() -> S3ObjectStore {
+        S3ObjectStore::new(
+            "my-bucket",
+            "prod",
+            "us-east-1",
+            "https://s3.amazonaws.com",
+            S3Credentials {
+                access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                session_token: None,
+            },
+            ureq::Agent::new(),
+        )
+    }
+
+    /// The signed bytes and the sent bytes must be the same bytes.
+    ///
+    /// This is the invariant behind the `SignatureDoesNotMatch` failures that
+    /// broke listing past 1000 objects: the URL was built from the caller's
+    /// query string while the signature was built from a re-encoded copy of
+    /// it, so the two agreed only as long as no value contained a reserved
+    /// character. Asserting they are literally equal makes that impossible to
+    /// reintroduce.
+    #[test]
+    fn test_url_query_matches_signed_query() {
+        let store = fake_store();
+        // A real R2 continuation token: base64, so it ends in '=' padding.
+        let token = "1-JTdCJTIybGFzdCUyMiUzQSUyMmZvbyUyMiU3RA==";
+        let query = format!("list-type=2&prefix=pond/data/&continuation-token={}", token);
+
+        let signed = store
+            .build_signed_request("GET", "", Some(&query), None, &[])
+            .unwrap();
+
+        let sent = signed.url.split_once('?').expect("query must be present").1;
+        assert_eq!(
+            sent,
+            canonicalize_query(&query),
+            "the URL query must be byte-identical to the signed canonical query"
+        );
+
+        // And specifically: the '=' padding is encoded once, not twice.
+        assert!(
+            sent.contains("%3D%3D"),
+            "base64 padding must be percent-encoded: {}",
+            sent
+        );
+        assert!(
+            !sent.contains("%253D"),
+            "double-encoding regression — this is the >1000-object listing bug: {}",
+            sent
+        );
+    }
+
+    /// Canonical query values are encoded exactly once, and parameters are
+    /// sorted by name as SigV4 requires.
+    #[test]
+    fn test_canonicalize_query_encodes_once_and_sorts() {
+        assert_eq!(
+            canonicalize_query("prefix=a/b&list-type=2"),
+            "list-type=2&prefix=a%2Fb",
+            "parameters must be sorted by name and values encoded once"
+        );
+        assert_eq!(canonicalize_query("uploads="), "uploads=");
+        assert_eq!(canonicalize_query(""), "");
+        // A value that is already percent-encoded is treated as raw text — so
+        // callers must pass raw values. This documents the contract.
+        assert_eq!(canonicalize_query("t=%3D"), "t=%253D");
+    }
+
+    /// A truncated ListObjectsV2 response must surface its continuation token,
+    /// and a complete one must not. Getting this wrong turns "the first 1000
+    /// objects" into "all the objects" silently.
+    #[test]
+    fn test_list_response_pagination_parsing() {
+        let truncated = "<ListBucketResult>\
+             <Contents><Key>a/1</Key></Contents>\
+             <Contents><Key>a/2</Key></Contents>\
+             <IsTruncated>true</IsTruncated>\
+             <NextContinuationToken>tok==</NextContinuationToken>\
+             </ListBucketResult>";
+        assert_eq!(list_response_keys(truncated), vec!["a/1", "a/2"]);
+        assert_eq!(
+            list_response_next_token(truncated),
+            Some("tok==".to_string())
+        );
+
+        let complete = "<ListBucketResult>\
+             <Contents><Key>a/1</Key></Contents>\
+             <IsTruncated>false</IsTruncated>\
+             </ListBucketResult>";
+        assert_eq!(list_response_keys(complete), vec!["a/1"]);
+        assert_eq!(list_response_next_token(complete), None);
+
+        // An empty bucket is not an error and is not truncated.
+        let empty = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+        assert!(list_response_keys(empty).is_empty());
+        assert_eq!(list_response_next_token(empty), None);
     }
 
     #[test]
