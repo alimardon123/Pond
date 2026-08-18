@@ -117,3 +117,27 @@ What Pond is NOT: everything else (see above)
 
 If a future proposal suggests adding any of the above to the kernel,
 it must pass the 5-criterion Admission Rule. So far, none have passed.
+
+---
+
+## Serializable transactions across concurrent writers
+
+Pond has no serialization point, by design: no coordinator, no catalog, no
+conditional writes. That is what buys coordination-free multi-writer and
+identical behaviour on local disk and object storage.
+
+The direct consequence, stated plainly so nobody discovers it in production:
+
+- **Available:** serializable transactions *within a single writer* (that
+  writer's head is its serialization point); atomic multi-collection publish;
+  coordination-free convergence *across* writers via per-field merge.
+- **Not available:** serializable transactions across arbitrary rows and
+  concurrent writers. Two processes doing `UPDATE ... WHERE balance > 0` on the
+  same row will both succeed, and the merge will resolve by version rather than
+  aborting one of them.
+
+This is the same trade WarpStream and Apache Fluss make. It covers streaming
+ingest, notebooks, spreadsheets, feature stores, agent sandboxes, ETL and
+analytics. It does not cover general-purpose OLTP with contended cross-row
+invariants. Anything needing that must layer its own concurrency control above
+Pond, or use a database.
