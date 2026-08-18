@@ -102,6 +102,43 @@ tree at these rates.
 
 ---
 
+## Claim 4 — listing and reclamation at scale
+
+Two operations whose cost is proportional to the *data* rather than to the
+change, and which therefore only misbehave once a bucket is large. Both were
+wrong until this run found them.
+
+**Listing past one page.** S3 caps a listing at 1000 keys and continues with a
+`NextContinuationToken`. That token is base64, so it ends in `=` padding — and
+the client percent-encoded it once when building the URL and again when
+building the SigV4 canonical string, so the signature covered `%253D` where the
+wire carried `%3D`. Every listing beyond the first page failed with
+`SignatureDoesNotMatch`.
+
+| operation | objects | result |
+|---|---|---|
+| `list_paths("")` | 1 200 | **succeeded**, 8.1 s (previously: hard failure) |
+
+This was not a cosmetic bug. `list_paths` is how the engine discovers writers,
+how GC enumerates blobs, and how the benchmark harness cleans up after itself —
+and the harness's cleanup silently deleted nothing for exactly this reason,
+leaving **974 orphaned objects** in the bucket across earlier runs.
+
+**Bulk delete.** Reclamation cannot be amortised by a tree or served from a
+cache, so its request count *is* its cost. S3's `DeleteObjects` takes 1000 keys
+per request:
+
+| method | objects | requests | wall clock |
+|---|---|---|---|
+| one DELETE per object | 1 200 | 1 200 | ~10 min |
+| `DeleteObjects` batches | 1 200 | **2** | **8.5 s** |
+
+**600× fewer round trips, ~70× faster** on the same work and the same endpoint.
+Extrapolated to a million dead nodes, that is a thousand requests instead of a
+million.
+
+---
+
 ## What this run also exercised
 
 Several code paths had never executed against a real endpoint before. All pass
@@ -123,11 +160,13 @@ Several code paths had never executed against a real endpoint before. All pass
 
 - **Latency is proxy-inflated** (see above). Request counts are sound; the
   milliseconds are not R2's.
-- **Scale is bounded by bulk load, not lookup.** Every node write is one
-  sequential PUT round trip, so building a 50 000-record index takes minutes
-  through the proxy. That is itself a finding: a production bulk-load path
-  needs parallel node writes. It does not affect the lookup or amplification
-  measurements.
+- **Bulk load was the binding constraint, and no longer is.** Every node write
+  used to be one sequential PUT, so building a 50 000-record index took minutes
+  through the proxy and the largest scale timed out entirely. A tree level is
+  now built in full and written in one batch, which S3 issues 32-wide; the run
+  that previously timed out completes. Lookup and amplification measurements
+  are unaffected — batching changed when writes are issued, never what is
+  written, which the byte-identical-root tests confirm.
 - **Retry/backoff is not exercised here.** R2 will not produce 503s on demand;
   that path is covered by unit tests on the classification logic.
 - Sizes span two orders of magnitude, not the 10⁹ keys the design targets.

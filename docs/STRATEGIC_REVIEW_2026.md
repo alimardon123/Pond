@@ -161,19 +161,33 @@ without an operational story.
 
 Being straight about the boundary is what makes the rest credible.
 
-**Full Postgres semantics cannot be built on this.** Serializable transactions
-across arbitrary rows and writers need a serialization point. Pond deliberately
-has none. What Pond *can* offer:
+**What Pond cannot provide is a serialization point it does not have.**
+Serializable transactions across arbitrary rows and *mutually unaware writers*
+need one. Pond deliberately has none. What it does offer:
 
 - serializable transactions **within a single writer** (that writer's head is
   its serialization point);
-- atomic multi-collection publish (already built);
+- atomic multi-collection publish (already built, and now literally one object
+  write);
 - coordination-free convergence **across** writers, with per-field merge.
 
-That covers Kafka-shaped ingest, notebooks, spreadsheets, feature stores, agent
-sandboxes, ETL, and analytics. It does not cover "two app servers doing
-`UPDATE … WHERE balance > 0` on the same row." Say so, in `NON_GOALS.md`,
-before someone builds a bank on it.
+This is worth stating carefully, because the obvious reading of it is wrong.
+It does **not** mean "no database can run on Pond" — see
+[`POSTGRES_ON_POND.md`](POSTGRES_ON_POND.md). Postgres brings its own
+serialization point: MVCC, its lock manager, and one primary that orders every
+write. What it asks of storage is a durable ordered append (the WAL) and a page
+lookup by `(relation, block)`. Both are Pond's best case, and the primary is a
+single writer by construction, so nothing needs coordinating at the storage
+layer at all.
+
+The limit is narrower than "no OLTP": it is *two writers that do not know about
+each other, resolving a conflict on the same row without talking*. Pond
+converges those deterministically by per-field last-writer-wins, which is the
+right answer for a feature store and the wrong one for a ledger. So: two
+Postgres primaries on one Pond collection is not a thing. One Postgres primary
+on Pond is, and so is "two app servers doing `UPDATE … WHERE balance > 0`" —
+provided they go through that primary, exactly as they do today. Say the narrow
+version in `NON_GOALS.md`; the broad version would be false.
 
 **Cold reads will not beat a warm database.** 2–3 round trips to object storage
 is 40–150 ms on a good day. The honest pitch is: cold is bounded and constant,
@@ -193,12 +207,16 @@ use the engine. Delete `manifest.rs` only once the engine has run in anger.
 **Acceptance:** a differential test proving the two paths agree on the same
 operations, and the CLI writing an engine-backed collection end to end.
 
-### P1 — Parallel bulk load
+### P1 — Parallel bulk load — **done**
 
-Every node write is currently one sequential PUT. Building a 50 k index took
-minutes on R2. This bounds every benchmark and would bound every real import.
-Fan out node writes with bounded concurrency; the index already exposes the
-node list.
+Every node write used to be one sequential PUT, which bounded every benchmark
+and would have bounded every real import. A tree level is now built in full and
+written in one `put_batch`, which S3 issues 32-wide. The 50 000-record R2 build
+that previously timed out completes, and reader open went from two sequential
+round trips per writer to one batched read for all of them.
+
+Remaining: bounded concurrency across *levels* for very wide trees, which only
+matters above roughly 10⁴ nodes per level.
 
 ### P2 — Segments (PAX)
 

@@ -375,6 +375,10 @@ impl<S: ObjectStore> ObjectStore for BlobCache<S> {
         self.inner.delete_path(path)
     }
 
+    fn delete_path_batch(&self, paths: &[String]) -> io::Result<usize> {
+        self.inner.delete_path_batch(paths)
+    }
+
     fn list_paths(&self, prefix: &str) -> io::Result<Vec<String>> {
         self.inner.list_paths(prefix)
     }

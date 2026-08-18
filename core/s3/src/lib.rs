@@ -1558,6 +1558,20 @@ impl ObjectStore for S3ObjectStore {
         }
     }
 
+    /// Bulk delete of named paths, same mechanism as
+    /// [`delete_blob_batch`](Self::delete_blob_batch).
+    fn delete_path_batch(&self, paths: &[String]) -> io::Result<usize> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        for chunk in paths.chunks(DELETE_BATCH_LIMIT) {
+            let keys: Vec<String> = chunk.iter().map(|p| self.path_key(p)).collect();
+            removed += self.delete_objects(&keys)?;
+        }
+        Ok(removed)
+    }
+
     /// Bulk delete via S3 `DeleteObjects`: up to
     /// [`DELETE_BATCH_LIMIT`] keys in a single request.
     ///

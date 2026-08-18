@@ -92,9 +92,13 @@ fn main() {
     );
 
     let paths = result.expect("pagination must not fail");
+    // This store's own blob tree must not appear in its ref listing. Keys
+    // belonging to a *nested* store (`<prefix>/sub/blobs/...`) are a different
+    // matter — to this store they are opaque keys it does not own, and hiding
+    // them is what previously made cleanup silently delete nothing.
     assert!(
-        paths.iter().all(|p| !p.contains("/blobs/")),
-        "blob keys must be filtered out of ref listings"
+        paths.iter().all(|p| !p.starts_with("blobs/")),
+        "this store's own blobs must not be listed as refs"
     );
     assert_eq!(removed, hashes.len(), "every written blob must be removed");
     println!("OK");
@@ -104,10 +108,8 @@ fn main() {
 /// every shard. Used to reset the bucket after an interrupted run.
 fn purge(store: &pond_s3::S3ObjectStore) {
     let paths = store.list_paths("").unwrap_or_default();
-    for p in &paths {
-        let _ = store.delete_path(p);
-    }
-    println!("purged {} refs", paths.len());
+    let removed = store.delete_path_batch(&paths).unwrap_or(0);
+    println!("purged {}/{} refs", removed, paths.len());
 
     let mut hashes = Vec::new();
     for shard in all_shards() {

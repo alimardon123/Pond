@@ -673,6 +673,33 @@ mod tests {
         assert_eq!(store.delete_blob_batch(&[]).unwrap(), 0);
     }
 
+    /// The same contract for named paths.
+    #[test]
+    fn test_delete_path_batch() {
+        let dir = tempdir().unwrap();
+        let store = LocalFSObjectStore::new(dir.path()).unwrap();
+
+        for i in 0..3 {
+            store
+                .put_path(&format!("collections/c{}", i), "cafebabe")
+                .unwrap();
+        }
+        store.put_path("collections/keep", "cafebabe").unwrap();
+
+        let targets: Vec<String> = (0..3)
+            .map(|i| format!("collections/c{}", i))
+            .chain(std::iter::once("collections/never-existed".to_string()))
+            .collect();
+
+        assert_eq!(store.delete_path_batch(&targets).unwrap(), 3);
+        assert_eq!(store.get_path("collections/c0"), None);
+        assert_eq!(
+            store.get_path("collections/keep"),
+            Some("cafebabe".to_string())
+        );
+        assert_eq!(store.delete_path_batch(&[]).unwrap(), 0);
+    }
+
     /// Ranged reads must return exactly the requested window, and must agree
     /// with slicing the whole blob — otherwise a reader that ranges into an
     /// index chunk or a column chunk gets different bytes than one that reads

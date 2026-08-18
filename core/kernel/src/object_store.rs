@@ -138,6 +138,22 @@ pub trait ObjectStore: Send + Sync {
     /// Delete a named path. Returns true if it existed.
     fn delete_path(&self, path: &str) -> io::Result<bool>;
 
+    /// Delete many named paths, returning how many existed and were removed.
+    ///
+    /// The same argument as [`delete_blob_batch`](Self::delete_blob_batch):
+    /// reclamation is sized by the data, so one round trip per name does not
+    /// scale. Refs are fewer than blobs, but "fewer" is not "few" once every
+    /// writer, branch, and collection has one.
+    fn delete_path_batch(&self, paths: &[String]) -> io::Result<usize> {
+        let mut removed = 0usize;
+        for p in paths {
+            if self.delete_path(p)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// List all paths under a prefix. Returns relative paths (without prefix).
     fn list_paths(&self, prefix: &str) -> io::Result<Vec<String>>;
 
