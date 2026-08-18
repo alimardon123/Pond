@@ -461,6 +461,61 @@ fn write_amplification_is_bounded_and_amortizes() {
     );
 }
 
+/// A small insert must not read the whole tree.
+///
+/// `insert_batch` used to scan everything and rebuild: write cost was already
+/// minimal thanks to content-addressed dedup, but read cost was O(n), which
+/// would have been inherited by every layer built on top. The splice reads the
+/// internal nodes (about 1/fanout of the tree) plus only the leaves it
+/// touches, so read cost tracks the tree's *shape* rather than its size.
+#[test]
+fn insert_read_cost_tracks_depth_not_size() {
+    let cfg = ChunkConfig::default();
+
+    println!("\n  entries | leaves | reads for a 1-row insert | reads as % of leaves");
+    println!("  --------+--------+--------------------------+---------------------");
+
+    let mut ratios = Vec::new();
+
+    for n in [10_000usize, 100_000, 500_000] {
+        let store = MemStore::new();
+        let tree = Tree::build(&store, records(n), cfg);
+        let leaves = tree.len(&store) as f64 / 512.0; // approx, fanout ~512
+
+        let key = Key::new(vec![str_("users"), int((n / 2) as i64), int(1)]).encode();
+        store.reset_counters();
+        let _ = tree.insert_batch(&store, vec![(key, b"spliced".to_vec())]);
+        let reads = store.reads();
+
+        println!(
+            "  {:>7} | {:>6.0} | {:>24} | {:>18.1}%",
+            n,
+            leaves,
+            reads,
+            100.0 * reads as f64 / leaves.max(1.0)
+        );
+        ratios.push(reads as f64 / leaves.max(1.0));
+    }
+
+    // The decisive check: reads must not grow proportionally with the data.
+    // A full scan would read every leaf, giving a ratio near 1.0 at every
+    // scale; the splice should stay far below that and *fall* as n grows,
+    // because the internal-node overhead is amortized over more leaves.
+    for (i, r) in ratios.iter().enumerate() {
+        assert!(
+            *r < 0.5,
+            "insert read {:.0}% of the leaf count at scale {} — that is a scan, not a splice",
+            r * 100.0,
+            i
+        );
+    }
+    assert!(
+        ratios.last().unwrap() < ratios.first().unwrap(),
+        "read cost should become a smaller fraction of the tree as it grows, got {:?}",
+        ratios
+    );
+}
+
 /// Two versions of a tree must share almost all of their nodes — that sharing
 /// is what makes branching, time travel, and incremental sync cheap.
 #[test]

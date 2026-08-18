@@ -27,6 +27,15 @@ pond_kernel = { path = "../kernel" }
 pond_storage = { path = "../storage" }
 sha2 = "0.10"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# Needed to add a private/proxy CA to the trust store. rustls and webpki-roots
+# are already in the tree via ureq; declaring them directly lets the client
+# honour AWS_CA_BUNDLE / SSL_CERT_FILE, which is required to work behind a
+# TLS-inspecting proxy or against a private S3 deployment.
+# `ring` (not aws-lc-rs) to match the provider ureq already links, so the
+# binary carries one crypto backend rather than two.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 hex = "0.4"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

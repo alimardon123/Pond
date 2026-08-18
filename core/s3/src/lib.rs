@@ -348,6 +348,108 @@ fn is_range_not_satisfiable(e: &io::Error) -> bool {
     status_of(e) == Some(416)
 }
 
+/// Build the HTTP agent, honouring the environment every other S3 client does.
+///
+/// Two things here are not optional for a storage system that expects to be
+/// deployed inside someone else's network:
+///
+/// **Custom CA bundles.** Corporate networks routinely terminate and re-issue
+/// TLS at an inspecting proxy, and private S3-compatible deployments (MinIO,
+/// Ceph) commonly use a private CA. A client that only trusts the compiled-in
+/// Mozilla root set simply cannot connect in either case, with an
+/// `UnknownIssuer` error that looks like a bug in the server. `AWS_CA_BUNDLE`
+/// is the AWS-standard variable for this; `SSL_CERT_FILE` is the OpenSSL
+/// convention that most tooling also sets. Both are honoured, additively —
+/// the public roots stay trusted, the extra bundle is added.
+///
+/// **Proxy configuration.** `HTTPS_PROXY` / `ALL_PROXY` with `NO_PROXY` is the
+/// universal convention; ignoring it means the client is unusable anywhere
+/// egress is mediated.
+///
+/// Both are read from the environment rather than configured in code, so
+/// deployment does not require recompiling or a Pond-specific setting.
+fn build_agent() -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new()
+        // Split-phase timeouts: a slow connect and a slow body are different
+        // failures and deserve different budgets. A single blanket timeout
+        // either kills large legitimate transfers or waits far too long on a
+        // dead host.
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(120))
+        .timeout_write(std::time::Duration::from_secs(120));
+
+    if let Some(tls) = tls_config_with_extra_roots() {
+        builder = builder.tls_config(std::sync::Arc::new(tls));
+    }
+
+    if let Some(proxy_url) = proxy_from_env() {
+        if let Ok(p) = ureq::Proxy::new(&proxy_url) {
+            builder = builder.proxy(p);
+        }
+    }
+
+    builder.build()
+}
+
+/// Read a proxy URL from the conventional environment variables.
+///
+/// Lowercase is checked first because it is the more specific convention
+/// (`https_proxy` is what curl documents); uppercase is the widely-set
+/// fallback. `NO_PROXY` is left to ureq, which applies it per-request.
+fn proxy_from_env() -> Option<String> {
+    ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok())
+        .filter(|v| !v.is_empty())
+}
+
+/// Build a rustls config trusting the public roots plus any bundle named by
+/// `AWS_CA_BUNDLE` or `SSL_CERT_FILE`.
+///
+/// Returns None when no extra bundle is configured, so ureq keeps its default
+/// (webpki-roots) and nothing changes for the common case.
+fn tls_config_with_extra_roots() -> Option<rustls::ClientConfig> {
+    let path = ["AWS_CA_BUNDLE", "SSL_CERT_FILE"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok())
+        .filter(|v| !v.is_empty())?;
+
+    let pem = std::fs::read(&path).ok()?;
+    let mut roots = rustls::RootCertStore::empty();
+
+    // Start from the public roots so adding a private CA does not silently
+    // drop trust in everything else.
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut reader = std::io::BufReader::new(&pem[..]);
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut reader).flatten() {
+        if roots.add(cert).is_ok() {
+            added += 1;
+        }
+    }
+    if added == 0 {
+        // The variable pointed at something unusable. Fall back to defaults
+        // rather than starting from an empty trust store, which would fail
+        // every connection with a confusing error.
+        return None;
+    }
+
+    // rustls 0.23 requires an explicit crypto provider unless a process
+    // default was installed. Naming `ring` here matches the provider ureq
+    // links, so the binary carries one crypto backend rather than two, and
+    // avoids depending on global init order.
+    Some(
+        rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    )
+}
+
 /// Exponential backoff with full jitter: `random(0, min(cap, base * 2^n))`.
 ///
 /// Full jitter rather than plain exponential because the failure that makes
@@ -455,7 +557,14 @@ impl S3ObjectStore {
             )
         })?;
 
-        Ok(Self::new(bucket, prefix, region, endpoint, credentials, ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(10)).timeout_read(std::time::Duration::from_secs(120)).timeout_write(std::time::Duration::from_secs(120)).build()))
+        Ok(Self::new(
+            bucket,
+            prefix,
+            region,
+            endpoint,
+            credentials,
+            build_agent(),
+        ))
     }
 
     // --- Key helpers ---

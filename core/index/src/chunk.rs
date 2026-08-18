@@ -1,10 +1,13 @@
 // chunk.rs — content-defined chunk boundaries.
 //
-// This is the single decision that makes the index history-independent, and
-// it is the one the archived prolly tree documented but never implemented:
-// `archive/legacy-sdk/prolly_tree.py` describes rolling-hash boundaries in
-// detail, defines `_rolling_hash_boundary()`, and then chunks with fixed
-// 64-entry slices. A fixed-fanout tree has none of the properties below.
+// This is the single decision that makes the index history-independent.
+//
+// It is worth stating plainly because it is easy to get wrong in a way that
+// still "works": an earlier prototype in this repo documented rolling-hash
+// boundaries in detail, defined the boundary function, and then chunked with
+// fixed-size slices. That produces a valid search tree with none of the four
+// properties below, and the difference is invisible until you try to merge or
+// diff two versions of it.
 //
 // The rule: an entry ends a chunk when a hash *of that entry's own bytes*
 // lands on a boundary value. Nothing about the entry's position, the insertion

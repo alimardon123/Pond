@@ -23,6 +23,7 @@ members = [
     "extensions/semantic/base/rust",
     "extensions/semantic/ossie/rust",
     "mcp-server",
+    "benchmarks",
 ]
 
 [workspace.package]

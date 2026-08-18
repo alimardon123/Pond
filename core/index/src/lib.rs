@@ -34,9 +34,10 @@
 // contents, which in turn gives convergence without coordination: two writers
 // who arrive at the same data arrive at the same bytes.
 //
-// The archived prototype (`archive/legacy-sdk/prolly_tree.py`) documented this
-// and then chunked with fixed 64-entry slices, so it had none of these
-// properties. That is worth knowing before re-litigating the approach.
+// An earlier prototype in this repo documented exactly this and then chunked
+// by fixed position, so it had none of these properties — which is why the
+// approach looked like it had been tried and found wanting when it had not.
+// Worth knowing before re-litigating it.
 
 pub mod chunk;
 pub mod key;

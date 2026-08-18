@@ -44,7 +44,7 @@ reading the code and running the tests, not by trusting the worklog.
   `get_r2_client, get_r2_bucket, get_r2_prefix` from `_r2_config` and
   uses them. No credentials in the file.
 - A repo-wide grep for the two specific leaked credential strings
-  (`4331a4a6283b...` and `286c9be9d520...`) finds them in **exactly
+  (`<REDACTED-ACCESS-KEY-ID>` and `<REDACTED-SECRET-ACCESS-KEY>`) finds them in **exactly
   one file**: my own V1 review. They are gone from all source.
 
 **Minor residual:** the seven refactored scripts
@@ -1203,7 +1203,7 @@ $ python3 scripts/phase_l_property_tests.py
 RESULTS: 491 pass, 0 fail, 0 skip
 (was 490 pass, 1 fail in V1 — A7 law test correctly refined)
 
-$ grep -rn "4331a4a6283b1d929cda0085d24450e0\|286c9be9d520e15fee90145147a43f15001209d192b63ca7a9e2ba53dde31122" /home/z/my-project/pond_repo
+$ grep -rn "<REDACTED-ACCESS-KEY-ID>\|<REDACTED-SECRET-ACCESS-KEY>" /home/z/my-project/pond_repo
 → only match: docs/VETERAN_ARCHITECT_REVIEW.md (the V1 review itself)
 → credentials are gone from all source
 ```

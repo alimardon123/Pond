@@ -1,0 +1,18 @@
+[package]
+name = "pond_bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond benchmarks — measures the storage claims against real object storage"
+publish = false
+
+[[bin]]
+name = "r2_validation"
+path = "src/r2_validation.rs"
+
+[dependencies]
+pond_index = { path = "../core/index" }
+pond_record = { path = "../core/record" }
+pond_cache = { path = "../core/cache" }
+pond_kernel = { path = "../core/kernel" }
+pond_s3 = { path = "../core/s3" }
