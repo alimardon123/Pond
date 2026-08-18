@@ -1,0 +1,18 @@
+[package]
+name = "pond_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pond engine — the API a database or lens needs, over index + record + cache"
+
+[lib]
+name = "pond_engine"
+
+[dependencies]
+pond_kernel = { path = "../kernel" }
+pond_index = { path = "../index" }
+pond_record = { path = "../record" }
+pond_cache = { path = "../cache" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

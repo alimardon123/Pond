@@ -1532,6 +1532,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond_engine"
+version = "0.3.0"
+dependencies = [
+ "pond_cache",
+ "pond_index",
+ "pond_kernel",
+ "pond_record",
+ "tempfile",
+]
+
+[[package]]
 name = "pond_hnsw_index"
 version = "0.3.0"
 dependencies = [

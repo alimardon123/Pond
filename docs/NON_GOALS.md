@@ -120,24 +120,32 @@ it must pass the 5-criterion Admission Rule. So far, none have passed.
 
 ---
 
-## Serializable transactions across concurrent writers
+## Multi-writer serializability on a single collection
 
 Pond has no serialization point, by design: no coordinator, no catalog, no
-conditional writes. That is what buys coordination-free multi-writer and
+conditional writes. That is what buys coordination-free convergence and
 identical behaviour on local disk and object storage.
 
-The direct consequence, stated plainly so nobody discovers it in production:
+What that does and does not rule out is worth stating precisely, because it is
+easy to overstate:
 
-- **Available:** serializable transactions *within a single writer* (that
-  writer's head is its serialization point); atomic multi-collection publish;
-  coordination-free convergence *across* writers via per-field merge.
-- **Not available:** serializable transactions across arbitrary rows and
-  concurrent writers. Two processes doing `UPDATE ... WHERE balance > 0` on the
-  same row will both succeed, and the merge will resolve by version rather than
-  aborting one of them.
+- **Available:** serializable transactions *within a writer* — that writer's
+  head is its serialization point, and it can offer any isolation level it
+  likes above that. Atomic multi-collection publish. Coordination-free
+  convergence *between* writers via per-field merge.
+- **Not available:** a *single* serial order agreed between two writers who
+  are concurrently mutating the same key and who both need one of their
+  transactions to abort. Pond will converge them by version rather than abort
+  either.
 
-This is the same trade WarpStream and Apache Fluss make. It covers streaming
-ingest, notebooks, spreadsheets, feature stores, agent sandboxes, ETL and
-analytics. It does not cover general-purpose OLTP with contended cross-row
-invariants. Anything needing that must layer its own concurrency control above
-Pond, or use a database.
+This is emphatically **not** the same as "you cannot run a database on Pond."
+A database engine — Postgres included — performs its own concurrency control
+in its own process: one WAL stream, one lock manager, one MVCC implementation.
+Storage underneath it only has to durably persist an ordered stream, which is
+exactly the single-writer case Pond serves. See
+`docs/POSTGRES_ON_POND.md`.
+
+The uncovered case is narrower than it sounds: two *independent database
+engines* mutating the same rows with no channel between them. Aurora
+Multi-Master shaped, not Postgres shaped. Almost nobody runs that, and the
+systems that do all pay for a coordinator to get it.

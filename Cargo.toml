@@ -10,6 +10,7 @@ members = [
     "core/index",
     "core/cache",
     "core/record",
+    "core/engine",
     "cli",
     "bindings/python/pyo3",
     "lenses/keyvalue/rust",
