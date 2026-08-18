@@ -356,6 +356,21 @@ impl<S: ObjectStore> ObjectStore for BlobCache<S> {
         self.inner.get_path(path)
     }
 
+    /// Named bytes are mutable, so they pass straight through — the same
+    /// reason refs are never cached. Caching here would need invalidation,
+    /// which is precisely what content addressing exists to avoid.
+    fn put_object(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
+        self.inner.put_object(path, bytes)
+    }
+
+    fn get_object(&self, path: &str) -> Option<Vec<u8>> {
+        self.inner.get_object(path)
+    }
+
+    fn get_object_batch(&self, paths: &[String]) -> Vec<Option<Vec<u8>>> {
+        self.inner.get_object_batch(paths)
+    }
+
     fn delete_path(&self, path: &str) -> io::Result<bool> {
         self.inner.delete_path(path)
     }
@@ -436,6 +451,12 @@ mod tests {
         }
         fn get_path(&self, p: &str) -> Option<String> {
             self.inner.get_path(p)
+        }
+        fn put_object(&self, p: &str, bytes: &[u8]) -> io::Result<()> {
+            self.inner.put_object(p, bytes)
+        }
+        fn get_object(&self, p: &str) -> Option<Vec<u8>> {
+            self.inner.get_object(p)
         }
         fn delete_path(&self, p: &str) -> io::Result<bool> {
             self.inner.delete_path(p)

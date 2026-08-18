@@ -379,6 +379,12 @@ impl<S: ObjectStore> ObjectStore for FailingList<S> {
     fn get_path(&self, path: &str) -> Option<String> {
         self.0.get_path(path)
     }
+    fn put_object(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.put_object(path, bytes)
+    }
+    fn get_object(&self, path: &str) -> Option<Vec<u8>> {
+        self.0.get_object(path)
+    }
     fn delete_path(&self, path: &str) -> std::io::Result<bool> {
         self.0.delete_path(path)
     }
@@ -422,4 +428,151 @@ fn reader_open_fails_loudly_when_listing_fails() {
         err.is_err(),
         "a failed head listing must not be reported as an empty store"
     );
+}
+
+/// Counts the round trips a backend is asked for. The counters live behind an
+/// `Arc` so the test can still read them after the store is moved into the
+/// engine.
+#[derive(Default)]
+struct Counters {
+    puts: std::sync::atomic::AtomicU64,
+    gets: std::sync::atomic::AtomicU64,
+    lists: std::sync::atomic::AtomicU64,
+}
+
+impl Counters {
+    fn snapshot(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.puts.load(Relaxed),
+            self.gets.load(Relaxed),
+            self.lists.load(Relaxed),
+        )
+    }
+    fn reset(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.puts.store(0, Relaxed);
+        self.gets.store(0, Relaxed);
+        self.lists.store(0, Relaxed);
+    }
+}
+
+struct Counting<S: ObjectStore> {
+    inner: S,
+    c: std::sync::Arc<Counters>,
+}
+
+impl<S: ObjectStore> Counting<S> {
+    fn new(inner: S, c: std::sync::Arc<Counters>) -> Self {
+        Self { inner, c }
+    }
+}
+
+impl<S: ObjectStore> ObjectStore for Counting<S> {
+    fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
+        self.c.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.put_blob(data)
+    }
+    fn get_blob(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        self.c.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get_blob(hash)
+    }
+    fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
+        self.c.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.put_path(path, hash)
+    }
+    fn get_path(&self, path: &str) -> Option<String> {
+        self.c.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get_path(path)
+    }
+    fn put_object(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.c.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.put_object(path, bytes)
+    }
+    fn get_object(&self, path: &str) -> Option<Vec<u8>> {
+        self.c.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get_object(path)
+    }
+    fn delete_path(&self, path: &str) -> std::io::Result<bool> {
+        self.inner.delete_path(path)
+    }
+    fn list_paths(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.c.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.list_paths(prefix)
+    }
+    fn blob_exists(&self, hash: &str) -> bool {
+        self.inner.blob_exists(hash)
+    }
+    fn delete_blob(&self, hash: &str) -> std::io::Result<bool> {
+        self.inner.delete_blob(hash)
+    }
+}
+
+/// Committing costs exactly one write, however many collections it spans.
+///
+/// This is the whole atomicity argument. Object stores make a single object
+/// write atomic, so a commit that *is* one write needs no transaction
+/// machinery to be all-or-nothing. Two writes — a blob, then a name pointing
+/// at it — would be neither atomic nor cheap, and readers would never see the
+/// first one on its own anyway.
+#[test]
+fn commit_is_exactly_one_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = std::sync::Arc::new(Counters::default());
+    let mut e = Engine::open(Counting::new(store(dir.path()), c.clone()), 1).unwrap();
+
+    for collection in ["users", "orders", "events"] {
+        e.write_records(
+            collection,
+            vec![(
+                user(1),
+                Record::new().with_field("v", Value::Int(1), v(100, 1)),
+            )],
+        )
+        .unwrap();
+    }
+
+    c.reset();
+    e.publish().unwrap();
+    let (puts, _, lists) = c.snapshot();
+
+    assert_eq!(
+        puts, 1,
+        "publishing three collections must be one object write, was {}",
+        puts
+    );
+    assert_eq!(lists, 0, "the commit path must not list");
+}
+
+/// Opening a reader costs one LIST plus one read per writer — never a read
+/// per writer *chained behind another read*, and never anything proportional
+/// to how much data those writers hold.
+#[test]
+fn reader_open_cost_is_one_list_plus_one_read_per_writer() {
+    let dir = tempfile::tempdir().unwrap();
+
+    const WRITERS: u64 = 4;
+    for w in 1..=WRITERS {
+        let mut e = Engine::open(store(dir.path()), w).unwrap();
+        e.write_records(
+            "users",
+            vec![(
+                user(w as i64),
+                Record::new().with_field("v", Value::Int(w as i64), v(100, w)),
+            )],
+        )
+        .unwrap();
+        e.publish().unwrap();
+    }
+
+    let c = std::sync::Arc::new(Counters::default());
+    let r = Reader::open(Counting::new(store(dir.path()), c.clone())).unwrap();
+    let (_, gets, lists) = c.snapshot();
+
+    assert_eq!(lists, 1, "one LIST discovers every writer");
+    assert_eq!(
+        gets, WRITERS,
+        "one read per head — not the two an indirection would cost"
+    );
+    assert_eq!(r.collections(), vec!["users".to_string()]);
 }

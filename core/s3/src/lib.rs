@@ -1411,6 +1411,50 @@ impl ObjectStore for S3ObjectStore {
         }
     }
 
+    fn put_object(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
+        let key = self.path_key(path);
+        self.s3_request("PUT", &key, None, Some(bytes), &[])?;
+        let mut s = self.stats.lock().unwrap();
+        s.puts += 1;
+        s.bytes_written += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn get_object(&self, path: &str) -> Option<Vec<u8>> {
+        let key = self.path_key(path);
+        let resp = self.s3_request("GET", &key, None, None, &[]).ok()?;
+        let mut buf = Vec::new();
+        resp.into_reader().read_to_end(&mut buf).ok()?;
+        let mut s = self.stats.lock().unwrap();
+        s.gets += 1;
+        s.bytes_read += buf.len() as u64;
+        Some(buf)
+    }
+
+    /// Parallel reads. Named objects are independent of one another, so the
+    /// cost of reading N of them should be one round trip, not N.
+    fn get_object_batch(&self, paths: &[String]) -> Vec<Option<Vec<u8>>> {
+        if paths.len() <= 1 {
+            return paths.iter().map(|p| self.get_object(p)).collect();
+        }
+        const MAX_PARALLEL: usize = 32;
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(paths.len());
+        for chunk in paths.chunks(MAX_PARALLEL) {
+            let results: Vec<Option<Vec<u8>>> = std::thread::scope(|sc| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|p| sc.spawn(move || self.get_object(p)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or(None))
+                    .collect()
+            });
+            out.extend(results);
+        }
+        out
+    }
+
     fn delete_path(&self, path: &str) -> io::Result<bool> {
         let key = self.path_key(path);
         // S3 DELETE is idempotent — returns 204 even if the key didn't exist

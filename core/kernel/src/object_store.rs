@@ -104,6 +104,37 @@ pub trait ObjectStore: Send + Sync {
     /// Resolve a named path to its content hash. Returns None if unbound.
     fn get_path(&self, path: &str) -> Option<String>;
 
+    /// Write bytes directly at a named path, replacing whatever was there.
+    ///
+    /// This is the more primitive of the two named-write operations, and
+    /// `put_path` is expressible in terms of it — the reverse is not true.
+    /// The difference shows up on small mutable state: binding a name to a
+    /// hash means the value has to be written as a blob first and read back
+    /// through an indirection, so a small object costs two round trips to
+    /// write and two to read. Storing the bytes under the name costs one each
+    /// way.
+    ///
+    /// That matters most for the commit path, where the whole point is that
+    /// publishing is a single object write, and for anything read on every
+    /// open. Content-addressed storage is still the right default for
+    /// everything large or shared — this is for the state that is small,
+    /// mutable, and owned by exactly one writer.
+    ///
+    /// Last-writer-wins, like `put_path`, and durable on the same terms: a
+    /// plain PUT on object storage, temp→fsync→rename locally.
+    fn put_object(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
+
+    /// Read the bytes written by [`put_object`]. `None` if the path is unset.
+    fn get_object(&self, path: &str) -> Option<Vec<u8>>;
+
+    /// Read many named paths at once. Missing paths come back as `None` in
+    /// place, so the result lines up with the input.
+    ///
+    /// Default is the sequential loop; S3 overrides it with parallel requests.
+    fn get_object_batch(&self, paths: &[String]) -> Vec<Option<Vec<u8>>> {
+        paths.iter().map(|p| self.get_object(p)).collect()
+    }
+
     /// Delete a named path. Returns true if it existed.
     fn delete_path(&self, path: &str) -> io::Result<bool>;
 
@@ -386,6 +417,27 @@ impl ObjectStore for LocalFSObjectStore {
             }
             Err(_) => None,
         }
+    }
+
+    fn put_object(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
+        let file = self.path_file(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to write outside the store root: '{}'", path),
+            )
+        })?;
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_file_durably(&file, bytes)?;
+        let mut s = self.stats.lock().unwrap();
+        s.puts += 1;
+        Ok(())
+    }
+
+    fn get_object(&self, path: &str) -> Option<Vec<u8>> {
+        let file = self.path_file(path)?;
+        fs::read(&file).ok()
     }
 
     fn delete_path(&self, path: &str) -> io::Result<bool> {

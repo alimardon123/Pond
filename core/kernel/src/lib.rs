@@ -611,6 +611,41 @@ mod tests {
         assert!(kernel.list_blobs_prefix(&hash[..4]).contains(&hash));
     }
 
+    /// Named bytes round-trip, replace in place, and refuse to escape the
+    /// store root — the same three properties `put_path` has, because they are
+    /// the same operation with one less indirection.
+    #[test]
+    fn test_put_object_round_trip_and_containment() {
+        let dir = tempdir().unwrap();
+        let store = LocalFSObjectStore::new(dir.path()).unwrap();
+
+        assert_eq!(store.get_object("heads/writer-1"), None);
+
+        store.put_object("heads/writer-1", b"first").unwrap();
+        assert_eq!(store.get_object("heads/writer-1").unwrap(), b"first");
+
+        // Last write wins, in place — no versioning, no CAS.
+        store.put_object("heads/writer-1", b"second").unwrap();
+        assert_eq!(store.get_object("heads/writer-1").unwrap(), b"second");
+
+        // It appears in a ref listing, because it is one.
+        assert!(store
+            .list_paths("heads/")
+            .unwrap()
+            .contains(&"heads/writer-1".to_string()));
+
+        // Batch reads line up with their inputs, misses included.
+        let got = store.get_object_batch(&[
+            "heads/writer-1".to_string(),
+            "heads/absent".to_string(),
+        ]);
+        assert_eq!(got, vec![Some(b"second".to_vec()), None]);
+
+        // And the containment check applies here too.
+        assert!(store.put_object("../escape", b"x").is_err());
+        assert!(!dir.path().parent().unwrap().join("escape").exists());
+    }
+
     /// Deleting a batch must remove exactly the named blobs and report how
     /// many existed, whether the backend has a bulk API or falls back to the
     /// sequential default.

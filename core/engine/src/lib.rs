@@ -112,13 +112,12 @@ impl<S: ObjectStore> Engine<S> {
         let cached = BlobCache::new(backend, cache)?;
         let store = EngineStore::new(cached);
 
-        // Recover this writer's own head, if it has published before.
-        let head = match store.inner().get_path(&head_key(writer_id)) {
-            Some(hash) => match store.inner().get_blob(&hash) {
-                Ok(bytes) => pond_record::decode_head(&bytes)
-                    .ok_or_else(|| EngineError::Corrupt("head".into()))?,
-                Err(_) => Head::new(writer_id),
-            },
+        // Recover this writer's own head, if it has published before. One
+        // read, not two: the head lives *as* the object under its name rather
+        // than as a name pointing at a blob.
+        let head = match store.inner().get_object(&head_key(writer_id)) {
+            Some(bytes) => pond_record::decode_head(&bytes)
+                .ok_or_else(|| EngineError::Corrupt("head".into()))?,
             None => Head::new(writer_id),
         };
 
@@ -264,8 +263,14 @@ impl<S: ObjectStore> Engine<S> {
             self.head.set_root(collection, &tree.root);
         }
         let bytes = pond_record::encode_head(&self.head);
-        let hash = self.store.inner().put_blob(&bytes)?;
-        self.store.inner().put_path(&head_key(self.writer_id), &hash)?;
+        // One write. Storing the head as a blob and then binding its name to
+        // the hash would be two sequential round trips on the commit path —
+        // and the second one is what readers would actually see, so the first
+        // buys nothing. A head is small, mutable, and owned by exactly one
+        // writer, which is the case content addressing does not help.
+        self.store
+            .inner()
+            .put_object(&head_key(self.writer_id), &bytes)?;
         self.staged.clear();
         Ok(())
     }
@@ -336,17 +341,14 @@ impl<S: ObjectStore> Reader<S> {
         // history the reader never saw.
         let paths = store.inner().list_paths(HEADS_PREFIX)?;
 
-        // Resolve every head ref, then fetch all of them in one batch. Heads
-        // are independent of each other, so there is no reason to pay a round
-        // trip per writer in sequence — S3 issues the batch in parallel.
-        let hashes: Vec<String> = paths
-            .iter()
-            .filter_map(|p| store.inner().get_path(p))
-            .collect();
-        let bodies = store.inner().get_blob_batch(&hashes).unwrap_or_default();
+        // Then one batched read of every head. Heads are independent of each
+        // other, so nothing forces a round trip per writer in sequence — S3
+        // issues the batch in parallel. Opening a reader is therefore one LIST
+        // plus one wave, whatever the number of writers.
+        let bodies = store.inner().get_object_batch(&paths);
 
         let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for bytes in bodies {
+        for bytes in bodies.into_iter().flatten() {
             // A head that does not decode is skipped, not fatal: one writer
             // publishing a corrupt head must not make every other writer's
             // data unreadable.
