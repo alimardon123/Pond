@@ -261,3 +261,98 @@ fn decode_to_typed(blob: &[u8]) -> Vec<(String, TypedColumn)> {
         })
         .collect()
 }
+
+/// A second write adds rows; it does not replace the first.
+///
+/// This is the failure the row-identity design exists to prevent. A column
+/// batch has no notion of which row is which, and its ordinals restart at zero
+/// on every write — so keying rows by position makes each write silently
+/// overwrite the previous one, row for row, while reporting success. Rows
+/// without a supplied `_rowid` get a generated one instead.
+#[test]
+fn a_second_write_appends_rather_than_replacing() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "users").unwrap();
+
+    engine_path::write_rows(
+        &k,
+        "users",
+        &[
+            ("id", TypedColumn::Int64(vec![1, 2])),
+            ("name", TypedColumn::String(vec!["ada".into(), "grace".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    engine_path::write_rows(
+        &k,
+        "users",
+        &[
+            ("id", TypedColumn::Int64(vec![3])),
+            ("name", TypedColumn::String(vec!["alan".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    let columns = engine_path::read_rows(&k, "users").unwrap();
+    let mut ids = match columns.iter().find(|(n, _)| n == "id") {
+        Some((_, TypedColumn::Int64(v))) => v.clone(),
+        _ => panic!("id column missing"),
+    };
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "all three rows must survive; got {:?}",
+        ids
+    );
+}
+
+/// Naming a row by `_rowid` updates it in place.
+///
+/// The other half of the same rule: identity supplied means "this row", so a
+/// second write to the same id is an update, not a duplicate.
+#[test]
+fn writing_the_same_rowid_updates_that_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "users").unwrap();
+
+    engine_path::write_rows(
+        &k,
+        "users",
+        &[
+            ("_rowid", TypedColumn::String(vec!["r1".into()])),
+            ("id", TypedColumn::Int64(vec![1])),
+            ("name", TypedColumn::String(vec!["ada".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    engine_path::write_rows(
+        &k,
+        "users",
+        &[
+            ("_rowid", TypedColumn::String(vec!["r1".into()])),
+            ("id", TypedColumn::Int64(vec![1])),
+            ("name", TypedColumn::String(vec!["ada lovelace".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    let columns = engine_path::read_rows(&k, "users").unwrap();
+    let names_col = match columns.iter().find(|(n, _)| n == "name") {
+        Some((_, TypedColumn::String(v))) => v.clone(),
+        _ => panic!("name column missing"),
+    };
+    assert_eq!(
+        names_col,
+        vec!["ada lovelace".to_string()],
+        "one row, updated — not two rows"
+    );
+}

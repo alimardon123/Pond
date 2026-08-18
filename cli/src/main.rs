@@ -62,6 +62,15 @@ enum Commands {
         #[arg(default_value = ".")]
         location: String,
     },
+    /// Create an engine-backed collection.
+    ///
+    /// Collections created this way use the content-defined index: a commit is
+    /// one object write, lookups cost the same at any size, and any number of
+    /// writers converge without coordinating. Collections created any other
+    /// way keep the original format and are unaffected.
+    Create {
+        collection: String,
+    },
     Write { collection: String, #[arg(group = "input")] file: Option<String>,
             #[arg(long, group = "input")] json: Option<String>,
             #[arg(long, group = "input")] bytes: bool,
@@ -189,6 +198,15 @@ fn main() {
             // at _active_branch/{collection} → blob containing branch name.
             load_persisted_active_branches(&storage);
             match cmd {
+                Commands::Create { collection } => {
+                    match pond_storage::engine_path::create(storage.kernel(), &collection) {
+                        Ok(()) => println!("{}\tengine", collection),
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 Commands::Write { collection, file, json, bytes, message } => {
                     cmd_write(&storage, &collection, file, json, bytes, message);
                 }
@@ -848,6 +866,26 @@ fn cmd_write_rows(
         .map(|(name, col)| (name.as_str(), col.clone()))
         .collect();
 
+    // Engine-backed collections take the new path.
+    if pond_storage::definition::format_of(storage.kernel(), collection)
+        == pond_storage::definition::Format::Engine
+    {
+        let writer_id = pond_kernel::crdt::stable_writer_id();
+        match pond_storage::engine_path::write_rows(
+            storage.kernel(),
+            collection,
+            &columns_ref,
+            writer_id,
+        ) {
+            Ok(()) => println!("{}\t{} rows", collection, n_rows),
+            Err(e) => {
+                eprintln!("Error: write failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let active = storage.get_active_branch(collection);
     match write::write_rows(
         storage.kernel(),
@@ -1086,6 +1124,18 @@ fn read_rows_as_json(
     limit: Option<usize>,
 ) -> Result<Vec<JsonValue>, String> {
     let kernel = storage.kernel();
+
+    // Engine-backed collections take the new path. Legacy ones — everything
+    // written before the engine existed, which is recognised by having no
+    // definition object at all — fall through unchanged below.
+    if pond_storage::definition::format_of(kernel, collection)
+        == pond_storage::definition::Format::Engine
+    {
+        let blob = pond_storage::engine_path::read_pnd2(kernel, collection)?;
+        let rows = pnd2_blob_to_json(&blob)?;
+        return apply_filters(rows, where_filter, columns, limit);
+    }
+
     let active = storage.get_active_branch(collection);
 
     // Resolve HEAD commit.
@@ -1123,55 +1173,78 @@ fn read_rows_as_json(
         let blob = kernel
             .read_blob(&rg.blob_hash)
             .map_err(|e| format!("Failed to read data blob: {}", e))?;
-        let cols = pnd2_decode(&blob).map_err(|e| format!("Failed to decode PND2: {}", e))?;
-        let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
-        for row_idx in 0..n_rows {
-            let mut row_obj = serde_json::Map::new();
-            for col in &cols {
-                let name = col.name.to_string_lossy().to_string();
-                // Skip CRDT metadata columns — they're internal.
-                if name == "_rowid" || name == "_version" || name == "_deleted" {
-                    continue;
-                }
-                let val = match col.vtype {
-                    VT_INT64 => col
-                        .i64_data
-                        .get(row_idx)
-                        .map(|v| json!(*v))
-                        .unwrap_or(JsonValue::Null),
-                    VT_FLOAT64 => col
-                        .f64_data
-                        .get(row_idx)
-                        .and_then(|v| serde_json::Number::from_f64(*v))
-                        .map(JsonValue::Number)
-                        .unwrap_or(JsonValue::Null),
-                    VT_STRING => col
-                        .str_data
-                        .get(row_idx)
-                        .map(|v| json!(v.to_string_lossy().to_string()))
-                        .unwrap_or(JsonValue::Null),
-                    VT_BOOLEAN => col
-                        .i64_data
-                        .get(row_idx)
-                        .map(|v| json!(*v != 0))
-                        .unwrap_or(JsonValue::Null),
-                    _ => JsonValue::Null,
-                };
-                row_obj.insert(name, val);
-            }
-            all_rows.push(JsonValue::Object(row_obj));
-        }
+        all_rows.extend(pnd2_blob_to_json(&blob)?);
     }
 
-    // Apply WHERE filter.
+    apply_filters(all_rows, where_filter, columns, limit)
+}
+
+/// Decode one PND2 blob into JSON rows.
+///
+/// Shared by both storage paths on purpose: a row read through the engine and
+/// the same row read through the legacy manifest must be presented
+/// identically, and the surest way to guarantee that is for one function to do
+/// the presenting.
+fn pnd2_blob_to_json(blob: &[u8]) -> Result<Vec<JsonValue>, String> {
+    let cols = pnd2_decode(blob).map_err(|e| format!("Failed to decode PND2: {}", e))?;
+    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+    let mut rows = Vec::with_capacity(n_rows);
+    for row_idx in 0..n_rows {
+        let mut row_obj = serde_json::Map::new();
+        for col in &cols {
+            let name = col.name.to_string_lossy().to_string();
+            // Skip CRDT metadata columns — they're internal.
+            if name == "_rowid" || name == "_version" || name == "_deleted" {
+                continue;
+            }
+            let val = match col.vtype {
+                VT_INT64 => col
+                    .i64_data
+                    .get(row_idx)
+                    .map(|v| json!(*v))
+                    .unwrap_or(JsonValue::Null),
+                VT_FLOAT64 => col
+                    .f64_data
+                    .get(row_idx)
+                    .and_then(|v| serde_json::Number::from_f64(*v))
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null),
+                VT_STRING => col
+                    .str_data
+                    .get(row_idx)
+                    .map(|v| json!(v.to_string_lossy().to_string()))
+                    .unwrap_or(JsonValue::Null),
+                VT_BOOLEAN => col
+                    .i64_data
+                    .get(row_idx)
+                    .map(|v| json!(*v != 0))
+                    .unwrap_or(JsonValue::Null),
+                _ => JsonValue::Null,
+            };
+            row_obj.insert(name, val);
+        }
+        rows.push(JsonValue::Object(row_obj));
+    }
+    Ok(rows)
+}
+
+/// Apply WHERE, column projection, and LIMIT — in that order, which is the
+/// only order that gives the expected answer: filtering after projection
+/// cannot see a column that was projected away, and limiting before filtering
+/// would return the wrong rows.
+fn apply_filters(
+    mut rows: Vec<JsonValue>,
+    where_filter: Option<&str>,
+    columns: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<JsonValue>, String> {
     if let Some(w) = where_filter {
         if !w.trim().is_empty() {
             let predicates = parse_where_clause(w)?;
-            all_rows.retain(|r| predicates.iter().all(|(c, op, v)| eval_predicate(r, c, op, v)));
+            rows.retain(|r| predicates.iter().all(|(c, op, v)| eval_predicate(r, c, op, v)));
         }
     }
 
-    // Apply column projection.
     if let Some(cols_str) = columns {
         if !cols_str.trim().is_empty() {
             let col_list: Vec<String> = cols_str
@@ -1179,7 +1252,7 @@ fn read_rows_as_json(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            all_rows = all_rows
+            rows = rows
                 .into_iter()
                 .map(|r| {
                     if let Some(obj) = r.as_object() {
@@ -1200,12 +1273,11 @@ fn read_rows_as_json(
         }
     }
 
-    // Apply LIMIT.
     if let Some(lim) = limit {
-        all_rows.truncate(lim);
+        rows.truncate(lim);
     }
 
-    Ok(all_rows)
+    Ok(rows)
 }
 
 /// Parse a simple WHERE clause into a list of (column, op, value) predicates

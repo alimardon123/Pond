@@ -11,6 +11,7 @@
 
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // UUIDv7 — time-ordered UUID for distributed row identification
@@ -196,6 +197,46 @@ pub fn current_time_ms() -> u64 {
 ///     writers share it;
 ///   - counter disambiguates writes within one process, which can easily emit
 ///     several shards inside a single clock tick.
+/// A writer id that is the same on every run for the same machine and user.
+///
+/// Writer identity is not a nicety here — it is what bounds the store's
+/// metadata. Every distinct writer id becomes one head object, and every head
+/// object is read when a reader opens. A process that invented a fresh random
+/// id each run would leave a head behind on every write, so opening a reader
+/// would get steadily slower forever, for a collection that never grew.
+///
+/// Derived from hostname and username rather than persisted, so there is no
+/// state file to lose or to disagree with. Two users on one machine are two
+/// writers, which is the right granularity: they are exactly the parties whose
+/// concurrent edits need to be told apart.
+///
+/// Falls back to a random id when neither is readable. That is the safe
+/// direction — a random id costs an extra head object, while a colliding id
+/// would let two writers overwrite each other's heads.
+pub fn stable_writer_id() -> u64 {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|s| s.trim().to_string());
+    let user = std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok());
+
+    match (host, user) {
+        (None, None) => {
+            let mut bytes = [0u8; 8];
+            fill_random(&mut bytes);
+            u64::from_be_bytes(bytes)
+        }
+        (h, u) => {
+            let mut hasher = Sha256::new();
+            hasher.update(h.unwrap_or_default().as_bytes());
+            hasher.update(b"\x00");
+            hasher.update(u.unwrap_or_default().as_bytes());
+            let out = hasher.finalize();
+            u64::from_be_bytes(out[..8].try_into().unwrap_or([0u8; 8]))
+        }
+    }
+}
+
 pub fn shard_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
@@ -421,6 +462,17 @@ mod tests {
         assert!(HLC::is_valid(&v), "HLC must be valid");
         // Legacy 32-char values (written before writer ids) stay valid.
         assert!(HLC::is_valid(&"0".repeat(32)));
+    }
+
+    /// The writer id must be the same on every call in one environment, and
+    /// different for a different user. Instability here is not a cosmetic
+    /// problem: it leaks a head object per run.
+    #[test]
+    fn test_stable_writer_id_is_stable() {
+        let a = stable_writer_id();
+        let b = stable_writer_id();
+        assert_eq!(a, b, "the same environment must produce the same writer id");
+        assert_ne!(a, 0, "a writer id of zero would collide with an unset one");
     }
 
     /// Shard names must be unique even when generated in a tight loop, where

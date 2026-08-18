@@ -15,11 +15,13 @@
 //      definition carries a schema and not just a format tag.
 //
 //   2. **Rows need identity.** A column layout has no notion of *which* row is
-//      which — position is the only handle, and position is exactly what stops
-//      being stable once two writers merge. The legacy write path already adds
-//      `_rowid` (UUIDv7) and `_version` (HLC) for its CRDT support, so those
-//      are used when present; when absent, the row ordinal stands in, which is
-//      correct for a single writer and honestly labelled as such.
+//      which. Position is the only handle it offers, and position is not an
+//      identity: the second write to a collection starts again at row 0, so
+//      keying by ordinal makes every write overwrite the one before it. The
+//      legacy path already generates `_rowid` (UUIDv7) per row for exactly
+//      this reason, and this path does the same — a supplied `_rowid` names
+//      the row, and its absence means "these are new rows", which is what an
+//      insert is.
 
 use std::collections::BTreeMap;
 
@@ -28,7 +30,7 @@ use pond_core::constants::{
     VT_VECTOR,
 };
 use pond_core::encode::TypedColumn;
-use pond_index::{int, str_, Key};
+use pond_index::{str_, Key};
 use pond_record::{Record, Value, Version};
 
 use crate::definition::Definition;
@@ -75,12 +77,26 @@ pub fn columns_to_records(
             record = record.with_field(name, value, Version::new(physical, row as u64, writer_id));
         }
 
-        // A supplied `_rowid` is the row's identity across writers and across
-        // rewrites. Without one, position is all there is; that is correct for
-        // a single writer and is what the legacy path already relies on.
+        // A supplied `_rowid` is the row's identity, across writers and across
+        // rewrites — write the same id again and you have updated that row.
+        //
+        // Without one, the row is new. Generating an id rather than falling
+        // back to the ordinal is not a detail: ordinals restart at zero on
+        // every write, so keying by them would make each write silently
+        // replace the previous one row for row. The generated id is stored on
+        // the record, so it survives the round trip and a later update can
+        // name the row it means.
         let key = match rowid {
             Some(id) => Key::new(vec![str_(id)]),
-            None => Key::new(vec![int(row as i64)]),
+            None => {
+                let id = pond_kernel::crdt::uuidv7();
+                record = record.with_field(
+                    ROWID,
+                    Value::Str(id.clone()),
+                    Version::new(physical, row as u64, writer_id),
+                );
+                Key::new(vec![str_(id)])
+            }
         };
         out.push((key, record));
     }
