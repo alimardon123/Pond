@@ -356,3 +356,80 @@ fn writing_the_same_rowid_updates_that_row() {
         "one row, updated — not two rows"
     );
 }
+
+/// A deleted row stops being readable.
+///
+/// The record itself stays in the tree — a delete that erased the bytes could
+/// not converge, because a writer who never saw it would re-add the row with
+/// nothing to compare against. What makes it a delete is that readers skip it.
+#[test]
+fn deleted_rows_disappear_from_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "users").unwrap();
+
+    engine_path::write_rows(
+        &k,
+        "users",
+        &[
+            ("_rowid", TypedColumn::String(vec!["r1".into(), "r2".into()])),
+            ("id", TypedColumn::Int64(vec![1, 2])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(engine_path::delete_rows(&k, "users", &["r1".to_string()], 1).unwrap(), 1);
+
+    let columns = engine_path::read_rows(&k, "users").unwrap();
+    let ids = match columns.iter().find(|(n, _)| n == "id") {
+        Some((_, TypedColumn::Int64(v))) => v.clone(),
+        _ => panic!("id column missing"),
+    };
+    assert_eq!(ids, vec![2], "the deleted row must not be returned");
+}
+
+/// A write that lands after a delete brings the row back.
+///
+/// This is not a quirk to be tolerated — it is the only answer that converges.
+/// Two writers with no channel between them can produce a delete and an update
+/// in either order, and both must reach the same state. Ordering by version
+/// rather than by arrival is what makes that true.
+#[test]
+fn a_later_write_resurrects_a_deleted_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "users").unwrap();
+
+    engine_path::write_rows(
+        &k,
+        "users",
+        &[
+            ("_rowid", TypedColumn::String(vec!["r1".into()])),
+            ("id", TypedColumn::Int64(vec![1])),
+        ],
+        1,
+    )
+    .unwrap();
+    engine_path::delete_rows(&k, "users", &["r1".to_string()], 1).unwrap();
+    assert!(engine_path::read_rows(&k, "users").unwrap().is_empty());
+
+    // A later update to the same row.
+    engine_path::write_rows(
+        &k,
+        "users",
+        &[
+            ("_rowid", TypedColumn::String(vec!["r1".into()])),
+            ("id", TypedColumn::Int64(vec![99])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    let columns = engine_path::read_rows(&k, "users").unwrap();
+    let ids = match columns.iter().find(|(n, _)| n == "id") {
+        Some((_, TypedColumn::Int64(v))) => v.clone(),
+        _ => panic!("id column missing"),
+    };
+    assert_eq!(ids, vec![99], "a write newer than the tombstone wins");
+}

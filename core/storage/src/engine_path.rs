@@ -114,6 +114,48 @@ pub fn write_rows(
         .map_err(|e| format!("failed to publish: {}", e))
 }
 
+/// Delete rows by `_rowid`.
+///
+/// A delete is a write. The record keeps its bytes and gains a tombstone
+/// version, because a delete that removed the row could not converge: a writer
+/// who never saw it would re-add the row and there would be nothing to compare
+/// against. Readers skip tombstoned records, so the row is gone as far as
+/// anyone can tell — and a field written *after* the delete brings it back,
+/// which is the right answer when a delete and a later update cross in flight.
+pub fn delete_rows(
+    kernel: &PondKernel,
+    collection: &str,
+    rowids: &[String],
+    writer_id: u64,
+) -> Result<usize> {
+    if rowids.is_empty() {
+        return Ok(0);
+    }
+    if definition::load(kernel, collection).format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+
+    let physical = pond_kernel::crdt::current_time_ms();
+    let mut engine = Engine::open(store_of(kernel), writer_id)
+        .map_err(|e| format!("failed to open engine: {}", e))?;
+
+    let mut records = Vec::with_capacity(rowids.len());
+    for (i, id) in rowids.iter().enumerate() {
+        let mut record = pond_record::Record::new();
+        record.delete(pond_record::Version::new(physical, i as u64, writer_id));
+        records.push((pond_index::Key::new(vec![pond_index::str_(id.clone())]), record));
+    }
+    let count = records.len();
+
+    engine
+        .write_records(collection, records)
+        .map_err(|e| format!("failed to stage deletes: {}", e))?;
+    engine
+        .publish()
+        .map_err(|e| format!("failed to publish: {}", e))?;
+    Ok(count)
+}
+
 /// Read an engine-backed collection as typed columns.
 ///
 /// The read merges every writer's view, so a collection written by four

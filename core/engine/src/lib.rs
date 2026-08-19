@@ -218,12 +218,18 @@ impl<S: ObjectStore> Engine<S> {
     }
 
     /// Read one record from this writer's view (staged writes included).
+    ///
+    /// A record hidden by a tombstone reads as absent, the same as one that
+    /// was never written. The bytes stay in the tree — see `decode_pairs` for
+    /// why a delete cannot erase them and still merge.
     pub fn get(&mut self, collection: &str, key: &Key) -> Result<Option<Record>> {
         let tree = self.tree_for(collection);
         match tree.get(&self.store, &key.encode()) {
-            Some(bytes) => decode_record(&bytes)
-                .map(Some)
-                .ok_or_else(|| EngineError::Corrupt(format!("record in {}", collection))),
+            Some(bytes) => {
+                let rec = decode_record(&bytes)
+                    .ok_or_else(|| EngineError::Corrupt(format!("record in {}", collection)))?;
+                Ok(rec.is_visible().then_some(rec))
+            }
             None => Ok(None),
         }
     }
@@ -410,12 +416,19 @@ impl<S: ObjectStore> Reader<S> {
         acc
     }
 
+    /// Read one record from the merged view of every writer.
+    ///
+    /// A record hidden by a tombstone reads as absent — including a tombstone
+    /// written by a different writer than the one that created the record,
+    /// which is the case a delete has to survive.
     pub fn get(&mut self, collection: &str, key: &Key) -> Result<Option<Record>> {
         let tree = self.tree_for(collection);
         match tree.get(&self.store, &key.encode()) {
-            Some(bytes) => decode_record(&bytes)
-                .map(Some)
-                .ok_or_else(|| EngineError::Corrupt(format!("record in {}", collection))),
+            Some(bytes) => {
+                let rec = decode_record(&bytes)
+                    .ok_or_else(|| EngineError::Corrupt(format!("record in {}", collection)))?;
+                Ok(rec.is_visible().then_some(rec))
+            }
             None => Ok(None),
         }
     }
@@ -460,6 +473,17 @@ fn resolve_records(a: &[u8], b: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Decode a scan's raw pairs, dropping records a tombstone hides.
+///
+/// Deletion is a write here, not an erasure: the record stays in the tree
+/// carrying a tombstone version, because a delete that removed the bytes could
+/// not merge — a writer that never saw the delete would simply re-add the row,
+/// and there would be nothing to compare against. What makes it a delete is
+/// that readers do not return it.
+///
+/// `is_visible` is deliberately not "has a tombstone": a field written *after*
+/// the delete resurrects the record, which is the correct answer when a delete
+/// and a later update arrive out of order.
 fn decode_pairs(raw: Vec<(Vec<u8>, Vec<u8>)>, collection: &str) -> Result<Vec<(Key, Record)>> {
     let mut out = Vec::with_capacity(raw.len());
     for (k, v) in raw {
@@ -467,6 +491,9 @@ fn decode_pairs(raw: Vec<(Vec<u8>, Vec<u8>)>, collection: &str) -> Result<Vec<(K
             .ok_or_else(|| EngineError::Corrupt(format!("key in {}", collection)))?;
         let rec = decode_record(&v)
             .ok_or_else(|| EngineError::Corrupt(format!("record in {}", collection)))?;
+        if !rec.is_visible() {
+            continue;
+        }
         out.push((key, rec));
     }
     Ok(out)

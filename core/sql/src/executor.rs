@@ -1062,6 +1062,22 @@ fn read_collection_as_json_rows(
     let kernel = storage.kernel();
     let mut rows: Vec<(String, JsonValue)> = Vec::new();
 
+    // Engine-backed collections read through the engine. Their rows arrive as
+    // PND2 so the decode below is shared verbatim — SQL sees the same row
+    // shape whichever path produced it, which is the property that lets one
+    // executor serve both.
+    //
+    // There are no shards to merge here: the engine's reader already merges
+    // every writer's tree, so the union that shards exist to provide has
+    // already happened by the time the rows arrive.
+    if pond_storage::definition::format_of(kernel, collection)
+        == pond_storage::definition::Format::Engine
+    {
+        let blob = pond_storage::engine_path::read_pnd2(kernel, collection)?;
+        let cols = pnd2_decode(&blob).map_err(|e| format!("Failed to decode PND2: {}", e))?;
+        return Ok(decode_cols_to_rows(&cols, key_fields));
+    }
+
     let active = storage.get_active_branch(collection);
 
     // --- Read HEAD data ---
@@ -1276,6 +1292,21 @@ fn execute_insert(
         .map(|(n, c)| (n.as_str(), c.clone()))
         .collect();
 
+    if pond_storage::definition::format_of(kernel, collection)
+        == pond_storage::definition::Format::Engine
+    {
+        pond_storage::engine_path::write_rows(
+            kernel,
+            collection,
+            &col_refs,
+            pond_kernel::crdt::stable_writer_id(),
+        )?;
+        // The engine publishes a head rather than a commit chain, so there is
+        // no commit hash to hand back. Report the row count, which is what an
+        // INSERT is actually being asked about.
+        return Ok(SqlResult::status("inserted", rows.len()));
+    }
+
     let commit_hash = storage_write::write_rows(kernel, collection, &active, &col_refs, "INSERT")?;
     Ok(SqlResult::commit(&commit_hash))
 }
@@ -1311,6 +1342,28 @@ fn execute_update(
     let count = matched.len();
     if count == 0 {
         return Ok(SqlResult::status("updated", 0));
+    }
+
+    // On an engine collection an update *is* a write: the row is named by its
+    // `_rowid`, and the engine merges field by field, so columns the statement
+    // did not mention are preserved rather than being reconstructed by the
+    // caller. There is no shard to write and none to compact later.
+    if pond_storage::definition::format_of(kernel, collection)
+        == pond_storage::definition::Format::Engine
+    {
+        let names = column_names_of(&matched);
+        let typed = build_typed_columns(&names, &rows_as_vectors(&matched, &names));
+        let col_refs: Vec<(&str, TypedColumn)> = typed
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.clone()))
+            .collect();
+        pond_storage::engine_path::write_rows(
+            kernel,
+            collection,
+            &col_refs,
+            pond_kernel::crdt::stable_writer_id(),
+        )?;
+        return Ok(SqlResult::status("updated", count));
     }
 
     // Observe existing versions, then write as a CRDT upsert shard.
@@ -1354,6 +1407,18 @@ fn execute_delete(
     let count = tombstones.len();
     if count == 0 {
         return Ok(SqlResult::status("deleted", 0));
+    }
+
+    if pond_storage::definition::format_of(kernel, collection)
+        == pond_storage::definition::Format::Engine
+    {
+        let removed = pond_storage::engine_path::delete_rows(
+            kernel,
+            collection,
+            &tombstones,
+            pond_kernel::crdt::stable_writer_id(),
+        )?;
+        return Ok(SqlResult::status("deleted", removed));
     }
 
     let mut hlc = HLC::new();
@@ -1513,6 +1578,40 @@ fn execute_merge(
 // ---------------------------------------------------------------------------
 
 /// Build a `Vec<(String, TypedColumn)>` from columnar input.
+/// Every column name appearing in a set of JSON rows, in a stable order.
+///
+/// `_rowid` is forced first so the engine sees it as the row's identity rather
+/// than as just another column; without it an update would be indistinguishable
+/// from an insert and would create a second row.
+fn column_names_of(rows: &[JsonValue]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for row in rows {
+        if let Some(obj) = row.as_object() {
+            for k in obj.keys() {
+                if !names.contains(k) {
+                    names.push(k.clone());
+                }
+            }
+        }
+    }
+    if let Some(pos) = names.iter().position(|n| n == "_rowid") {
+        names.swap(0, pos);
+    }
+    names
+}
+
+/// Flatten JSON rows into positional values matching `names`.
+fn rows_as_vectors(rows: &[JsonValue], names: &[String]) -> Vec<Vec<JsonValue>> {
+    rows.iter()
+        .map(|row| {
+            names
+                .iter()
+                .map(|n| row.get(n).cloned().unwrap_or(JsonValue::Null))
+                .collect()
+        })
+        .collect()
+}
+
 fn build_typed_columns(
     columns: &[String],
     rows: &[Vec<JsonValue>],
