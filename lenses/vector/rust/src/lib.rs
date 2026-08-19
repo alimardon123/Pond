@@ -201,34 +201,54 @@ impl VectorLens {
     ///
     /// Returns: HashMap<id, (vector, metadata_json)>
     pub fn get_all(&self, collection: &str) -> Result<HashMap<String, (Vec<f64>, String)>, String> {
-        let active = self.storage.get_active_branch(collection);
-        let head = self.storage.kernel().resolve(&pond_storage::branch_ref(collection, &active))
-            .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
-
-        let head_data = self.storage.kernel().read_blob(&head)
-            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-
-        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
-                .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-            manifest_bytes
+        // Both storage paths hand back PND2, so the decode below is shared: a
+        // vector read through the engine and one read through the legacy
+        // manifest go through identical code, which is what stops the two from
+        // drifting apart.
+        let blobs: Vec<Vec<u8>> = if pond_storage::definition::format_of(
+            self.storage.kernel(),
+            collection,
+        ) == pond_storage::definition::Format::Engine
+        {
+            vec![pond_storage::engine_path::read_pnd2(self.storage.kernel(), collection)?]
         } else {
-            let commit = pond_storage::commit::read_commit(self.storage.kernel(), &head)
-                .ok_or_else(|| "Failed to read commit".to_string())?;
-            self.storage.kernel().read_blob(&commit.manifest)
-                .map_err(|e| format!("Failed to read manifest: {}", e))?
-        };
+            let active = self.storage.get_active_branch(collection);
+            let head = self.storage.kernel().resolve(&pond_storage::branch_ref(collection, &active))
+                .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
-        let manifest = CollectionManifest::decode(&manifest_bytes)
-            .ok_or_else(|| "Failed to decode manifest".to_string())?;
+            let head_data = self.storage.kernel().read_blob(&head)
+                .map_err(|e| format!("Failed to read HEAD: {}", e))?;
+
+            let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
+                let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
+                    .ok_or_else(|| "Failed to decode PondPack".to_string())?;
+                manifest_bytes
+            } else {
+                let commit = pond_storage::commit::read_commit(self.storage.kernel(), &head)
+                    .ok_or_else(|| "Failed to read commit".to_string())?;
+                self.storage.kernel().read_blob(&commit.manifest)
+                    .map_err(|e| format!("Failed to read manifest: {}", e))?
+            };
+
+            let manifest = CollectionManifest::decode(&manifest_bytes)
+                .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+            manifest
+                .row_groups
+                .iter()
+                .map(|rg| {
+                    self.storage
+                        .kernel()
+                        .read_blob(&rg.blob_hash)
+                        .map_err(|e| format!("Failed to read data blob: {}", e))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
 
         let mut result: HashMap<String, (Vec<f64>, String)> = HashMap::new();
 
-        for rg in &manifest.row_groups {
-            let blob_data = self.storage.kernel().read_blob(&rg.blob_hash)
-                .map_err(|e| format!("Failed to read data blob: {}", e))?;
-
-            let cols = pond_core::pnd2_decode(&blob_data)
+        for blob_data in &blobs {
+            let cols = pond_core::pnd2_decode(blob_data)
                 .map_err(|e| format!("Failed to decode PND2: {}", e))?;
 
             // Find ID column (INT64 or STRING)

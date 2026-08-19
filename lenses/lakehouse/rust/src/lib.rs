@@ -173,6 +173,25 @@ impl LakehouseLens {
         table_name: &str,
         columns: Option<&[String]>,
     ) -> Result<Vec<(String, TypedColumn)>, String> {
+        // Engine-backed tables read through the engine. A lens is a view over
+        // the data, not a storage format of its own, so which storage holds a
+        // table is not the lens's business beyond choosing the right reader.
+        if pond_storage::definition::format_of(self.storage.kernel(), table_name)
+            == pond_storage::definition::Format::Engine
+        {
+            let all = pond_storage::engine_path::read_rows(self.storage.kernel(), table_name)?;
+            return Ok(all
+                .into_iter()
+                .filter(|(name, _)| {
+                    name != "_rowid" && name != "_version" && name != "_deleted"
+                })
+                .filter(|(name, _)| match columns {
+                    Some(cols) => cols.contains(name),
+                    None => true,
+                })
+                .collect());
+        }
+
         let active = self.storage.get_active_branch(table_name);
 
         // Resolve HEAD

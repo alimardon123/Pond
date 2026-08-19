@@ -1606,6 +1606,24 @@ impl Storage {
             .map(|(name, col)| (name.as_str(), col.clone()))
             .collect();
 
+        // Engine-backed collections take the new path. The `crdt` flag has no
+        // meaning there: convergence is a property of the record model rather
+        // than an opt-in, so every write merges field by field.
+        if pond_storage::definition::format_of(storage.kernel(), collection)
+            == pond_storage::definition::Format::Engine
+        {
+            pond_storage::engine_path::write_rows(
+                storage.kernel(),
+                collection,
+                &col_refs,
+                pond_kernel::crdt::stable_writer_id(),
+            )
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            // No commit chain to name; report what was written.
+            let written = col_refs.first().map(|(_, c)| c.len()).unwrap_or(0);
+            return Ok(format!("{} rows", written));
+        }
+
         if crdt {
             storage_write::write_rows(storage.kernel(), collection, &active, &col_refs, message)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
@@ -1613,6 +1631,18 @@ impl Storage {
             storage_write::write_rows_no_crdt(storage.kernel(), collection, &active, &col_refs, message)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
         }
+    }
+
+    /// Create an engine-backed collection.
+    ///
+    /// Collections created this way use the content-defined index: a commit is
+    /// one object write, lookups cost the same at any size, and any number of
+    /// writers converge without coordinating. Existing collections are
+    /// unaffected and keep their original format.
+    fn create_collection(&self, collection: &str) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        pond_storage::engine_path::create(storage.kernel(), collection)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 
     // ===================================================================
@@ -5234,6 +5264,27 @@ fn read_collection_as_json_rows_filtered(
     let kernel = storage.kernel();
     let mut rows: Vec<(String, JsonValue)> = Vec::new();
 
+    // Engine-backed collections read through the engine, then go through the
+    // same PND2 decode and the same predicate evaluation as everything else.
+    // There are no shards to merge: the engine's reader has already merged
+    // every writer's tree by the time the rows arrive.
+    if pond_storage::definition::format_of(kernel, collection)
+        == pond_storage::definition::Format::Engine
+    {
+        let blob = pond_storage::engine_path::read_pnd2(kernel, collection)?;
+        let cols = pond_core::pnd2_decode(&blob)
+            .map_err(|e| format!("Failed to decode PND2: {}", e))?;
+        return Ok(if predicates.is_empty() {
+            decode_cols_to_rows(&cols, key_fields)
+        } else {
+            // The same SIMD columnar filter the legacy path uses, applied
+            // before rows become JSON — filtering after conversion would
+            // allocate a JSON object per row only to discard most of them.
+            let mask = simd::columnar_filter(&cols, predicates);
+            decode_cols_to_rows_filtered(&cols, key_fields, Some(&mask))
+        });
+    }
+
     let active = storage.get_active_branch(collection);
 
     // --- Read HEAD data ---
@@ -5988,6 +6039,75 @@ mod tests {
             let tenants = extract_string_vec(py, &result, "_tenant");
             assert_eq!(tenants.len(), 2);
             assert!(tenants.iter().all(|t| t == "tenant_A"));
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    /// The Python binding reads and writes an engine-backed collection.
+    ///
+    /// This is the last surface that could not reach the engine. It goes
+    /// through the same `write_rows` / `read_rows` the legacy path uses, so
+    /// the only difference a caller sees is that the collection was created
+    /// with `create_collection`.
+    #[test]
+    fn test_engine_collection_round_trip_through_python_api() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            storage.create_collection("users").unwrap();
+            storage
+                .write_rows(
+                    "users",
+                    vec![
+                        (
+                            "name".to_string(),
+                            vec!["ada".to_object(py), "grace".to_object(py)],
+                        ),
+                        ("age".to_string(), vec![36i64.to_object(py), 45i64.to_object(py)]),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            let result = storage.read_rows(py, "users", None, None).unwrap();
+            let mut names = extract_string_vec(py, &result, "name");
+            names.sort();
+            assert_eq!(names, vec!["ada".to_string(), "grace".to_string()]);
+
+            // A second write accumulates rather than replacing.
+            storage
+                .write_rows(
+                    "users",
+                    vec![
+                        ("name".to_string(), vec!["alan".to_object(py)]),
+                        ("age".to_string(), vec![41i64.to_object(py)]),
+                    ],
+                    "more",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            let result = storage.read_rows(py, "users", None, None).unwrap();
+            let names = extract_string_vec(py, &result, "name");
+            assert_eq!(names.len(), 3, "expected three rows, got {:?}", names);
+
+            // Predicate pushdown runs through the same columnar filter.
+            let result = storage
+                .read_rows(
+                    py,
+                    "users",
+                    None,
+                    Some(vec![("age".to_string(), ">".to_string(), 40i64.to_object(py))]),
+                )
+                .unwrap();
+            let names = extract_string_vec(py, &result, "name");
+            assert_eq!(names.len(), 2, "expected two rows over 40, got {:?}", names);
 
             cleanup_dir(&dir);
         });

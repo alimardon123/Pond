@@ -233,3 +233,59 @@ fn engine_write_costs_far_fewer_round_trips() {
         c.puts.load(Ordering::Relaxed)
     );
 }
+
+/// The raw-bytes collection API rewrites the whole collection on every write.
+///
+/// `storage_read::read` returns one blob and `storage_write::write` replaces
+/// it, so a caller that wants to append has to read everything, append in
+/// memory, and write everything back. The streaming, OLTP and key-value lenses
+/// are all built on exactly that loop.
+///
+/// This test measures the consequence: bytes written per append grow with the
+/// size of the collection, so appending N rows costs O(N²) bytes. It is a
+/// finding recorded as a test, not a bar being enforced — the fix is to move
+/// those lenses onto the engine's append path, which touches only the
+/// right-most leaf and its ancestors.
+#[test]
+fn raw_bytes_append_rewrites_the_whole_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Arc::new(Counters::default());
+    let store = Counting {
+        inner: LocalFSObjectStore::new(dir.path()).unwrap(),
+        c: c.clone(),
+    };
+    let kernel = PondKernel::new_with_store(Box::new(store));
+
+    // Simulate the lens loop: read all, append one, write all back.
+    let mut rows: Vec<String> = Vec::new();
+    let mut bytes_at: Vec<usize> = Vec::new();
+
+    for i in 0..40 {
+        let existing =
+            pond_storage::read::read(&kernel, "events", "main").unwrap_or_default();
+        if !existing.is_empty() {
+            rows = serde_json::from_slice(&existing).unwrap_or_default();
+        }
+        rows.push(format!("event-{:04}", i));
+        let payload = serde_json::to_vec(&rows).unwrap();
+        bytes_at.push(payload.len());
+        pond_storage::write::write(&kernel, "events", "main", &payload, "append").unwrap();
+    }
+
+    let first = bytes_at.first().copied().unwrap_or(0);
+    let last = bytes_at.last().copied().unwrap_or(0);
+    println!(
+        "raw-bytes append: write #1 sent {} bytes, write #40 sent {} bytes ({}x growth)",
+        first,
+        last,
+        last / first.max(1)
+    );
+
+    assert!(
+        last > first * 10,
+        "each append should rewrite everything written so far — \
+         first {} bytes, last {} bytes",
+        first,
+        last
+    );
+}
