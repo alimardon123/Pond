@@ -15,8 +15,7 @@ use crate::parser::{
     SqlStatement, TableRef,
 };
 use crate::where_clause::WhereExpr;
-use pond_core::{pnd2_decode, PondColumn, TypedColumn, VT_BINARY, VT_FLOAT64, VT_INT64,
-                VT_STRING, VT_VARIANT};
+use pond_core::{pnd2_decode, PondColumn, TypedColumn};
 use pond_kernel::crdt::{uuidv7, HLC};
 use pond_storage::shard;
 use pond_storage::{commit, manifest::CollectionManifest, write as storage_write, UnifiedStorage};
@@ -1128,56 +1127,20 @@ fn read_collection_as_json_rows(
     Ok(rows)
 }
 
+/// Decoded columns as (rowid, row) pairs.
+///
+/// The column-to-JSON conversion lives in `pond_core::to_json` so that SQL,
+/// the CLI and the Python bindings cannot disagree about the same row — they
+/// did, when per-value nulls arrived and only one of the three learned to
+/// report them.
 fn decode_cols_to_rows(cols: &[PondColumn], key_fields: &[String]) -> Vec<(String, JsonValue)> {
-    let mut rows = Vec::new();
-    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
-
-    for row_idx in 0..n_rows {
-        let mut row_obj = serde_json::Map::new();
-        for col in cols {
-            let name = col.name.to_string_lossy().to_string();
-            let val = match col.vtype {
-                VT_INT64 => col
-                    .i64_data
-                    .get(row_idx)
-                    .map(|v| JsonValue::Number(serde_json::Number::from(*v)))
-                    .unwrap_or(JsonValue::Null),
-                VT_FLOAT64 => col
-                    .f64_data
-                    .get(row_idx)
-                    .and_then(|v| serde_json::Number::from_f64(*v))
-                    .map(JsonValue::Number)
-                    .unwrap_or(JsonValue::Null),
-                VT_STRING => col
-                    .str_data
-                    .get(row_idx)
-                    .map(|v| JsonValue::String(v.to_string_lossy().to_string()))
-                    .unwrap_or(JsonValue::Null),
-                VT_BINARY => col
-                    .bin_data
-                    .get(row_idx)
-                    .map(|b| {
-                        JsonValue::String(format!("__bin_b64__:{}", simple_base64_encode(b)))
-                    })
-                    .unwrap_or(JsonValue::Null),
-                VT_VARIANT => col
-                    .str_data
-                    .get(row_idx)
-                    .and_then(|s| {
-                        let s_str = s.to_string_lossy();
-                        serde_json::from_str::<JsonValue>(&s_str).ok()
-                    })
-                    .unwrap_or(JsonValue::Null),
-                // VT_NULL and any type this decoder does not model yet.
-                _ => JsonValue::Null,
-            };
-            row_obj.insert(name, val);
-        }
-        let row = JsonValue::Object(row_obj);
-        let rowid = determine_rowid(&row, key_fields);
-        rows.push((rowid, row));
-    }
-    rows
+    pond_core::to_json::columns_to_json_rows(cols, false)
+        .into_iter()
+        .map(|row| {
+            let rowid = determine_rowid(&row, key_fields);
+            (rowid, row)
+        })
+        .collect()
 }
 
 fn determine_rowid(row: &JsonValue, key_fields: &[String]) -> String {

@@ -56,6 +56,7 @@ pub mod decode;
 pub mod encode;
 pub mod parser;
 pub mod types;
+pub mod to_json;
 pub mod vector;
 pub mod search;
 

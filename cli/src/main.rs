@@ -1235,56 +1235,7 @@ fn read_rows_as_json(
 /// the presenting.
 fn pnd2_blob_to_json(blob: &[u8]) -> Result<Vec<JsonValue>, String> {
     let cols = pnd2_decode(blob).map_err(|e| format!("Failed to decode PND2: {}", e))?;
-    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
-    let mut rows = Vec::with_capacity(n_rows);
-    for row_idx in 0..n_rows {
-        let mut row_obj = serde_json::Map::new();
-        for col in &cols {
-            let name = col.name.to_string_lossy().to_string();
-            // Skip CRDT metadata columns — they're internal.
-            if name == "_rowid" || name == "_version" || name == "_deleted" {
-                continue;
-            }
-            // A column is dense, so a null occupies its slot with the type's
-            // zero. The bitmap is the only thing that distinguishes that
-            // placeholder from a zero the caller actually wrote.
-            if col
-                .null_bitmap
-                .as_ref()
-                .is_some_and(|b| pond_core::decode::is_null_at(b, row_idx))
-            {
-                row_obj.insert(name, JsonValue::Null);
-                continue;
-            }
-            let val = match col.vtype {
-                VT_INT64 => col
-                    .i64_data
-                    .get(row_idx)
-                    .map(|v| json!(*v))
-                    .unwrap_or(JsonValue::Null),
-                VT_FLOAT64 => col
-                    .f64_data
-                    .get(row_idx)
-                    .and_then(|v| serde_json::Number::from_f64(*v))
-                    .map(JsonValue::Number)
-                    .unwrap_or(JsonValue::Null),
-                VT_STRING => col
-                    .str_data
-                    .get(row_idx)
-                    .map(|v| json!(v.to_string_lossy().to_string()))
-                    .unwrap_or(JsonValue::Null),
-                VT_BOOLEAN => col
-                    .i64_data
-                    .get(row_idx)
-                    .map(|v| json!(*v != 0))
-                    .unwrap_or(JsonValue::Null),
-                _ => JsonValue::Null,
-            };
-            row_obj.insert(name, val);
-        }
-        rows.push(JsonValue::Object(row_obj));
-    }
-    Ok(rows)
+    Ok(pond_core::to_json::columns_to_json_rows(&cols, true))
 }
 
 /// Apply WHERE, column projection, and LIMIT — in that order, which is the

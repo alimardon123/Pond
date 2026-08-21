@@ -123,3 +123,50 @@ fn a_second_insert_accumulates() {
     let r = execute(&s, "SELECT * FROM users").expect("select");
     assert_eq!(rows(&r).len(), 4);
 }
+
+/// SQL and the columnar API must agree about nulls.
+///
+/// They did not: when per-value nulls were added, the CLI's converter learned
+/// to report them and the SQL executor's copy did not, so `SELECT` returned a
+/// zero where `read-rows` returned null for the same row. Three
+/// implementations of one conversion is what allowed that, and there is now
+/// one, in `pond_core::to_json`.
+#[test]
+fn sql_reports_nulls_rather_than_the_types_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = storage(&dir);
+    pond_storage::engine_path::create(s.kernel(), "t").expect("create");
+
+    // A real zero and a null, side by side.
+    execute(&s, "INSERT INTO t (id, score) VALUES (1, 0)").expect("insert zero");
+    pond_storage::engine_path::write_rows_with_nulls(
+        s.kernel(),
+        "t",
+        &[
+            ("id", pond_core::encode::TypedColumn::Int64(vec![2])),
+            ("score", pond_core::encode::TypedColumn::Int64(vec![0])),
+        ],
+        &[None, Some(vec![true])],
+        1,
+    )
+    .expect("insert null");
+
+    let r = execute(&s, "SELECT * FROM t").expect("select");
+    let by_id = |id: i64| -> &JsonValue {
+        rows(&r)
+            .iter()
+            .find(|row| row.get("id").and_then(|v| v.as_i64()) == Some(id))
+            .expect("row present")
+    };
+
+    assert_eq!(
+        by_id(1).get("score"),
+        Some(&JsonValue::Number(0.into())),
+        "a zero the caller wrote must stay a zero"
+    );
+    assert_eq!(
+        by_id(2).get("score"),
+        Some(&JsonValue::Null),
+        "a null must not be reported as the type's zero"
+    );
+}

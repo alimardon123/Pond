@@ -5390,63 +5390,40 @@ fn decode_cols_to_rows(cols: &[pond_core::PondColumn], key_fields: &[String]) ->
     decode_cols_to_rows_filtered(cols, key_fields, None)
 }
 
+/// Decoded columns as (rowid, row) pairs, skipping rows the filter rejected.
+///
+/// The per-value conversion lives in `pond_core::to_json` so that Python, SQL
+/// and the CLI cannot disagree about the same row. They did: when per-value
+/// nulls arrived, only one of the three learned to report them, and the other
+/// two kept returning the type's zero for a null.
+///
+/// Filtered rows are skipped *before* conversion, which is the point of the
+/// mask — converting a row only to discard it allocates a JSON object per
+/// rejected row.
 fn decode_cols_to_rows_filtered(
     cols: &[pond_core::PondColumn],
     key_fields: &[String],
     keep_mask: Option<&[bool]>,
 ) -> Vec<(String, JsonValue)> {
-    use pond_core::{VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY, VT_NULL};
-    let mut rows = Vec::new();
     let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+    let mut rows = Vec::with_capacity(n_rows);
 
     for row_idx in 0..n_rows {
-        // Skip filtered-out rows — this is the key optimization:
-        // we never convert these rows to JSON
         if let Some(mask) = keep_mask {
-            if !mask[row_idx] { continue; }
+            if !mask.get(row_idx).copied().unwrap_or(false) {
+                continue;
+            }
         }
-
-        let mut row_obj = serde_json::Map::new();
+        let mut obj = serde_json::Map::new();
         for col in cols {
-            let name = col.name.to_string_lossy().to_string();
-            let val = match col.vtype {
-                VT_INT64 => {
-                    col.i64_data.get(row_idx)
-                        .map(|v| JsonValue::Number(serde_json::Number::from(*v)))
-                        .unwrap_or(JsonValue::Null)
-                }
-                VT_FLOAT64 => {
-                    col.f64_data.get(row_idx)
-                        .and_then(|v| serde_json::Number::from_f64(*v))
-                        .map(JsonValue::Number)
-                        .unwrap_or(JsonValue::Null)
-                }
-                VT_STRING => {
-                    col.str_data.get(row_idx)
-                        .map(|v| JsonValue::String(v.to_string_lossy().to_string()))
-                        .unwrap_or(JsonValue::Null)
-                }
-                VT_BINARY => {
-                    // Binary data stored as base64 string — decoded back to bytes on read
-                    col.bin_data.get(row_idx)
-                        .map(|b| JsonValue::String(format!("__bin_b64__:{}", base64_encode(b))))
-                        .unwrap_or(JsonValue::Null)
-                }
-                VT_VARIANT => {
-                    // Variant: JSON-encoded string — parse back to JSON value
-                    col.str_data.get(row_idx)
-                        .and_then(|s| {
-                            let s_str = s.to_string_lossy();
-                            serde_json::from_str::<JsonValue>(&s_str).ok()
-                        })
-                        .unwrap_or(JsonValue::Null)
-                }
-                VT_NULL | _ => JsonValue::Null,
-            };
-            row_obj.insert(name, val);
+            obj.insert(
+                col.name.to_string_lossy().into_owned(),
+                pond_core::to_json::column_value_to_json(col, row_idx),
+            );
         }
-        let rowid = determine_rowid(&JsonValue::Object(row_obj.clone()), key_fields);
-        rows.push((rowid, JsonValue::Object(row_obj)));
+        let row = JsonValue::Object(obj);
+        let rowid = determine_rowid(&row, key_fields);
+        rows.push((rowid, row));
     }
     rows
 }
