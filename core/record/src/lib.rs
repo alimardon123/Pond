@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 pub mod encode;
 pub mod head;
 
-pub use encode::{decode_record, encode_record};
+pub use encode::{decode_record, decode_value, encode_record, encode_value};
 pub use head::{decode_head, encode_head, Head};
 
 /// A typed field value.

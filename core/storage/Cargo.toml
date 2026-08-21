@@ -23,6 +23,7 @@ pond_engine = { path = "../engine" }
 pond_record = { path = "../record" }
 pond_index = { path = "../index" }
 pond_cache = { path = "../cache" }
+pond_crypto = { path = "../crypto" }
 getrandom = "0.3"
 serde_json = "1"
 sha2 = "0.10"

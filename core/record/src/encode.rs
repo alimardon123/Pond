@@ -109,6 +109,27 @@ fn put_version(out: &mut Vec<u8>, v: Version) {
     out.extend_from_slice(&v.writer.to_le_bytes());
 }
 
+/// Encode one value on its own.
+///
+/// Exposed so a layer above can take a value out of a record, transform it —
+/// encrypt it, for instance — and put the result back, without having to
+/// re-implement the value encoding and risk disagreeing with it.
+pub fn encode_value(v: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_value(&mut out, v);
+    out
+}
+
+/// Decode a value written by [`encode_value`].
+///
+/// Returns `None` for anything that is not a well-formed value, rather than
+/// panicking: these bytes may have come back from storage, or from a
+/// decryption that produced the wrong plaintext.
+pub fn decode_value(bytes: &[u8]) -> Option<Value> {
+    let mut r = Reader { buf: bytes, pos: 0 };
+    r.value()
+}
+
 fn put_value(out: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Null => out.push(T_NULL),

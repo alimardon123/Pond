@@ -705,3 +705,227 @@ fn columns_without_nulls_carry_no_mask() {
     let decoded = pond_core::decode::pnd2_decode(&blob).unwrap();
     assert!(decoded.iter().all(|c| c.null_bitmap.is_none()));
 }
+
+// ---------------------------------------------------------------------------
+// Erasure — see docs/ERASURE.md
+// ---------------------------------------------------------------------------
+
+/// The contract, end to end: a subject's data is readable, then erased, and
+/// what remains is unreadable — while everybody else's rows are untouched.
+#[test]
+fn erasing_a_subject_removes_their_values_and_no_one_elses() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            (
+                "owner",
+                TypedColumn::String(vec!["alice".into(), "bob".into()]),
+            ),
+            (
+                "note",
+                TypedColumn::String(vec!["alice's secret".into(), "bob's secret".into()]),
+            ),
+            ("score", TypedColumn::Int64(vec![10, 20])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    let notes = |k: &pond_kernel::PondKernel| -> Vec<(String, Option<String>)> {
+        let columns = engine_path::read_rows(k, "people").unwrap();
+        let owners = match columns.iter().find(|(n, _)| n == "owner") {
+            Some((_, TypedColumn::String(v))) => v.clone(),
+            _ => panic!("owner column must stay readable"),
+        };
+        let (_, masks) = engine_path::read_rows_with_nulls(k, "people").unwrap();
+        let note_at = columns.iter().position(|(n, _)| n == "note");
+        let notes = match note_at.map(|i| &columns[i].1) {
+            Some(TypedColumn::String(v)) => v.clone(),
+            _ => vec![String::new(); owners.len()],
+        };
+        let mask = note_at.and_then(|i| masks.get(i).cloned().flatten());
+        owners
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let erased = mask.as_ref().is_some_and(|m| m[i]);
+                (o.clone(), if erased { None } else { Some(notes[i].clone()) })
+            })
+            .collect()
+    };
+
+    // Both readable to start.
+    let before = notes(&k);
+    assert_eq!(
+        before.iter().find(|(o, _)| o == "alice").unwrap().1,
+        Some("alice's secret".to_string())
+    );
+    assert_eq!(
+        before.iter().find(|(o, _)| o == "bob").unwrap().1,
+        Some("bob's secret".to_string())
+    );
+
+    // Erase one subject.
+    assert!(pond_storage::subject::erase_subject(&k, "alice").unwrap());
+
+    let after = notes(&k);
+    assert_eq!(
+        after.iter().find(|(o, _)| o == "alice").unwrap().1,
+        None,
+        "the erased subject's value must not be readable"
+    );
+    assert_eq!(
+        after.iter().find(|(o, _)| o == "bob").unwrap().1,
+        Some("bob's secret".to_string()),
+        "erasing one subject must not touch another's data"
+    );
+}
+
+/// An erased subject must not break the collection.
+///
+/// A scan that failed because one row's key was destroyed would hand a denial
+/// of service to anyone exercising their right to deletion.
+#[test]
+fn a_scan_still_works_after_an_erasure() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+
+    let owners: Vec<String> = (0..50).map(|i| format!("subject-{:03}", i)).collect();
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            ("owner", TypedColumn::String(owners.clone())),
+            (
+                "note",
+                TypedColumn::String((0..50).map(|i| format!("note {}", i)).collect()),
+            ),
+        ],
+        1,
+    )
+    .unwrap();
+
+    for victim in owners.iter().take(10) {
+        pond_storage::subject::erase_subject(&k, victim).unwrap();
+    }
+
+    let columns = engine_path::read_rows(&k, "people").unwrap();
+    let read_owners = match columns.iter().find(|(n, _)| n == "owner") {
+        Some((_, TypedColumn::String(v))) => v.clone(),
+        _ => panic!("owner column missing"),
+    };
+    assert_eq!(read_owners.len(), 50, "every row must still be returned");
+}
+
+/// Rows must actually be sealed on disk, not merely hidden on read.
+#[test]
+fn sealed_values_are_not_stored_in_the_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            ("owner", TypedColumn::String(vec!["alice".into()])),
+            ("note", TypedColumn::String(vec!["TOPSECRETVALUE".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    // Walk every byte the store holds and look for the plaintext.
+    let mut found = false;
+    for entry in walkdir(dir.path()) {
+        if let Ok(bytes) = std::fs::read(&entry) {
+            if bytes
+                .windows(b"TOPSECRETVALUE".len())
+                .any(|w| w == b"TOPSECRETVALUE")
+            {
+                found = true;
+            }
+        }
+    }
+    assert!(!found, "the plaintext was written to disk somewhere");
+
+    // Control: the same check against an unsealed collection must find it.
+    // Without this, the test above would pass just as happily if the search
+    // were broken.
+    let plain_dir = tempfile::tempdir().unwrap();
+    let pk = kernel(plain_dir.path());
+    engine_path::create(&pk, "people").unwrap();
+    engine_path::write_rows(
+        &pk,
+        "people",
+        &[("note", TypedColumn::String(vec!["TOPSECRETVALUE".into()]))],
+        1,
+    )
+    .unwrap();
+    let plain_found = walkdir(plain_dir.path()).iter().any(|p| {
+        std::fs::read(p).is_ok_and(|b| {
+            b.windows(b"TOPSECRETVALUE".len())
+                .any(|w| w == b"TOPSECRETVALUE")
+        })
+    });
+    assert!(
+        plain_found,
+        "the search itself is broken — it cannot even find an unsealed value"
+    );
+}
+
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Turning sealing on for a collection that already holds cleartext rows must
+/// be refused, not silently half-applied.
+#[test]
+fn sealing_cannot_be_switched_on_after_the_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "people").unwrap();
+    engine_path::write_rows(&k, "people", &[("owner", TypedColumn::String(vec!["alice".into()]))], 1)
+        .unwrap();
+
+    let err = engine_path::create_for_subjects(&k, "people", "owner")
+        .expect_err("must refuse");
+    assert!(err.contains("in the clear"), "the refusal should say why: {}", err);
+}
+
+/// A row with no usable subject must be refused rather than stored unsealed.
+#[test]
+fn a_row_without_a_subject_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+
+    let err = engine_path::write_rows(
+        &k,
+        "people",
+        &[("note", TypedColumn::String(vec!["no owner here".into()]))],
+        1,
+    )
+    .expect_err("must refuse a row with no subject");
+    assert!(err.contains("owner"), "the refusal should name the column: {}", err);
+}

@@ -37,6 +37,47 @@ type Result<T> = std::result::Result<T, String>;
 /// Creating the definition is what routes every later call; there is no
 /// separate registry, and no way for the marker and the data to disagree,
 /// because the marker is what decides where the data goes.
+/// Create a collection whose rows belong to subjects, and seal them.
+///
+/// `subject_column` names the column holding each row's subject id. Every
+/// other column is then sealed under that subject's key, so erasing the
+/// subject makes their values unreadable everywhere at once. See
+/// `docs/ERASURE.md`.
+///
+/// Refuses to turn sealing on for a collection that already holds rows: those
+/// rows were written in the clear and would stay that way, so the collection
+/// would be partly protected while reporting that it is protected. Refuses to
+/// change the subject column for the same reason — existing rows would be
+/// sealed under subjects nothing could name, and therefore never erasable.
+pub fn create_for_subjects(
+    kernel: &PondKernel,
+    collection: &str,
+    subject_column: &str,
+) -> Result<()> {
+    create(kernel, collection)?;
+    let mut def = definition::load(kernel, collection);
+    if def.subject_column.as_deref() == Some(subject_column) {
+        return Ok(());
+    }
+    if def.subject_column.is_some() {
+        return Err(format!(
+            "collection '{}' already seals rows by column '{}'; changing it \
+             would leave existing rows sealed under subjects nobody can name",
+            collection,
+            def.subject_column.as_deref().unwrap_or("")
+        ));
+    }
+    if !def.columns.is_empty() {
+        return Err(format!(
+            "collection '{}' already holds rows written in the clear; turning \
+             on sealing now would protect only what comes after",
+            collection
+        ));
+    }
+    def.subject_column = Some(subject_column.to_string());
+    definition::store(kernel, collection, &def)
+}
+
 pub fn create(kernel: &PondKernel, collection: &str) -> Result<()> {
     if definition::load(kernel, collection).format == Format::Engine {
         return Ok(());
@@ -120,6 +161,17 @@ pub fn write_rows_with_nulls(
 
     let physical = pond_kernel::crdt::current_time_ms();
     let records = columns_to_records_with_nulls(columns, nulls, writer_id, physical);
+
+    // Seal before the records reach the index. Doing it here rather than
+    // deeper means the engine never holds plaintext for a collection that
+    // declared a subject column, so there is no path — a cache, a spill, a
+    // scan — that could expose it.
+    let records = records
+        .into_iter()
+        .map(|(key, record)| {
+            crate::subject::seal_record(kernel, &def, collection, record).map(|r| (key, r))
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
 
     let mut engine = open_engine(kernel, &def, writer_id)?;
     engine
@@ -501,10 +553,30 @@ pub fn read_rows(kernel: &PondKernel, collection: &str) -> Result<Vec<(String, T
         def.engine_config(),
     )
     .map_err(|e| format!("failed to open reader: {}", e))?;
-    let records = reader
+    let records = open_all(kernel, &def, collection, reader
         .scan(collection)
-        .map_err(|e| format!("failed to scan: {}", e))?;
+        .map_err(|e| format!("failed to scan: {}", e))?);
     Ok(records_to_columns_with_nulls(&records, &def).0)
+}
+
+/// Open every record's sealed fields.
+///
+/// A field whose subject key is gone drops out, so an erased subject reads as
+/// absent rather than failing the scan — one erased subject must not make a
+/// collection unreadable.
+fn open_all(
+    kernel: &PondKernel,
+    def: &Definition,
+    collection: &str,
+    records: Vec<(pond_index::Key, pond_record::Record)>,
+) -> Vec<(pond_index::Key, pond_record::Record)> {
+    if def.subject_column.is_none() {
+        return records;
+    }
+    records
+        .into_iter()
+        .map(|(k, r)| (k, crate::subject::open_record(kernel, def, collection, r)))
+        .collect()
 }
 
 /// Read an engine-backed collection as typed columns plus their null masks.
@@ -518,9 +590,9 @@ pub fn read_rows_with_nulls(
     }
     let mut reader = Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
         .map_err(|e| format!("failed to open reader: {}", e))?;
-    let records = reader
+    let records = open_all(kernel, &def, collection, reader
         .scan(collection)
-        .map_err(|e| format!("failed to scan: {}", e))?;
+        .map_err(|e| format!("failed to scan: {}", e))?);
     Ok(records_to_columns_with_nulls(&records, &def))
 }
 

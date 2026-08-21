@@ -120,24 +120,79 @@ rather than a traversal.
 
 ---
 
-## What does not exist yet
+## How to use it
 
-This is the mechanism, not the integration. Still to do, in order:
+```rust
+// A collection whose rows belong to subjects, named by a column.
+engine_path::create_for_subjects(&kernel, "people", "owner")?;
 
-1. **A policy for which fields are subject data**, and which subject a row
-   belongs to. This is a deployment question, not a storage one, and it decides
-   everything else.
-2. **Sealing on the write path** — `engine_path` would seal field values under
-   the row's subject key before they reach a record.
-3. **Opening on the read path**, with a defined behaviour for a value whose key
-   is gone. Returning "erased" is right; returning an error that fails the
-   whole scan is not, since one erased subject must not make a collection
-   unreadable.
-4. **Keystore durability separated from data durability.** Same store today,
-   which is the wrong place for the reason in the costs above.
-5. **An erasure audit log** — what was erased, when, on whose request — which
-   is usually required alongside the erasure itself.
+// Every other column is now sealed under that row's subject key.
+engine_path::write_rows(&kernel, "people", &columns, writer_id)?;
 
-Until those exist, this is a correct primitive with no callers, and the honest
-description of the feature is "designed and implemented at the crypto layer,
-not yet wired to the data path".
+// Erase. One key destroyed; their values are noise everywhere at once.
+subject::erase_subject(&kernel, "alice")?;
+
+// The collection still reads. Alice's sealed fields are absent; everyone
+// else's are untouched.
+let rows = engine_path::read_rows(&kernel, "people")?;
+```
+
+**Default-deny.** Naming a subject column seals *every* other column. The
+alternative — listing which columns hold personal data — has a failure mode
+this does not: a field added later, by a lens that never heard of the policy,
+would silently be stored in the clear. For a protection mechanism the safe
+default is to protect everything and make the exceptions explicit.
+
+The subject column itself stays readable. It is an identifier rather than
+personal detail, and sealing it would leave nothing able to say which rows
+belong to whom — including the erasure.
+
+**An erased subject reads as absent, not as an error.** A scan over a million
+rows that failed because one of them was erased would hand a denial of service
+to anyone exercising their right to deletion. Absent is also the honest answer:
+the value no longer exists. What it cannot distinguish is "erased" from "never
+set" — the keystore is the record of which is which, since a subject with no
+key is an erased subject.
+
+**Refusals, and why.** Turning sealing on for a collection that already holds
+rows is refused: those rows were written in the clear and would stay that way,
+so the collection would be partly protected while reporting that it is
+protected. Changing the subject column afterwards is refused for the same
+reason — existing rows would be sealed under subjects nothing could name, and
+so could never be erased. A row with no usable subject value is refused rather
+than stored unsealed, because guessing a subject means that row can never be
+erased with the one it actually belongs to.
+
+---
+
+## What the tests establish
+
+- A subject's values are readable, then erased, and what remains is unreadable
+  — while another subject's rows in the same collection are untouched.
+- A scan over 50 rows still returns all 50 after 10 subjects are erased.
+- **The plaintext is not on disk.** Every byte the store holds is searched for
+  it, with a control that performs the same search against an unsealed
+  collection and *does* find it — so a broken search cannot pass as a clean
+  result.
+- Sealing cannot be switched on after rows exist, and a row without a subject
+  is refused.
+- Garbage collection cannot destroy a subject key. Keys are named objects and
+  GC only deletes blobs, which is a deliberate property of the design rather
+  than an accident, so it is pinned by a test.
+
+---
+
+## What is still missing
+
+1. **Keystore durability separated from data durability.** Keys live in the
+   same object store as the data today. That is the wrong place for the reason
+   stated above: a backup of the keystore that outlives an erasure undoes it.
+   The keystore is small precisely so it can be held somewhere with real
+   deletion, and it should be.
+2. **An erasure audit log** — what was erased, when, on whose request. Usually
+   required alongside the erasure itself.
+3. **Key rotation.** A subject's key is created once and never changes. Rotating
+   it would require re-sealing their rows, which is a rewrite rather than a
+   pointer change.
+4. **Erasure through the CLI and the bindings.** Reachable from the Rust API
+   only.

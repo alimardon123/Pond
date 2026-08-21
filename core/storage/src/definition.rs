@@ -97,6 +97,22 @@ pub struct Definition {
     /// writers using different thresholds produce different index bytes for
     /// identical data — and stop converging.
     pub spill_threshold: u32,
+    /// Column naming the subject each row's data belongs to, if this
+    /// collection holds personal data.
+    ///
+    /// Setting it turns on per-subject encryption: every other column is
+    /// sealed under a key belonging to the subject named here, so erasing that
+    /// subject makes their values unreadable everywhere at once — in every
+    /// branch, every historical root, and every replica that already copied
+    /// them. See `docs/ERASURE.md`.
+    ///
+    /// The subject column itself stays in the clear. It is an identifier
+    /// rather than personal detail, and sealing it would leave no way to tell
+    /// which rows belong to whom — including for the erasure itself.
+    ///
+    /// `None` means the collection holds no subject data and nothing is
+    /// sealed, which is what every collection written before this existed is.
+    pub subject_column: Option<String>,
     /// `(column name, PND2 value type)`, in declaration order.
     pub columns: Vec<(String, u8)>,
 }
@@ -105,7 +121,9 @@ const MAGIC: &[u8; 4] = b"PDEF";
 
 /// v1 had no `chunk_target`; it is read back as [`LEGACY_CHUNK_TARGET`].
 const VERSION_V1: u8 = 1;
-const VERSION: u8 = 2;
+/// v2 predates per-subject encryption; it reads back with no subject column.
+const VERSION_V2: u8 = 2;
+const VERSION: u8 = 3;
 
 /// What v1 definitions were built with, and what they must keep using.
 pub const LEGACY_CHUNK_TARGET: u32 = 512;
@@ -117,6 +135,7 @@ impl Definition {
             chunk_target: pond_index::DEFAULT_TARGET_ENTRIES,
             chunk_salt: random_salt(),
             spill_threshold: pond_engine::SPILL_THRESHOLD as u32,
+            subject_column: None,
             columns: Vec::new(),
         }
     }
@@ -127,6 +146,7 @@ impl Definition {
             chunk_target: pond_index::DEFAULT_TARGET_ENTRIES,
             chunk_salt: random_salt(),
             spill_threshold: pond_engine::SPILL_THRESHOLD as u32,
+            subject_column: None,
             columns,
         }
     }
@@ -180,6 +200,9 @@ impl Definition {
         out.extend_from_slice(&self.chunk_target.to_le_bytes());
         out.extend_from_slice(&self.chunk_salt.to_le_bytes());
         out.extend_from_slice(&self.spill_threshold.to_le_bytes());
+        let subject = self.subject_column.as_deref().unwrap_or("");
+        out.extend_from_slice(&(subject.len() as u32).to_le_bytes());
+        out.extend_from_slice(subject.as_bytes());
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for (name, vtype) in &self.columns {
             let bytes = name.as_bytes();
@@ -206,7 +229,7 @@ impl Definition {
             // a threshold of "never spill" is what keeps those collections
             // producing the bytes they already contain.
             VERSION_V1 => (LEGACY_CHUNK_TARGET, 0u64, u32::MAX, 6usize),
-            VERSION => {
+            VERSION_V2 | VERSION => {
                 if bytes.len() < 26 {
                     return None;
                 }
@@ -218,6 +241,28 @@ impl Definition {
                 )
             }
             _ => return None,
+        };
+
+        // v2 has no subject column, so it reads back as a collection holding
+        // no subject data — which is what it is.
+        let subject_column = if bytes[4] == VERSION {
+            if pos + 4 > bytes.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+            pos += 4;
+            if pos + len > bytes.len() {
+                return None;
+            }
+            let name = String::from_utf8(bytes[pos..pos + len].to_vec()).ok()?;
+            pos += len;
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
+        } else {
+            None
         };
         if chunk_target == 0 {
             return None;
@@ -250,6 +295,7 @@ impl Definition {
             chunk_target,
             chunk_salt,
             spill_threshold,
+            subject_column,
             columns,
         })
     }
@@ -279,6 +325,7 @@ fn legacy() -> Definition {
         chunk_target: LEGACY_CHUNK_TARGET,
         chunk_salt: 0,
         spill_threshold: u32::MAX,
+        subject_column: None,
         columns: Vec::new(),
     }
 }
