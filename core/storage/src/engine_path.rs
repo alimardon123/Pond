@@ -166,12 +166,9 @@ pub fn write_rows_with_nulls(
     // deeper means the engine never holds plaintext for a collection that
     // declared a subject column, so there is no path — a cache, a spill, a
     // scan — that could expose it.
-    let records = records
-        .into_iter()
-        .map(|(key, record)| {
-            crate::subject::seal_record(kernel, &def, collection, record).map(|r| (key, r))
-        })
-        .collect::<std::result::Result<Vec<_>, String>>()?;
+    let (keys, plain): (Vec<_>, Vec<_>) = records.into_iter().unzip();
+    let sealed = crate::subject::seal_records(kernel, &def, collection, plain)?;
+    let records: Vec<_> = keys.into_iter().zip(sealed).collect();
 
     let mut engine = open_engine(kernel, &def, writer_id)?;
     engine
@@ -573,10 +570,9 @@ fn open_all(
     if def.subject_column.is_none() {
         return records;
     }
-    records
-        .into_iter()
-        .map(|(k, r)| (k, crate::subject::open_record(kernel, def, collection, r)))
-        .collect()
+    let (keys, sealed): (Vec<_>, Vec<_>) = records.into_iter().unzip();
+    let opened = crate::subject::open_records(kernel, def, collection, sealed);
+    keys.into_iter().zip(opened).collect()
 }
 
 /// Read an engine-backed collection as typed columns plus their null masks.

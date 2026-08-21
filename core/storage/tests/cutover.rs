@@ -929,3 +929,108 @@ fn a_row_without_a_subject_is_refused() {
     .expect_err("must refuse a row with no subject");
     assert!(err.contains("owner"), "the refusal should name the column: {}", err);
 }
+
+/// Sealing a batch must not consult the keystore once per row.
+///
+/// Rows in a batch overwhelmingly share a subject — that is what a batch *is*
+/// for a per-subject collection — so a lookup per row turns one round trip
+/// into thousands against an object store.
+#[test]
+fn sealing_a_batch_does_not_fetch_a_key_per_row() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Counter {
+        key_reads: AtomicU64,
+    }
+
+    struct Counting<S: pond_kernel::ObjectStore> {
+        inner: S,
+        c: Arc<Counter>,
+    }
+
+    impl<S: pond_kernel::ObjectStore> pond_kernel::ObjectStore for Counting<S> {
+        fn put_blob(&self, d: &[u8]) -> std::io::Result<String> {
+            self.inner.put_blob(d)
+        }
+        fn get_blob(&self, h: &str) -> std::io::Result<Vec<u8>> {
+            self.inner.get_blob(h)
+        }
+        fn put_path(&self, p: &str, h: &str) -> std::io::Result<()> {
+            self.inner.put_path(p, h)
+        }
+        fn get_path(&self, p: &str) -> Option<String> {
+            self.inner.get_path(p)
+        }
+        fn put_object(&self, p: &str, b: &[u8]) -> std::io::Result<()> {
+            self.inner.put_object(p, b)
+        }
+        fn get_object(&self, p: &str) -> Option<Vec<u8>> {
+            if p.starts_with("keys/") {
+                self.c.key_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.get_object(p)
+        }
+        fn delete_path(&self, p: &str) -> std::io::Result<bool> {
+            self.inner.delete_path(p)
+        }
+        fn list_paths(&self, p: &str) -> std::io::Result<Vec<String>> {
+            self.inner.list_paths(p)
+        }
+        fn blob_exists(&self, h: &str) -> bool {
+            self.inner.blob_exists(h)
+        }
+        fn delete_blob(&self, h: &str) -> std::io::Result<bool> {
+            self.inner.delete_blob(h)
+        }
+    }
+
+    const ROWS: usize = 200;
+    let dir = tempfile::tempdir().unwrap();
+    let c = Arc::new(Counter::default());
+    let store = Counting {
+        inner: pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),
+        c: c.clone(),
+    };
+    let k = pond_kernel::PondKernel::new_with_store(Box::new(store));
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+
+    // Every row belongs to the same subject — the common case.
+    c.key_reads.store(0, Ordering::Relaxed);
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            ("owner", TypedColumn::String(vec!["alice".into(); ROWS])),
+            (
+                "note",
+                TypedColumn::String((0..ROWS).map(|i| format!("n{}", i)).collect()),
+            ),
+        ],
+        1,
+    )
+    .unwrap();
+    let writes = c.key_reads.load(Ordering::Relaxed);
+
+    c.key_reads.store(0, Ordering::Relaxed);
+    let _ = engine_path::read_rows(&k, "people").unwrap();
+    let reads = c.key_reads.load(Ordering::Relaxed);
+
+    println!(
+        "keystore lookups for {} rows of one subject: {} sealing, {} opening",
+        ROWS, writes, reads
+    );
+    assert!(
+        writes < ROWS as u64,
+        "sealing fetched the key {} times for {} rows — one per row",
+        writes,
+        ROWS
+    );
+    assert!(
+        reads < ROWS as u64,
+        "opening fetched the key {} times for {} rows — one per row",
+        reads,
+        ROWS
+    );
+}

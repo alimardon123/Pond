@@ -48,65 +48,130 @@ fn context(collection: &str, field: &str) -> Vec<u8> {
     format!("{}\u{1f}{}", collection, field).into_bytes()
 }
 
-/// Seal a record's fields under its subject's key.
+/// Subject keys held for the duration of one operation.
 ///
-/// A row whose subject column is missing or not a string is left in the clear
-/// and reported, rather than sealed under some fallback subject. Guessing here
-/// would mean the row could never be erased with the subject it actually
-/// belongs to — a silent, permanent failure of the thing this exists for.
-pub fn seal_record(
+/// Rows in a batch overwhelmingly share a subject — that is what a batch *is*
+/// for a per-subject collection — so fetching a key per row turns one round
+/// trip into thousands against an object store, which would defeat the
+/// batching the whole design rests on. Measured before this existed: 201
+/// keystore reads to seal 200 rows.
+///
+/// Scoped to one operation rather than cached globally, deliberately. A key
+/// held across operations is a key that outlives an erasure performed by
+/// somebody else, and the window in which an erased subject still decrypts
+/// should be as short as the code can make it.
+struct Keys<'a> {
+    store: KeyStore<std::sync::Arc<dyn pond_kernel::ObjectStore>>,
+    cache: std::collections::HashMap<String, Option<SubjectKey>>,
+    _kernel: std::marker::PhantomData<&'a ()>,
+}
+
+impl Keys<'_> {
+    fn new(kernel: &PondKernel) -> Self {
+        Self {
+            store: KeyStore::new(kernel.store_handle()),
+            cache: std::collections::HashMap::new(),
+            _kernel: std::marker::PhantomData,
+        }
+    }
+
+    /// The subject's key, creating one if this subject is new.
+    fn get_or_create(&mut self, subject: &str) -> Result<SubjectKey, String> {
+        if let Some(Some(key)) = self.cache.get(subject) {
+            return Ok(key.clone());
+        }
+        let key = self
+            .store
+            .get_or_create(&subject.to_string())
+            .map_err(|e| format!("failed to get subject key: {}", e))?;
+        self.cache.insert(subject.to_string(), Some(key.clone()));
+        Ok(key)
+    }
+
+    /// The subject's key, or `None` if they have been erased.
+    fn get(&mut self, subject: &str) -> Option<SubjectKey> {
+        if let Some(cached) = self.cache.get(subject) {
+            return cached.clone();
+        }
+        let key = self.store.get(&subject.to_string()).ok().flatten();
+        self.cache.insert(subject.to_string(), key.clone());
+        key
+    }
+}
+
+/// Seal every record's fields under its subject's key.
+///
+/// A row whose subject column is missing or not a string is reported rather
+/// than sealed under some fallback subject. Guessing would mean the row could
+/// never be erased with the subject it actually belongs to — a silent,
+/// permanent failure of the thing this exists for.
+pub fn seal_records(
     kernel: &PondKernel,
     def: &Definition,
     collection: &str,
-    record: Record,
-) -> Result<Record, String> {
+    records: Vec<Record>,
+) -> Result<Vec<Record>, String> {
     let Some(subject_column) = def.subject_column.as_deref() else {
-        return Ok(record);
+        return Ok(records);
     };
-    let Some(Value::Str(subject)) = record.get(subject_column).cloned() else {
-        return Err(format!(
-            "collection '{}' seals rows by column '{}', but this row has no \
-             string value there — refusing to store it unsealed",
-            collection, subject_column
-        ));
+    let mut keys = Keys::new(kernel);
+    let mut out = Vec::with_capacity(records.len());
+
+    for record in records {
+        let Some(Value::Str(subject)) = record.get(subject_column).cloned() else {
+            return Err(format!(
+                "collection '{}' seals rows by column '{}', but this row has no \
+                 string value there — refusing to store it unsealed",
+                collection, subject_column
+            ));
+        };
+        let key = keys.get_or_create(&subject)?;
+        out.push(map_fields(record, subject_column, |field, value| {
+            let plaintext = pond_record::encode_value(&value);
+            Value::Bytes(pond_crypto::seal(
+                &key,
+                &context(collection, field),
+                &plaintext,
+            ))
+        }));
+    }
+    Ok(out)
+}
+
+/// Open every record's sealed fields, fetching each subject's key once.
+pub fn open_records(
+    kernel: &PondKernel,
+    def: &Definition,
+    collection: &str,
+    records: Vec<Record>,
+) -> Vec<Record> {
+    let Some(subject_column) = def.subject_column.as_deref() else {
+        return records;
     };
-
-    let store = KeyStore::new(kernel.store_handle());
-    let key = store
-        .get_or_create(&subject)
-        .map_err(|e| format!("failed to get subject key: {}", e))?;
-
-    Ok(map_fields(record, subject_column, |field, value| {
-        let plaintext = pond_record::encode_value(&value);
-        Value::Bytes(pond_crypto::seal(
-            &key,
-            &context(collection, field),
-            &plaintext,
-        ))
-    }))
+    let mut keys = Keys::new(kernel);
+    records
+        .into_iter()
+        .map(|record| open_one(&mut keys, subject_column, collection, record))
+        .collect()
 }
 
 /// Open a record's sealed fields.
 ///
 /// Fields whose key is gone are dropped, which is what makes an erased subject
 /// read as absent rather than as an error.
-pub fn open_record(
-    kernel: &PondKernel,
-    def: &Definition,
+fn open_one(
+    keys: &mut Keys<'_>,
+    subject_column: &str,
     collection: &str,
     record: Record,
 ) -> Record {
-    let Some(subject_column) = def.subject_column.as_deref() else {
-        return record;
-    };
     let Some(Value::Str(subject)) = record.get(subject_column).cloned() else {
         return record;
     };
 
-    let store = KeyStore::new(kernel.store_handle());
     // No key means the subject was erased — or never existed. Either way there
     // is nothing to open, and every sealed field drops out.
-    let key: Option<SubjectKey> = store.get(&subject).ok().flatten();
+    let key: Option<SubjectKey> = keys.get(&subject);
 
     let mut out = Record::new();
     if let Some(tomb) = record.deleted {

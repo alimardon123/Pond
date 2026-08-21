@@ -176,9 +176,33 @@ erased with the one it actually belongs to.
   result.
 - Sealing cannot be switched on after rows exist, and a row without a subject
   is refused.
+- Sealing a 200-row batch fetches the key twice, not 201 times. Rows in a
+  batch overwhelmingly share a subject — that is what a batch *is* here — so a
+  lookup per row would turn one round trip into hundreds and defeat the
+  batching the whole design rests on. The key cache is scoped to one operation
+  rather than held globally: a key kept across operations is a key that
+  outlives somebody else's erasure.
 - Garbage collection cannot destroy a subject key. Keys are named objects and
   GC only deletes blobs, which is a deliberate property of the design rather
   than an accident, so it is pinned by a test.
+
+---
+
+## What leaks anyway
+
+Worth stating, because encryption invites the assumption that nothing does.
+
+- **Column names.** A column called `hiv_status` discloses by existing. Sealing
+  protects values, not the schema.
+- **Value lengths.** Ciphertext is the length of its plaintext plus a fixed
+  overhead, so a short value is visibly short. This is ordinary for
+  authenticated encryption and is only worth padding against when the length
+  itself is the secret.
+- **Row counts and which subjects exist.** The subject column is in the clear
+  by design, so how many rows a subject has is visible to anyone who can read
+  the collection.
+- **Deterministic encryption confirms guesses**, for someone who holds the key
+  and already suspects a value.
 
 ---
 
