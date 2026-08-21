@@ -18,6 +18,10 @@ path = "src/r2_pagination.rs"
 name = "nodesize"
 path = "src/nodesize.rs"
 
+[[bin]]
+name = "adversarial"
+path = "src/adversarial.rs"
+
 [dependencies]
 pond_index = { path = "../core/index" }
 pond_record = { path = "../core/record" }

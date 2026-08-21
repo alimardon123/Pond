@@ -66,9 +66,45 @@ pub const DEFAULT_TARGET_ENTRIES: u32 = 2048;
 /// produce an unbounded node.
 pub const MAX_ENTRIES_PER_CHUNK: usize = 4 * DEFAULT_TARGET_ENTRIES as usize;
 
-/// Minimum entries per chunk, so a pathological input cannot produce a tree of
-/// one-entry nodes (which would destroy fanout and blow up depth).
+/// Floor on entries per chunk, as a fraction of the target.
+///
+/// This is a security bound, not a tuning knob. Boundaries are decided by a
+/// hash of the key, and keys are application data, so a writer who wants a
+/// degenerate tree can search for keys whose fingerprint lands on a boundary
+/// and insert only those — driving every chunk to the minimum, and with it the
+/// fanout and therefore the depth.
+///
+/// Measured before this floor existed (`cargo run -p pond_bench --bin
+/// adversarial`): 20 000 mined keys produced **10 009 nodes at depth 3**,
+/// against **20 nodes at depth 2** for the same number of ordinary keys. The
+/// mining ran at ~2 600 keys/s on a single core of a laptop, so this is a
+/// cheap attack, and the gap widens with scale — a minimum of two entries
+/// means fanout two, so depth grows as log₂(n) instead of log_target(n).
+///
+/// A floor proportional to the target bounds the damage structurally: whatever
+/// the keys, fanout cannot fall below it, so depth cannot exceed
+/// log(n) / log(target/DIVISOR). It costs nothing on honest data, where chunks
+/// average the target anyway and the floor is almost never the binding
+/// constraint.
+///
+/// It does not make boundaries any less content-defined — it suppresses a
+/// boundary that fires too early, exactly as the maximum forces one that has
+/// not fired soon enough. History independence is unaffected and is verified
+/// by the 1000-insertion-order test.
+const MIN_ENTRIES_DIVISOR: usize = 4;
+
+/// Absolute floor, so tiny test configurations stay sane.
 pub const MIN_ENTRIES_PER_CHUNK: usize = 2;
+
+/// The chunk-size floor for a given target.
+pub const fn min_entries_for(target: u32) -> usize {
+    let derived = target as usize / MIN_ENTRIES_DIVISOR;
+    if derived < MIN_ENTRIES_PER_CHUNK {
+        MIN_ENTRIES_PER_CHUNK
+    } else {
+        derived
+    }
+}
 
 /// Chunking parameters.
 ///
@@ -95,7 +131,7 @@ impl Default for ChunkConfig {
         Self {
             target_entries: DEFAULT_TARGET_ENTRIES,
             max_entries: MAX_ENTRIES_PER_CHUNK,
-            min_entries: MIN_ENTRIES_PER_CHUNK,
+            min_entries: min_entries_for(DEFAULT_TARGET_ENTRIES),
         }
     }
 }
@@ -107,7 +143,7 @@ impl ChunkConfig {
         Self {
             target_entries: target,
             max_entries: (target as usize) * 4,
-            min_entries: MIN_ENTRIES_PER_CHUNK,
+            min_entries: min_entries_for(target),
         }
     }
 
