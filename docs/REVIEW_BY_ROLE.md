@@ -84,6 +84,14 @@ batching amortises (0.02 PUTs/record at 1000-row batches on R2).
 reads do not. The 1 KiB threshold is reasoned rather than measured against a
 real read/write mix, and should be measured.
 
+**A measurement that could not be made stable, and why that is a finding.** The
+one-row flush cost swung between 0.5x and 2.2x on identical inputs. Averaging
+over probes narrowed it but did not fix it, because the cause is a feature: each
+collection draws a random chunk salt, so boundaries fall differently every run
+and leaves differ in occupancy. The absolute threshold was removed rather than
+loosened until it passed — a flaky test is worse than none — and the comparative
+assertion, which is stable in direction, carries the claim.
+
 **Open:** `tree_for` writes an empty node when a collection is first touched —
 a wasted round trip per new collection.
 
@@ -106,24 +114,41 @@ can confirm it exists. That is inherent to content addressing, not new here,
 but spilling widens it from index nodes to user data. It matters for a
 multi-tenant deployment and should be stated in any security review.
 
-**Erasure is still unaddressed and is the largest open risk.** Immutable
-content-addressed storage has no mechanism for "delete this subject's data",
-and spilling makes it harder rather than easier: a deduplicated blob may be
-referenced by rows belonging to different subjects, so deleting a row does not
-free it. The known answer is crypto-shredding — encrypt per subject, destroy
-the key — and it has to be designed in rather than retrofitted.
+**Erasure — mechanism built, not yet wired.** `core/crypto` implements
+crypto-shredding: deterministic ChaCha20-Poly1305 with a synthetic IV, so
+encryption preserves content addressing and dedup rather than destroying them,
+and a keystore of named objects whose deletion makes a subject's ciphertext
+noise everywhere at once. Seventeen tests, including the end-to-end contract.
+
+Deliberately honest about what it is not: there are no callers on the data
+path. The write path does not seal, the read path does not open, and no policy
+says which fields belong to which subject. `docs/ERASURE.md` lists those in
+order and states the costs — no cross-subject dedup, deterministic encryption
+confirms guesses for key holders, and erasure is exactly as complete as the
+destruction of the last copy of the key.
 
 ---
 
 ## Data architect
 
-**`NULL` becomes `0`.** Verified through the CLI: writing `{"score": null}`
-reads back `{"score": 0}` — indistinguishable from a real zero. This is a
-`TypedColumn` limitation, which has no null representation, so it affects the
-legacy path identically and is not a cutover regression. `PondColumn` has a
-`null_bitmap` field the write path never populates, and `Value::Null` exists in
-the record model, so the information is lost precisely at the `TypedColumn`
-boundary. Fixing it means changing a type used by thirteen crates.
+**`NULL` became `0` — fixed.** Writing `{"score": null}` read back
+`{"score": 0}`, indistinguishable from a real zero, on both storage paths.
+PND2 had no per-value null representation in either direction;
+`PondColumn::null_bitmap` existed but was hardcoded `None` in every decoder arm
+and written by no encoder.
+
+Fixed additively behind a header flag, so a blob with no nulls is byte-identical
+to before and older readers never look further. Threaded through the CLI, the
+columnar bridge, `read_pnd2`, SQL, Python and the lakehouse lens.
+
+**The first fix was incomplete, and that is the more useful finding.** It
+landed in the CLI only, so `SELECT` still returned `0` where `read-rows`
+returned `null` — worse than the original bug, because the answer depended on
+how you asked. The cause was three independent implementations of "decoded
+columns to JSON rows". There is now one, in `pond_core::to_json`, which makes
+that class of divergence impossible rather than merely fixed — and
+consolidating exposed a latent gap where SQL and Python had no `VT_BOOLEAN`
+case at all.
 
 **Row identity is explicit, and that is right.** A supplied `_rowid` names the
 row; its absence means "these are new rows". The alternative — position — was
@@ -143,10 +168,16 @@ absence meaning legacy — which is what let the engine land without migrating
 anything. `manifest.rs` stays until the streaming, OLTP and key-value lenses
 move off the raw-bytes API.
 
-**Those three lenses rewrite the whole collection per append** — measured at
-14 bytes growing to 521 across 40 appends, so O(N²). For a *streaming* lens
-that is the worst possible characteristic, and it is a property of the lens
-design rather than the storage beneath it.
+**All three lenses are off the whole-collection rewrite.** Measured:
+
+| lens | before | after |
+|---|---|---|
+| streaming, 60 appends | 22 880 → 227 838 B (10.0x) | 5 519 → 14 027 B (2.5x) |
+| key-value, point lookup | full scan | 1 read at 100 pairs, 2 at 5 000 |
+| OLTP, one-row flush | 164 255 → 669 256 B (4.1x) | plateaus |
+
+The shapes matter more than the ratios: the engine's cost is bounded by one
+leaf, the rewrite's by the collection, so the gap widens without limit.
 
 **Everything that decides bytes is now pinned per collection** — chunk target,
 chunk salt, spill threshold. That invariant is worth stating explicitly,
