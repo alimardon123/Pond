@@ -62,6 +62,24 @@ enum Commands {
         #[arg(default_value = ".")]
         location: String,
     },
+    /// Erase a subject: destroy their key, making their data unreadable
+    /// everywhere at once.
+    ///
+    /// Irreversible. The ciphertext remains but nothing can decrypt it — not
+    /// in this branch, not in history, not in any replica.
+    Erase {
+        subject: String,
+        /// Who asked. Recorded in the erasure log.
+        #[arg(long, default_value = "unspecified")]
+        requested_by: String,
+        /// Required, so an irreversible operation is never one keystroke away.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// List subjects that still have a key, and are therefore erasable.
+    Subjects,
+    /// Show the erasure log, oldest first.
+    ErasureLog,
     /// Create an engine-backed collection.
     ///
     /// Collections created this way use the content-defined index: a commit is
@@ -198,6 +216,66 @@ fn main() {
             // at _active_branch/{collection} → blob containing branch name.
             load_persisted_active_branches(&storage);
             match cmd {
+                Commands::Erase { subject, requested_by, confirm } => {
+                    if !confirm {
+                        eprintln!(
+                            "Refusing to erase '{}' without --confirm.\n\
+                             This destroys the key for that subject. Their data \
+                             becomes unreadable in every branch, in history, and \
+                             in every replica, and cannot be recovered.",
+                            subject
+                        );
+                        std::process::exit(1);
+                    }
+                    match pond_storage::subject::erase_subject_for(
+                        storage.kernel(),
+                        &subject,
+                        &requested_by,
+                    ) {
+                        Ok(true) => println!("erased\t{}", subject),
+                        Ok(false) => println!("no key\t{}\t(already erased or never existed)", subject),
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Commands::Subjects => {
+                    match pond_storage::subject::subjects(storage.kernel()) {
+                        Ok(mut names) => {
+                            names.sort();
+                            for n in names {
+                                println!("{}", n);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Commands::ErasureLog => {
+                    match pond_storage::subject::erasure_log(storage.kernel()) {
+                        Ok(entries) => {
+                            if entries.is_empty() {
+                                println!("(no erasures recorded)");
+                            }
+                            for e in entries {
+                                println!(
+                                    "{}\t{}\t{}\t{}",
+                                    e.at_ms,
+                                    e.subject_digest,
+                                    if e.key_existed { "destroyed" } else { "no-key" },
+                                    e.requested_by
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 Commands::Create { collection } => {
                     match pond_storage::engine_path::create(storage.kernel(), &collection) {
                         Ok(()) => println!("{}\tengine", collection),
@@ -400,7 +478,7 @@ fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>
         #[cfg(feature = "s3")]
         {
             let store = pond_s3::S3ObjectStore::from_url(root)?;
-            let kernel = PondKernel::new_with_store(Box::new(store));
+            let kernel = with_keystore(PondKernel::new_with_store(Box::new(store)))?;
             Ok(UnifiedStorage::new(kernel))
         }
         #[cfg(not(feature = "s3"))]
@@ -410,11 +488,44 @@ fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>
                  Rebuild with `cargo build` (default features include s3)."
             ).into())
         }
-    } else if let Some(path) = root.strip_prefix("file://") {
-        UnifiedStorage::new_local(path).map_err(|e| e.into())
     } else {
-        UnifiedStorage::new_local(root).map_err(|e| e.into())
+        let path = root.strip_prefix("file://").unwrap_or(root);
+        let kernel = with_keystore(PondKernel::new_local(path)?)?;
+        Ok(UnifiedStorage::new(kernel))
     }
+}
+
+/// Point subject keys at `POND_KEYSTORE`, if it is set.
+///
+/// Erasure is exactly as complete as the destruction of the last copy of a
+/// key, and keys kept in the data store are copied by every backup and replica
+/// of the data — so restoring one undoes every erasure since it was taken.
+/// This is how a deployment says "keys live over here", somewhere with a
+/// retention policy of its own.
+///
+/// Unset means the data store, which is right for a single machine and wrong
+/// for anything with a backup schedule.
+fn with_keystore(kernel: PondKernel) -> Result<PondKernel, Box<dyn std::error::Error>> {
+    let Ok(location) = std::env::var("POND_KEYSTORE") else {
+        return Ok(kernel);
+    };
+    if location.trim().is_empty() {
+        return Ok(kernel);
+    }
+    let store: std::sync::Arc<dyn pond_kernel::ObjectStore> = if location.starts_with("s3://") {
+        #[cfg(feature = "s3")]
+        {
+            std::sync::Arc::new(pond_s3::S3ObjectStore::from_url(&location)?)
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            return Err("POND_KEYSTORE names S3 storage, which is not compiled in".into());
+        }
+    } else {
+        let path = location.strip_prefix("file://").unwrap_or(&location);
+        std::sync::Arc::new(pond_kernel::LocalFSObjectStore::new(path)?)
+    };
+    Ok(kernel.with_keystore(store))
 }
 
 /// Initialize or connect to a Pond repository.

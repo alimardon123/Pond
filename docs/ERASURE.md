@@ -259,13 +259,32 @@ Worth stating, because encryption invites the assumption that nothing does.
 
 ---
 
+## From the command line
+
+```bash
+export POND_KEYSTORE=/secure/keys      # keys and audit log live here, not with the data
+
+pond subjects                          # who is erasable
+pond erase alice@example.com --confirm --requested-by ticket-42
+pond erasure-log                       # salted digests, timestamps, who asked
+```
+
+`--confirm` is required. The operation destroys a key, and the data it
+protected cannot be recovered in any branch, in history, or in any replica —
+that should not be one keystroke away.
+
+`POND_KEYSTORE` accepts a path or an `s3://` URL. Unset means the data store.
+
+---
+
 ## What is still missing
 
 1. **Key rotation.** A subject's key is created once and never changes.
    Rotating it means re-sealing that subject's rows, which is a rewrite rather
-   than a pointer change.
-2. **Erasure through the CLI and the bindings.** Reachable from the Rust API
-   only.
-3. **A startup check.** `keystore_is_separate()` exists; nothing calls it. A
-   deployment that must prove erasure should refuse to start without it, and
-   that policy is not expressible in configuration yet.
+   than a pointer change — cheap per subject, but not free, and there is no
+   mechanism yet.
+2. **A startup policy.** `keystore_is_separate()` exists and the CLI honours
+   `POND_KEYSTORE`, but nothing *refuses to run* when the keys sit with the
+   data. A deployment that must prove erasure wants that as a hard failure, not
+   a documented recommendation.
+3. **Erasure through the language bindings.** Rust and the CLI only.
