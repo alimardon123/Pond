@@ -150,3 +150,48 @@ fn gc_is_idempotent_over_engine_data() {
 
     assert_eq!(rows_of(&s, "users"), vec![1, 2]);
 }
+
+/// Garbage collection must not destroy subject keys.
+///
+/// This is the same class of bug as GC deleting engine collections: a new kind
+/// of persistent state arrives, and a subsystem that reasons about what is
+/// live has never heard of it. The consequence here would be worse than data
+/// loss — it would be *silent* data loss, since destroying a key makes every
+/// subject's data unreadable with no error anywhere.
+///
+/// It is safe today because keys are named objects rather than blobs, and GC
+/// only ever deletes blobs. That is a deliberate property of the keystore
+/// design, so it is worth pinning rather than rediscovering.
+#[test]
+fn gc_does_not_destroy_subject_keys() {
+    use pond_crypto::{KeyStore, SubjectId};
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = kernel(dir.path());
+
+    let keystore = KeyStore::new(pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap());
+    let subject: SubjectId = "alice".to_string();
+    let key = keystore.get_or_create(&subject).unwrap();
+    let sealed = pond_crypto::seal(&key, b"users/name", b"personal data");
+
+    // Some ordinary data alongside, so GC has real work to do.
+    engine_path::create(&s, "users").unwrap();
+    engine_path::write_rows(&s, "users", &[("id", TypedColumn::Int64(vec![1]))], 1).unwrap();
+
+    let gc = GarbageCollector::new(&s);
+    gc.vacuum(None, 0, false);
+
+    let after = keystore
+        .get(&subject)
+        .unwrap()
+        .expect("the subject's key must survive garbage collection");
+    assert_eq!(
+        after.as_bytes(),
+        key.as_bytes(),
+        "the key changed, which would make every existing value unreadable"
+    );
+    assert_eq!(
+        pond_crypto::open(&after, b"users/name", &sealed).unwrap(),
+        b"personal data"
+    );
+}

@@ -1823,6 +1823,7 @@ dependencies = [
  "getrandom 0.3.4",
  "pond_cache",
  "pond_core",
+ "pond_crypto",
  "pond_engine",
  "pond_index",
  "pond_kernel",
