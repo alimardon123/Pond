@@ -1119,3 +1119,131 @@ fn an_erasure_is_auditable_afterwards() {
     assert_eq!(log[0].requested_by, "ticket-42");
     assert!(log[0].key_existed);
 }
+
+/// Rotating a subject's key must keep their data readable and make the old key
+/// useless.
+///
+/// A key that never changes has unbounded exposure in time: anyone who
+/// obtained it once can read everything that subject ever stored, including
+/// rows written long afterwards.
+#[test]
+fn rotating_a_key_preserves_the_data_and_retires_the_old_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            (
+                "owner",
+                TypedColumn::String(vec!["alice".into(), "bob".into()]),
+            ),
+            (
+                "note",
+                TypedColumn::String(vec!["alice's note".into(), "bob's note".into()]),
+            ),
+        ],
+        1,
+    )
+    .unwrap();
+
+    // Capture the key an attacker might have taken before the rotation.
+    let stolen = pond_crypto::KeyStore::new(k.keystore_handle())
+        .get(&"alice".to_string())
+        .unwrap()
+        .expect("alice has a key");
+
+    assert!(engine_path::rotate_subject(&k, "people", "alice", 1).unwrap());
+
+    // The data still reads.
+    let notes = |owner: &str| -> Option<String> {
+        let columns = engine_path::read_rows(&k, "people").unwrap();
+        let owners = match columns.iter().find(|(n, _)| n == "owner") {
+            Some((_, TypedColumn::String(v))) => v.clone(),
+            _ => return None,
+        };
+        let notes = match columns.iter().find(|(n, _)| n == "note") {
+            Some((_, TypedColumn::String(v))) => v.clone(),
+            _ => return None,
+        };
+        owners.iter().position(|o| o == owner).map(|i| notes[i].clone())
+    };
+    assert_eq!(notes("alice"), Some("alice's note".to_string()));
+    assert_eq!(
+        notes("bob"),
+        Some("bob's note".to_string()),
+        "rotating one subject must not disturb another"
+    );
+
+    // The old key is retired.
+    let current = pond_crypto::KeyStore::new(k.keystore_handle())
+        .get(&"alice".to_string())
+        .unwrap()
+        .expect("alice still has a key");
+    assert_ne!(
+        current.as_bytes(),
+        stolen.as_bytes(),
+        "rotation must actually change the key"
+    );
+
+    // And erasure still works afterwards, against the rotated key. A rotation
+    // that left the subject unerasable would be worse than no rotation.
+    pond_storage::subject::erase_subject(&k, "alice").unwrap();
+    assert_eq!(
+        notes("alice"),
+        Some(String::new()),
+        "after erasure the field is absent, which a dense column shows as empty"
+    );
+    assert_eq!(
+        notes("bob"),
+        Some("bob's note".to_string()),
+        "erasing alice must still not touch bob"
+    );
+}
+
+/// Rotating a subject who has no key must not mint one.
+///
+/// A subject with no key was erased, or never seen. Creating one would quietly
+/// restore the ability to store data for somebody who asked to be forgotten.
+#[test]
+fn rotating_an_erased_subject_does_not_revive_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            ("owner", TypedColumn::String(vec!["alice".into()])),
+            ("note", TypedColumn::String(vec!["secret".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    pond_storage::subject::erase_subject(&k, "alice").unwrap();
+    assert!(
+        !engine_path::rotate_subject(&k, "people", "alice", 1).unwrap(),
+        "rotation must report that there was nothing to rotate"
+    );
+    assert!(
+        pond_crypto::KeyStore::new(k.keystore_handle())
+            .get(&"alice".to_string())
+            .unwrap()
+            .is_none(),
+        "an erased subject must not get a key back from a rotation"
+    );
+}
+
+/// Rotation is refused on a collection that does not seal rows.
+#[test]
+fn rotation_is_refused_where_there_is_nothing_to_rotate() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "plain").unwrap();
+    engine_path::write_rows(&k, "plain", &[("id", TypedColumn::Int64(vec![1]))], 1).unwrap();
+
+    let err = engine_path::rotate_subject(&k, "plain", "alice", 1).expect_err("must refuse");
+    assert!(err.contains("does not seal"), "should say why: {}", err);
+}

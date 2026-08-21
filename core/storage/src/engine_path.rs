@@ -533,6 +533,78 @@ pub fn read_range(
         .collect())
 }
 
+/// Rotate one subject's key across a collection.
+///
+/// A key that never changes has unbounded exposure in time: anyone who
+/// obtained it once can read everything that subject ever stored, including
+/// rows written long afterwards.
+///
+/// The order is the safety argument. Rows are opened under the old key,
+/// re-sealed under a new one, and **published** — and only then does the new
+/// key replace the old. An interruption at any point leaves data readable
+/// under a key that still exists. Destroying or replacing the key first and
+/// then failing would leave rows nothing can open, which is an erasure nobody
+/// requested.
+///
+/// Costs a rewrite of that subject's rows, unlike erasure which costs one key.
+/// That is inherent: erasure may destroy the values, rotation must preserve
+/// them.
+pub fn rotate_subject(
+    kernel: &PondKernel,
+    collection: &str,
+    subject: &str,
+    writer_id: u64,
+) -> Result<bool> {
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+    let Some(subject_column) = def.subject_column.clone() else {
+        return Err(format!(
+            "collection '{}' does not seal rows, so it has no keys to rotate",
+            collection
+        ));
+    };
+
+    let mut reader = Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
+        .map_err(|e| format!("failed to open reader: {}", e))?;
+    let rows = reader
+        .scan(collection)
+        .map_err(|e| format!("failed to scan: {}", e))?;
+    let (keys, records): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+
+    let fresh = pond_crypto::SubjectKey::generate();
+    let (resealed, had_key) = crate::subject::reseal_for_rotation(
+        kernel,
+        &def,
+        collection,
+        subject,
+        &subject_column,
+        records,
+        &fresh,
+        writer_id,
+    )?;
+    if !had_key {
+        // No key means erased, or never seen. Minting one would quietly
+        // restore the ability to store data for a subject who asked to be
+        // forgotten.
+        return Ok(false);
+    }
+
+    // Publish the re-sealed rows before the key that opens them exists as the
+    // subject's key. Until this succeeds, the old key still opens the old rows.
+    let mut engine = open_engine(kernel, &def, writer_id)?;
+    engine
+        .write_records(collection, keys.into_iter().zip(resealed).collect())
+        .map_err(|e| format!("failed to stage re-sealed rows: {}", e))?;
+    engine
+        .publish()
+        .map_err(|e| format!("failed to publish re-sealed rows: {}", e))?;
+
+    crate::subject::install_rotated_key(kernel, subject, &fresh)?;
+    Ok(true)
+}
+
 /// Read an engine-backed collection as typed columns.
 ///
 /// The read merges every writer's view, so a collection written by four

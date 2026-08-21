@@ -277,12 +277,55 @@ that should not be one keystroke away.
 
 ---
 
+## Rotation
+
+A key that never changes has unbounded exposure in time: anyone who obtained it
+once can read everything that subject ever stored, including rows written long
+afterwards.
+
+```rust
+engine_path::rotate_subject(&kernel, "people", "alice@example.com", writer_id)?;
+```
+
+**The order is the safety argument.** Rows are opened under the old key,
+re-sealed under a new one, and *published* — and only then does the new key
+replace the old. An interruption at any point leaves data readable under a key
+that still exists. Replacing the key first and then failing would leave rows
+nothing can open: an erasure nobody requested.
+
+**Rotation costs more than erasure, inherently.** Erasure destroys one key and
+every value it protected becomes noise wherever it sits — no rewrite, no scan.
+Rotation must *keep* the values readable, so each is opened and re-sealed: a
+rewrite of that subject's rows, proportional to how much they have.
+
+Rotating a subject who has no key does nothing and says so. A subject with no
+key was erased, or never seen; minting one would quietly restore the ability to
+store data for somebody who asked to be forgotten.
+
+### The race worth knowing about
+
+Rotation is not atomic against concurrent writes. A write that lands between
+the scan and the key replacement seals under the *old* key and is then
+unreadable — the value is lost, not merely stale.
+
+The window is one scan plus one publish. Mitigating it properly needs either a
+write barrier for the subject being rotated, or a two-key read path that tries
+both keys during the transition. Neither exists yet, so rotate when the subject
+is not being written to, and treat it as maintenance rather than a background
+task.
+
+One subtlety that cost a debugging round: re-sealed fields must carry *newer*
+versions than the ones they replace. The engine merges per field, and a field
+whose version is unchanged does not win that merge — so the old ciphertext
+survived under a key that no longer existed, rotation reported success, and the
+data came back empty.
+
+---
+
 ## What is still missing
 
-1. **Key rotation.** A subject's key is created once and never changes.
-   Rotating it means re-sealing that subject's rows, which is a rewrite rather
-   than a pointer change — cheap per subject, but not free, and there is no
-   mechanism yet.
+1. **A write barrier during rotation**, or a two-key read path — see the race
+   above.
 2. **A startup policy.** `keystore_is_separate()` exists and the CLI honours
    `POND_KEYSTORE`, but nothing *refuses to run* when the keys sit with the
    data. A deployment that must prove erasure wants that as a hard failure, not

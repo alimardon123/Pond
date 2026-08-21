@@ -259,11 +259,127 @@ pub fn erasure_log(kernel: &PondKernel) -> Result<Vec<pond_crypto::ErasureRecord
         .map_err(|e| format!("failed to read the erasure log: {}", e))
 }
 
+/// Re-seal one subject's rows under `fresh`, leaving every other row alone.
+///
+/// Returns the rewritten records and whether the subject had a key at all. A
+/// subject with no key was erased, or never seen; minting one for them would
+/// quietly restore the ability to store data for somebody who asked to be
+/// forgotten, so the caller is told rather than surprised.
+///
+/// This does not touch the keystore. Installing the new key is a separate step
+/// so the caller controls the order — the re-sealed rows must be durable
+/// before the key that opens them replaces the one that opens the old rows.
+#[allow(clippy::too_many_arguments)]
+pub fn reseal_for_rotation(
+    kernel: &PondKernel,
+    def: &Definition,
+    collection: &str,
+    subject: &str,
+    subject_column: &str,
+    records: Vec<Record>,
+    fresh: &SubjectKey,
+    rotation_writer: u64,
+) -> Result<(Vec<Record>, bool), String> {
+    if def.subject_column.as_deref() != Some(subject_column) {
+        return Err(format!(
+            "collection '{}' does not seal rows by '{}'",
+            collection, subject_column
+        ));
+    }
+
+    let store = KeyStore::new(kernel.keystore_handle());
+    let Some(old) = store
+        .get(&subject.to_string())
+        .map_err(|e| format!("failed to read the subject key: {}", e))?
+    else {
+        return Ok((records, false));
+    };
+
+    let mut keys = Keys::new(kernel);
+    keys.cache.insert(subject.to_string(), Some(old));
+
+    let belongs = |r: &Record| matches!(r.get(subject_column), Some(Value::Str(s)) if s == subject);
+
+    // The re-sealed fields need versions newer than the ones they replace.
+    //
+    // A write goes through the engine's per-field merge, and a field whose
+    // version is unchanged does not win it — so the old ciphertext would
+    // survive, sealed under a key that no longer exists, and the value would
+    // be silently unreadable. That is what happened before this: rotation
+    // returned success and the data came back empty.
+    let now = pond_kernel::crdt::current_time_ms();
+    let out = records
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if !belongs(&r) {
+                return r;
+            }
+            let opened = open_one(&mut keys, subject_column, collection, r);
+            let version = pond_record::Version::new(now, i as u64, rotation_writer);
+            map_versioned_fields(opened, subject_column, version, |field, value| {
+                let plaintext = pond_record::encode_value(&value);
+                Value::Bytes(pond_crypto::seal(
+                    fresh,
+                    &context(collection, field),
+                    &plaintext,
+                ))
+            })
+        })
+        .collect();
+    Ok((out, true))
+}
+
+/// Install a rotated key, after its rows have been re-sealed and published.
+///
+/// Separate from [`rotate_subject_key`] so the caller controls the order: the
+/// new rows must be durable before the key that opens them replaces the one
+/// that opens the old rows.
+pub fn install_rotated_key(
+    kernel: &PondKernel,
+    subject: &str,
+    key: &SubjectKey,
+) -> Result<(), String> {
+    KeyStore::new(kernel.keystore_handle())
+        .replace(&subject.to_string(), key)
+        .map_err(|e| format!("failed to install the rotated key: {}", e))
+}
+
 /// Every subject with a key. What is erasable, for audit.
 pub fn subjects(kernel: &PondKernel) -> Result<Vec<String>, String> {
     KeyStore::new(kernel.keystore_handle())
         .subjects()
         .map_err(|e| format!("failed to list subjects: {}", e))
+}
+
+/// As [`map_fields`], but stamping the transformed fields with a new version.
+///
+/// Rotation needs this: an unchanged version does not win the per-field merge,
+/// so the old ciphertext would survive under a key that no longer exists.
+fn map_versioned_fields<F>(
+    record: Record,
+    subject_column: &str,
+    version: pond_record::Version,
+    mut f: F,
+) -> Record
+where
+    F: FnMut(&str, Value) -> Value,
+{
+    let mut out = Record::new();
+    if let Some(tomb) = record.deleted {
+        out.delete(tomb);
+    }
+    for (name, field) in record.fields {
+        let sealed = is_sealed_column(&name, subject_column);
+        let (value, version) = if sealed {
+            (f(&name, field.value), version)
+        } else {
+            (field.value, field.version)
+        };
+        out.fields
+            .insert(name, pond_record::Field { value, version });
+    }
+    out
 }
 
 /// Rebuild a record, transforming the fields that should be sealed.

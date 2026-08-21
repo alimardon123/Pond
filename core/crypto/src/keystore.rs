@@ -81,6 +81,15 @@ impl<S: ObjectStore> KeyStore<S> {
         Ok(Some(SubjectKey::from_bytes(buf)))
     }
 
+    /// Replace a subject's key.
+    ///
+    /// Used by rotation, after the subject's rows have been re-sealed under
+    /// the new key and made durable. Doing it earlier would leave rows that
+    /// nothing can open — an erasure nobody asked for.
+    pub fn replace(&self, subject: &SubjectId, key: &SubjectKey) -> io::Result<()> {
+        self.store.put_object(&key_path(subject), key.as_bytes())
+    }
+
     /// Erase a subject: destroy their key.
     ///
     /// Returns whether a key was there to destroy. Erasing an already-erased
