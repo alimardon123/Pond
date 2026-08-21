@@ -1,59 +1,79 @@
-// Can a writer who chooses keys degrade the tree?
+// adversarial.rs — can a writer who chooses keys degrade the tree?
 //
-// Boundaries are decided by a hash of the key, and keys are application data.
-// A writer who wants shallow chunks can search for keys whose fingerprint
-// lands on a boundary and insert only those, driving chunk sizes to the
-// minimum — which drives fanout to the minimum and depth up.
-use pond_index::{fingerprint, ChunkConfig, MemStore, NodeStore, Tree};
+// Chunk boundaries are decided by a hash of the key, and keys are application
+// data. So a writer can search for keys whose fingerprint lands on a boundary
+// and insert only those, driving every chunk to the smallest size the
+// configuration permits — and with it the fanout, and therefore the depth and
+// the object count.
+//
+// This measures the attack against the honest baseline. The defence is the
+// chunk floor: below it, no key can end a chunk however long it is searched
+// for, so fanout has a hard lower bound that does not depend on the data.
+//
+//   cargo run --release -p pond_bench --bin adversarial
+
+use pond_index::{fingerprint, ChunkConfig, MemStore, Tree};
+
+/// How many keys to mine. Enough to show the shape; the effect grows with n.
+const KEYS: usize = 5_000;
 
 fn main() {
     let cfg = ChunkConfig::default();
-    let target = 20_000usize;
 
-    // Mine keys whose fingerprint is a boundary at any chunk position.
+    // The attacker's best move is to end a chunk at the earliest position the
+    // configuration allows. Searching for a key that ends one *earlier* is
+    // futile — that is what the floor buys.
+    let earliest = cfg.min_entries;
+    println!(
+        "target {} entries/chunk, floor {} — no key can end a chunk before the floor",
+        cfg.target_entries, earliest
+    );
+
     let t = std::time::Instant::now();
-    let mut mined: Vec<Vec<u8>> = Vec::new();
+    let mut mined: Vec<Vec<u8>> = Vec::with_capacity(KEYS);
     let mut tried = 0u64;
     let mut i = 0u64;
-    while mined.len() < target {
-        let k = format!("k{:020}", i);
+    let mut buf = String::with_capacity(24);
+    while mined.len() < KEYS {
+        use std::fmt::Write;
+        buf.clear();
+        let _ = write!(buf, "k{:020}", i);
         i += 1;
         tried += 1;
-        // position 2 is the first at which a boundary is allowed
-        if cfg.is_boundary(fingerprint(k.as_bytes()), 2) {
-            mined.push(k.into_bytes());
+        if cfg.is_boundary(fingerprint(buf.as_bytes()), earliest) {
+            mined.push(buf.as_bytes().to_vec());
         }
     }
     let mine_time = t.elapsed();
     mined.sort();
 
-    let store = MemStore::new();
-    let entries: Vec<(Vec<u8>, Vec<u8>)> =
-        mined.into_iter().map(|k| (k, vec![b'x'; 100])).collect();
-    let tree = Tree::build_sorted(&store, entries, cfg);
-
-    // Honest baseline: the same number of ordinary keys.
-    let store2 = MemStore::new();
-    let normal: Vec<(Vec<u8>, Vec<u8>)> = (0..target as u64)
-        .map(|i| (format!("user:{:012}", i).into_bytes(), vec![b'x'; 100]))
+    let adversarial = build(&mined, cfg);
+    let honest: Vec<Vec<u8>> = (0..KEYS as u64)
+        .map(|i| format!("user:{:012}", i).into_bytes())
         .collect();
-    let tree2 = Tree::build_sorted(&store2, normal, cfg);
+    let honest = build(&honest, cfg);
 
     println!(
         "mined {} boundary keys from {} candidates in {:.1}s ({:.0} keys/s)",
-        target,
+        KEYS,
         tried,
         mine_time.as_secs_f64(),
-        target as f64 / mine_time.as_secs_f64()
+        KEYS as f64 / mine_time.as_secs_f64().max(1e-9)
     );
+    println!("  adversarial: depth {}, {} nodes", adversarial.1, adversarial.0);
+    println!("  honest     : depth {}, {} nodes", honest.1, honest.0);
     println!(
-        "  adversarial: depth {}, {} nodes",
-        tree.depth(&store),
-        store.len()
+        "  ratio      : {:.1}x the objects, {:+} levels",
+        adversarial.0 as f64 / honest.0.max(1) as f64,
+        adversarial.1 as i64 - honest.1 as i64
     );
-    println!(
-        "  honest     : depth {}, {} nodes",
-        tree2.depth(&store2),
-        store2.len()
-    );
+}
+
+/// Build a tree from keys and return (node count, depth).
+fn build(keys: &[Vec<u8>], cfg: ChunkConfig) -> (usize, usize) {
+    let store = MemStore::new();
+    let entries: Vec<(Vec<u8>, Vec<u8>)> =
+        keys.iter().map(|k| (k.clone(), vec![b'x'; 100])).collect();
+    let tree = Tree::build_sorted(&store, entries, cfg);
+    (store.len(), tree.depth(&store))
 }

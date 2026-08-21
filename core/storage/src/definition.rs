@@ -26,6 +26,13 @@
 
 use pond_kernel::PondKernel;
 
+/// A fresh salt for a new collection.
+fn random_salt() -> u64 {
+    let mut b = [0u8; 8];
+    getrandom::fill(&mut b).expect("OS CSPRNG unavailable — cannot salt a new collection");
+    u64::from_le_bytes(b)
+}
+
 use crate::definition_ref;
 
 /// Which storage path owns a collection's data.
@@ -72,6 +79,17 @@ pub struct Definition {
     /// Pinned per collection, so the default can be tuned for new collections
     /// without touching a single existing one.
     pub chunk_target: u32,
+    /// Per-collection value mixed into the chunk boundary decision.
+    ///
+    /// Chosen randomly at creation. Without it the boundary function is public
+    /// and fixed, so one search for keys that land on boundaries produces a
+    /// key set that degrades every collection everywhere. With it, the search
+    /// has to be redone per collection against a value the attacker must first
+    /// obtain — which an append-only client cannot.
+    ///
+    /// Zero means unsalted, which is exactly what pre-salt collections were,
+    /// so they keep chunking identically.
+    pub chunk_salt: u64,
     /// `(column name, PND2 value type)`, in declaration order.
     pub columns: Vec<(String, u8)>,
 }
@@ -90,6 +108,7 @@ impl Definition {
         Self {
             format,
             chunk_target: pond_index::DEFAULT_TARGET_ENTRIES,
+            chunk_salt: random_salt(),
             columns: Vec::new(),
         }
     }
@@ -98,13 +117,14 @@ impl Definition {
         Self {
             format,
             chunk_target: pond_index::DEFAULT_TARGET_ENTRIES,
+            chunk_salt: random_salt(),
             columns,
         }
     }
 
     /// The chunk configuration this collection was created with.
     pub fn chunk_config(&self) -> pond_index::ChunkConfig {
-        pond_index::ChunkConfig::with_target(self.chunk_target)
+        pond_index::ChunkConfig::with_target(self.chunk_target).with_salt(self.chunk_salt)
     }
 
     /// Declared type of a column, if the definition names it.
@@ -142,6 +162,7 @@ impl Definition {
         out.push(VERSION);
         out.push(self.format.tag());
         out.extend_from_slice(&self.chunk_target.to_le_bytes());
+        out.extend_from_slice(&self.chunk_salt.to_le_bytes());
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for (name, vtype) in &self.columns {
             let bytes = name.as_bytes();
@@ -163,13 +184,17 @@ impl Definition {
 
         // v1 carried no chunk target. Reading it back as the value v1 was
         // built with is what keeps those collections rechunking identically.
-        let (chunk_target, mut pos) = match bytes[4] {
-            VERSION_V1 => (LEGACY_CHUNK_TARGET, 6usize),
+        let (chunk_target, chunk_salt, mut pos) = match bytes[4] {
+            VERSION_V1 => (LEGACY_CHUNK_TARGET, 0u64, 6usize),
             VERSION => {
-                if bytes.len() < 14 {
+                if bytes.len() < 22 {
                     return None;
                 }
-                (u32::from_le_bytes(bytes[6..10].try_into().ok()?), 10usize)
+                (
+                    u32::from_le_bytes(bytes[6..10].try_into().ok()?),
+                    u64::from_le_bytes(bytes[10..18].try_into().ok()?),
+                    18usize,
+                )
             }
             _ => return None,
         };
@@ -202,6 +227,7 @@ impl Definition {
         Some(Self {
             format,
             chunk_target,
+            chunk_salt,
             columns,
         })
     }
@@ -216,7 +242,22 @@ pub fn load(kernel: &PondKernel, collection: &str) -> Definition {
     kernel
         .read_named(&definition_ref(collection))
         .and_then(|b| Definition::decode(&b))
-        .unwrap_or_else(|| Definition::new(Format::Legacy))
+        .unwrap_or_else(legacy)
+}
+
+/// What a collection with no definition object is.
+///
+/// Deterministic on purpose: `Definition::new` draws a random salt, which is
+/// right for a collection being created and wrong for one being described. A
+/// legacy collection does not use the index at all, but a value that differs
+/// between two reads of the same collection is a bug waiting for a caller.
+fn legacy() -> Definition {
+    Definition {
+        format: Format::Legacy,
+        chunk_target: LEGACY_CHUNK_TARGET,
+        chunk_salt: 0,
+        columns: Vec::new(),
+    }
 }
 
 /// Write a collection's definition. One object write.
@@ -259,6 +300,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kernel = PondKernel::new_local(dir.path()).unwrap();
         assert_eq!(format_of(&kernel, "never-created"), Format::Legacy);
+
+        // And describing an absent collection is deterministic — two reads of
+        // the same collection must not differ.
+        let a = load(&kernel, "never-created");
+        let b = load(&kernel, "never-created");
+        assert_eq!(a, b);
+        assert_eq!(a.chunk_salt, 0, "an unsalted collection stays unsalted");
+        assert_eq!(a.chunk_target, LEGACY_CHUNK_TARGET);
+    }
+
+    /// Two collections must not share a salt, or one mined key set degrades
+    /// both.
+    #[test]
+    fn each_collection_gets_its_own_salt() {
+        let salts: std::collections::HashSet<u64> = (0..32)
+            .map(|_| Definition::new(Format::Engine).chunk_salt)
+            .collect();
+        assert!(
+            salts.len() > 30,
+            "salts must be drawn independently, saw {} distinct of 32",
+            salts.len()
+        );
+        // And the salt reaches the chunker.
+        let def = Definition::new(Format::Engine);
+        assert_eq!(def.chunk_config().salt, def.chunk_salt);
     }
 
     #[test]

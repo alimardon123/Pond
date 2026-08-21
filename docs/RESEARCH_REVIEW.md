@@ -56,10 +56,34 @@ of the target (`min_entries_for`), so whatever the keys, fanout cannot fall
 below it and depth cannot exceed log(n)/log(target/4). It costs nothing on
 honest data, where chunks average the target and the floor almost never binds.
 
-The research also suggested salting the boundary function per shard. That is
-worth doing and is *not* done yet — see Open below — but it is a weaker
-defence than the floor, because a writer who can read the collection can read
-the salt.
+Re-measured after the fix, at the current default (target 2048, floor 512):
+
+| keys | nodes | depth |
+|---|---|---|
+| 5 000 mined | 11 | 2 |
+| 5 000 ordinary | 3 | 2 |
+
+**3.7x the objects and no extra level** — against a theoretical worst case of
+4x, which is exactly the ratio between the target and the floor. The attack is
+now bounded by arithmetic rather than by luck.
+
+A side effect worth noting: with the floor in place, a search for a key that
+ends a chunk *earlier* than the floor never terminates, because no such key
+exists. The first version of this benchmark hung for that reason, which is a
+blunter demonstration than the table.
+
+The research also suggested salting the boundary function per shard, and that
+is now done: each collection draws a random `chunk_salt` at creation, pinned in
+its definition alongside the chunk target and mixed into the boundary decision.
+
+The salt is a weaker defence than the floor and is deliberately described as
+one. It is not secret from anyone who can read the collection, so it does not
+stop a reader. What it stops is the case that generalises: without it the
+boundary function is public and fixed, so *one* search produces a key set that
+degrades every collection everywhere, forever. With it the search must be
+redone per collection, against a value an append-only client cannot obtain.
+Zero means unsalted and is exactly a no-op, so collections written before it
+existed chunk identically.
 
 ### 3. Object-storage economics → node size retuned
 
@@ -155,15 +179,13 @@ research raises its priority above the remaining lens conversions.
 
 ## Open
 
-1. **Salt the boundary function per collection.** Weaker than the chunk floor,
-   but it stops a single mined key set from transferring between collections.
-2. **Erasure / crypto-shredding.** The strongest prediction in the review, and
+1. **Erasure / crypto-shredding.** The strongest prediction in the review, and
    entirely unaddressed here: immutable content-addressed storage has no
    mechanism for "delete this subject's data", and every system in the lineage
    discovered that late and paid for it. Encrypt per subject, keep keys in a
    small mutable keystore, destroy the key to erase. Structural GC handles
    cost; it does not handle law.
-3. **Segments (C1 above).**
-4. **Filters sized for object storage.** A false positive costs a billable
+2. **Segments (C1 above).**
+3. **Filters sized for object storage.** A false positive costs a billable
    request and tens of milliseconds, not the microseconds it costs on NVMe.
    Relevant once filters exist; they do not yet.

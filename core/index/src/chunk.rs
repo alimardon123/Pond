@@ -124,6 +124,23 @@ pub struct ChunkConfig {
     pub target_entries: u32,
     pub max_entries: usize,
     pub min_entries: usize,
+    /// Per-collection value mixed into the boundary decision.
+    ///
+    /// The chunk floor bounds how much damage mined keys can do; this raises
+    /// the cost of mining them in the first place. Without a salt, one search
+    /// produces a key set that degrades *every* collection everywhere, forever
+    /// — the boundary function is public and fixed. With one, the search has
+    /// to be redone per collection, against a value the attacker must first
+    /// obtain.
+    ///
+    /// It is not a secret from anyone who can read the collection, so it does
+    /// not defend against a reader. It defends against the case that actually
+    /// generalises: an attacker who can append but not read, and an attacker
+    /// who wants one key set to work against many targets.
+    ///
+    /// Zero means "unsalted" and is exactly a no-op, so collections written
+    /// before this existed chunk identically.
+    pub salt: u64,
 }
 
 impl Default for ChunkConfig {
@@ -132,11 +149,19 @@ impl Default for ChunkConfig {
             target_entries: DEFAULT_TARGET_ENTRIES,
             max_entries: MAX_ENTRIES_PER_CHUNK,
             min_entries: min_entries_for(DEFAULT_TARGET_ENTRIES),
+            salt: 0,
         }
     }
 }
 
 impl ChunkConfig {
+    /// Fix the salt. Participates in content addressing like every other
+    /// field here, so it is chosen once per collection and never changed.
+    pub fn with_salt(mut self, salt: u64) -> Self {
+        self.salt = salt;
+        self
+    }
+
     /// Smaller chunks, for tests that need multi-level trees without needing
     /// hundreds of thousands of entries.
     pub fn with_target(target: u32) -> Self {
@@ -144,6 +169,7 @@ impl ChunkConfig {
             target_entries: target,
             max_entries: (target as usize) * 4,
             min_entries: min_entries_for(target),
+            salt: 0,
         }
     }
 
@@ -162,7 +188,11 @@ impl ChunkConfig {
         }
         // The high bits of the fingerprint are the best mixed; use them so the
         // decision is independent of any low-bit structure in the input.
-        (fingerprint >> 40).is_multiple_of(self.target_entries as u64)
+        //
+        // XOR with the salt before selecting those bits, so which keys land on
+        // a boundary differs per collection. At salt 0 this is the identity,
+        // which is what keeps pre-salt collections chunking unchanged.
+        ((fingerprint ^ self.salt) >> 40).is_multiple_of(self.target_entries as u64)
     }
 }
 
