@@ -168,6 +168,51 @@ impl LakehouseLens {
     ///   - columns: Optional list of column names (None = all columns)
     ///
     /// Returns: Vec<(column_name, TypedColumn)>
+    /// As [`read_columns`](Self::read_columns), and also which values are null.
+    ///
+    /// `TypedColumn` is dense and has no way to say "no value here", so a null
+    /// arrives as the type's zero — indistinguishable from a zero the writer
+    /// actually meant. Callers that care about the difference need the mask;
+    /// `read_columns` is kept for those that do not, rather than changing a
+    /// signature every consumer of this lens depends on.
+    ///
+    /// Only engine-backed tables can report nulls. The legacy path has no
+    /// per-value null representation to read them from, so its masks are all
+    /// `None` — which is honest rather than a claim that no nulls exist.
+    #[allow(clippy::type_complexity)]
+    pub fn read_columns_with_nulls(
+        &self,
+        table_name: &str,
+        columns: Option<&[String]>,
+    ) -> Result<(Vec<(String, TypedColumn)>, Vec<Option<Vec<bool>>>), String> {
+        if pond_storage::definition::format_of(self.storage.kernel(), table_name)
+            != pond_storage::definition::Format::Engine
+        {
+            let cols = self.read_columns(table_name, columns)?;
+            let masks = vec![None; cols.len()];
+            return Ok((cols, masks));
+        }
+
+        let (all, all_masks) =
+            pond_storage::engine_path::read_rows_with_nulls(self.storage.kernel(), table_name)?;
+
+        let mut out_cols = Vec::new();
+        let mut out_masks = Vec::new();
+        for (i, (name, col)) in all.into_iter().enumerate() {
+            if name == "_rowid" || name == "_version" || name == "_deleted" {
+                continue;
+            }
+            if let Some(wanted) = columns {
+                if !wanted.contains(&name) {
+                    continue;
+                }
+            }
+            out_cols.push((name, col));
+            out_masks.push(all_masks.get(i).cloned().flatten());
+        }
+        Ok((out_cols, out_masks))
+    }
+
     pub fn read_columns(
         &self,
         table_name: &str,
@@ -179,17 +224,7 @@ impl LakehouseLens {
         if pond_storage::definition::format_of(self.storage.kernel(), table_name)
             == pond_storage::definition::Format::Engine
         {
-            let all = pond_storage::engine_path::read_rows(self.storage.kernel(), table_name)?;
-            return Ok(all
-                .into_iter()
-                .filter(|(name, _)| {
-                    name != "_rowid" && name != "_version" && name != "_deleted"
-                })
-                .filter(|(name, _)| match columns {
-                    Some(cols) => cols.contains(name),
-                    None => true,
-                })
-                .collect());
+            return Ok(self.read_columns_with_nulls(table_name, columns)?.0);
         }
 
         let active = self.storage.get_active_branch(table_name);
