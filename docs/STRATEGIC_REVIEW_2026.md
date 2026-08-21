@@ -2,7 +2,7 @@
 
 Written against the stated goal: *a universal, multi-workload, PB-scale storage
 system that behaves identically on local disk and object storage, needs no
-coordinator and no extra service, avoids CAS/if-not-exists boilerplate,
+sequencer and no extra service, avoids CAS/if-not-exists boilerplate,
 minimises backend round trips, and lets any application plug in on top.*
 
 ---
@@ -133,7 +133,7 @@ there.
 
 Three properties, and no existing system has all three:
 
-| System | No service to run | Multi-writer without coordination | Constant-depth metadata |
+| System | No service to run | Multi-writer without a sequencer | Constant-depth metadata |
 |---|---|---|---|
 | Iceberg / Delta | ✅ (with a catalog…) | ❌ catalog serialises commits | ❌ 4–5 RTTs, grows |
 | DuckLake | ❌ needs a database | ❌ database serialises | ✅ |
@@ -147,8 +147,18 @@ The unoccupied square is **all three at once**, and Pond has now measured all
 three. That is the claim worth building the product around:
 
 > **A storage substrate where any number of writers, anywhere, converge with no
-> coordinator, no catalog, no metadata service, and no conditional writes — at
+> sequencer, no catalog, no metadata service, and no conditional writes — at
 > constant metadata cost regardless of size.**
+
+State it as *sequencer-free*, never *coordination-free*. A writer that must PUT
+to the store is not available when partitioned from it, so the object store is
+a coordinator — and coordination-freeness is formally equivalent to
+availability under partition, which makes the stronger phrase false. What Pond
+removes is the coordinator it would otherwise have to **operate**. Every system
+in the comparison above runs one; Pond rents a linearizable namespace instead.
+The accurate claim is the differentiating one, so there is nothing to gain by
+overstating it — and a claim that contradicts a published impossibility result
+is worth less than none.
 
 The second differentiator follows from content addressing and is easy to
 under-sell: **the cache needs no coherence protocol.** Neon runs a pageserver
@@ -170,7 +180,7 @@ need one. Pond deliberately has none. What it does offer:
   its serialization point);
 - atomic multi-collection publish (already built, and now literally one object
   write);
-- coordination-free convergence **across** writers, with per-field merge.
+- sequencer-free convergence **across** writers, with per-field merge.
 
 This is worth stating carefully, because the obvious reading of it is wrong.
 It does **not** mean "no database can run on Pond" — see
@@ -268,7 +278,7 @@ Not "a better lakehouse" — that fight is ecosystem-bound and unwinnable. This:
 
 > **The storage substrate with no moving parts.** One copy of your data on
 > object storage, any workload, any number of writers worldwide, converging
-> without a coordinator — and nothing to deploy, scale, or page on.
+> without a sequencer — and nothing to deploy, scale, or page on.
 
 Every competitor above either runs a service or restricts you to one writer.
 That is the sentence, and Pond is now the only system that has measured it.

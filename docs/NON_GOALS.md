@@ -122,16 +122,26 @@ it must pass the 5-criterion Admission Rule. So far, none have passed.
 
 ## Multi-writer serializability on a single collection
 
-Pond has no serialization point, by design: no coordinator, no catalog, no
-conditional writes. That is what buys coordination-free convergence and
-identical behaviour on local disk and object storage.
+Pond has no serialization point of its own, by design: no coordinator, no
+catalog, no conditional writes. That is what buys convergence without a
+sequencer and identical behaviour on local disk and object storage.
+
+A precision worth keeping: this is **sequencer-free**, not coordination-free.
+A writer that must PUT to the store, and a reader that must GET from it, are
+not available when partitioned from it — so the object store *is* a
+coordinator, and by CALM's definition (coordination-freeness is equivalent to
+availability under partition) the stronger phrase is simply false. What Pond
+removes is the thing it would otherwise have to *operate*: a transactor, a
+catalog, a metadata service, a lease holder, a CAS loop on a hot pointer. It
+rents a linearizable namespace; it does not run one. That is the real and
+defensible claim, and it is not diminished by stating it accurately.
 
 What that does and does not rule out is worth stating precisely, because it is
 easy to overstate:
 
 - **Available:** serializable transactions *within a writer* — that writer's
   head is its serialization point, and it can offer any isolation level it
-  likes above that. Atomic multi-collection publish. Coordination-free
+  likes above that. Atomic multi-collection publish. Sequencer-free
   convergence *between* writers via per-field merge.
 - **Not available:** a *single* serial order agreed between two writers who
   are concurrently mutating the same key and who both need one of their
