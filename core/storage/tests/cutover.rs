@@ -535,3 +535,97 @@ fn spill_threshold_is_pinned_per_collection() {
         other => panic!("body column missing or wrong type: {:?}", other.is_some()),
     }
 }
+
+/// Branching is a pointer copy: the branch sees the source's rows, then the
+/// two diverge without either affecting the other.
+#[test]
+fn branching_shares_then_diverges() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "users").unwrap();
+    engine_path::write_rows(
+        &k,
+        "users",
+        &[("id", TypedColumn::Int64(vec![1, 2]))],
+        1,
+    )
+    .unwrap();
+
+    engine_path::branch(&k, "users", "users_v2", 1).unwrap();
+
+    let ids = |c: &str| -> Vec<i64> {
+        let columns = engine_path::read_rows(&k, c).unwrap();
+        match columns.iter().find(|(n, _)| n == "id") {
+            Some((_, TypedColumn::Int64(v))) => {
+                let mut v = v.clone();
+                v.sort();
+                v
+            }
+            _ => Vec::new(),
+        }
+    };
+
+    assert_eq!(ids("users_v2"), vec![1, 2], "the branch inherits the rows");
+
+    engine_path::write_rows(&k, "users_v2", &[("id", TypedColumn::Int64(vec![3]))], 1).unwrap();
+    assert_eq!(ids("users_v2"), vec![1, 2, 3]);
+    assert_eq!(ids("users"), vec![1, 2], "the source must not change");
+
+    engine_path::write_rows(&k, "users", &[("id", TypedColumn::Int64(vec![4]))], 1).unwrap();
+    assert_eq!(ids("users"), vec![1, 2, 4]);
+    assert_eq!(ids("users_v2"), vec![1, 2, 3], "the branch must not change");
+}
+
+/// A branch inherits the source's pinned configuration.
+///
+/// A branch that chunked differently from its source would share no nodes with
+/// it — which defeats the entire point, since sharing is what makes branching
+/// free.
+#[test]
+fn a_branch_inherits_the_source_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "users").unwrap();
+    engine_path::write_rows(&k, "users", &[("id", TypedColumn::Int64(vec![1]))], 1).unwrap();
+    engine_path::branch(&k, "users", "users_v2", 1).unwrap();
+
+    let src = definition::load(&k, "users");
+    let branched = definition::load(&k, "users_v2");
+    assert_eq!(branched.chunk_target, src.chunk_target);
+    assert_eq!(
+        branched.chunk_salt, src.chunk_salt,
+        "a different salt would place boundaries differently and share nothing"
+    );
+    assert_eq!(branched.spill_threshold, src.spill_threshold);
+    assert_eq!(branched.columns, src.columns, "the schema comes with it");
+}
+
+/// Branching refuses rather than doing something surprising.
+#[test]
+fn branching_refuses_bad_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "users").unwrap();
+    engine_path::write_rows(&k, "users", &[("id", TypedColumn::Int64(vec![1]))], 1).unwrap();
+    engine_path::create(&k, "taken").unwrap();
+
+    assert!(
+        engine_path::branch(&k, "users", "taken", 1).is_err(),
+        "must not silently overwrite an existing collection"
+    );
+    assert!(
+        engine_path::branch(&k, "absent", "x", 1).is_err(),
+        "must not branch a collection that does not exist"
+    );
+
+    // A legacy collection is not branchable through this path.
+    pond_storage::write::write_rows_no_crdt(
+        &k,
+        "old",
+        "main",
+        &[("id", TypedColumn::Int64(vec![7]))],
+        "seed",
+    )
+    .unwrap();
+    assert!(engine_path::branch(&k, "old", "old_v2", 1).is_err());
+}

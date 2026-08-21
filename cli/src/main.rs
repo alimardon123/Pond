@@ -214,6 +214,23 @@ fn main() {
                     cmd_read(&storage, &name_or_hash, output);
                 }
                 Commands::Branch { collection, branch_name } => {
+                    if pond_storage::definition::format_of(storage.kernel(), &collection)
+                        == pond_storage::definition::Format::Engine
+                    {
+                        match pond_storage::engine_path::branch(
+                            storage.kernel(),
+                            &collection,
+                            &branch_name,
+                            pond_kernel::crdt::stable_writer_id(),
+                        ) {
+                            Ok(()) => println!("{}\t<- {}", branch_name, collection),
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                        return;
+                    }
                     cmd_branch(&storage, &collection, &branch_name);
                 }
                 Commands::Checkout { collection, branch_name, new } => {

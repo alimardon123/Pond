@@ -154,6 +154,48 @@ pub fn delete_rows(
     Ok(count)
 }
 
+/// Branch a collection: a new name over the same tree.
+///
+/// O(1) whatever the size, because the tree is immutable and
+/// content-addressed — the branch shares every node until it diverges, and
+/// nothing is copied.
+///
+/// The root branched from is the *merged* one, not this writer's. Those differ
+/// exactly when more than one writer has published to the collection, and
+/// branching a partial view would silently produce a branch missing other
+/// writers' rows — the kind of wrong answer that looks like a correct one.
+pub fn branch(kernel: &PondKernel, from: &str, to: &str, writer_id: u64) -> Result<()> {
+    let def = definition::load(kernel, from);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", from));
+    }
+    if definition::load(kernel, to).format == Format::Engine {
+        return Err(format!("collection '{}' already exists", to));
+    }
+
+    let root = {
+        let mut reader = Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
+            .map_err(|e| format!("failed to open reader: {}", e))?;
+        if !reader.collections().iter().any(|c| c == from) {
+            return Err(format!("collection '{}' has nothing to branch from", from));
+        }
+        reader.root_of(from)
+    };
+
+    // The branch inherits the source's schema and its pinned configuration.
+    // A branch that chunked differently from its source would share no nodes
+    // with it, which would defeat the entire point of branching.
+    definition::store(kernel, to, &def)?;
+
+    let mut engine = open_engine(kernel, &def, writer_id)?;
+    engine
+        .branch_from_root(to, root)
+        .map_err(|e| format!("failed to branch: {}", e))?;
+    engine
+        .publish()
+        .map_err(|e| format!("failed to publish branch: {}", e))
+}
+
 /// Read an engine-backed collection as typed columns.
 ///
 /// The read merges every writer's view, so a collection written by four

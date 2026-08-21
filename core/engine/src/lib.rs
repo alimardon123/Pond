@@ -359,6 +359,17 @@ impl<S: ObjectStore> Engine<S> {
             .root_of(from)
             .ok_or_else(|| EngineError::NotFound(from.to_string()))?
             .to_string();
+        self.branch_from_root(to, root)
+    }
+
+    /// Branch a collection from an explicit root.
+    ///
+    /// The plain `branch` copies *this writer's* root, which is only the whole
+    /// collection when this writer is the only one. Branching what a reader
+    /// actually sees means branching the merged root — see
+    /// [`Reader::root_of`] — so the caller supplies it rather than the engine
+    /// silently branching a partial view.
+    pub fn branch_from_root(&mut self, to: &str, root: String) -> Result<()> {
         self.head.set_root(to, &root);
         self.staged.insert(
             to.to_string(),
