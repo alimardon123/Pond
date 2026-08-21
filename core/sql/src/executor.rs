@@ -1620,31 +1620,6 @@ fn build_typed_columns(
     result
 }
 
-/// Tiny base64 encoder (avoids pulling in a base64 crate dependency).
-fn simple_base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
 
 /// Generate a sortable, writer-unique identifier for shard names.
 ///
