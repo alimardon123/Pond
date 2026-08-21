@@ -40,6 +40,8 @@ jobs:
       # It carries ~120 lints including 9 never-used functions — real dead code
       # worth removing, but that file is 6k lines and is slated for rework, so
       # it is tracked separately rather than blocking this gate.
+      # The same gate developers run locally, so CI and a local check cannot
+      # disagree about what passing means.
       - name: Clippy
         run: |
           cargo clippy --workspace --exclude pond_python --all-targets -- \
