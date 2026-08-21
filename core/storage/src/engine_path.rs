@@ -213,6 +213,133 @@ pub fn branch(kernel: &PondKernel, from: &str, to: &str, writer_id: u64) -> Resu
         .map_err(|e| format!("failed to publish branch: {}", e))
 }
 
+/// Append rows whose integer keys are known to be greater than everything
+/// already stored — a log, a stream, an event sequence.
+///
+/// Skips the read-merge an update needs, because nothing can already be at
+/// these keys. That makes it the cheapest write the engine has: it touches the
+/// right-most leaf and its ancestor path only, whatever the collection holds.
+///
+/// The caller is responsible for the keys actually being new. Appending at a
+/// key that exists replaces the row rather than merging with it, which is the
+/// correct behaviour for a log and the wrong one for a table.
+pub fn append_binary_rows(
+    kernel: &PondKernel,
+    collection: &str,
+    key_column: &str,
+    keys: &[i64],
+    value_column: &str,
+    values: &[Vec<u8>],
+    writer_id: u64,
+) -> Result<()> {
+    if keys.len() != values.len() {
+        return Err(format!(
+            "append needs one value per key, got {} keys and {} values",
+            keys.len(),
+            values.len()
+        ));
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+
+    let physical = pond_kernel::crdt::current_time_ms();
+    let records: Vec<(pond_index::Key, pond_record::Record)> = keys
+        .iter()
+        .zip(values)
+        .enumerate()
+        .map(|(i, (k, v))| {
+            let version = pond_record::Version::new(physical, i as u64, writer_id);
+            let record = pond_record::Record::new()
+                .with_field(key_column, pond_record::Value::Int(*k), version)
+                .with_field(value_column, pond_record::Value::Bytes(v.clone()), version);
+            (pond_index::Key::new(vec![pond_index::int(*k)]), record)
+        })
+        .collect();
+
+    let mut engine = open_engine(kernel, &def, writer_id)?;
+    engine
+        .append_records(collection, records)
+        .map_err(|e| format!("failed to append: {}", e))?;
+    engine
+        .publish()
+        .map_err(|e| format!("failed to publish: {}", e))
+}
+
+/// Write one row at an explicit integer key, merging with whatever is there.
+///
+/// `write_rows` derives the key from `_rowid`, generating one when the caller
+/// supplies none — which is right for table rows and wrong for anything whose
+/// key *is* the data, like a stream offset or a well-known metadata slot. Those
+/// callers need the key they chose, not one invented for them.
+///
+/// Merges rather than replaces, so a field this call does not mention survives
+/// it, exactly as `write_rows` behaves.
+pub fn put_int_keyed_row(
+    kernel: &PondKernel,
+    collection: &str,
+    key: i64,
+    fields: &[(&str, pond_record::Value)],
+    writer_id: u64,
+) -> Result<()> {
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+
+    let physical = pond_kernel::crdt::current_time_ms();
+    let version = pond_record::Version::new(physical, 0, writer_id);
+    let mut record = pond_record::Record::new();
+    for (name, value) in fields {
+        record = record.with_field(name, value.clone(), version);
+    }
+
+    let mut engine = open_engine(kernel, &def, writer_id)?;
+    engine
+        .write_records(
+            collection,
+            vec![(pond_index::Key::new(vec![pond_index::int(key)]), record)],
+        )
+        .map_err(|e| format!("failed to stage row: {}", e))?;
+    engine
+        .publish()
+        .map_err(|e| format!("failed to publish: {}", e))
+}
+
+/// Read rows whose integer key falls in `[start, end)`.
+///
+/// The point of a range scan is that it reads the range and not the
+/// collection: a stream that wants its last megabyte should not pay for the
+/// terabyte before it.
+pub fn read_range(
+    kernel: &PondKernel,
+    collection: &str,
+    start: i64,
+    end: i64,
+) -> Result<Vec<std::collections::BTreeMap<String, pond_record::Value>>> {
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+    let mut reader = Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
+        .map_err(|e| format!("failed to open reader: {}", e))?;
+    let rows = reader
+        .scan_range(
+            collection,
+            &pond_index::Key::new(vec![pond_index::int(start)]),
+            &pond_index::Key::new(vec![pond_index::int(end)]),
+        )
+        .map_err(|e| format!("failed to scan range: {}", e))?;
+    Ok(rows
+        .into_iter()
+        .map(|(_, rec)| crate::columnar::record_to_map(&rec))
+        .collect())
+}
+
 /// Read an engine-backed collection as typed columns.
 ///
 /// The read merges every writer's view, so a collection written by four

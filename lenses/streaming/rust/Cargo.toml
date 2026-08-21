@@ -12,6 +12,8 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [dependencies]
 pond_kernel = { path = "../../../core/kernel" }
 pond_storage = { path = "../../../core/storage" }
+pond_core = { path = "../../../core/codec" }
+pond_record = { path = "../../../core/record" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

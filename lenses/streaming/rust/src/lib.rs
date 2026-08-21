@@ -21,6 +21,8 @@ use pond_storage::{write as storage_write, read as storage_read};
 use serde_json::{Value, json};
 use std::sync::Mutex;
 
+pub mod engine_stream;
+
 /// Default segment size: 1 MB. Good for most streaming workloads.
 pub const DEFAULT_SEGMENT_SIZE: usize = 1024 * 1024;
 
