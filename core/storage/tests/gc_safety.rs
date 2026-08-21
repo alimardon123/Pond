@@ -1,0 +1,152 @@
+// gc_safety.rs — garbage collection must never delete live data.
+//
+// GC is the one operation where being wrong is unrecoverable. Everything else
+// can be retried, re-read, or rolled forward; a deleted blob is gone.
+//
+// It got this wrong. A legacy ref holds `{"hash":"..."}` and `kernel.resolve`
+// reads it; an engine head holds its bytes directly, so `resolve` returned
+// `None` and the engine's index nodes and spilled values never entered the
+// live set. `pond gc` then deleted them. Measured before the fix: two rows
+// before, zero after — silent, total data loss.
+//
+// These tests exist so that any future way of reaching data has to be added to
+// the live-set walk before it can ship.
+
+use pond_core::encode::TypedColumn;
+use pond_kernel::PondKernel;
+use pond_storage::maintenance::GarbageCollector;
+use pond_storage::engine_path;
+
+fn kernel(dir: &std::path::Path) -> PondKernel {
+    PondKernel::new_local(dir).unwrap()
+}
+
+fn rows_of(k: &PondKernel, collection: &str) -> Vec<i64> {
+    let columns = engine_path::read_rows(k, collection).expect("read");
+    match columns.iter().find(|(n, _)| n == "id") {
+        Some((_, TypedColumn::Int64(v))) => {
+            let mut v = v.clone();
+            v.sort();
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The headline: an engine collection survives garbage collection.
+#[test]
+fn gc_does_not_delete_engine_collections() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = kernel(dir.path());
+
+    engine_path::create(&s, "users").unwrap();
+    engine_path::write_rows(
+        &s,
+        "users",
+        &[
+            ("id", TypedColumn::Int64(vec![1, 2, 3])),
+            (
+                "name",
+                TypedColumn::String(vec!["ada".into(), "grace".into(), "alan".into()]),
+            ),
+        ],
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(rows_of(&s, "users"), vec![1, 2, 3]);
+
+    let gc = GarbageCollector::new(&s);
+    gc.vacuum(None, 0, false); // VacuumResult, not a Result
+
+    assert_eq!(
+        rows_of(&s, "users"),
+        vec![1, 2, 3],
+        "garbage collection deleted live engine data"
+    );
+}
+
+/// The subtler half: a value large enough to be spilled lives in its own blob,
+/// reachable only from inside an index leaf. A walk that stopped at the leaf
+/// would collect the leaf and delete the value it points at — leaving a tree
+/// that decodes and a row that cannot be read.
+#[test]
+fn gc_does_not_delete_spilled_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = kernel(dir.path());
+    let big = "x".repeat(64 * 1024);
+
+    engine_path::create(&s, "docs").unwrap();
+    engine_path::write_rows(
+        &s,
+        "docs",
+        &[
+            ("id", TypedColumn::Int64(vec![1])),
+            ("body", TypedColumn::String(vec![big.clone()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    let gc = GarbageCollector::new(&s);
+    gc.vacuum(None, 0, false); // VacuumResult, not a Result
+
+    let columns = engine_path::read_rows(&s, "docs").expect("read after gc");
+    match columns.iter().find(|(n, _)| n == "body") {
+        Some((_, TypedColumn::String(v))) => assert_eq!(
+            v,
+            &vec![big],
+            "the spilled value was collected as garbage"
+        ),
+        _ => panic!("body column is gone after gc"),
+    }
+}
+
+/// Both kinds of collection in one store, and both must survive.
+#[test]
+fn gc_preserves_legacy_and_engine_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = kernel(dir.path());
+
+    pond_storage::write::write_rows_no_crdt(
+        &s,
+        "old",
+        "main",
+        &[("id", TypedColumn::Int64(vec![9]))],
+        "seed",
+    )
+    .unwrap();
+
+    engine_path::create(&s, "new").unwrap();
+    engine_path::write_rows(&s, "new", &[("id", TypedColumn::Int64(vec![1]))], 1)
+        .unwrap();
+
+    let gc = GarbageCollector::new(&s);
+    gc.vacuum(None, 0, false); // VacuumResult, not a Result
+
+    assert_eq!(rows_of(&s, "new"), vec![1]);
+    assert!(
+        !pond_storage::read::read(&s, "old", "main")
+            .unwrap()
+            .is_empty(),
+        "the legacy collection was collected"
+    );
+}
+
+/// Running GC twice must be safe, and the second run must find nothing new to
+/// delete from live data.
+#[test]
+fn gc_is_idempotent_over_engine_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = kernel(dir.path());
+
+    engine_path::create(&s, "users").unwrap();
+    engine_path::write_rows(&s, "users", &[("id", TypedColumn::Int64(vec![1, 2]))], 1)
+        .unwrap();
+
+    let gc = GarbageCollector::new(&s);
+    gc.vacuum(None, 0, false); 
+    gc.vacuum(None, 0, false); 
+
+    assert_eq!(rows_of(&s, "users"), vec![1, 2]);
+}

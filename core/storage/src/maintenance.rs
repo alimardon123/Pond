@@ -386,7 +386,82 @@ impl<'a> GarbageCollector<'a> {
             }
         }
 
+        // Engine-backed collections are reached differently and were, until
+        // this existed, not reached at all.
+        //
+        // A legacy ref holds `{"hash":"..."}` and `kernel.resolve` reads it. An
+        // engine head holds its bytes directly, so `resolve` returns `None` for
+        // it — which meant every engine index node and every spilled value was
+        // absent from the live set, and therefore deleted. Verified before the
+        // fix: two rows before `pond gc`, zero after. Silent, total data loss.
+        //
+        // GC is the one operation where being wrong is unrecoverable, so it
+        // has to know about every way data is reachable, not just the ways it
+        // was written to know about.
+        self.walk_engine_heads(&mut live);
+
         live
+    }
+
+    /// Add everything reachable from every writer's engine head.
+    ///
+    /// Reachability here is: head → per-collection root → index nodes →
+    /// spilled values. All four levels must be walked; missing any one of them
+    /// deletes live data.
+    fn walk_engine_heads(&self, live: &mut HashSet<String>) {
+        let store = self.kernel.store_handle();
+        let heads = match store.list_paths("heads/") {
+            Ok(h) => h,
+            // A listing that failed must not be read as "there are no heads".
+            // Erring toward keeping blobs is the only safe direction here.
+            Err(_) => return,
+        };
+
+        for head_path in heads {
+            let Some(bytes) = store.get_object(&head_path) else {
+                continue;
+            };
+            let Some(head) = pond_record::decode_head(&bytes) else {
+                continue;
+            };
+            for root in head.collections.values() {
+                self.walk_index_node(&store, root, live);
+            }
+        }
+    }
+
+    /// Walk one index node, its children, and any values it spills.
+    fn walk_index_node(
+        &self,
+        store: &std::sync::Arc<dyn pond_kernel::ObjectStore>,
+        hash: &str,
+        live: &mut HashSet<String>,
+    ) {
+        if !live.insert(hash.to_string()) {
+            return; // already visited
+        }
+        let Ok(bytes) = store.get_blob(hash) else {
+            return;
+        };
+        let Some(node) = pond_index::Node::decode(&bytes) else {
+            return;
+        };
+        match node {
+            pond_index::Node::Internal { children } => {
+                for c in &children {
+                    self.walk_index_node(store, &c.hash, live);
+                }
+            }
+            pond_index::Node::Leaf { entries } => {
+                // A value may be a pointer to a spilled blob rather than the
+                // record itself. That blob is live too.
+                for (_, value) in &entries {
+                    if let Some(target) = pond_engine::spill::pointer_target(value) {
+                        live.insert(target.to_string());
+                    }
+                }
+            }
+        }
     }
 
     /// Walk all blobs reachable from a starting hash.
