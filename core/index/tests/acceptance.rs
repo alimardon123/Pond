@@ -543,11 +543,18 @@ fn versions_share_nearly_all_nodes() {
         100.0 * new_nodes as f64 / nodes_before as f64
     );
     assert_ne!(updated.root, tree.root);
+    // The invariant is O(depth), not a fraction of the tree. Expressing it as
+    // a percentage made it depend on how many nodes the tree happens to have,
+    // so a *shallower* tree — strictly better, fewer nodes rewritten in
+    // absolute terms — could fail it. What must hold is that the rewrite is
+    // bounded by the path from root to leaf and does not grow with the data.
+    let depth = updated.depth(&store);
     assert!(
-        new_nodes < nodes_before / 20,
-        "a one-row insert rewrote {} of {} nodes; versions should share nearly everything",
+        new_nodes <= depth,
+        "a one-row insert rewrote {} nodes for a tree of depth {}; \
+         only the leaf and its ancestors should change",
         new_nodes,
-        nodes_before
+        depth
     );
 }
 

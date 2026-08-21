@@ -433,3 +433,54 @@ fn a_later_write_resurrects_a_deleted_row() {
     };
     assert_eq!(ids, vec![99], "a write newer than the tombstone wins");
 }
+
+/// A collection keeps the chunk configuration it was created with.
+///
+/// The chunk target decides where boundaries fall, so it decides every node
+/// hash and therefore the root. If a collection read the current default
+/// instead of its own pinned value, tuning that default would rechunk existing
+/// collections on their next write — still correct, but no longer
+/// byte-identical to a rebuild, which is what structural sharing and
+/// deterministic merge depend on.
+#[test]
+fn chunk_config_is_pinned_per_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "users").unwrap();
+
+    let def = definition::load(&k, "users");
+    assert_eq!(
+        def.chunk_target,
+        pond_index::DEFAULT_TARGET_ENTRIES,
+        "a new collection is created with the current default"
+    );
+
+    // A definition written by an older version, before the target was stored,
+    // must read back as the value that version actually used — not as today's
+    // default.
+    let v1 = {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PDEF");
+        bytes.push(1); // version 1
+        bytes.push(2); // Format::Engine
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // no columns
+        bytes
+    };
+    let decoded = definition::Definition::decode(&v1).expect("v1 must still decode");
+    assert_eq!(decoded.format, Format::Engine);
+    assert_eq!(
+        decoded.chunk_target,
+        definition::LEGACY_CHUNK_TARGET,
+        "a v1 collection must keep chunking the way it always did"
+    );
+
+    // And the pinned value survives a write that extends the schema.
+    engine_path::write_rows(
+        &k,
+        "users",
+        &[("id", TypedColumn::Int64(vec![1]))],
+        1,
+    )
+    .unwrap();
+    assert_eq!(definition::load(&k, "users").chunk_target, def.chunk_target);
+}

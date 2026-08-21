@@ -31,13 +31,36 @@
 // default target it fires rarely, and the history-independence test in
 // `tree.rs` is what actually verifies the combination behaves.
 
-/// Target average number of entries per chunk.
+/// Target average number of entries per chunk, for collections created from
+/// now on. Existing collections keep whatever they were created with — see
+/// `pond_storage::definition`.
 ///
-/// Chosen so an internal node holds a few hundred children: at ~80 bytes per
-/// index entry, 512 entries is roughly a 40 KB node, which is a sensible unit
-/// for one ranged GET against object storage. Fanout of this order is what
-/// keeps the tree 2 levels deep from a gigabyte to a petabyte.
-pub const DEFAULT_TARGET_ENTRIES: u32 = 512;
+/// On a local disk the right node size is about a page, and the trade is the
+/// familiar one: bigger nodes mean fewer levels but more bytes touched per
+/// write. On object storage that trade inverts, because the cost of a read is
+/// a *request*, not a byte:
+///
+///   * a GET is billed per request, and a ranged GET is billed identically to
+///     a full one, so a 256 KB node costs exactly what a 64 KB node costs;
+///   * latency is roughly a fixed base plus a per-byte term, and at these
+///     sizes the base dominates — the extra 190 KB adds a few milliseconds to
+///     a request that already costs tens;
+///   * depth is the number of *dependent* round trips, and those cannot be
+///     overlapped, because each level names the next.
+///
+/// So a level saved is worth far more than the bytes it costs. Measured on
+/// 4 M entries of ~100 bytes (`cargo run -p pond_bench --bin nodesize`):
+///
+/// | target | depth | avg node | bytes rewritten per insert |
+/// |---|---|---|---|
+/// | 512  | 3 | 65 KB  | 195 KB |
+/// | 2048 | 2 | 256 KB | 511 KB |
+///
+/// One fewer dependent round trip, for 2.6x the bytes on a write — and the
+/// *number* of writes falls too, since an insert rewrites `depth` nodes. The
+/// expensive axis gets cheaper and the cheap axis gets more expensive, which
+/// is the trade worth making here.
+pub const DEFAULT_TARGET_ENTRIES: u32 = 2048;
 
 /// Hard cap on entries per chunk, so a run without a boundary hit cannot
 /// produce an unbounded node.
@@ -47,9 +70,19 @@ pub const MAX_ENTRIES_PER_CHUNK: usize = 4 * DEFAULT_TARGET_ENTRIES as usize;
 /// one-entry nodes (which would destroy fanout and blow up depth).
 pub const MIN_ENTRIES_PER_CHUNK: usize = 2;
 
-/// Chunking parameters. These participate in content addressing — changing
-/// them changes every hash — so they are fixed per index at creation and
-/// recorded in the root, never adjusted at runtime.
+/// Chunking parameters.
+///
+/// These participate in content addressing: they decide where boundaries fall,
+/// so they decide every node hash and therefore the root. A collection must
+/// therefore keep the values it was created with for life — reading them from
+/// a constant would mean that tuning the constant rechunks existing
+/// collections on their next write, producing trees that are still correct but
+/// no longer byte-identical to a rebuild, which is exactly what structural
+/// sharing and deterministic merge depend on.
+///
+/// They are persisted per collection in the collection definition
+/// (`pond_storage::definition::Definition::chunk_target`), and never adjusted
+/// at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkConfig {
     pub target_entries: u32,

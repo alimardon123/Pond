@@ -1732,6 +1732,7 @@ name = "pond_storage"
 version = "0.3.0"
 dependencies = [
  "criterion",
+ "pond_cache",
  "pond_core",
  "pond_engine",
  "pond_index",

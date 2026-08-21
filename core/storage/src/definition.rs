@@ -59,23 +59,52 @@ impl Format {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Definition {
     pub format: Format,
+    /// Target entries per index chunk, pinned at creation.
+    ///
+    /// This participates in content addressing: it decides where chunk
+    /// boundaries fall, so it decides every node hash and therefore the root.
+    /// It has to be stored rather than read from a constant, because a later
+    /// change to that constant would rechunk an existing collection on its
+    /// next insert — producing a tree that is still correct but no longer
+    /// byte-identical to a rebuild, silently losing the structural sharing and
+    /// the deterministic-merge property that the whole design rests on.
+    ///
+    /// Pinned per collection, so the default can be tuned for new collections
+    /// without touching a single existing one.
+    pub chunk_target: u32,
     /// `(column name, PND2 value type)`, in declaration order.
     pub columns: Vec<(String, u8)>,
 }
 
 const MAGIC: &[u8; 4] = b"PDEF";
-const VERSION: u8 = 1;
+
+/// v1 had no `chunk_target`; it is read back as [`LEGACY_CHUNK_TARGET`].
+const VERSION_V1: u8 = 1;
+const VERSION: u8 = 2;
+
+/// What v1 definitions were built with, and what they must keep using.
+pub const LEGACY_CHUNK_TARGET: u32 = 512;
 
 impl Definition {
     pub fn new(format: Format) -> Self {
         Self {
             format,
+            chunk_target: pond_index::DEFAULT_TARGET_ENTRIES,
             columns: Vec::new(),
         }
     }
 
     pub fn with_columns(format: Format, columns: Vec<(String, u8)>) -> Self {
-        Self { format, columns }
+        Self {
+            format,
+            chunk_target: pond_index::DEFAULT_TARGET_ENTRIES,
+            columns,
+        }
+    }
+
+    /// The chunk configuration this collection was created with.
+    pub fn chunk_config(&self) -> pond_index::ChunkConfig {
+        pond_index::ChunkConfig::with_target(self.chunk_target)
     }
 
     /// Declared type of a column, if the definition names it.
@@ -112,6 +141,7 @@ impl Definition {
         out.extend_from_slice(MAGIC);
         out.push(VERSION);
         out.push(self.format.tag());
+        out.extend_from_slice(&self.chunk_target.to_le_bytes());
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for (name, vtype) in &self.columns {
             let bytes = name.as_bytes();
@@ -126,14 +156,34 @@ impl Definition {
     /// version understands. A caller that gets `None` must treat the
     /// collection as legacy rather than assume a format.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 10 || &bytes[..4] != MAGIC || bytes[4] != VERSION {
+        if bytes.len() < 10 || &bytes[..4] != MAGIC {
             return None;
         }
         let format = Format::from_tag(bytes[5])?;
-        let count = u32::from_le_bytes(bytes[6..10].try_into().ok()?) as usize;
+
+        // v1 carried no chunk target. Reading it back as the value v1 was
+        // built with is what keeps those collections rechunking identically.
+        let (chunk_target, mut pos) = match bytes[4] {
+            VERSION_V1 => (LEGACY_CHUNK_TARGET, 6usize),
+            VERSION => {
+                if bytes.len() < 14 {
+                    return None;
+                }
+                (u32::from_le_bytes(bytes[6..10].try_into().ok()?), 10usize)
+            }
+            _ => return None,
+        };
+        if chunk_target == 0 {
+            return None;
+        }
+
+        if pos + 4 > bytes.len() {
+            return None;
+        }
+        let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
 
         let mut columns = Vec::with_capacity(count.min(1024));
-        let mut pos = 10usize;
         for _ in 0..count {
             if pos + 4 > bytes.len() {
                 return None;
@@ -149,7 +199,11 @@ impl Definition {
             pos += 1;
             columns.push((name, vtype));
         }
-        Some(Self { format, columns })
+        Some(Self {
+            format,
+            chunk_target,
+            columns,
+        })
     }
 }
 

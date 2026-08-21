@@ -104,8 +104,7 @@ pub fn write_rows(
     let physical = pond_kernel::crdt::current_time_ms();
     let records = columns_to_records(columns, writer_id, physical);
 
-    let mut engine = Engine::open(store_of(kernel), writer_id)
-        .map_err(|e| format!("failed to open engine: {}", e))?;
+    let mut engine = open_engine(kernel, &def, writer_id)?;
     engine
         .write_records(collection, records)
         .map_err(|e| format!("failed to stage records: {}", e))?;
@@ -131,13 +130,12 @@ pub fn delete_rows(
     if rowids.is_empty() {
         return Ok(0);
     }
-    if definition::load(kernel, collection).format != Format::Engine {
+    let physical = pond_kernel::crdt::current_time_ms();
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
         return Err(format!("collection '{}' is not engine-backed", collection));
     }
-
-    let physical = pond_kernel::crdt::current_time_ms();
-    let mut engine = Engine::open(store_of(kernel), writer_id)
-        .map_err(|e| format!("failed to open engine: {}", e))?;
+    let mut engine = open_engine(kernel, &def, writer_id)?;
 
     let mut records = Vec::with_capacity(rowids.len());
     for (i, id) in rowids.iter().enumerate() {
@@ -167,8 +165,12 @@ pub fn read_rows(kernel: &PondKernel, collection: &str) -> Result<Vec<(String, T
         return Err(format!("collection '{}' is not engine-backed", collection));
     }
 
-    let mut reader = Reader::open(store_of(kernel))
-        .map_err(|e| format!("failed to open reader: {}", e))?;
+    let mut reader = Reader::open_with(
+        store_of(kernel),
+        pond_cache_config(),
+        def.chunk_config(),
+    )
+    .map_err(|e| format!("failed to open reader: {}", e))?;
     let records = reader
         .scan(collection)
         .map_err(|e| format!("failed to scan: {}", e))?;
@@ -191,4 +193,29 @@ pub fn read_pnd2(kernel: &PondKernel, collection: &str) -> Result<Vec<u8>> {
 /// both see the same store and the same cache.
 fn store_of(kernel: &PondKernel) -> std::sync::Arc<dyn ObjectStore> {
     kernel.store_handle()
+}
+
+fn pond_cache_config() -> pond_cache::CacheConfig {
+    pond_cache::CacheConfig::default()
+}
+
+/// Open an engine using the chunk configuration this collection was created
+/// with, not the current default.
+///
+/// The two differ as soon as the default is tuned, and using the wrong one
+/// would rechunk the collection on its next write: still a correct tree, but
+/// no longer byte-identical to a rebuild, which is what structural sharing and
+/// deterministic merge depend on.
+fn open_engine(
+    kernel: &PondKernel,
+    def: &Definition,
+    writer_id: u64,
+) -> Result<Engine<std::sync::Arc<dyn ObjectStore>>> {
+    Engine::open_with(
+        store_of(kernel),
+        writer_id,
+        pond_cache_config(),
+        def.chunk_config(),
+    )
+    .map_err(|e| format!("failed to open engine: {}", e))
 }

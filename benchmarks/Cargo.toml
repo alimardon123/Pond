@@ -14,6 +14,10 @@ path = "src/r2_validation.rs"
 name = "r2_pagination"
 path = "src/r2_pagination.rs"
 
+[[bin]]
+name = "nodesize"
+path = "src/nodesize.rs"
+
 [dependencies]
 pond_index = { path = "../core/index" }
 pond_record = { path = "../core/record" }

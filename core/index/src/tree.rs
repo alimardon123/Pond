@@ -460,6 +460,25 @@ fn chunk_level<S: NodeStore>(
     level: Vec<ChildRef>,
     config: ChunkConfig,
 ) -> Vec<ChildRef> {
+    // A level small enough to fit in one node is never worth splitting.
+    //
+    // Boundaries are a coin flip with probability 1/target per child, so near
+    // the top of the tree — where a level holds far fewer than `target`
+    // children — the expected number of boundaries is well under one. When one
+    // fires anyway it does not divide the level usefully; it just inserts a
+    // level, and a level is a dependent round trip that cannot be parallelised
+    // because each node names the next. Measured: a 128-child level at
+    // target 8192 split in two, turning a 2-deep tree into a 3-deep one.
+    //
+    // Collapsing is still history-independent. The decision is a function of
+    // the level's contents alone — the same set of children always produces
+    // the same answer — which is the property that matters, not whether a hash
+    // was consulted. Two writers who converge on the same data still converge
+    // on the same bytes.
+    if level.len() <= config.target_entries as usize {
+        return write_level(store, vec![Node::Internal { children: level }]);
+    }
+
     let mut pending: Vec<Node> = Vec::new();
     let mut current: Vec<ChildRef> = Vec::new();
     for child in level {
