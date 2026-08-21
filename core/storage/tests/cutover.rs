@@ -1034,3 +1034,88 @@ fn sealing_a_batch_does_not_fetch_a_key_per_row() {
         ROWS
     );
 }
+
+/// Keys must be able to live somewhere other than the data store.
+///
+/// Erasure is exactly as complete as the destruction of the last copy of the
+/// key. Keys held in the data store are copied by every backup, snapshot and
+/// replica of the data — and restoring one undoes every erasure since it was
+/// taken. The keystore is a few bytes per subject precisely so it can live
+/// somewhere with a retention policy of its own.
+#[test]
+fn keys_can_be_held_apart_from_the_data() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let keys_dir = tempfile::tempdir().unwrap();
+
+    let keystore: std::sync::Arc<dyn pond_kernel::ObjectStore> = std::sync::Arc::new(
+        pond_kernel::LocalFSObjectStore::new(keys_dir.path()).unwrap(),
+    );
+    let k = pond_kernel::PondKernel::new_local(data_dir.path())
+        .unwrap()
+        .with_keystore(keystore);
+    assert!(k.keystore_is_separate());
+
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            ("owner", TypedColumn::String(vec!["alice".into()])),
+            ("note", TypedColumn::String(vec!["secret".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    // The key is in the key store, and nowhere in the data store.
+    let has_keys = |root: &std::path::Path| -> bool {
+        walkdir(root)
+            .iter()
+            .any(|p| p.to_string_lossy().contains("keys/subject-"))
+    };
+    assert!(has_keys(keys_dir.path()), "the key should be in the keystore");
+    assert!(
+        !has_keys(data_dir.path()),
+        "a key in the data store is copied by every backup of the data"
+    );
+
+    // And it still works.
+    let columns = engine_path::read_rows(&k, "people").unwrap();
+    match columns.iter().find(|(n, _)| n == "note") {
+        Some((_, TypedColumn::String(v))) => assert_eq!(v, &vec!["secret".to_string()]),
+        _ => panic!("note column missing"),
+    }
+}
+
+/// An erasure must leave a record that survives it.
+#[test]
+fn an_erasure_is_auditable_afterwards() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            ("owner", TypedColumn::String(vec!["alice".into()])),
+            ("note", TypedColumn::String(vec!["secret".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    assert!(!pond_storage::subject::was_erased(&k, "alice").unwrap());
+
+    pond_storage::subject::erase_subject_for(&k, "alice", "ticket-42").unwrap();
+
+    assert!(
+        pond_storage::subject::was_erased(&k, "alice").unwrap(),
+        "the erasure must be provable afterwards"
+    );
+    assert!(!pond_storage::subject::was_erased(&k, "bob").unwrap());
+
+    let log = pond_storage::subject::erasure_log(&k).unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].requested_by, "ticket-42");
+    assert!(log[0].key_existed);
+}

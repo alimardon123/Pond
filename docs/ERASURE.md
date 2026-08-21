@@ -188,6 +188,60 @@ erased with the one it actually belongs to.
 
 ---
 
+## Keeping the keys elsewhere
+
+Erasure is exactly as complete as the destruction of the last copy of the key.
+Keys held in the data store are copied by every backup, snapshot and replica of
+the data — and restoring one undoes every erasure performed since it was taken.
+
+```rust
+let keystore: Arc<dyn ObjectStore> = Arc::new(LocalFSObjectStore::new("/secure/keys")?);
+let kernel = PondKernel::new_local("/data")?.with_keystore(keystore);
+assert!(kernel.keystore_is_separate());
+```
+
+The keystore is a few bytes per subject precisely so it can live somewhere with
+a retention policy of its own. A deployment that must be able to *prove*
+erasure should check `keystore_is_separate()` at startup and refuse to run if
+it is false, rather than discover after a restore that the keys came back with
+the data.
+
+The default is the data store, which is right for a single-machine pond and
+wrong for anything with a backup schedule.
+
+---
+
+## Proving it happened
+
+Absence is not evidence: erased data looks the same as data that never
+existed. So erasure writes an append-only record.
+
+```rust
+subject::erase_subject_for(&kernel, "alice@example.com", "ticket-42")?;
+subject::was_erased(&kernel, "alice@example.com")?;   // true
+subject::erasure_log(&kernel)?;                        // every entry, oldest first
+```
+
+**The log does not contain subject ids.** A log naming erased subjects is a
+directory of erased people, retained after their data was destroyed — the
+opposite of what the erasure was for, and for an id that is itself personal
+data (an email, a customer number) it would retain exactly what was supposed to
+go.
+
+Entries record a **salted hash** of the id instead. That answers the question
+actually asked — *"was this subject erased?"*, by someone who already holds the
+id — and does not let anyone enumerate who was. The salt is per-store, because
+an unsalted hash of a low-entropy id is reversed by guessing, and because a log
+from one deployment must not identify subjects in another.
+
+The entry is written **after** the key is destroyed. Reversed, a failed
+destruction would leave the log claiming an erasure that did not happen — and a
+log that overstates is worse than one that lags, because the second is
+discoverable and the first is believed. A repeated request is recorded again
+rather than overwriting the first: asking twice is itself a fact.
+
+---
+
 ## What leaks anyway
 
 Worth stating, because encryption invites the assumption that nothing does.
@@ -195,9 +249,8 @@ Worth stating, because encryption invites the assumption that nothing does.
 - **Column names.** A column called `hiv_status` discloses by existing. Sealing
   protects values, not the schema.
 - **Value lengths.** Ciphertext is the length of its plaintext plus a fixed
-  overhead, so a short value is visibly short. This is ordinary for
-  authenticated encryption and is only worth padding against when the length
-  itself is the secret.
+  overhead. Ordinary for authenticated encryption, and only worth padding
+  against when the length itself is the secret.
 - **Row counts and which subjects exist.** The subject column is in the clear
   by design, so how many rows a subject has is visible to anyone who can read
   the collection.
@@ -208,15 +261,11 @@ Worth stating, because encryption invites the assumption that nothing does.
 
 ## What is still missing
 
-1. **Keystore durability separated from data durability.** Keys live in the
-   same object store as the data today. That is the wrong place for the reason
-   stated above: a backup of the keystore that outlives an erasure undoes it.
-   The keystore is small precisely so it can be held somewhere with real
-   deletion, and it should be.
-2. **An erasure audit log** — what was erased, when, on whose request. Usually
-   required alongside the erasure itself.
-3. **Key rotation.** A subject's key is created once and never changes. Rotating
-   it would require re-sealing their rows, which is a rewrite rather than a
-   pointer change.
-4. **Erasure through the CLI and the bindings.** Reachable from the Rust API
+1. **Key rotation.** A subject's key is created once and never changes.
+   Rotating it means re-sealing that subject's rows, which is a rewrite rather
+   than a pointer change.
+2. **Erasure through the CLI and the bindings.** Reachable from the Rust API
    only.
+3. **A startup check.** `keystore_is_separate()` exists; nothing calls it. A
+   deployment that must prove erasure should refuse to start without it, and
+   that policy is not expressible in configuration yet.

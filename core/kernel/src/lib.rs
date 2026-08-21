@@ -86,6 +86,22 @@ pub struct PondKernel {
     /// accumulate every hash it ever wrote. Forgetting is always safe — it
     /// costs one HEAD, which is exactly what happened before this existed.
     written: Mutex<std::collections::HashSet<String>>,
+    /// Where subject keys live, when that is not the data store.
+    ///
+    /// Erasure works by destroying a key, so it is exactly as complete as the
+    /// destruction of the last copy of that key. Keeping keys in the same
+    /// store as the data means every backup, snapshot and replica of the data
+    /// is also a backup of the keys — and restoring one undoes every erasure
+    /// performed since it was taken.
+    ///
+    /// The keystore is a few bytes per subject precisely so that it can live
+    /// somewhere with real deletion and a retention policy of its own. This
+    /// field is how a deployment says where.
+    ///
+    /// `None` means the data store, which is the right default for a
+    /// single-machine pond and the wrong one for anything with a backup
+    /// schedule.
+    keystore: Option<Arc<dyn ObjectStore>>,
 }
 
 /// How many recently written hashes to remember.
@@ -110,6 +126,7 @@ impl PondKernel {
             store: Arc::new(store),
             stats: Mutex::new(KernelStats::default()),
             written: Mutex::new(std::collections::HashSet::new()),
+            keystore: None,
         })
     }
 
@@ -119,6 +136,7 @@ impl PondKernel {
             store: Arc::from(store),
             stats: Mutex::new(KernelStats::default()),
             written: Mutex::new(std::collections::HashSet::new()),
+            keystore: None,
         }
     }
 
@@ -224,6 +242,33 @@ impl PondKernel {
     /// two independent stores over one bucket would double both.
     pub fn store_handle(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Put subject keys somewhere other than the data store.
+    ///
+    /// See [`keystore`](Self::keystore) for why that matters: a keystore
+    /// backed up alongside the data is a keystore whose restore undoes every
+    /// erasure since the backup.
+    pub fn with_keystore(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        self.keystore = Some(store);
+        self
+    }
+
+    /// Is the keystore held separately from the data?
+    ///
+    /// A deployment that must be able to prove erasure should check this and
+    /// refuse to start if it is false, rather than discover after a restore
+    /// that the keys came back with the data.
+    pub fn keystore_is_separate(&self) -> bool {
+        self.keystore.is_some()
+    }
+
+    /// The store subject keys live in.
+    pub fn keystore_handle(&self) -> Arc<dyn ObjectStore> {
+        match &self.keystore {
+            Some(s) => Arc::clone(s),
+            None => Arc::clone(&self.store),
+        }
     }
 
     /// Write bytes under a name, replacing whatever was there.

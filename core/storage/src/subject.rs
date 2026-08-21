@@ -69,7 +69,7 @@ struct Keys<'a> {
 impl Keys<'_> {
     fn new(kernel: &PondKernel) -> Self {
         Self {
-            store: KeyStore::new(kernel.store_handle()),
+            store: KeyStore::new(kernel.keystore_handle()),
             cache: std::collections::HashMap::new(),
             _kernel: std::marker::PhantomData,
         }
@@ -212,14 +212,56 @@ fn open_one(
 /// Returns whether there was a key to destroy. Erasing twice is not an error —
 /// a deletion request that arrives again must not fail.
 pub fn erase_subject(kernel: &PondKernel, subject: &str) -> Result<bool, String> {
-    KeyStore::new(kernel.store_handle())
+    erase_subject_for(kernel, subject, "unspecified")
+}
+
+/// Erase a subject, recording who asked.
+///
+/// The audit entry is written **after** the key is destroyed, deliberately. If
+/// the order were reversed and the destruction then failed, the log would
+/// claim an erasure that did not happen — and a log that overstates is worse
+/// than one that lags, because the second is discoverable and the first is
+/// believed.
+///
+/// A failure to write the entry is reported but does not undo the erasure:
+/// the data is already unreadable, and there is no putting it back.
+pub fn erase_subject_for(
+    kernel: &PondKernel,
+    subject: &str,
+    requested_by: &str,
+) -> Result<bool, String> {
+    let destroyed = KeyStore::new(kernel.keystore_handle())
         .erase(&subject.to_string())
-        .map_err(|e| format!("failed to erase subject: {}", e))
+        .map_err(|e| format!("failed to erase subject: {}", e))?;
+
+    pond_crypto::AuditLog::new(kernel.keystore_handle())
+        .record(subject, requested_by, destroyed)
+        .map_err(|e| {
+            format!(
+                "subject '{}' was erased, but recording it failed: {}",
+                subject, e
+            )
+        })?;
+    Ok(destroyed)
+}
+
+/// Was this subject erased? For a caller who already holds the id.
+pub fn was_erased(kernel: &PondKernel, subject: &str) -> Result<bool, String> {
+    pond_crypto::AuditLog::new(kernel.keystore_handle())
+        .was_erased(subject)
+        .map_err(|e| format!("failed to read the erasure log: {}", e))
+}
+
+/// The erasure log, oldest first.
+pub fn erasure_log(kernel: &PondKernel) -> Result<Vec<pond_crypto::ErasureRecord>, String> {
+    pond_crypto::AuditLog::new(kernel.keystore_handle())
+        .entries()
+        .map_err(|e| format!("failed to read the erasure log: {}", e))
 }
 
 /// Every subject with a key. What is erasable, for audit.
 pub fn subjects(kernel: &PondKernel) -> Result<Vec<String>, String> {
-    KeyStore::new(kernel.store_handle())
+    KeyStore::new(kernel.keystore_handle())
         .subjects()
         .map_err(|e| format!("failed to list subjects: {}", e))
 }

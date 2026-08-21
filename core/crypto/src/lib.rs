@@ -67,7 +67,9 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use sha2::{Digest, Sha256};
 
+pub mod audit;
 pub mod keystore;
+pub use audit::{AuditLog, ErasureRecord};
 pub use keystore::{KeyStore, SubjectId};
 
 /// A subject's data-encryption key.
