@@ -1633,6 +1633,7 @@ name = "pond_oltp_lens"
 version = "0.3.0"
 dependencies = [
  "pond_kernel",
+ "pond_record",
  "pond_storage",
  "serde",
  "serde_json",
