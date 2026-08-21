@@ -270,6 +270,150 @@ pub fn append_binary_rows(
         .map_err(|e| format!("failed to publish: {}", e))
 }
 
+/// Rows addressed by a string key the caller chooses.
+pub type NamedRow = (String, Vec<(String, pond_record::Value)>);
+
+/// Write rows at explicit string keys, merging with whatever is there.
+///
+/// The key is the caller's, not a generated row id — which is what a key-value
+/// collection needs, since its key *is* its identity rather than an attribute
+/// of the row.
+pub fn put_string_keyed_rows(
+    kernel: &PondKernel,
+    collection: &str,
+    rows: &[NamedRow],
+    writer_id: u64,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+
+    let physical = pond_kernel::crdt::current_time_ms();
+    let records: Vec<(pond_index::Key, pond_record::Record)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (key, fields))| {
+            let version = pond_record::Version::new(physical, i as u64, writer_id);
+            let mut record = pond_record::Record::new();
+            for (name, value) in fields {
+                record = record.with_field(name, value.clone(), version);
+            }
+            (
+                pond_index::Key::new(vec![pond_index::str_(key.clone())]),
+                record,
+            )
+        })
+        .collect();
+
+    let mut engine = open_engine(kernel, &def, writer_id)?;
+    engine
+        .write_records(collection, records)
+        .map_err(|e| format!("failed to stage rows: {}", e))?;
+    engine
+        .publish()
+        .map_err(|e| format!("failed to publish: {}", e))
+}
+
+/// Read one row by its string key.
+///
+/// This is the operation a key-value store is: a point lookup that costs the
+/// tree's depth — two or three requests — whatever the collection holds. The
+/// alternative it replaces is reading every row and filtering, which turns a
+/// point lookup into a full scan.
+pub fn get_string_keyed_row(
+    kernel: &PondKernel,
+    collection: &str,
+    key: &str,
+) -> Result<Option<std::collections::BTreeMap<String, pond_record::Value>>> {
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+    let mut reader = Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
+        .map_err(|e| format!("failed to open reader: {}", e))?;
+    let found = reader
+        .get(
+            collection,
+            &pond_index::Key::new(vec![pond_index::str_(key)]),
+        )
+        .map_err(|e| format!("failed to read: {}", e))?;
+    Ok(found.map(|rec| crate::columnar::record_to_map(&rec)))
+}
+
+/// Delete rows by string key, leaving tombstones.
+pub fn delete_string_keyed_rows(
+    kernel: &PondKernel,
+    collection: &str,
+    keys: &[String],
+    writer_id: u64,
+) -> Result<usize> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+
+    let physical = pond_kernel::crdt::current_time_ms();
+    let records: Vec<(pond_index::Key, pond_record::Record)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let mut record = pond_record::Record::new();
+            record.delete(pond_record::Version::new(physical, i as u64, writer_id));
+            (
+                pond_index::Key::new(vec![pond_index::str_(key.clone())]),
+                record,
+            )
+        })
+        .collect();
+    let count = records.len();
+
+    let mut engine = open_engine(kernel, &def, writer_id)?;
+    engine
+        .write_records(collection, records)
+        .map_err(|e| format!("failed to stage deletes: {}", e))?;
+    engine
+        .publish()
+        .map_err(|e| format!("failed to publish: {}", e))?;
+    Ok(count)
+}
+
+/// Every row, with its string key.
+pub fn scan_string_keyed_rows(
+    kernel: &PondKernel,
+    collection: &str,
+) -> Result<Vec<NamedRow>> {
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+    let mut reader = Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
+        .map_err(|e| format!("failed to open reader: {}", e))?;
+    let rows = reader
+        .scan(collection)
+        .map_err(|e| format!("failed to scan: {}", e))?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(key, rec)| {
+            let name = match key.0.first() {
+                Some(pond_index::KeyPart::Str(s)) => s.clone(),
+                _ => return None,
+            };
+            let fields = crate::columnar::record_to_map(&rec)
+                .into_iter()
+                .collect::<Vec<_>>();
+            Some((name, fields))
+        })
+        .collect())
+}
+
 /// Write one row at an explicit integer key, merging with whatever is there.
 ///
 /// `write_rows` derives the key from `_rowid`, generating one when the caller

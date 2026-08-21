@@ -28,6 +28,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+pub mod engine_kv;
+
 use pond_storage::UnifiedStorage;
 use serde_json::{Value, json};
 
