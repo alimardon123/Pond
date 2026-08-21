@@ -22,9 +22,15 @@ path = "src/nodesize.rs"
 name = "adversarial"
 path = "src/adversarial.rs"
 
+[[bin]]
+name = "valuesize"
+path = "src/valuesize.rs"
+
 [dependencies]
+tempfile = { workspace = true }
 pond_index = { path = "../core/index" }
 pond_record = { path = "../core/record" }
+pond_engine = { path = "../core/engine" }
 pond_cache = { path = "../core/cache" }
 pond_kernel = { path = "../core/kernel" }
 pond_s3 = { path = "../core/s3" }

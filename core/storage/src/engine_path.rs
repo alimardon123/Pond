@@ -168,7 +168,7 @@ pub fn read_rows(kernel: &PondKernel, collection: &str) -> Result<Vec<(String, T
     let mut reader = Reader::open_with(
         store_of(kernel),
         pond_cache_config(),
-        def.chunk_config(),
+        def.engine_config(),
     )
     .map_err(|e| format!("failed to open reader: {}", e))?;
     let records = reader
@@ -215,7 +215,7 @@ fn open_engine(
         store_of(kernel),
         writer_id,
         pond_cache_config(),
-        def.chunk_config(),
+        def.engine_config(),
     )
     .map_err(|e| format!("failed to open engine: {}", e))
 }

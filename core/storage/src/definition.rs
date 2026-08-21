@@ -90,6 +90,13 @@ pub struct Definition {
     /// Zero means unsalted, which is exactly what pre-salt collections were,
     /// so they keep chunking identically.
     pub chunk_salt: u64,
+    /// Values at or above this size are spilled to their own object.
+    ///
+    /// Pinned for the same reason as the chunk target: it decides whether a
+    /// value goes into a leaf or is replaced by a pointer to it, so two
+    /// writers using different thresholds produce different index bytes for
+    /// identical data — and stop converging.
+    pub spill_threshold: u32,
     /// `(column name, PND2 value type)`, in declaration order.
     pub columns: Vec<(String, u8)>,
 }
@@ -109,6 +116,7 @@ impl Definition {
             format,
             chunk_target: pond_index::DEFAULT_TARGET_ENTRIES,
             chunk_salt: random_salt(),
+            spill_threshold: pond_engine::SPILL_THRESHOLD as u32,
             columns: Vec::new(),
         }
     }
@@ -118,6 +126,7 @@ impl Definition {
             format,
             chunk_target: pond_index::DEFAULT_TARGET_ENTRIES,
             chunk_salt: random_salt(),
+            spill_threshold: pond_engine::SPILL_THRESHOLD as u32,
             columns,
         }
     }
@@ -125,6 +134,13 @@ impl Definition {
     /// The chunk configuration this collection was created with.
     pub fn chunk_config(&self) -> pond_index::ChunkConfig {
         pond_index::ChunkConfig::with_target(self.chunk_target).with_salt(self.chunk_salt)
+    }
+
+    /// The full engine configuration this collection was created with.
+    pub fn engine_config(&self) -> pond_engine::EngineConfig {
+        pond_engine::EngineConfig::default()
+            .with_chunk(self.chunk_config())
+            .with_spill_threshold(self.spill_threshold as usize)
     }
 
     /// Declared type of a column, if the definition names it.
@@ -163,6 +179,7 @@ impl Definition {
         out.push(self.format.tag());
         out.extend_from_slice(&self.chunk_target.to_le_bytes());
         out.extend_from_slice(&self.chunk_salt.to_le_bytes());
+        out.extend_from_slice(&self.spill_threshold.to_le_bytes());
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for (name, vtype) in &self.columns {
             let bytes = name.as_bytes();
@@ -184,16 +201,20 @@ impl Definition {
 
         // v1 carried no chunk target. Reading it back as the value v1 was
         // built with is what keeps those collections rechunking identically.
-        let (chunk_target, chunk_salt, mut pos) = match bytes[4] {
-            VERSION_V1 => (LEGACY_CHUNK_TARGET, 0u64, 6usize),
+        let (chunk_target, chunk_salt, spill_threshold, mut pos) = match bytes[4] {
+            // v1 predates spilling entirely: every value was stored inline, so
+            // a threshold of "never spill" is what keeps those collections
+            // producing the bytes they already contain.
+            VERSION_V1 => (LEGACY_CHUNK_TARGET, 0u64, u32::MAX, 6usize),
             VERSION => {
-                if bytes.len() < 22 {
+                if bytes.len() < 26 {
                     return None;
                 }
                 (
                     u32::from_le_bytes(bytes[6..10].try_into().ok()?),
                     u64::from_le_bytes(bytes[10..18].try_into().ok()?),
-                    18usize,
+                    u32::from_le_bytes(bytes[18..22].try_into().ok()?),
+                    22usize,
                 )
             }
             _ => return None,
@@ -228,6 +249,7 @@ impl Definition {
             format,
             chunk_target,
             chunk_salt,
+            spill_threshold,
             columns,
         })
     }
@@ -256,6 +278,7 @@ fn legacy() -> Definition {
         format: Format::Legacy,
         chunk_target: LEGACY_CHUNK_TARGET,
         chunk_salt: 0,
+        spill_threshold: u32::MAX,
         columns: Vec::new(),
     }
 }

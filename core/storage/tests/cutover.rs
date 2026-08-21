@@ -473,6 +473,11 @@ fn chunk_config_is_pinned_per_collection() {
         definition::LEGACY_CHUNK_TARGET,
         "a v1 collection must keep chunking the way it always did"
     );
+    assert_eq!(
+        decoded.spill_threshold,
+        u32::MAX,
+        "v1 predates spilling, so it must keep storing every value inline"
+    );
 
     // And the pinned value survives a write that extends the schema.
     engine_path::write_rows(
@@ -483,4 +488,50 @@ fn chunk_config_is_pinned_per_collection() {
     )
     .unwrap();
     assert_eq!(definition::load(&k, "users").chunk_target, def.chunk_target);
+}
+
+
+/// The spill threshold is pinned per collection, for the same reason the chunk
+/// target is.
+///
+/// It decides whether a value is written into a leaf or replaced by a pointer
+/// to it, so two writers using different thresholds produce different index
+/// bytes for identical data — different leaf hashes, different roots, and no
+/// convergence. A collection that read the current default instead of its own
+/// pinned value would diverge from itself across a version upgrade.
+#[test]
+fn spill_threshold_is_pinned_per_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "docs").unwrap();
+
+    let def = definition::load(&k, "docs");
+    assert_eq!(def.spill_threshold as usize, pond_engine::SPILL_THRESHOLD);
+    assert_eq!(
+        def.engine_config().spill_threshold as u32,
+        def.spill_threshold
+    );
+
+    // Survives a write that extends the schema.
+    let big = "x".repeat(64 * 1024);
+    engine_path::write_rows(
+        &k,
+        "docs",
+        &[
+            ("id", TypedColumn::Int64(vec![1])),
+            ("body", TypedColumn::String(vec![big.clone()])),
+        ],
+        1,
+    )
+    .unwrap();
+    assert_eq!(definition::load(&k, "docs").spill_threshold, def.spill_threshold);
+
+    // And a spilled value round-trips through the columnar path unchanged.
+    let columns = engine_path::read_rows(&k, "docs").unwrap();
+    match columns.iter().find(|(n, _)| n == "body") {
+        Some((_, TypedColumn::String(v))) => {
+            assert_eq!(v, &vec![big], "a spilled value must read back intact")
+        }
+        other => panic!("body column missing or wrong type: {:?}", other.is_some()),
+    }
 }

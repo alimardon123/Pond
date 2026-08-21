@@ -1494,10 +1494,12 @@ name = "pond_bench"
 version = "0.3.0"
 dependencies = [
  "pond_cache",
+ "pond_engine",
  "pond_index",
  "pond_kernel",
  "pond_record",
  "pond_s3",
+ "tempfile",
 ]
 
 [[package]]

@@ -44,7 +44,9 @@ use pond_index::{ChunkConfig, Key, Tree};
 use pond_kernel::ObjectStore;
 use pond_record::{decode_record, encode_record, merge_records, Head, Record};
 
+pub mod spill;
 pub mod store;
+pub use spill::SPILL_THRESHOLD;
 pub use store::EngineStore;
 
 /// Errors an engine operation can produce.
@@ -87,12 +89,53 @@ pub fn head_key(writer_id: u64) -> String {
 
 const HEADS_PREFIX: &str = "heads/";
 
+/// Everything about a collection that decides what bytes it produces.
+///
+/// Both fields participate in content addressing, and that is the whole reason
+/// this type exists rather than the values being read from constants. The
+/// chunk configuration decides where boundaries fall; the spill threshold
+/// decides whether a value is written into a leaf or replaced by a pointer to
+/// it. Either one differing between two writers means the same logical row
+/// produces different index bytes, different leaf hashes, and different roots
+/// — so the two stop converging, stop sharing structure, and stop merging
+/// deterministically.
+///
+/// A collection therefore pins these at creation and keeps them for life. See
+/// `pond_storage::definition`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EngineConfig {
+    pub chunk: ChunkConfig,
+    /// Values at or above this size are spilled to their own object.
+    pub spill_threshold: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            chunk: ChunkConfig::default(),
+            spill_threshold: spill::SPILL_THRESHOLD,
+        }
+    }
+}
+
+impl EngineConfig {
+    pub fn with_chunk(mut self, chunk: ChunkConfig) -> Self {
+        self.chunk = chunk;
+        self
+    }
+
+    pub fn with_spill_threshold(mut self, threshold: usize) -> Self {
+        self.spill_threshold = threshold;
+        self
+    }
+}
+
 /// One writer's handle on a pond.
 pub struct Engine<S: ObjectStore> {
     store: EngineStore<BlobCache<S>>,
     writer_id: u64,
     head: Head,
-    config: ChunkConfig,
+    config: EngineConfig,
     /// Trees staged since the last publish, by collection.
     staged: BTreeMap<String, Tree>,
 }
@@ -100,14 +143,14 @@ pub struct Engine<S: ObjectStore> {
 impl<S: ObjectStore> Engine<S> {
     /// Open a pond as `writer_id`, with a default cache.
     pub fn open(backend: S, writer_id: u64) -> Result<Self> {
-        Self::open_with(backend, writer_id, CacheConfig::default(), ChunkConfig::default())
+        Self::open_with(backend, writer_id, CacheConfig::default(), EngineConfig::default())
     }
 
     pub fn open_with(
         backend: S,
         writer_id: u64,
         cache: CacheConfig,
-        config: ChunkConfig,
+        config: EngineConfig,
     ) -> Result<Self> {
         let cached = BlobCache::new(backend, cache)?;
         let store = EngineStore::new(cached);
@@ -145,15 +188,15 @@ impl<S: ObjectStore> Engine<S> {
         if let Some(t) = self.staged.get(collection) {
             return Tree {
                 root: t.root.clone(),
-                config: self.config,
+                config: self.config.chunk,
             };
         }
         match self.head.root_of(collection) {
             Some(root) => Tree {
                 root: root.to_string(),
-                config: self.config,
+                config: self.config.chunk,
             },
-            None => Tree::build(&self.store, Vec::new(), self.config),
+            None => Tree::build(&self.store, Vec::new(), self.config.chunk),
         }
     }
 
@@ -173,20 +216,30 @@ impl<S: ObjectStore> Engine<S> {
         }
         let tree = self.tree_for(collection);
 
-        let mut updates: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(records.len());
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+        let mut values: Vec<Vec<u8>> = Vec::with_capacity(records.len());
         for (key, incoming) in records {
             let k = key.encode();
             // Merge with what is already there rather than replacing, so a
-            // caller that knows about two fields cannot delete a third.
-            let merged = match tree.get(&self.store, &k) {
-                Some(existing_bytes) => match decode_record(&existing_bytes) {
-                    Some(existing) => merge_records(&existing, &incoming),
-                    None => incoming,
-                },
+            // caller that knows about two fields cannot delete a third. The
+            // existing value may be a spill pointer, so it is resolved first —
+            // merging a pointer would produce nonsense.
+            let existing = tree
+                .get(&self.store, &k)
+                .map(|bytes| spill::resolve(self.store.inner(), bytes))
+                .transpose()?
+                .and_then(|bytes| decode_record(&bytes));
+            let merged = match existing {
+                Some(existing) => merge_records(&existing, &incoming),
                 None => incoming,
             };
-            updates.push((k, encode_record(&merged)));
+            keys.push(k);
+            values.push(encode_record(&merged));
         }
+
+        // Spill the large ones before they reach a leaf. One batched write.
+        let values = spill::store_batch(self.store.inner(), values, self.config.spill_threshold)?;
+        let updates: Vec<(Vec<u8>, Vec<u8>)> = keys.into_iter().zip(values).collect();
 
         let new_tree = tree.insert_batch(&self.store, updates);
         self.staged.insert(collection.to_string(), new_tree);
@@ -208,10 +261,12 @@ impl<S: ObjectStore> Engine<S> {
             return Ok(());
         }
         let tree = self.tree_for(collection);
-        let updates: Vec<(Vec<u8>, Vec<u8>)> = records
+        let (keys, values): (Vec<Vec<u8>>, Vec<Vec<u8>>) = records
             .into_iter()
             .map(|(k, r)| (k.encode(), encode_record(&r)))
-            .collect();
+            .unzip();
+        let values = spill::store_batch(self.store.inner(), values, self.config.spill_threshold)?;
+        let updates: Vec<(Vec<u8>, Vec<u8>)> = keys.into_iter().zip(values).collect();
         let new_tree = tree.insert_batch(&self.store, updates);
         self.staged.insert(collection.to_string(), new_tree);
         Ok(())
@@ -226,6 +281,7 @@ impl<S: ObjectStore> Engine<S> {
         let tree = self.tree_for(collection);
         match tree.get(&self.store, &key.encode()) {
             Some(bytes) => {
+                let bytes = spill::resolve(self.store.inner(), bytes)?;
                 let rec = decode_record(&bytes)
                     .ok_or_else(|| EngineError::Corrupt(format!("record in {}", collection)))?;
                 Ok(rec.is_visible().then_some(rec))
@@ -246,13 +302,13 @@ impl<S: ObjectStore> Engine<S> {
     ) -> Result<Vec<(Key, Record)>> {
         let tree = self.tree_for(collection);
         let raw = tree.scan_range(&self.store, &start.encode(), &end.encode());
-        decode_pairs(raw, collection)
+        decode_pairs(self.store.inner(), raw, collection)
     }
 
     /// Every record in a collection, in key order.
     pub fn scan(&mut self, collection: &str) -> Result<Vec<(Key, Record)>> {
         let tree = self.tree_for(collection);
-        decode_pairs(tree.scan(&self.store), collection)
+        decode_pairs(self.store.inner(), tree.scan(&self.store), collection)
     }
 
     /// Publish every staged collection **atomically**.
@@ -308,7 +364,7 @@ impl<S: ObjectStore> Engine<S> {
             to.to_string(),
             Tree {
                 root,
-                config: self.config,
+                config: self.config.chunk,
             },
         );
         Ok(())
@@ -324,16 +380,16 @@ impl<S: ObjectStore> Engine<S> {
 pub struct Reader<S: ObjectStore> {
     store: EngineStore<BlobCache<S>>,
     roots: BTreeMap<String, Vec<String>>,
-    config: ChunkConfig,
+    config: EngineConfig,
     merged: BTreeMap<String, Tree>,
 }
 
 impl<S: ObjectStore> Reader<S> {
     pub fn open(backend: S) -> Result<Self> {
-        Self::open_with(backend, CacheConfig::default(), ChunkConfig::default())
+        Self::open_with(backend, CacheConfig::default(), EngineConfig::default())
     }
 
-    pub fn open_with(backend: S, cache: CacheConfig, config: ChunkConfig) -> Result<Self> {
+    pub fn open_with(backend: S, cache: CacheConfig, config: EngineConfig) -> Result<Self> {
         let cached = BlobCache::new(backend, cache)?;
         let store = EngineStore::new(cached);
 
@@ -387,7 +443,7 @@ impl<S: ObjectStore> Reader<S> {
         if let Some(t) = self.merged.get(collection) {
             return Tree {
                 root: t.root.clone(),
-                config: self.config,
+                config: self.config.chunk,
             };
         }
         let roots = self.roots.get(collection).cloned().unwrap_or_default();
@@ -395,14 +451,14 @@ impl<S: ObjectStore> Reader<S> {
         let mut acc = match iter.next() {
             Some(r) => Tree {
                 root: r,
-                config: self.config,
+                config: self.config.chunk,
             },
-            None => Tree::build(&self.store, Vec::new(), self.config),
+            None => Tree::build(&self.store, Vec::new(), self.config.chunk),
         };
         for r in iter {
             let other = Tree {
                 root: r,
-                config: self.config,
+                config: self.config.chunk,
             };
             acc = acc.merge(&self.store, &other, resolve_records);
         }
@@ -410,7 +466,7 @@ impl<S: ObjectStore> Reader<S> {
             collection.to_string(),
             Tree {
                 root: acc.root.clone(),
-                config: self.config,
+                config: self.config.chunk,
             },
         );
         acc
@@ -425,6 +481,7 @@ impl<S: ObjectStore> Reader<S> {
         let tree = self.tree_for(collection);
         match tree.get(&self.store, &key.encode()) {
             Some(bytes) => {
+                let bytes = spill::resolve(self.store.inner(), bytes)?;
                 let rec = decode_record(&bytes)
                     .ok_or_else(|| EngineError::Corrupt(format!("record in {}", collection)))?;
                 Ok(rec.is_visible().then_some(rec))
@@ -435,7 +492,7 @@ impl<S: ObjectStore> Reader<S> {
 
     pub fn scan(&mut self, collection: &str) -> Result<Vec<(Key, Record)>> {
         let tree = self.tree_for(collection);
-        decode_pairs(tree.scan(&self.store), collection)
+        decode_pairs(self.store.inner(), tree.scan(&self.store), collection)
     }
 
     pub fn scan_range(
@@ -446,7 +503,7 @@ impl<S: ObjectStore> Reader<S> {
     ) -> Result<Vec<(Key, Record)>> {
         let tree = self.tree_for(collection);
         let raw = tree.scan_range(&self.store, &start.encode(), &end.encode());
-        decode_pairs(raw, collection)
+        decode_pairs(self.store.inner(), raw, collection)
     }
 
     /// Root hash of the merged view — the identity of what this reader sees.
@@ -484,9 +541,21 @@ fn resolve_records(a: &[u8], b: &[u8]) -> Vec<u8> {
 /// `is_visible` is deliberately not "has a tombstone": a field written *after*
 /// the delete resurrects the record, which is the correct answer when a delete
 /// and a later update arrive out of order.
-fn decode_pairs(raw: Vec<(Vec<u8>, Vec<u8>)>, collection: &str) -> Result<Vec<(Key, Record)>> {
-    let mut out = Vec::with_capacity(raw.len());
-    for (k, v) in raw {
+fn decode_pairs<S: ObjectStore>(
+    backend: &S,
+    raw: Vec<(Vec<u8>, Vec<u8>)>,
+    collection: &str,
+) -> Result<Vec<(Key, Record)>> {
+    let (keys, values): (Vec<Vec<u8>>, Vec<Vec<u8>>) = raw.into_iter().unzip();
+
+    // Resolve every spilled value in one batch rather than one round trip
+    // each. A scan that touched a thousand large rows would otherwise pay a
+    // thousand sequential GETs, which is the cost this whole design exists to
+    // avoid.
+    let values = spill::resolve_batch(backend, values)?;
+
+    let mut out = Vec::with_capacity(keys.len());
+    for (k, v) in keys.into_iter().zip(values) {
         let key = Key::decode(&k)
             .ok_or_else(|| EngineError::Corrupt(format!("key in {}", collection)))?;
         let rec = decode_record(&v)

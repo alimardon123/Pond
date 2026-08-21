@@ -576,3 +576,111 @@ fn reader_open_cost_is_one_list_plus_one_read_per_writer() {
     );
     assert_eq!(r.collections(), vec!["users".to_string()]);
 }
+
+/// A large row must not be rewritten `target` times over.
+///
+/// An insert rewrites its whole leaf, and a leaf holds thousands of entries,
+/// so storing large values inline means a one-row update rewrites megabytes.
+/// Spilling puts a pointer in the leaf instead, which is what keeps the write
+/// cost proportional to the row rather than to the leaf.
+#[test]
+fn a_large_row_does_not_rewrite_its_whole_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = std::sync::Arc::new(Counters::default());
+    let big = "x".repeat(64 * 1024);
+
+    let mut e = Engine::open(Counting::new(store(dir.path()), c.clone()), 1).unwrap();
+    let rows: Vec<(pond_index::Key, Record)> = (0..200)
+        .map(|i| {
+            (
+                user(i),
+                Record::new().with_field("blob", Value::Str(big.clone()), v(100, 1)),
+            )
+        })
+        .collect();
+    e.write_records("docs", rows).unwrap();
+    e.publish().unwrap();
+
+    // The value must survive the round trip intact.
+    let mut r = Reader::open(store(dir.path())).unwrap();
+    let got = r.get("docs", &user(7)).unwrap().expect("record");
+    assert_eq!(
+        got.get("blob"),
+        Some(&Value::Str(big.clone())),
+        "a spilled value must read back byte-identical"
+    );
+
+    // And a scan resolves every pointer.
+    let all = r.scan("docs").unwrap();
+    assert_eq!(all.len(), 200);
+    assert!(all
+        .iter()
+        .all(|(_, rec)| rec.get("blob") == Some(&Value::Str(big.clone()))));
+}
+
+/// Spilling must not change what a small record costs or how it is stored.
+#[test]
+fn small_records_are_unaffected_by_spilling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = Engine::open(store(dir.path()), 1).unwrap();
+    e.write_records(
+        "users",
+        vec![(
+            user(1),
+            Record::new().with_field("name", Value::Str("ada".into()), v(100, 1)),
+        )],
+    )
+    .unwrap();
+    e.publish().unwrap();
+
+    let mut r = Reader::open(store(dir.path())).unwrap();
+    assert_eq!(
+        r.get("users", &user(1)).unwrap().unwrap().get("name"),
+        Some(&Value::Str("ada".into()))
+    );
+}
+
+/// A partial update of a spilled row must still merge field by field.
+///
+/// The existing value is a pointer, so a merge that forgot to resolve it would
+/// either fail to decode or silently replace the row — dropping every field
+/// the update did not mention.
+#[test]
+fn partial_update_of_a_spilled_row_preserves_other_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = "y".repeat(8 * 1024);
+
+    let mut e = Engine::open(store(dir.path()), 1).unwrap();
+    e.write_records(
+        "docs",
+        vec![(
+            user(1),
+            Record::new()
+                .with_field("body", Value::Str(big.clone()), v(100, 1))
+                .with_field("title", Value::Str("first".into()), v(100, 1)),
+        )],
+    )
+    .unwrap();
+    e.publish().unwrap();
+
+    // Update only the title.
+    let mut e = Engine::open(store(dir.path()), 1).unwrap();
+    e.write_records(
+        "docs",
+        vec![(
+            user(1),
+            Record::new().with_field("title", Value::Str("second".into()), v(200, 1)),
+        )],
+    )
+    .unwrap();
+    e.publish().unwrap();
+
+    let mut r = Reader::open(store(dir.path())).unwrap();
+    let got = r.get("docs", &user(1)).unwrap().expect("record");
+    assert_eq!(got.get("title"), Some(&Value::Str("second".into())));
+    assert_eq!(
+        got.get("body"),
+        Some(&Value::Str(big)),
+        "the large field must survive an update that never mentioned it"
+    );
+}
