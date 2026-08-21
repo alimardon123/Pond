@@ -55,6 +55,21 @@ pub fn columns_to_records(
     writer_id: u64,
     physical: u64,
 ) -> Vec<(Key, Record)> {
+    columns_to_records_with_nulls(columns, &[], writer_id, physical)
+}
+
+/// As [`columns_to_records`], but honouring a per-column null mask.
+///
+/// A dense column cannot say "no value here", so without the mask a null and
+/// the type's zero are the same bytes. They are not the same fact — a score of
+/// zero and an unrecorded score are different things — so the mask is what
+/// lets the record carry [`Value::Null`] instead of a fabricated zero.
+pub fn columns_to_records_with_nulls(
+    columns: &[(&str, TypedColumn)],
+    nulls: &[Option<Vec<bool>>],
+    writer_id: u64,
+    physical: u64,
+) -> Vec<(Key, Record)> {
     let n_rows = columns.first().map(|(_, c)| c.len()).unwrap_or(0);
     let mut out = Vec::with_capacity(n_rows);
 
@@ -62,9 +77,20 @@ pub fn columns_to_records(
         let mut record = Record::new();
         let mut rowid: Option<String> = None;
 
-        for (name, col) in columns {
-            let Some(value) = value_at(col, row) else {
-                continue;
+        for (idx, (name, col)) in columns.iter().enumerate() {
+            let is_null = nulls
+                .get(idx)
+                .and_then(|m| m.as_ref())
+                .and_then(|m| m.get(row))
+                .copied()
+                .unwrap_or(false);
+            let value = if is_null {
+                Value::Null
+            } else {
+                match value_at(col, row) {
+                    Some(v) => v,
+                    None => continue,
+                }
             };
             if *name == ROWID {
                 if let Value::Str(s) = &value {
@@ -114,6 +140,19 @@ pub fn records_to_columns(
     records: &[(Key, Record)],
     def: &Definition,
 ) -> Vec<(String, TypedColumn)> {
+    records_to_columns_with_nulls(records, def).0
+}
+
+/// As [`records_to_columns`], and also the null mask each column needs.
+///
+/// A field holding [`Value::Null`], and a field a record does not carry at
+/// all, are both null to a reader: the column is dense, so something has to
+/// occupy the slot, and the mask is what says the occupant is a placeholder.
+#[allow(clippy::type_complexity)]
+pub fn records_to_columns_with_nulls(
+    records: &[(Key, Record)],
+    def: &Definition,
+) -> (Vec<(String, TypedColumn)>, Vec<Option<Vec<bool>>>) {
     // Every column name present anywhere, in a stable order.
     let mut names: Vec<String> = def.columns.iter().map(|(n, _)| n.clone()).collect();
     let mut extra: Vec<String> = Vec::new();
@@ -127,21 +166,40 @@ pub fn records_to_columns(
     extra.sort();
     names.extend(extra);
 
-    names
-        .into_iter()
-        .filter_map(|name| {
-            let values: Vec<Option<&Value>> =
-                records.iter().map(|(_, r)| r.get(&name)).collect();
-            // A column no record carries is not a column.
-            if values.iter().all(|v| v.is_none()) {
-                return None;
-            }
-            let declared = def
-                .column_type(&name)
-                .or_else(|| values.iter().flatten().next().map(|v| default_vtype(v)))?;
-            column_from_values(&values, declared).map(|c| (name, c))
-        })
-        .collect()
+    let mut columns = Vec::new();
+    let mut masks = Vec::new();
+    for name in names {
+        let values: Vec<Option<&Value>> = records.iter().map(|(_, r)| r.get(&name)).collect();
+        // A column no record carries is not a column.
+        if values.iter().all(|v| v.is_none()) {
+            continue;
+        }
+        // Pick the declared type, or infer from the first value that is
+        // neither absent nor null — a null carries no type information.
+        let Some(declared) = def.column_type(&name).or_else(|| {
+            values
+                .iter()
+                .flatten()
+                .find(|v| !matches!(v, Value::Null))
+                .map(|v| default_vtype(v))
+        }) else {
+            continue;
+        };
+        let Some(col) = column_from_values(&values, declared) else {
+            continue;
+        };
+        let mask: Vec<bool> = values
+            .iter()
+            .map(|v| matches!(v, None | Some(Value::Null)))
+            .collect();
+        columns.push((name, col));
+        masks.push(if mask.iter().any(|b| *b) {
+            Some(mask)
+        } else {
+            None
+        });
+    }
+    (columns, masks)
 }
 
 /// The value at one row of a column, or `None` if the row is past its end.

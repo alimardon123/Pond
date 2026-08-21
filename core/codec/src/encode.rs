@@ -663,7 +663,29 @@ impl TypedColumn {
 /// ]);
 /// ```
 pub fn pnd2_encode_multi_typed(columns: &[(&str, TypedColumn)]) -> Vec<u8> {
+    pnd2_encode_multi_typed_with_nulls(columns, &[])
+}
+
+/// Encode typed columns, recording which values are null.
+///
+/// `nulls[i]`, when present, marks the null positions of `columns[i]`: `true`
+/// means the value at that row is absent, and the value sitting in the dense
+/// payload is a placeholder that no reader should surface.
+///
+/// This exists because a dense column cannot say "no value here", so writing a
+/// null and reading back the type's zero were indistinguishable — a real zero
+/// and a missing measurement are not the same fact, and a store that conflates
+/// them is quietly lying about the data.
+///
+/// The bitmap section is written only when some column actually has a null, so
+/// blobs that carry no nulls are byte-identical to what this function produced
+/// before the section existed.
+pub fn pnd2_encode_multi_typed_with_nulls(
+    columns: &[(&str, TypedColumn)],
+    nulls: &[Option<Vec<bool>>],
+) -> Vec<u8> {
     let n_rows = columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+    let has_nulls = nulls.iter().any(|n| n.as_ref().is_some_and(|m| m.iter().any(|b| *b)));
     let mut inner = Vec::new();
 
     // Phase 1: Write ALL schemas
@@ -694,16 +716,54 @@ pub fn pnd2_encode_multi_typed(columns: &[(&str, TypedColumn)]) -> Vec<u8> {
         inner.extend_from_slice(&payload);
     }
 
+    // Phase 4: null bitmaps, one per column, only when any value is null.
+    //
+    // Written after the payloads so a decoder that stops early — one built
+    // before this section existed — reads every payload correctly and simply
+    // never looks further.
+    if has_nulls {
+        for i in 0..columns.len() {
+            let mask = nulls.get(i).and_then(|m| m.as_ref());
+            match mask {
+                Some(bits) if bits.iter().any(|b| *b) => {
+                    let packed = pack_bits(bits, n_rows);
+                    inner.push(1);
+                    inner.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+                    inner.extend_from_slice(&packed);
+                }
+                _ => inner.push(0),
+            }
+        }
+    }
+
     // Final PND2 blob
     let mut blob = Vec::with_capacity(13 + inner.len());
     blob.extend_from_slice(PND2_MAGIC);
     blob.push(PND2_VERSION);
-    blob.push(FLAG_HAS_STATS);
+    blob.push(if has_nulls {
+        FLAG_HAS_STATS | FLAG_HAS_NULLS
+    } else {
+        FLAG_HAS_STATS
+    });
     blob.extend_from_slice(&(n_rows as u32).to_le_bytes());
     blob.extend_from_slice(&(columns.len() as u16).to_le_bytes());
     blob.push(COMPRESSION_NONE);
     blob.extend_from_slice(&inner);
     blob
+}
+
+/// Pack a boolean mask into bits, least-significant bit first.
+///
+/// `n_rows` rather than `bits.len()` so a short or long mask cannot change the
+/// section's length and desynchronise the reader.
+fn pack_bits(bits: &[bool], n_rows: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n_rows.div_ceil(8)];
+    for (i, set) in bits.iter().take(n_rows).enumerate() {
+        if *set {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
 }
 
 /// Encode a PND2 blob with automatic encoding selection for INT64 columns.
@@ -886,5 +946,98 @@ mod tests {
         blob.push(COMPRESSION_NONE);
         blob.extend_from_slice(&inner);
         blob
+    }
+}
+
+#[cfg(test)]
+mod null_tests {
+    use super::*;
+    use crate::decode::{is_null_at, pnd2_decode};
+
+    /// A null must not read back as the type's zero.
+    ///
+    /// This is the whole point: a real zero and a missing measurement are
+    /// different facts, and a store that returns one for the other is quietly
+    /// wrong in a way no error surfaces.
+    #[test]
+    fn nulls_are_distinguishable_from_zero() {
+        let cols = vec![(
+            "score",
+            TypedColumn::Int64(vec![0, 0, 7]),
+        )];
+        let nulls = vec![Some(vec![false, true, false])];
+
+        let blob = pnd2_encode_multi_typed_with_nulls(&cols, &nulls);
+        let decoded = pnd2_decode(&blob).expect("decode");
+        let col = &decoded[0];
+
+        let bitmap = col.null_bitmap.as_ref().expect("null bitmap must survive");
+        assert!(!is_null_at(bitmap, 0), "row 0 holds a real zero");
+        assert!(is_null_at(bitmap, 1), "row 1 was written as null");
+        assert!(!is_null_at(bitmap, 2));
+        assert_eq!(col.i64_data, vec![0, 0, 7], "values are unchanged");
+    }
+
+    /// A blob with no nulls must be byte-identical to what the plain encoder
+    /// produces — that is what makes this additive rather than a format break.
+    #[test]
+    fn no_nulls_means_no_section() {
+        let cols = vec![("a", TypedColumn::Int64(vec![1, 2, 3]))];
+        let with = pnd2_encode_multi_typed_with_nulls(&cols, &[Some(vec![false; 3])]);
+        let without = pnd2_encode_multi_typed(&cols);
+        assert_eq!(
+            with, without,
+            "an all-present mask must not change a single byte"
+        );
+        assert!(pnd2_decode(&with).unwrap()[0].null_bitmap.is_none());
+    }
+
+    /// Nulls across several columns of different types.
+    #[test]
+    fn nulls_in_several_columns() {
+        let cols = vec![
+            ("i", TypedColumn::Int64(vec![1, 0])),
+            ("s", TypedColumn::String(vec!["x".into(), String::new()])),
+            ("f", TypedColumn::Float64(vec![1.5, 2.5])),
+        ];
+        let nulls = vec![
+            Some(vec![false, true]),
+            Some(vec![true, false]),
+            None, // no nulls in this column at all
+        ];
+        let decoded = pnd2_decode(&pnd2_encode_multi_typed_with_nulls(&cols, &nulls)).unwrap();
+
+        assert!(is_null_at(decoded[0].null_bitmap.as_ref().unwrap(), 1));
+        assert!(is_null_at(decoded[1].null_bitmap.as_ref().unwrap(), 0));
+        assert!(
+            decoded[2].null_bitmap.is_none(),
+            "a column with no nulls carries no bitmap"
+        );
+    }
+
+    /// Every row null, and every row present — the boundaries.
+    #[test]
+    fn all_null_and_none_null() {
+        let cols = vec![("a", TypedColumn::Int64(vec![0; 9]))];
+        let decoded =
+            pnd2_decode(&pnd2_encode_multi_typed_with_nulls(&cols, &[Some(vec![true; 9])]))
+                .unwrap();
+        let bitmap = decoded[0].null_bitmap.as_ref().unwrap();
+        for row in 0..9 {
+            assert!(is_null_at(bitmap, row), "row {} should be null", row);
+        }
+        // Past the end is not null rather than a panic.
+        assert!(!is_null_at(bitmap, 9));
+        assert!(!is_null_at(bitmap, 10_000));
+    }
+
+    /// A truncated null section must not lose the data.
+    #[test]
+    fn a_truncated_null_section_keeps_the_values() {
+        let cols = vec![("a", TypedColumn::Int64(vec![1, 2, 3]))];
+        let mut blob = pnd2_encode_multi_typed_with_nulls(&cols, &[Some(vec![false, true, false])]);
+        blob.truncate(blob.len() - 2);
+        let decoded = pnd2_decode(&blob).expect("must still decode");
+        assert_eq!(decoded[0].i64_data, vec![1, 2, 3]);
     }
 }

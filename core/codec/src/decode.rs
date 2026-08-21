@@ -36,6 +36,7 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
     }
     let flags = blob[5];
     let has_stats = (flags & FLAG_HAS_STATS) != 0;
+    let has_nulls = (flags & FLAG_HAS_NULLS) != 0;
     let n_rows = u32::from_le_bytes([blob[6], blob[7], blob[8], blob[9]]) as usize;
     let n_columns = u16::from_le_bytes([blob[10], blob[11]]) as usize;
     let compression_tag = blob[12];
@@ -46,7 +47,7 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
         {
             let decompressed = decompress_zstd(&blob[13..])?;
             let mut parser = PND2Parser::new(&decompressed);
-            return decode_inner(&decompressed, &mut parser, n_rows, n_columns, has_stats);
+            return decode_inner(&decompressed, &mut parser, n_rows, n_columns, has_stats, has_nulls);
         }
         #[cfg(not(feature = "zstd"))]
         {
@@ -61,7 +62,7 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
     let inner = &blob[13..];
     check_row_count(n_rows, inner.len())?;
     let mut parser = PND2Parser::new(inner);
-    decode_inner(inner, &mut parser, n_rows, n_columns, has_stats)
+    decode_inner(inner, &mut parser, n_rows, n_columns, has_stats, has_nulls)
 }
 
 /// Reject a header row count that the payload could not possibly hold.
@@ -118,6 +119,7 @@ fn decode_inner(
     n_rows: usize,
     n_columns: usize,
     has_stats: bool,
+    has_nulls: bool,
 ) -> Result<Vec<PondColumn>, String> {
 
     // Parse schema
@@ -171,7 +173,40 @@ fn decode_inner(
         columns.push(col);
     }
 
+    // Null bitmaps, if the writer recorded any. They sit after every payload,
+    // so a blob without them is read exactly as it was before this section
+    // existed and no version bump is needed.
+    //
+    // A truncated or malformed section leaves the columns as they are rather
+    // than failing the decode: losing null information degrades fidelity,
+    // while rejecting the blob would lose the data entirely.
+    if has_nulls {
+        for col in columns.iter_mut() {
+            let Some(present) = parser.read_u8() else { break };
+            if present == 0 {
+                continue;
+            }
+            let Some(len) = parser.read_u32() else { break };
+            let Some(bits) = parser.read_bytes(len as usize) else { break };
+            if len as usize != n_rows.div_ceil(8) {
+                break;
+            }
+            col.null_bitmap = Some(bits.to_vec());
+        }
+    }
+
     Ok(columns)
+}
+
+/// Is row `row` null, according to a packed bitmap?
+///
+/// Bits are least-significant-first within each byte, matching the encoder.
+/// Out-of-range rows are not null, so a short bitmap degrades to "present"
+/// rather than to a panic.
+pub fn is_null_at(bitmap: &[u8], row: usize) -> bool {
+    bitmap
+        .get(row / 8)
+        .is_some_and(|b| b & (1 << (row % 8)) != 0)
 }
 
 /// Decode a single column's payload. Dispatches on encoding.

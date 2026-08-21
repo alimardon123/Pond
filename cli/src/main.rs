@@ -888,10 +888,12 @@ fn cmd_write_rows(
         == pond_storage::definition::Format::Engine
     {
         let writer_id = pond_kernel::crdt::stable_writer_id();
-        match pond_storage::engine_path::write_rows(
+        let masks = json_null_masks(&parsed, &typed);
+        match pond_storage::engine_path::write_rows_with_nulls(
             storage.kernel(),
             collection,
             &columns_ref,
+            &masks,
             writer_id,
         ) {
             Ok(()) => println!("{}\t{} rows", collection, n_rows),
@@ -1038,6 +1040,35 @@ fn json_to_typed_columns(rows: &[JsonValue]) -> Vec<(String, TypedColumn)> {
         .map(|(name, info)| {
             let col = build_typed_column(&info);
             (name, col)
+        })
+        .collect()
+}
+
+/// Which rows of each column were null in the input, in the same order
+/// `json_to_typed_columns` returns.
+///
+/// The column itself is dense — `build_typed_column` substitutes the type's
+/// zero for a null, because something has to occupy the slot. Without this
+/// mask that substitute is indistinguishable from a value the caller actually
+/// wrote, so `{"score": null}` would read back as `{"score": 0}`: a different
+/// fact, returned with no error to notice.
+fn json_null_masks(rows: &[JsonValue], columns: &[(String, TypedColumn)]) -> Vec<Option<Vec<bool>>> {
+    columns
+        .iter()
+        .map(|(name, _)| {
+            let mask: Vec<bool> = rows
+                .iter()
+                .map(|row| {
+                    row.as_object()
+                        .map(|o| matches!(o.get(name), None | Some(JsonValue::Null)))
+                        .unwrap_or(true)
+                })
+                .collect();
+            if mask.iter().any(|b| *b) {
+                Some(mask)
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -1212,6 +1243,17 @@ fn pnd2_blob_to_json(blob: &[u8]) -> Result<Vec<JsonValue>, String> {
             let name = col.name.to_string_lossy().to_string();
             // Skip CRDT metadata columns — they're internal.
             if name == "_rowid" || name == "_version" || name == "_deleted" {
+                continue;
+            }
+            // A column is dense, so a null occupies its slot with the type's
+            // zero. The bitmap is the only thing that distinguishes that
+            // placeholder from a zero the caller actually wrote.
+            if col
+                .null_bitmap
+                .as_ref()
+                .is_some_and(|b| pond_core::decode::is_null_at(b, row_idx))
+            {
+                row_obj.insert(name, JsonValue::Null);
                 continue;
             }
             let val = match col.vtype {

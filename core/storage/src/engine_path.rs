@@ -24,7 +24,9 @@ use pond_core::encode::TypedColumn;
 use pond_engine::{Engine, Reader};
 use pond_kernel::{ObjectStore, PondKernel};
 
-use crate::columnar::{columns_to_records, records_to_columns, schema_of};
+use crate::columnar::{
+    columns_to_records_with_nulls, records_to_columns_with_nulls, schema_of,
+};
 use crate::definition::{self, Definition, Format};
 
 /// Errors are strings here to match the rest of `core/storage`'s API.
@@ -81,6 +83,21 @@ pub fn write_rows(
     columns: &[(&str, TypedColumn)],
     writer_id: u64,
 ) -> Result<()> {
+    write_rows_with_nulls(kernel, collection, columns, &[], writer_id)
+}
+
+/// As [`write_rows`], recording which values are null.
+///
+/// Without the mask a null and the type's zero are the same bytes, so a store
+/// that accepted one would return the other — a different fact, returned
+/// without any error to notice.
+pub fn write_rows_with_nulls(
+    kernel: &PondKernel,
+    collection: &str,
+    columns: &[(&str, TypedColumn)],
+    nulls: &[Option<Vec<bool>>],
+    writer_id: u64,
+) -> Result<()> {
     let mut def = definition::load(kernel, collection);
     if def.format != Format::Engine {
         return Err(format!(
@@ -102,7 +119,7 @@ pub fn write_rows(
     }
 
     let physical = pond_kernel::crdt::current_time_ms();
-    let records = columns_to_records(columns, writer_id, physical);
+    let records = columns_to_records_with_nulls(columns, nulls, writer_id, physical);
 
     let mut engine = open_engine(kernel, &def, writer_id)?;
     engine
@@ -216,18 +233,39 @@ pub fn read_rows(kernel: &PondKernel, collection: &str) -> Result<Vec<(String, T
     let records = reader
         .scan(collection)
         .map_err(|e| format!("failed to scan: {}", e))?;
-    Ok(records_to_columns(&records, &def))
+    Ok(records_to_columns_with_nulls(&records, &def).0)
+}
+
+/// Read an engine-backed collection as typed columns plus their null masks.
+pub fn read_rows_with_nulls(
+    kernel: &PondKernel,
+    collection: &str,
+) -> Result<(Vec<(String, TypedColumn)>, Vec<Option<Vec<bool>>>)> {
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+    let mut reader = Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
+        .map_err(|e| format!("failed to open reader: {}", e))?;
+    let records = reader
+        .scan(collection)
+        .map_err(|e| format!("failed to scan: {}", e))?;
+    Ok(records_to_columns_with_nulls(&records, &def))
 }
 
 /// Read an engine-backed collection as a PND2 blob, so callers that already
 /// speak PND2 need no changes.
 pub fn read_pnd2(kernel: &PondKernel, collection: &str) -> Result<Vec<u8>> {
-    let columns = read_rows(kernel, collection)?;
+    let (columns, nulls) = read_rows_with_nulls(kernel, collection)?;
     let borrowed: Vec<(&str, TypedColumn)> = columns
         .iter()
         .map(|(n, c)| (n.as_str(), c.clone()))
         .collect();
-    Ok(pond_core::encode::pnd2_encode_multi_typed(&borrowed))
+    // Carries the null masks, so a reader that goes through PND2 sees the same
+    // nulls a reader that took the records directly would see.
+    Ok(pond_core::encode::pnd2_encode_multi_typed_with_nulls(
+        &borrowed, &nulls,
+    ))
 }
 
 /// The engine takes an owned backend, and the kernel holds an `Arc` to one.

@@ -14,6 +14,13 @@ pub const PND2_MAGIC: &[u8] = b"PND2";
 pub const PND2_VERSION: u8 = 2;
 pub const FLAG_HAS_STATS: u8 = 0x01;
 pub const FLAG_COMPRESSED: u8 = 0x02;
+/// The blob carries a per-column null bitmap section.
+///
+/// Optional and additive: a blob written without it decodes exactly as before,
+/// with every value present. That is what lets this land without a version
+/// bump and without rewriting any existing data — a reader that finds the bit
+/// clear behaves the way every reader behaved before the bit existed.
+pub const FLAG_HAS_NULLS: u8 = 0x04;
 
 // ---------------------------------------------------------------------------
 // Compression tags (byte 12 of the PND2 header)

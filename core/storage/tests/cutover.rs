@@ -629,3 +629,79 @@ fn branching_refuses_bad_targets() {
     .unwrap();
     assert!(engine_path::branch(&k, "old", "old_v2", 1).is_err());
 }
+
+/// A null must not read back as the type's zero.
+///
+/// A dense column has to put *something* in a null's slot, and without a mask
+/// that placeholder is indistinguishable from a value the caller wrote. A
+/// score of zero and an unrecorded score are different facts; returning one
+/// for the other is wrong data with no error to notice.
+#[test]
+fn nulls_survive_the_round_trip_and_differ_from_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "t").unwrap();
+
+    engine_path::write_rows_with_nulls(
+        &k,
+        "t",
+        &[
+            ("id", TypedColumn::Int64(vec![1, 2, 3])),
+            ("score", TypedColumn::Int64(vec![0, 0, 5])),
+        ],
+        &[None, Some(vec![false, true, false])],
+        1,
+    )
+    .unwrap();
+
+    let (columns, nulls) = engine_path::read_rows_with_nulls(&k, "t").unwrap();
+    let score_at = columns.iter().position(|(n, _)| n == "score").expect("score");
+    let mask = nulls[score_at].as_ref().expect("score has a null mask");
+
+    // Rows come back in key order, which for generated rowids is not input
+    // order — so locate the rows by their id.
+    let id_at = columns.iter().position(|(n, _)| n == "id").unwrap();
+    let ids = match &columns[id_at].1 {
+        TypedColumn::Int64(v) => v.clone(),
+        _ => panic!("id must be Int64"),
+    };
+    let row_of = |id: i64| ids.iter().position(|x| *x == id).expect("row present");
+
+    assert!(!mask[row_of(1)], "a real zero must not be marked null");
+    assert!(mask[row_of(2)], "the null must be marked null");
+    assert!(!mask[row_of(3)]);
+
+    // And through PND2, which is how SQL, the lenses and Python read this.
+    let blob = engine_path::read_pnd2(&k, "t").unwrap();
+    let decoded = pond_core::decode::pnd2_decode(&blob).unwrap();
+    let score = decoded
+        .iter()
+        .find(|c| c.name.to_string_lossy() == "score")
+        .expect("score column");
+    let bitmap = score
+        .null_bitmap
+        .as_ref()
+        .expect("the null mask must survive PND2");
+    assert!(!pond_core::decode::is_null_at(bitmap, row_of(1)));
+    assert!(pond_core::decode::is_null_at(bitmap, row_of(2)));
+}
+
+/// A column with no nulls must carry no mask, so nothing changes for data that
+/// has none.
+#[test]
+fn columns_without_nulls_carry_no_mask() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create(&k, "t").unwrap();
+    engine_path::write_rows(&k, "t", &[("id", TypedColumn::Int64(vec![1, 2]))], 1).unwrap();
+
+    let (_, nulls) = engine_path::read_rows_with_nulls(&k, "t").unwrap();
+    assert!(
+        nulls.iter().all(|m| m.is_none()),
+        "no nulls written, so no masks should come back"
+    );
+
+    let blob = engine_path::read_pnd2(&k, "t").unwrap();
+    let decoded = pond_core::decode::pnd2_decode(&blob).unwrap();
+    assert!(decoded.iter().all(|c| c.null_bitmap.is_none()));
+}
