@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pond_engine::{Engine, Reader};
+use pond_engine::{compact_heads, Engine, EngineConfig, Reader};
 use pond_index::{int, Key};
 use pond_kernel::{LocalFSObjectStore, Metered, ObjectStore};
 use pond_record::{Record, Value, Version};
@@ -105,10 +105,12 @@ struct Sample {
     writers: u64,
     open_requests: u64,
     open_round_trips: u64,
-    scan_requests: u64,
     scan_round_trips: u64,
     /// Measured wall clock of the first scan, with every request delayed.
     scan_millis: f64,
+    /// The same scan after one compaction pass folded the heads.
+    compacted_millis: f64,
+    compacted_round_trips: u64,
     /// What that scan would have cost if every request waited for the one
     /// before it — the left fold this replaced.
     sequential_millis: f64,
@@ -148,14 +150,34 @@ fn measure(writers: u64) -> Sample {
     let scan_millis = started.elapsed().as_secs_f64() * 1_000.0;
     let scan = store.stats();
 
+    // One compaction pass, then the same scan again.
+    compact_heads(
+        Arc::clone(&store),
+        pond_cache::CacheConfig::default(),
+        EngineConfig::default(),
+    )
+    .unwrap();
+    let mut r2 = Reader::open(Arc::clone(&store)).unwrap();
+    store.reset();
+    let started = Instant::now();
+    let compacted_rows = r2.scan("t").unwrap();
+    let compacted_millis = started.elapsed().as_secs_f64() * 1_000.0;
+    let compacted_round_trips = store.stats().round_trips;
+    assert_eq!(
+        compacted_rows.len(),
+        rows.len(),
+        "compaction must not change what the scan returns"
+    );
+
     Sample {
         writers,
         open_requests: open.requests(),
         open_round_trips: open.round_trips,
-        scan_requests: scan.requests(),
         scan_round_trips: scan.round_trips,
         scan_millis,
         sequential_millis: scan.round_trips as f64 * RTT.as_secs_f64() * 1_000.0,
+        compacted_millis,
+        compacted_round_trips,
         rows: rows.len(),
     }
 }
@@ -173,24 +195,24 @@ fn main() {
         RTT
     );
     println!(
-        "| writers | rows | open reqs / trips | scan reqs / trips | scan wall clock | \
-         if fully sequential | speedup |"
+        "| writers | rows | open reqs / trips | scan trips | scan ms | fully sequential ms | \
+         after compaction: trips / ms |"
     );
     println!("|---|---|---|---|---|---|---|");
 
     for writers in [1u64, 2, 4, 8, 16, 32, 64, 128, 256] {
         let s = measure(writers);
         println!(
-            "| {} | {} | {} / {} | {} / {} | {:.0} ms | {:.0} ms | **{:.1}x** |",
+            "| {} | {} | {} / {} | {} | {:.0} | {:.0} | **{} / {:.0}** |",
             s.writers,
             s.rows,
             s.open_requests,
             s.open_round_trips,
-            s.scan_requests,
             s.scan_round_trips,
             s.scan_millis,
             s.sequential_millis,
-            s.sequential_millis / s.scan_millis.max(0.001),
+            s.compacted_round_trips,
+            s.compacted_millis,
         );
     }
 
@@ -199,7 +221,8 @@ fn main() {
          measures. The merge is a semilattice join — associative and\n\
          commutative — so the fold over writer roots can be re-associated into\n\
          a balanced reduction whose levels are independent. That leaves the\n\
-         request count alone and collapses the *dependent* depth from W to\n\
-         log2(W), which is the column on the right."
+         request count alone and buys a constant factor of about 3x.\n\
+         Compaction is what removes the growth itself: one head absorbing the\n\
+         rest leaves a reader merging one root instead of W."
     );
 }

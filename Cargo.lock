@@ -1587,7 +1587,9 @@ name = "pond_cli"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "pond_cache",
  "pond_core",
+ "pond_engine",
  "pond_kernel",
  "pond_s3",
  "pond_sql",

@@ -106,6 +106,13 @@ enum Commands {
     Revert { collection: String, commit_hash: String },
     Ls,
     Cat { hash: String },
+    /// Fold every writer's head into one, so reads stop paying for writers
+    /// that have gone away.
+    ///
+    /// Safe to run at any time, from anywhere, concurrently, and while writers
+    /// are publishing: nothing is deleted and a publish that races the pass is
+    /// never absorbed. A pond that is never compacted is slower, not wrong.
+    Compact,
     /// Garbage collect unreachable blobs.
     /// Analyzes reachability and optionally deletes dead blobs.
     Gc {
@@ -331,6 +338,9 @@ fn main() {
                 }
                 Commands::Ls => { cmd_ls(&storage); }
                 Commands::Cat { hash } => { cmd_cat(&storage, &hash); }
+                Commands::Compact => {
+                    cmd_compact(&storage);
+                }
                 Commands::Gc { compute_size, dry_run } => {
                     cmd_gc(&storage, compute_size, dry_run);
                 }
@@ -873,6 +883,37 @@ fn cmd_cat(storage: &UnifiedStorage, hash: &str) {
 
 
 /// Garbage collect — analyze reachability and optionally delete dead blobs.
+fn cmd_compact(storage: &UnifiedStorage) {
+    let kernel = storage.kernel();
+    let report = match pond_engine::compact_heads(
+        kernel.store_handle(),
+        pond_cache::CacheConfig::default(),
+        pond_engine::EngineConfig::default(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("compaction failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if report.heads_seen == 0 {
+        println!("nothing to compact — no writer has published yet");
+        return;
+    }
+    println!(
+        "compacted {} head(s) across {} collection(s)",
+        report.heads_absorbed, report.collections
+    );
+    if report.heads_absorbed > 1 {
+        println!(
+            "readers now merge one root instead of {}",
+            report.heads_absorbed
+        );
+    }
+    println!("nothing was deleted; run `pond gc` to reclaim space");
+}
+
 fn cmd_gc(storage: &UnifiedStorage, compute_size: bool, dry_run: bool) {
     let kernel = storage.kernel();
     let gc = pond_storage::maintenance::GarbageCollector::new(kernel);

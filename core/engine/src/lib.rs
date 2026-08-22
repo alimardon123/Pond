@@ -89,6 +89,14 @@ pub fn head_key(writer_id: u64) -> String {
 
 const HEADS_PREFIX: &str = "heads/";
 
+/// The writer id a compacted head is published under.
+///
+/// Reserved rather than allocated: `stable_writer_id` derives ids from a hash
+/// of hostname and username, so the chance of a real writer landing here is the
+/// chance of a 64-bit hash collision, and using a sentinel keeps compaction
+/// from needing a registry.
+pub const COMPACTOR_WRITER_ID: u64 = u64::MAX;
+
 /// How many merges of one reduction level run at once.
 ///
 /// Matches the S3 backend's batch width: the requests these merges issue are
@@ -191,7 +199,7 @@ impl<S: ObjectStore> Engine<S> {
 
     /// Load a collection's current tree — staged if it has uncommitted writes,
     /// otherwise this writer's last published root, otherwise empty.
-    fn tree_for(&mut self, collection: &str) -> Tree {
+    pub fn tree_for(&mut self, collection: &str) -> Tree {
         if let Some(t) = self.staged.get(collection) {
             return Tree {
                 root: t.root.clone(),
@@ -400,6 +408,11 @@ pub struct Reader<S: ObjectStore> {
     roots: BTreeMap<String, Vec<String>>,
     config: EngineConfig,
     merged: BTreeMap<String, Tree>,
+    /// Every head this reader read, as (content hash, head) — including the
+    /// ones it skipped as already absorbed. Compaction needs the skipped ones
+    /// too: it republishes over the previous compacted head, so it has to
+    /// re-claim everything that head claimed or the coverage would shrink.
+    heads: Vec<(String, Head)>,
 }
 
 impl<S: ObjectStore> Reader<S> {
@@ -427,14 +440,43 @@ impl<S: ObjectStore> Reader<S> {
         // plus one wave, whatever the number of writers.
         let bodies = store.inner().get_object_batch(&paths);
 
-        let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for bytes in bodies.into_iter().flatten() {
+        let heads: Vec<(String, Head)> = bodies
+            .into_iter()
+            .flatten()
             // A head that does not decode is skipped, not fatal: one writer
             // publishing a corrupt head must not make every other writer's
             // data unreadable.
-            let Some(head) = pond_record::decode_head(&bytes) else {
+            .filter_map(|bytes| {
+                let head = pond_record::decode_head(&bytes)?;
+                Some((pond_kernel::hash_bytes(&bytes), head))
+            })
+            .collect();
+
+        // A compacted head names, in `observed`, the exact heads it folded in
+        // — writer id to the content hash of that head's bytes. Any head still
+        // sitting at a hash somebody has already absorbed contributes nothing,
+        // so it is dropped before the merge rather than re-merged.
+        //
+        // Matching on the content hash rather than on the writer id is what
+        // makes this safe without a compare-and-swap. If that writer published
+        // again — during the compaction or after it — its head holds different
+        // bytes and therefore a different hash, no longer matches, and is
+        // merged normally. A concurrent publish cannot be skipped.
+        //
+        // And if the skip were wrong in the other direction, the cost would be
+        // a slower read and not a wrong one: merge is idempotent, so folding a
+        // writer's root in twice yields the same tree. The optimisation cannot
+        // corrupt the answer, only fail to speed it up.
+        let absorbed: std::collections::HashSet<(u64, &str)> = heads
+            .iter()
+            .flat_map(|(_, h)| h.observed.iter().map(|(w, hash)| (*w, hash.as_str())))
+            .collect();
+
+        let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (hash, head) in &heads {
+            if absorbed.contains(&(head.writer_id, hash.as_str())) {
                 continue;
-            };
+            }
             for (collection, root) in &head.collections {
                 roots
                     .entry(collection.clone())
@@ -448,6 +490,7 @@ impl<S: ObjectStore> Reader<S> {
             roots,
             config,
             merged: BTreeMap::new(),
+            heads,
         })
     }
 
@@ -559,8 +602,37 @@ impl<S: ObjectStore> Reader<S> {
         level.pop().expect("a non-empty level always reduces to one tree")
     }
 
+    /// How many heads this reader read, absorbed ones included.
+    pub fn head_count(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// Every head identity this reader's view covers, as (writer, content
+    /// hash of that head's bytes).
+    ///
+    /// Includes the transitive closure — the heads read directly *and* every
+    /// head those heads already claimed to have absorbed. Compaction
+    /// republishes over the single compacted head key, so anything the
+    /// previous compacted head claimed has to be re-claimed here or those
+    /// writers would become live again on the next read.
+    ///
+    /// The compactor's own head is excluded: it is the thing being replaced,
+    /// and a head claiming to have absorbed itself is meaningless.
+    pub fn head_identities(&self) -> Vec<(u64, String)> {
+        let mut out: BTreeMap<u64, String> = BTreeMap::new();
+        for (hash, head) in &self.heads {
+            for (writer, absorbed) in &head.observed {
+                out.insert(*writer, absorbed.clone());
+            }
+            if head.writer_id != COMPACTOR_WRITER_ID {
+                out.insert(head.writer_id, hash.clone());
+            }
+        }
+        out.into_iter().collect()
+    }
+
     /// Merge every writer's tree for a collection, memoised per reader.
-    fn tree_for(&mut self, collection: &str) -> Tree {
+    pub fn tree_for(&mut self, collection: &str) -> Tree {
         if let Some(t) = self.merged.get(collection) {
             return Tree {
                 root: t.root.clone(),
@@ -623,6 +695,104 @@ impl<S: ObjectStore> Reader<S> {
 /// Conflict resolution between two writers' versions of one record.
 ///
 /// Per-field last-writer-wins over a total order `(physical, logical, writer)`.
+/// What one compaction pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReport {
+    /// Heads read.
+    pub heads_seen: usize,
+    /// Heads folded into the compacted head, and therefore skippable by
+    /// readers from now on.
+    pub heads_absorbed: usize,
+    /// Collections in the compacted head.
+    pub collections: usize,
+}
+
+/// Fold every writer's head into one, so readers stop paying for writers that
+/// have gone away.
+///
+/// # The problem this exists for
+///
+/// Heads are what makes coordination-free multi-writer possible: each writer
+/// owns one key, nobody contends, no compare-and-swap is needed. The price is
+/// that a head, once written, is read by every reader forever — a writer that
+/// published once and vanished still costs a read and a merge on every open.
+/// Measured with `pond_bench --bin writerscale`, the first read of a collection
+/// with 256 writers merged 511 roots; that number tracks the writers that have
+/// *ever* published, not the data and not the active writers.
+///
+/// # How this bounds it without a compare-and-swap
+///
+/// A compaction pass reads every head, merges their roots per collection, and
+/// publishes the result as a single head under [`COMPACTOR_WRITER_ID`] whose
+/// `observed` map names each head it absorbed by **the content hash of that
+/// head's bytes**. Readers drop any head sitting at an absorbed hash.
+///
+/// Naming heads by content hash rather than by writer id is the whole safety
+/// argument. The dangerous case is a writer publishing while compaction runs:
+/// its new head has different bytes, so a different hash, so it does not match
+/// what was absorbed, so it is merged normally. There is no window in which a
+/// publish can be swallowed, and nothing is deleted — the compacted head is
+/// purely additive, which is why this needs no conditional write and behaves
+/// identically on a local filesystem and on object storage.
+///
+/// If a head is wrongly *not* skipped, the merge just includes it twice, and
+/// merge is idempotent. The optimisation can cost time; it cannot cost
+/// correctness.
+///
+/// # Who runs it
+///
+/// Anyone, any number of times, concurrently. Two compactors racing publish to
+/// the same key and last-writer-wins is correct, because both computed a merge
+/// of a subset of the same heads and the loser's contribution is still present
+/// in its own writers' heads. Running it is a maintenance choice, not a
+/// protocol obligation — a pond that never compacts is slower, never wrong.
+pub fn compact_heads<S: ObjectStore>(
+    backend: S,
+    cache: CacheConfig,
+    config: EngineConfig,
+) -> Result<CompactionReport> {
+    let mut reader = Reader::open_with(backend, cache, config)?;
+
+    // Taken from the reader's own view, so exactly what it merged is what gets
+    // recorded — re-listing here would open a window between the two.
+    //
+    // Nothing to fold means nothing to write. Publishing an empty compacted
+    // head anyway would leave a head behind that every later pass counts as
+    // one it has "seen" — which is how `pond compact` on an empty pond came to
+    // report "0 heads absorbed of 1 seen".
+    let absorbed = reader.head_identities();
+    if absorbed.is_empty() {
+        return Ok(CompactionReport {
+            heads_seen: 0,
+            heads_absorbed: 0,
+            collections: 0,
+        });
+    }
+
+    let collections = reader.collections();
+
+    let mut head = Head::new(COMPACTOR_WRITER_ID);
+    for collection in &collections {
+        let tree = reader.tree_for(collection);
+        head.set_root(collection, &tree.root);
+    }
+    for (writer, hash) in &absorbed {
+        head.observe(*writer, hash);
+    }
+
+    let bytes = pond_record::encode_head(&head);
+    reader
+        .store
+        .inner()
+        .put_object(&head_key(COMPACTOR_WRITER_ID), &bytes)?;
+
+    Ok(CompactionReport {
+        heads_seen: reader.head_count(),
+        heads_absorbed: absorbed.len(),
+        collections: collections.len(),
+    })
+}
+
 /// Commutative, so `merge(a,b) == merge(b,a)` and readers converge regardless
 /// of the order heads were discovered in.
 fn resolve_records(a: &[u8], b: &[u8]) -> Vec<u8> {

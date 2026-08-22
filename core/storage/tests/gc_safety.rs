@@ -195,3 +195,63 @@ fn gc_does_not_destroy_subject_keys() {
         b"personal data"
     );
 }
+
+/// A compacted pond survives garbage collection.
+///
+/// Compaction publishes a head under a reserved writer id holding *merged*
+/// roots — index nodes that no individual writer's head names. If the live-set
+/// walk enumerated writers rather than heads, or skipped the reserved id as
+/// "not a real writer", those merged nodes would be unreachable and GC would
+/// delete the very structure that makes reads cheap. This is the same shape as
+/// the bug at the top of this file, one layer up, so it gets its own test
+/// rather than an assumption that walking `heads/` covers it.
+#[test]
+fn gc_does_not_delete_a_compacted_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = kernel(dir.path());
+
+    engine_path::create(&s, "users").unwrap();
+    for w in 1..=4u64 {
+        engine_path::write_rows(
+            &s,
+            "users",
+            &[
+                ("id", TypedColumn::Int64(vec![w as i64])),
+                ("name", TypedColumn::String(vec![format!("w{}", w)])),
+            ],
+            w,
+        )
+        .unwrap();
+    }
+
+    let before = rows_of(&s, "users");
+    assert_eq!(before.len(), 4, "four writers, four rows");
+
+    pond_engine::compact_heads(
+        s.store_handle(),
+        pond_cache::CacheConfig::default(),
+        pond_storage::definition::load(&s, "users").engine_config(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        rows_of(&s, "users"),
+        before,
+        "compaction alone must not change the rows"
+    );
+
+    let report = GarbageCollector::new(&s).collect(None, false);
+    println!("gc over a compacted pond: {:?}", report);
+
+    assert_eq!(
+        rows_of(&s, "users"),
+        before,
+        "garbage collection must not delete the merged index nodes that only \
+         the compacted head names"
+    );
+
+    // And the pond is still readable through a fresh engine reader, not only
+    // through the storage path.
+    let mut r = pond_engine::Reader::open(s.store_handle()).unwrap();
+    assert_eq!(r.scan("users").unwrap().len(), 4);
+}

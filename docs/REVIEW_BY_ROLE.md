@@ -213,15 +213,49 @@ cheap bottom of the reduction, and it plateaus:
 Widening the fan-out past 32 makes it worse — 2.5x at a fan-out of 256 — as
 thread scheduling overtakes the overlap gained.
 
-**So the ceiling stands.** 3x off a line is still a line, and "multi-writer from
-any lens, any user worldwide" implies a writer population that grows without
-bound. The fix is head compaction: periodically merge many heads into one
-published root and delete the heads folded in, so the read path sees a number of
-heads bounded by recent activity rather than by all history. That is a real
-design question — it needs a rule for who compacts, and it must not lose a write
-that lands mid-compaction, which is the same race the key-rotation work already
-had to solve once. It does not exist yet, and until it does the writer count is
-the scaling limit, not the data volume.
+**The ceiling is now removed, by compaction rather than by a faster fold.** 3x
+off a line is still a line, and "multi-writer from any lens, any user worldwide"
+implies a writer population that grows without bound. `pond compact` (or
+`pond_engine::compact_heads`) reads every head, merges their roots, and
+publishes the result as a single head under a reserved writer id whose
+`observed` map names each head it absorbed. Readers drop any head sitting at an
+absorbed identity, so they merge one root instead of W:
+
+| writers | first scan, dependent round trips | after compaction |
+|---|---|---|
+| 16  | 31  | 1 |
+| 64  | 127 | 1 |
+| 256 | 511 | 1 |
+
+Flat, not merely smaller.
+
+**What makes it safe without a compare-and-swap** is that heads are claimed by
+the *content hash of their bytes*, not by writer id. The dangerous case is a
+writer publishing while compaction runs: its new head has different bytes, so a
+different hash, so it does not match what was absorbed and is merged normally.
+There is no window in which a publish can be swallowed. Both race tests fail if
+the claim is changed to a writer id, which is how that was checked rather than
+argued.
+
+Two further properties fall out of the same choice. Nothing is deleted — the
+compacted head is purely additive, so this behaves identically on a local
+filesystem and on object storage, with no conditional write anywhere. And if a
+head is wrongly *not* skipped, merge is idempotent, so the reader folds it in
+twice and gets the same tree: the optimisation can cost time, never
+correctness.
+
+Anyone can run it, any number of times, concurrently. A pond that is never
+compacted is slower, never wrong.
+
+This also gives `Head::observed` its first implementation. The field, its
+encoding and its "makes fast-forward detection exact" docstring have been in the
+tree throughout, written by nothing and read by nothing.
+
+**Remaining:** compaction does not shrink the LIST or the head reads — a reader
+still issues one request per head that has ever existed, though in two round
+trips rather than W. That is cheap in latency and not free in money, and
+bounding it needs the absorbed heads deleted, which is a harder problem than
+this one: a delete cannot be made safe by content hash the way a skip can.
 
 **Column pruning does not exist yet.** A scan that wants one field still reads
 whole records, and a spilled record is fetched whole. That is what a PAX
