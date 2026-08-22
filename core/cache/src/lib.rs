@@ -311,6 +311,101 @@ impl<S: ObjectStore> ObjectStore for BlobCache<S> {
         Ok(hash)
     }
 
+    /// Forwarded, not left to the trait's sequential default.
+    ///
+    /// That default calls `self.put_blob` N times — on `self`, the cache —
+    /// so the backend's parallel batch never runs and a 32-wide level write
+    /// becomes 32 dependent round trips. Request counts are identical either
+    /// way, which is why no cost assertion in the suite catches it; only wall
+    /// clock moves, by the width of the batch. Every decorator over
+    /// `ObjectStore` has to forward these three explicitly.
+    fn put_blob_batch(&self, items: &[Vec<u8>]) -> io::Result<Vec<String>> {
+        let hashes = self.inner.put_blob_batch(items)?;
+        for (hash, data) in hashes.iter().zip(items) {
+            self.admit(hash, data);
+        }
+        Ok(hashes)
+    }
+
+    /// Serves what is cached and fetches only the misses, in one batch.
+    ///
+    /// The partial-hit case is the reason this cannot simply forward: a batch
+    /// where half the entries are warm should cost one request for the other
+    /// half, not one for all of them and not N for the misses.
+    fn get_blob_batch(&self, hashes: &[String]) -> io::Result<Vec<Vec<u8>>> {
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(hashes.len());
+        let mut missing = Vec::new();
+        let mut missing_at = Vec::new();
+
+        for (i, hash) in hashes.iter().enumerate() {
+            // Scoped, not chained into the `if let`: an `if let` holds its
+            // guard for the whole block, and the disk branch below locks
+            // `memory` again to promote what it found — which on a
+            // non-reentrant mutex is a deadlock. It is reachable only when a
+            // disk tier is configured and the entry is on it, so no
+            // memory-only test would ever hit it.
+            let cached = self.memory.lock().unwrap().get(hash);
+            if let Some(data) = cached {
+                self.memory_hits.fetch_add(1, Ordering::Relaxed);
+                out.push(Some(data));
+            } else if let Some(data) = self.read_disk(hash) {
+                self.disk_hits.fetch_add(1, Ordering::Relaxed);
+                if data.len() as u64 <= self.config.max_memory_entry_bytes {
+                    self.memory.lock().unwrap().insert(hash, &data);
+                }
+                out.push(Some(data));
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                out.push(None);
+                missing_at.push(i);
+                missing.push(hash.clone());
+            }
+        }
+
+        if !missing.is_empty() {
+            let fetched = self.inner.get_blob_batch(&missing)?;
+            // A short result would leave slots unfilled, and filling them with
+            // empty bytes would hand the caller a silently wrong answer for a
+            // blob that exists. Refuse instead.
+            if fetched.len() != missing.len() {
+                return Err(io::Error::other(format!(
+                    "backend returned {} blobs for a batch of {}",
+                    fetched.len(),
+                    missing.len()
+                )));
+            }
+            for (slot, data) in missing_at.into_iter().zip(fetched) {
+                self.admit(&hashes[slot], &data);
+                out[slot] = Some(data);
+            }
+        }
+
+        out.into_iter()
+            .map(|d| d.ok_or_else(|| io::Error::other("batch read left a hole")))
+            .collect()
+    }
+
+    /// Purges every tier, then deletes in one backend call.
+    ///
+    /// On S3 that call is a single `DeleteObjects` carrying up to 1000 keys;
+    /// unrolled it would be 1000 separate DELETEs, which is what GC would
+    /// otherwise pay on every sweep.
+    fn delete_blob_batch(&self, hashes: &[String]) -> io::Result<usize> {
+        for hash in hashes {
+            {
+                let mut mem = self.memory.lock().unwrap();
+                if let Some(gone) = mem.entries.remove(hash) {
+                    mem.bytes -= gone.len() as u64;
+                    mem.order.retain(|h| h != hash);
+                }
+            }
+            if let Some(path) = self.disk_path(hash) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        self.inner.delete_blob_batch(hashes)
+    }
+
     fn get_blob(&self, hash: &str) -> io::Result<Vec<u8>> {
         if let Some(data) = self.memory.lock().unwrap().get(hash) {
             self.memory_hits.fetch_add(1, Ordering::Relaxed);
