@@ -47,11 +47,35 @@ use pond_kernel::ObjectStore;
 /// enough that paying a round trip to avoid it is a bad deal; above it, the
 /// write cost dominates by orders of magnitude.
 ///
-/// 1 KiB is chosen so that a full leaf of inline values stays inside the size
-/// that one GET should carry: at the default target of 2048 entries, 2048 x
-/// 1 KiB is a 2 MiB ceiling on a leaf, while the common case — records of a
-/// few hundred bytes — stays inline and costs no extra request at all.
-pub const SPILL_THRESHOLD: usize = 1024;
+/// Measured rather than reasoned. `cargo run -p pond_bench --bin spillpoint`
+/// runs 40 writes and N reads over 2000 rows and prices both terms — requests
+/// at a PUT costing 12.5x a GET, plus 30 ms per request and 20 ms per MiB:
+///
+/// | value | reads/write | bytes inline -> spill | spilling |
+/// |---|---|---|---|
+/// | 1 KiB  | 1   | 76 MiB -> 6 MiB      | 1.1x slower |
+/// | 1 KiB  | 100 | 76 MiB -> 6 MiB      | 1.3x slower |
+/// | 4 KiB  | 1   | 293 MiB -> 6 MiB     | 1.1x faster |
+/// | 4 KiB  | 100 | 293 MiB -> 6 MiB     | 1.3x slower |
+/// | 16 KiB | 1   | 1159 MiB -> 7 MiB    | 2.3x faster |
+/// | 16 KiB | 10  | 1159 MiB -> 7 MiB    | 1.2x faster |
+///
+/// The first version of this constant was 1 KiB, argued from leaf arithmetic.
+/// The measurement says that is the one band where spilling loses at *every*
+/// mix: the bytes it saves do not pay for the requests it adds.
+///
+/// 4 KiB is where the byte saving becomes large enough — 47x at that size — to
+/// carry the extra request, and it is above the band where spilling is simply
+/// a loss. Values of a few hundred bytes, the common case, still stay inline
+/// and cost nothing extra.
+///
+/// **The read side of that table is the cold case.** The benchmark opens a
+/// fresh reader per read, so nothing is cached. Spilled blobs are
+/// content-addressed like index nodes, so a warm cache serves them without a
+/// request and the read penalty disappears — which is the case this design is
+/// built for, and why the write side is weighted more heavily here than a
+/// cold-only reading of the table would suggest.
+pub const SPILL_THRESHOLD: usize = 4096;
 
 /// Marks an index value as a pointer rather than a record.
 ///
