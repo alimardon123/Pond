@@ -1408,3 +1408,45 @@ fn a_rotation_does_not_duplicate_the_subject_in_listings() {
         "the displaced key is the same subject, not another one"
     );
 }
+
+/// Mirrors what the Python binding does: write two subjects, erase one, and
+/// check the surviving subject's value is still there *through PND2*, which is
+/// the path SQL, the lenses and Python all take.
+#[test]
+fn a_survivors_value_reads_through_pnd2_after_someone_else_is_erased() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            (
+                "owner",
+                TypedColumn::String(vec!["alice".into(), "bob".into()]),
+            ),
+            (
+                "note",
+                TypedColumn::String(vec!["alice secret".into(), "bob secret".into()]),
+            ),
+        ],
+        1,
+    )
+    .unwrap();
+
+    pond_storage::subject::erase_subject(&k, "alice").unwrap();
+
+    let blob = engine_path::read_pnd2(&k, "people").unwrap();
+    let cols = pond_core::decode::pnd2_decode(&blob).unwrap();
+    let rows = pond_core::to_json::columns_to_json_rows(&cols, true);
+    let notes: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("note").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    assert!(
+        notes.contains(&"bob secret".to_string()),
+        "the surviving subject's value must read through PND2: {:?} (columns: {:?})",
+        notes,
+        cols.iter().map(|c| c.name.to_string_lossy().into_owned()).collect::<Vec<_>>()
+    );
+}

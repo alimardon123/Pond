@@ -26,6 +26,10 @@ path = "src/adversarial.rs"
 name = "valuesize"
 path = "src/valuesize.rs"
 
+[[bin]]
+name = "spillpoint"
+path = "src/spillpoint.rs"
+
 [dependencies]
 tempfile = { workspace = true }
 pond_index = { path = "../core/index" }

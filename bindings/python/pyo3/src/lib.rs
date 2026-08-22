@@ -1633,6 +1633,101 @@ impl Storage {
         }
     }
 
+    /// Create a collection whose rows belong to subjects, and seal them.
+    ///
+    /// `subject_column` names the column holding each row's subject id. Every
+    /// other column is then sealed under that subject's key, so erasing the
+    /// subject makes their values unreadable everywhere at once — in every
+    /// branch, in history, and in every replica.
+    fn create_collection_for_subjects(
+        &self,
+        collection: &str,
+        subject_column: &str,
+    ) -> PyResult<()> {
+        let storage = self.storage.lock().unwrap();
+        pond_storage::engine_path::create_for_subjects(
+            storage.kernel(),
+            collection,
+            subject_column,
+        )
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Erase a subject: destroy their key.
+    ///
+    /// Irreversible. Returns whether there was a key to destroy — erasing an
+    /// already-erased subject is not an error, because a deletion request that
+    /// arrives twice must not fail the second time.
+    #[pyo3(signature = (subject, requested_by = "unspecified"))]
+    fn erase_subject(&self, subject: &str, requested_by: &str) -> PyResult<bool> {
+        let storage = self.storage.lock().unwrap();
+        pond_storage::subject::erase_subject_for(storage.kernel(), subject, requested_by)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Was this subject erased? For a caller who already holds the id.
+    fn was_erased(&self, subject: &str) -> PyResult<bool> {
+        let storage = self.storage.lock().unwrap();
+        pond_storage::subject::was_erased(storage.kernel(), subject)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Subjects that still have a key, and are therefore erasable.
+    fn subjects(&self) -> PyResult<Vec<String>> {
+        let storage = self.storage.lock().unwrap();
+        let mut names = pond_storage::subject::subjects(storage.kernel())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        names.sort();
+        Ok(names)
+    }
+
+    /// The erasure log, oldest first.
+    ///
+    /// Entries carry a salted digest rather than the subject id: a log naming
+    /// erased subjects is a directory of erased people, retained after their
+    /// data was destroyed.
+    fn erasure_log(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let storage = self.storage.lock().unwrap();
+        let entries = pond_storage::subject::erasure_log(storage.kernel())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let out = pyo3::types::PyList::empty_bound(py);
+        for e in entries {
+            let d = PyDict::new_bound(py);
+            d.set_item("subject_digest", e.subject_digest)?;
+            d.set_item("at_ms", e.at_ms)?;
+            d.set_item("requested_by", e.requested_by)?;
+            d.set_item("key_existed", e.key_existed)?;
+            out.append(d)?;
+        }
+        Ok(out.into())
+    }
+
+    /// Rotate a subject's key across a collection.
+    ///
+    /// Re-seals that subject's rows under a fresh key and retires the old one.
+    /// Costs a rewrite of their rows, unlike erasure which costs one key —
+    /// rotation must keep the values readable.
+    fn rotate_subject(&self, collection: &str, subject: &str) -> PyResult<bool> {
+        let storage = self.storage.lock().unwrap();
+        pond_storage::engine_path::rotate_subject(
+            storage.kernel(),
+            collection,
+            subject,
+            pond_kernel::crdt::stable_writer_id(),
+        )
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Retire the key a rotation displaced.
+    ///
+    /// Until this is called the old key still opens data, which is the point
+    /// while a write might have raced the rotation and a liability afterwards.
+    fn finish_rotation(&self, subject: &str) -> PyResult<bool> {
+        let storage = self.storage.lock().unwrap();
+        pond_storage::subject::finish_rotation(storage.kernel(), subject)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
     /// Create an engine-backed collection.
     ///
     /// Collections created this way use the content-defined index: a commit is
@@ -6085,6 +6180,128 @@ mod tests {
                 .unwrap();
             let names = extract_string_vec(py, &result, "name");
             assert_eq!(names.len(), 2, "expected two rows over 40, got {:?}", names);
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    /// Erasure through the Python API, end to end.
+    ///
+    /// The bindings are how most callers reach this, so an erasure that works
+    /// only from Rust is not much of a compliance story.
+    #[test]
+    fn test_erasure_through_the_python_api() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            storage
+                .create_collection_for_subjects("people", "owner")
+                .unwrap();
+            storage
+                .write_rows(
+                    "people",
+                    vec![
+                        (
+                            "owner".to_string(),
+                            vec!["alice".to_object(py), "bob".to_object(py)],
+                        ),
+                        (
+                            "note".to_string(),
+                            vec!["alice secret".to_object(py), "bob secret".to_object(py)],
+                        ),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            // `Option<String>` per row, not `String`: an erased subject's field
+            // comes back as `None`, and a column holding one cannot extract as
+            // `Vec<String>` — which silently yields an empty vec and makes the
+            // surviving subject's value look lost too.
+            let notes = |storage: &Storage| -> Vec<Option<String>> {
+                let result = storage.read_rows(py, "people", None, None).unwrap();
+                let dict = result.bind(py).downcast::<PyDict>().unwrap().clone();
+                match dict.get_item("note").unwrap() {
+                    Some(v) => v
+                        .extract::<Vec<Option<String>>>()
+                        .expect("note must extract as optional strings"),
+                    None => Vec::new(),
+                }
+            };
+
+            assert_eq!(storage.subjects().unwrap(), vec!["alice", "bob"]);
+            assert!(!storage.was_erased("alice").unwrap());
+            assert!(notes(&storage).contains(&Some("alice secret".to_string())));
+
+            assert!(storage.erase_subject("alice", "ticket-42").unwrap());
+
+            assert!(storage.was_erased("alice").unwrap());
+            assert_eq!(storage.subjects().unwrap(), vec!["bob"]);
+
+            let after = notes(&storage);
+            assert!(
+                !after.contains(&Some("alice secret".to_string())),
+                "the erased subject's value must not be readable: {:?}",
+                after
+            );
+            assert!(
+                after.contains(&Some("bob secret".to_string())),
+                "erasing one subject must not touch another: {:?}",
+                after
+            );
+
+            let log = storage.erasure_log(py).unwrap();
+            let entries = log.bind(py).downcast::<pyo3::types::PyList>().unwrap().len();
+            assert_eq!(entries, 1, "the erasure must be recorded");
+
+            cleanup_dir(&dir);
+        });
+    }
+
+    /// Rotation through the Python API keeps the data and retires the key.
+    #[test]
+    fn test_rotation_through_the_python_api() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dir = make_temp_dir();
+            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+
+            storage
+                .create_collection_for_subjects("people", "owner")
+                .unwrap();
+            storage
+                .write_rows(
+                    "people",
+                    vec![
+                        ("owner".to_string(), vec!["alice".to_object(py)]),
+                        ("note".to_string(), vec!["keep me".to_object(py)]),
+                    ],
+                    "init",
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            assert!(storage.rotate_subject("people", "alice").unwrap());
+            assert!(storage.finish_rotation("alice").unwrap());
+
+            let result = storage.read_rows(py, "people", None, None).unwrap();
+            let dict = result.bind(py).downcast::<PyDict>().unwrap().clone();
+            let notes: Vec<String> = dict
+                .get_item("note")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(
+                notes,
+                vec!["keep me".to_string()],
+                "rotation must preserve the data"
+            );
 
             cleanup_dir(&dir);
         });
