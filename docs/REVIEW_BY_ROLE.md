@@ -80,9 +80,16 @@ the leaf holds thousands of entries and is rewritten whole. After spilling,
 single-row update — inherent to a copy-on-write tree with small rows, and what
 batching amortises (0.02 PUTs/record at 1000-row batches on R2).
 
-**Open:** reading a spilled value costs one extra GET. Scans batch it, point
-reads do not. The 1 KiB threshold is reasoned rather than measured against a
-real read/write mix, and should be measured.
+**The spill threshold was measured, and the reasoning had been wrong.** 1 KiB
+was argued from leaf arithmetic; measurement showed it is the one band where
+spilling loses at *every* read/write mix — the bytes saved do not pay for the
+requests added. Raised to 4 KiB.
+
+The first version of that benchmark priced only requests and concluded spilling
+never wins. That was the wrong cost function: a leaf rewritten whole is one PUT
+however large it is, so counting requests alone makes an inline 200 MB leaf
+look cheaper than a spilled 200 KB one. The uniformly negative result is what
+exposed the modelling error.
 
 **A measurement that could not be made stable, and why that is a finding.** The
 one-row flush cost swung between 0.5x and 2.2x on identical inputs. Averaging
