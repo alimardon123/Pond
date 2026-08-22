@@ -579,3 +579,150 @@ fn compaction_leaves_alone_what_it_does_not_recognise() {
         6
     );
 }
+
+/// Two compaction passes overlapping must not lose a writer between them.
+///
+/// The claim on `compact_heads` is that anyone may run it, any number of
+/// times, concurrently. That was easy to guarantee while it only ever added a
+/// head. Now that a pass also deletes what it absorbed, the claim needs
+/// checking against the case that breaks it:
+///
+///   - pass A lists {h1, h2, h3}, merges, publishes, deletes all three;
+///   - pass B listed only {h1, h2} earlier, publishes *after* A, and so takes
+///     a higher sequence.
+///
+/// If readers take only the newest compacted head, they see B's — which never
+/// contained h3 — while A has already deleted h3. The row is gone.
+#[test]
+fn two_overlapping_compaction_passes_lose_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), 2, 1);
+
+    // Pass B reads the listing now, while only writers 1 and 2 exist.
+    let mut b = Reader::open(store(dir.path())).unwrap();
+    let b_absorbed = b.head_identities();
+    let b_root = b.root_of("t");
+    let b_paths = b.all_head_paths();
+    drop(b);
+
+    // Writer 3 appears and publishes.
+    let mut e = Engine::open(store(dir.path()), 3).unwrap();
+    e.write_records("t", vec![row(3, 0)]).unwrap();
+    e.publish().unwrap();
+
+    // Pass A runs to completion: it sees all three, folds them, retires them.
+    compact(dir.path());
+    assert_eq!(
+        Reader::open(store(dir.path())).unwrap().scan("t").unwrap().len(),
+        3,
+        "pass A alone must leave all three rows readable"
+    );
+
+    // Now pass B finishes, publishing its stale merge at a *later* moment and
+    // therefore a higher sequence, and retiring what it had listed.
+    let s = store(dir.path());
+    let mut head = pond_record::Head::new(COMPACTOR_WRITER_ID);
+    head.set_root("t", &b_root);
+    for (w, hash) in &b_absorbed {
+        head.observe(*w, hash);
+    }
+    let bytes = pond_record::encode_head(&head);
+    s.put_object(
+        &pond_engine::head_key(
+            COMPACTOR_WRITER_ID,
+            u64::MAX - 1, // unambiguously later than pass A's
+            &pond_kernel::hash_bytes(&bytes),
+        ),
+        &bytes,
+    )
+    .unwrap();
+    for p in b_paths.iter().filter(|p| pond_engine::parse_head_key(p).is_some()) {
+        let _ = s.delete_path(p);
+    }
+
+    let mut r = Reader::open(store(dir.path())).unwrap();
+    let rows = r.scan("t").unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "writer 3's row must survive two overlapping passes; a reader that \
+         takes only the newest compacted head sees B's, which never contained \
+         it, while A has already deleted the original. Got {:?}",
+        rows.iter().map(|(k, _)| k).collect::<Vec<_>>()
+    );
+}
+
+/// Overlapping passes leave two compacted heads; the next pass folds them.
+///
+/// Reading every compacted head is what makes the overlap safe, so the
+/// question this raises is whether they accumulate. They do not: a pass
+/// retires every compacted head it read, so the fixpoint is one.
+#[test]
+fn overlapping_compacted_heads_converge_back_to_one() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), 3, 1);
+
+    // Two passes from the same starting view — the overlap, in its simplest
+    // form. Both publish; neither can delete the other's head, because neither
+    // listed it.
+    // Both passes read *before* either publishes — that is what makes them
+    // overlap. Reading one after the other would just be two sequential
+    // passes, and the second would legitimately retire the first's head.
+    let view = || {
+        let mut r = Reader::open(store(dir.path())).unwrap();
+        let v = (r.head_identities(), r.root_of("t"), r.all_head_paths());
+        drop(r);
+        v
+    };
+    let views = [view(), view()];
+
+    let publish_from = |seq: u64, (absorbed, root, paths): &(Vec<(u64, String)>, String, Vec<String>)| {
+        let s = store(dir.path());
+        let mut head = pond_record::Head::new(COMPACTOR_WRITER_ID);
+        head.set_root("t", root);
+        for (w, hash) in absorbed {
+            head.observe(*w, hash);
+        }
+        // A distinct sequence per pass, so the two heads are distinct objects
+        // even though their contents are identical here.
+        let bytes = pond_record::encode_head(&head);
+        s.put_object(
+            &pond_engine::head_key(COMPACTOR_WRITER_ID, seq, &pond_kernel::hash_bytes(&bytes)),
+            &bytes,
+        )
+        .unwrap();
+        for p in paths.iter().filter(|p| pond_engine::parse_head_key(p).is_some()) {
+            let _ = s.delete_path(p);
+        }
+    };
+
+    publish_from(10, &views[0]);
+    publish_from(20, &views[1]);
+
+    let heads = store(dir.path()).list_paths("heads/").unwrap();
+    let compacted = heads
+        .iter()
+        .filter_map(|h| pond_engine::parse_head_key(h))
+        .filter(|(id, _, _)| *id == COMPACTOR_WRITER_ID)
+        .count();
+    assert_eq!(compacted, 2, "two overlapping passes leave two: {:?}", heads);
+    assert_eq!(
+        Reader::open(store(dir.path())).unwrap().scan("t").unwrap().len(),
+        3,
+        "and every row is still readable across both"
+    );
+
+    // One ordinary pass folds them back together.
+    compact(dir.path());
+    let heads = store(dir.path()).list_paths("heads/").unwrap();
+    assert_eq!(
+        heads.len(),
+        1,
+        "the next pass must retire both and leave one: {:?}",
+        heads
+    );
+    assert_eq!(
+        Reader::open(store(dir.path())).unwrap().scan("t").unwrap().len(),
+        3
+    );
+}

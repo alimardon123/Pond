@@ -161,12 +161,23 @@ pub fn latest_heads(paths: &[String]) -> Vec<(u64, u64, Option<String>, String)>
     // that wrote it may never run again, and nothing else holds its rows — so
     // it must never be superseded by one. It stays in its own group and is
     // always read, until a compaction pass folds it in and retires it.
-    let mut best: BTreeMap<(u64, bool), (u64, Option<String>, String)> = BTreeMap::new();
+    let mut best: BTreeMap<(u64, bool, u64), (u64, Option<String>, String)> = BTreeMap::new();
     for path in paths {
         let Some((id, seq, hash)) = parse_head_key(path) else {
             continue;
         };
-        let group = (id, hash.is_some());
+        // Compacted heads are never collapsed against each other, because they
+        // are not versions of one another. A writer's heads are cumulative —
+        // sequence N+1 contains everything N did — so keeping the newest is
+        // right. Two compaction passes that overlapped are not: each merged the
+        // heads *it* listed, so a later one can be missing a writer an earlier
+        // one absorbed and already deleted. Taking only the newest loses that
+        // writer's rows outright.
+        //
+        // Merging them all instead is correct and costs nothing: merge is
+        // idempotent, and a pass retires every compacted head it read, so they
+        // do not accumulate.
+        let group = (id, hash.is_some(), if id == COMPACTOR_WRITER_ID { seq } else { 0 });
         let candidate = (seq, hash.map(|h| h.to_string()), path.clone());
         match best.get(&group) {
             Some(current) if (current.0, &current.1) >= (candidate.0, &candidate.1) => {}
@@ -176,7 +187,7 @@ pub fn latest_heads(paths: &[String]) -> Vec<(u64, u64, Option<String>, String)>
         }
     }
     best.into_iter()
-        .map(|((id, _), (seq, hash, path))| (id, seq, hash, path))
+        .map(|((id, _, _), (seq, hash, path))| (id, seq, hash, path))
         .collect()
 }
 
@@ -608,21 +619,33 @@ impl<S: ObjectStore> Reader<S> {
         let mut heads: Vec<(String, Head)> = Vec::new();
         let mut head_paths: Vec<String> = Vec::new();
 
-        let compacted = latest
+        // Every compacted head, not just the newest — see `latest_heads` for
+        // why there can legitimately be more than one, and why taking only the
+        // newest loses data. In steady state this is one object.
+        let compacted_keys: Vec<&(u64, u64, Option<String>, String)> = latest
             .iter()
-            .find(|(id, _, _, _)| *id == COMPACTOR_WRITER_ID)
-            .and_then(|(_, _, hash, path)| {
-                let bytes = store.inner().get_object(path)?;
-                let head = pond_record::decode_head(&bytes)?;
-                let own = hash
-                    .clone()
-                    .unwrap_or_else(|| pond_kernel::hash_bytes(&bytes));
-                Some((own, head, path.clone()))
-            });
-        if let Some((hash, head, path)) = compacted {
+            .filter(|(id, _, _, _)| *id == COMPACTOR_WRITER_ID)
+            .collect();
+        let compacted_paths: Vec<String> = compacted_keys
+            .iter()
+            .map(|(_, _, _, path)| path.clone())
+            .collect();
+        for (bytes, (_, _, hash, path)) in store
+            .inner()
+            .get_object_batch(&compacted_paths)
+            .into_iter()
+            .zip(&compacted_keys)
+        {
+            let Some(bytes) = bytes else { continue };
+            let Some(head) = pond_record::decode_head(&bytes) else {
+                continue;
+            };
             absorbed.extend(head.observed.values().cloned());
-            heads.push((hash, head));
-            head_paths.push(path);
+            let own = hash
+                .clone()
+                .unwrap_or_else(|| pond_kernel::hash_bytes(&bytes));
+            heads.push((own, head));
+            head_paths.push(path.clone());
         }
 
         // A head whose key carries no content hash was written before keys
@@ -958,11 +981,23 @@ pub struct CompactionReport {
 ///
 /// # Who runs it
 ///
-/// Anyone, any number of times, concurrently. Two compactors racing publish to
-/// the same key and last-writer-wins is correct, because both computed a merge
-/// of a subset of the same heads and the loser's contribution is still present
-/// in its own writers' heads. Running it is a maintenance choice, not a
-/// protocol obligation — a pond that never compacts is slower, never wrong.
+/// Anyone, any number of times, concurrently. Running it is a maintenance
+/// choice, not a protocol obligation — a pond that never compacts is slower,
+/// never wrong.
+///
+/// Concurrency is safe for a narrower reason than it first appears, and the
+/// original version of this comment got it wrong. Two overlapping passes each
+/// merge the heads *they* listed, so a pass that publishes later can be
+/// missing a writer that an earlier pass absorbed and has already deleted. If
+/// readers took only the newest compacted head, that writer's rows would be
+/// gone — which they were, until
+/// `two_overlapping_compaction_passes_lose_nothing` was written to check the
+/// claim instead of repeating it.
+///
+/// What makes it safe is that readers merge *every* compacted head, because
+/// compacted heads are not versions of one another. They do not accumulate: a
+/// pass retires every compacted head it read, so overlapping passes leave two
+/// and the next ordinary pass folds them back into one.
 pub fn compact_heads<S: ObjectStore>(
     backend: S,
     cache: CacheConfig,
