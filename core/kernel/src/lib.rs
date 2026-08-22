@@ -255,12 +255,31 @@ impl PondKernel {
     }
 
     /// Is the keystore held separately from the data?
-    ///
-    /// A deployment that must be able to prove erasure should check this and
-    /// refuse to start if it is false, rather than discover after a restore
-    /// that the keys came back with the data.
     pub fn keystore_is_separate(&self) -> bool {
         self.keystore.is_some()
+    }
+
+    /// Fail unless the keystore is separate from the data.
+    ///
+    /// A deployment that must be able to *prove* erasure cannot rely on a
+    /// documented recommendation. Keys stored with the data are copied by
+    /// every backup, snapshot and replica of the data, so restoring one undoes
+    /// every erasure since it was taken — and that is discovered after the
+    /// restore, when nothing can be done about it.
+    ///
+    /// This turns it into a startup failure instead, which is the only point
+    /// at which it is cheap to fix.
+    pub fn require_separate_keystore(self) -> io::Result<Self> {
+        if self.keystore.is_some() {
+            return Ok(self);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "subject keys would be stored alongside the data, so any backup of the \
+             data is also a backup of the keys and restoring it would undo every \
+             erasure. Point POND_KEYSTORE at storage with its own retention, or \
+             drop the requirement.",
+        ))
     }
 
     /// The store subject keys live in.

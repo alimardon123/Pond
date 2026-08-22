@@ -1247,3 +1247,164 @@ fn rotation_is_refused_where_there_is_nothing_to_rotate() {
     let err = engine_path::rotate_subject(&k, "plain", "alice", 1).expect_err("must refuse");
     assert!(err.contains("does not seal"), "should say why: {}", err);
 }
+
+/// A write that races a rotation must survive it.
+///
+/// Rotation is not atomic: it scans, re-seals, publishes, then installs the
+/// new key. A write landing inside that window seals under the *old* key, and
+/// if the old key were simply discarded the value would be unreadable —
+/// destroyed by an operation whose entire purpose is to preserve it.
+///
+/// Keeping the displaced key readable until the rotation is explicitly
+/// finished is what makes that write survive.
+#[test]
+fn a_write_that_races_a_rotation_is_not_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            ("_rowid", TypedColumn::String(vec!["r1".into()])),
+            ("owner", TypedColumn::String(vec!["alice".into()])),
+            ("note", TypedColumn::String(vec!["before".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    // Simulate the race: a row sealed under the key that is current *now*,
+    // published, and only afterwards does the rotation install a new key.
+    // Writing it before `rotate_subject` scans is exactly the window.
+    let racing = pond_crypto::KeyStore::new(k.keystore_handle())
+        .get(&"alice".to_string())
+        .unwrap()
+        .expect("alice has a key");
+    let sealed = pond_crypto::seal(
+        &racing,
+        b"people\x1fnote",
+        &pond_record::encode_value(&pond_record::Value::Str("raced".into())),
+    );
+
+    assert!(engine_path::rotate_subject(&k, "people", "alice", 1).unwrap());
+
+    // Now land the racing row, sealed under the pre-rotation key.
+    {
+        let mut rec = pond_record::Record::new();
+        let v = pond_record::Version::new(pond_kernel::crdt::current_time_ms() + 1, 0, 9);
+        rec = rec.with_field("owner", pond_record::Value::Str("alice".into()), v);
+        rec = rec.with_field("note", pond_record::Value::Bytes(sealed), v);
+        let mut e = pond_engine::Engine::open_with(
+            k.store_handle(),
+            9,
+            pond_cache::CacheConfig::default(),
+            definition::load(&k, "people").engine_config(),
+        )
+        .unwrap();
+        e.write_records(
+            "people",
+            vec![(
+                pond_index::Key::new(vec![pond_index::str_("r1")]),
+                rec,
+            )],
+        )
+        .unwrap();
+        e.publish().unwrap();
+    }
+
+    let note = || -> Option<String> {
+        let columns = engine_path::read_rows(&k, "people").unwrap();
+        match columns.iter().find(|(n, _)| n == "note") {
+            Some((_, TypedColumn::String(v))) => v.first().cloned(),
+            _ => None,
+        }
+    };
+    assert_eq!(
+        note(),
+        Some("raced".to_string()),
+        "a write sealed under the pre-rotation key must still be readable"
+    );
+
+    // Once the rotation is finished the old key is gone, and with it the only
+    // way to read anything still sealed under it. The whole column disappears
+    // here because it was the only row carrying it — a field no record has is
+    // not a column.
+    assert!(pond_storage::subject::finish_rotation(&k, "alice").unwrap());
+    assert!(
+        matches!(note().as_deref(), None | Some("")),
+        "after finishing, the displaced key must open nothing — got {:?}",
+        note()
+    );
+    // The row itself is still there; only the field it could not open is gone.
+    let columns = engine_path::read_rows(&k, "people").unwrap();
+    match columns.iter().find(|(n, _)| n == "owner") {
+        Some((_, TypedColumn::String(v))) => {
+            assert_eq!(v, &vec!["alice".to_string()], "the row must survive")
+        }
+        _ => panic!("the owner column must remain readable"),
+    }
+}
+
+/// Erasure must destroy the displaced key too.
+///
+/// An erasure that left a rotation's previous key behind would leave the
+/// subject's older rows readable — which is not an erasure, however it is
+/// reported.
+#[test]
+fn erasure_destroys_the_rotations_previous_key_as_well() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            ("owner", TypedColumn::String(vec!["alice".into()])),
+            ("note", TypedColumn::String(vec!["secret".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    engine_path::rotate_subject(&k, "people", "alice", 1).unwrap();
+    let store = pond_crypto::KeyStore::new(k.keystore_handle());
+    assert_eq!(
+        store.get_all(&"alice".to_string()).unwrap().len(),
+        2,
+        "a rotation in flight keeps both keys"
+    );
+
+    pond_storage::subject::erase_subject(&k, "alice").unwrap();
+    assert!(
+        store.get_all(&"alice".to_string()).unwrap().is_empty(),
+        "erasure must destroy every key that can open the subject's data"
+    );
+}
+
+/// A rotation in flight must not make the subject appear twice.
+#[test]
+fn a_rotation_does_not_duplicate_the_subject_in_listings() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = kernel(dir.path());
+    engine_path::create_for_subjects(&k, "people", "owner").unwrap();
+    engine_path::write_rows(
+        &k,
+        "people",
+        &[
+            ("owner", TypedColumn::String(vec!["alice".into()])),
+            ("note", TypedColumn::String(vec!["x".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+    engine_path::rotate_subject(&k, "people", "alice", 1).unwrap();
+
+    let subjects = pond_storage::subject::subjects(&k).unwrap();
+    assert_eq!(
+        subjects,
+        vec!["alice".to_string()],
+        "the displaced key is the same subject, not another one"
+    );
+}

@@ -62,7 +62,10 @@ fn context(collection: &str, field: &str) -> Vec<u8> {
 /// should be as short as the code can make it.
 struct Keys<'a> {
     store: KeyStore<std::sync::Arc<dyn pond_kernel::ObjectStore>>,
-    cache: std::collections::HashMap<String, Option<SubjectKey>>,
+    /// Every key that can open a subject's data — current first, then the one
+    /// a rotation displaced. Ordered so the common case costs one decryption
+    /// attempt and only a row that raced a rotation pays for two.
+    cache: std::collections::HashMap<String, Vec<SubjectKey>>,
     _kernel: std::marker::PhantomData<&'a ()>,
 }
 
@@ -75,27 +78,36 @@ impl Keys<'_> {
         }
     }
 
-    /// The subject's key, creating one if this subject is new.
+    /// The key to seal under, creating one if this subject is new.
+    ///
+    /// Always the current key. A rotation's displaced key can still *open*
+    /// data, but nothing new is ever sealed under it.
     fn get_or_create(&mut self, subject: &str) -> Result<SubjectKey, String> {
-        if let Some(Some(key)) = self.cache.get(subject) {
-            return Ok(key.clone());
+        if let Some(keys) = self.cache.get(subject) {
+            if let Some(current) = keys.first() {
+                return Ok(current.clone());
+            }
         }
         let key = self
             .store
             .get_or_create(&subject.to_string())
             .map_err(|e| format!("failed to get subject key: {}", e))?;
-        self.cache.insert(subject.to_string(), Some(key.clone()));
+        self.cache
+            .insert(subject.to_string(), vec![key.clone()]);
         Ok(key)
     }
 
-    /// The subject's key, or `None` if they have been erased.
-    fn get(&mut self, subject: &str) -> Option<SubjectKey> {
+    /// Every key that can open this subject's data. Empty means erased.
+    fn opening_keys(&mut self, subject: &str) -> Vec<SubjectKey> {
         if let Some(cached) = self.cache.get(subject) {
             return cached.clone();
         }
-        let key = self.store.get(&subject.to_string()).ok().flatten();
-        self.cache.insert(subject.to_string(), key.clone());
-        key
+        let keys = self
+            .store
+            .get_all(&subject.to_string())
+            .unwrap_or_default();
+        self.cache.insert(subject.to_string(), keys.clone());
+        keys
     }
 }
 
@@ -171,7 +183,12 @@ fn open_one(
 
     // No key means the subject was erased — or never existed. Either way there
     // is nothing to open, and every sealed field drops out.
-    let key: Option<SubjectKey> = keys.get(&subject);
+    //
+    // More than one key means a rotation is in flight: the current key opens
+    // rows the rotation re-sealed, and the displaced key opens any write that
+    // raced it. Trying both is what stops such a write being destroyed by an
+    // operation meant to preserve it.
+    let opening = keys.opening_keys(&subject);
 
     let mut out = Record::new();
     if let Some(tomb) = record.deleted {
@@ -188,7 +205,7 @@ fn open_one(
             out.fields.insert(name, field);
             continue;
         };
-        let opened = key.as_ref().and_then(|k| {
+        let opened = opening.iter().find_map(|k| {
             pond_crypto::open(k, &context(collection, &name), sealed)
                 .ok()
                 .and_then(|bytes| pond_record::decode_value(&bytes))
@@ -296,7 +313,7 @@ pub fn reseal_for_rotation(
     };
 
     let mut keys = Keys::new(kernel);
-    keys.cache.insert(subject.to_string(), Some(old));
+    keys.cache.insert(subject.to_string(), vec![old]);
 
     let belongs = |r: &Record| matches!(r.get(subject_column), Some(Value::Str(s)) if s == subject);
 
@@ -343,6 +360,21 @@ pub fn install_rotated_key(
     KeyStore::new(kernel.keystore_handle())
         .replace(&subject.to_string(), key)
         .map_err(|e| format!("failed to install the rotated key: {}", e))
+}
+
+/// Retire the key a rotation displaced.
+///
+/// Until this is called the old key still opens data — which is the point
+/// during the window when a write might have raced the rotation, and a
+/// liability afterwards, since rotation exists to stop an old key working.
+///
+/// Call it once no write that started before the rotation can still be in
+/// flight. There is no way for storage to know when that is, so it is the
+/// caller's judgement rather than a timer.
+pub fn finish_rotation(kernel: &PondKernel, subject: &str) -> Result<bool, String> {
+    KeyStore::new(kernel.keystore_handle())
+        .finish_rotation(&subject.to_string())
+        .map_err(|e| format!("failed to retire the previous key: {}", e))
 }
 
 /// Every subject with a key. What is erasable, for audit.

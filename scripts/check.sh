@@ -29,8 +29,12 @@ fail() { echo "FAIL: $1"; exit 1; }
 # device"), which wastes time looking for a bug that is not there. Say so up
 # front instead.
 avail_kb=$(df -Pk . | awk 'NR==2 {print $4}')
-if [ "$avail_kb" -lt 2097152 ]; then
-  echo "warning: only $((avail_kb / 1024)) MiB free — tests may fail as 'No space left on device'."
+# A full workspace build, test and clippy run needs real headroom: rustdoc and
+# the linker fail in ways that look like ordinary test failures when they run
+# out. 2 GiB was not enough — a run failed at 7 GiB free.
+if [ "$avail_kb" -lt 10485760 ]; then
+  echo "warning: only $((avail_kb / 1024)) MiB free. A full run needs headroom;"
+  echo "         failures here may be disk exhaustion rather than bugs."
   echo "         try: rm -rf target/debug/incremental"
 fi
 

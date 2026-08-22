@@ -31,6 +31,22 @@ fn key_path(subject: &SubjectId) -> String {
     format!("keys/subject-{}", hex::encode(subject.as_bytes()))
 }
 
+/// Where the key a rotation just replaced lives, until the rotation is
+/// finished.
+///
+/// Rotation is not atomic against concurrent writes: a write landing between
+/// the rotation's scan and its key install seals under the *old* key, and
+/// would then be unreadable — lost, not merely stale. Keeping the old key in a
+/// second slot lets a reader try both, so such a write survives instead of
+/// being destroyed by an operation that was supposed to preserve it.
+///
+/// It is retired by [`KeyStore::finish_rotation`], and destroyed by
+/// [`KeyStore::erase`] like any other copy of a subject's key — an erasure
+/// that left this behind would not be an erasure.
+fn previous_key_path(subject: &SubjectId) -> String {
+    format!("keys/previous-{}", hex::encode(subject.as_bytes()))
+}
+
 /// Subject keys, held over any object store.
 pub struct KeyStore<S: ObjectStore> {
     store: S,
@@ -81,13 +97,53 @@ impl<S: ObjectStore> KeyStore<S> {
         Ok(Some(SubjectKey::from_bytes(buf)))
     }
 
-    /// Replace a subject's key.
+    /// Replace a subject's key, keeping the old one readable.
     ///
     /// Used by rotation, after the subject's rows have been re-sealed under
     /// the new key and made durable. Doing it earlier would leave rows that
     /// nothing can open — an erasure nobody asked for.
+    ///
+    /// The displaced key is kept in the previous slot rather than discarded,
+    /// so a write that raced the rotation and sealed under it is still
+    /// readable. Call [`finish_rotation`](Self::finish_rotation) once those
+    /// writes cannot be outstanding any more.
     pub fn replace(&self, subject: &SubjectId, key: &SubjectKey) -> io::Result<()> {
+        if let Some(old) = self.get(subject)? {
+            self.store
+                .put_object(&previous_key_path(subject), old.as_bytes())?;
+        }
         self.store.put_object(&key_path(subject), key.as_bytes())
+    }
+
+    /// Every key that can currently open this subject's data: the current one
+    /// first, then the one a rotation displaced, if any.
+    ///
+    /// Ordered so the common case costs one decryption attempt and only a row
+    /// that raced a rotation pays for two.
+    pub fn get_all(&self, subject: &SubjectId) -> io::Result<Vec<SubjectKey>> {
+        let mut keys = Vec::with_capacity(2);
+        if let Some(current) = self.get(subject)? {
+            keys.push(current);
+        }
+        if let Some(bytes) = self.store.get_object(&previous_key_path(subject)) {
+            if bytes.len() == 32 {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(&bytes);
+                keys.push(SubjectKey::from_bytes(buf));
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Retire the key a rotation displaced.
+    ///
+    /// Until this is called, the old key still opens data — which is the point
+    /// during the window when a racing write might have used it, and a
+    /// liability afterwards, since rotation exists to stop an old key from
+    /// working. Call it once no write that started before the rotation can
+    /// still be in flight.
+    pub fn finish_rotation(&self, subject: &SubjectId) -> io::Result<bool> {
+        self.store.delete_path(&previous_key_path(subject))
     }
 
     /// Erase a subject: destroy their key.
@@ -104,7 +160,12 @@ impl<S: ObjectStore> KeyStore<S> {
     /// snapshot, a replica of the keystore. Erasure is exactly as complete as
     /// the destruction of the last copy of this key.
     pub fn erase(&self, subject: &SubjectId) -> io::Result<bool> {
-        self.store.delete_path(&key_path(subject))
+        // Both slots. An erasure that left a rotation's displaced key behind
+        // would leave the subject's older rows readable — which is not an
+        // erasure, however it is reported.
+        let previous = self.store.delete_path(&previous_key_path(subject))?;
+        let current = self.store.delete_path(&key_path(subject))?;
+        Ok(current || previous)
     }
 
     /// Every subject with a key, for auditing what is erasable.
@@ -114,6 +175,8 @@ impl<S: ObjectStore> KeyStore<S> {
             .list_paths("keys/")?
             .into_iter()
             .filter_map(|p| {
+                // Only current keys. A previous slot is the same subject, and
+                // listing it twice would overstate what is erasable.
                 let encoded = p.strip_prefix("keys/subject-")?;
                 let bytes = hex::decode(encoded).ok()?;
                 String::from_utf8(bytes).ok()

@@ -506,10 +506,20 @@ fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>
 /// Unset means the data store, which is right for a single machine and wrong
 /// for anything with a backup schedule.
 fn with_keystore(kernel: PondKernel) -> Result<PondKernel, Box<dyn std::error::Error>> {
-    let Ok(location) = std::env::var("POND_KEYSTORE") else {
-        return Ok(kernel);
-    };
+    // `POND_REQUIRE_SEPARATE_KEYSTORE=1` turns "keys should live elsewhere"
+    // from a recommendation into a startup failure. A deployment that must
+    // prove erasure wants the failure now, not after a restore has quietly
+    // resurrected every key it ever destroyed.
+    let required = matches!(
+        std::env::var("POND_REQUIRE_SEPARATE_KEYSTORE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+
+    let location = std::env::var("POND_KEYSTORE").unwrap_or_default();
     if location.trim().is_empty() {
+        if required {
+            return Ok(kernel.require_separate_keystore()?);
+        }
         return Ok(kernel);
     }
     let store: std::sync::Arc<dyn pond_kernel::ObjectStore> = if location.starts_with("s3://") {
@@ -525,7 +535,11 @@ fn with_keystore(kernel: PondKernel) -> Result<PondKernel, Box<dyn std::error::E
         let path = location.strip_prefix("file://").unwrap_or(&location);
         std::sync::Arc::new(pond_kernel::LocalFSObjectStore::new(path)?)
     };
-    Ok(kernel.with_keystore(store))
+    let kernel = kernel.with_keystore(store);
+    if required {
+        return Ok(kernel.require_separate_keystore()?);
+    }
+    Ok(kernel)
 }
 
 /// Initialize or connect to a Pond repository.
