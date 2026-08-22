@@ -192,3 +192,19 @@ fn duplicate_writes_are_idempotent() {
     assert_eq!(s.get_blob(&h1).expect("get"), payload);
     s.delete_blob(&h1).ok();
 }
+
+/// The same listing contract the local backend is held to, against real S3.
+///
+/// This is the point of having the check in the kernel rather than in one
+/// backend's tests. `list_paths` is specified as a prefix listing; the local
+/// backend used to implement a directory listing, and the two only agreed
+/// because every caller happened to pass a prefix ending in `/`. A contract
+/// that only one backend is checked against is a convention.
+#[test]
+#[ignore = "requires real R2 credentials"]
+fn list_paths_is_a_prefix_listing_on_real_object_storage() {
+    // The helper deletes every key it writes, which is the convention the
+    // other tests here follow, and the run prefix is unique per run anyway.
+    let (s, _run) = require_r2!();
+    pond_kernel::assert_list_paths_is_a_prefix_listing(&s, "conformance");
+}

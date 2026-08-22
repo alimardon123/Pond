@@ -521,6 +521,81 @@ where
     });
 }
 
+/// Assert that a backend's `list_paths` matches a *prefix*, not a directory.
+///
+/// The trait specifies a prefix listing and S3 implements one. The local
+/// backend used to list a directory, so `list_paths("heads/writer-00")`
+/// returned matches on one backend and nothing on the other — a semantic that
+/// changes with the backend, which is precisely what this system refuses
+/// elsewhere (it is why there is no conditional write in the trait).
+///
+/// The divergence stayed invisible for as long as every caller happened to
+/// pass a prefix ending in `/`. This makes the contract checkable instead of
+/// conventional, for any backend, including one reached over the network.
+///
+/// # Panics
+///
+/// Describing which case the store got wrong.
+pub fn assert_list_paths_is_a_prefix_listing<S: ObjectStore>(store: &S, scope: &str) {
+    let scope = scope.trim_end_matches('/');
+    let hash = store.put_blob(b"conformance").expect("put_blob");
+
+    let keys = [
+        format!("{}/alpha-one", scope),
+        format!("{}/alpha-two", scope),
+        format!("{}/beta-one", scope),
+        format!("{}/nested/alpha-three", scope),
+    ];
+    for k in &keys {
+        store.put_path(k, &hash).expect("put_path");
+    }
+
+    let listed = |prefix: &str| -> Vec<String> {
+        let mut v = store.list_paths(prefix).expect("list_paths");
+        v.retain(|p| p.starts_with(scope));
+        v.sort();
+        v
+    };
+
+    // A directory prefix returns everything beneath it, recursively.
+    assert_eq!(
+        listed(&format!("{}/", scope)).len(),
+        4,
+        "a directory prefix must return every key beneath it, nested included"
+    );
+
+    // A partial name is a prefix, not a directory. This is the case that
+    // diverged.
+    let partial = listed(&format!("{}/alpha-", scope));
+    assert_eq!(
+        partial,
+        vec![keys[0].clone(), keys[1].clone()],
+        "a partial name must match as a string prefix; got {:?}",
+        partial
+    );
+
+    // Including a partial name that is also a directory's prefix.
+    let nest = listed(&format!("{}/nest", scope));
+    assert_eq!(
+        nest,
+        vec![keys[3].clone()],
+        "a prefix of a directory name must match the keys under it; got {:?}",
+        nest
+    );
+
+    // A prefix matching nothing returns nothing rather than erroring.
+    assert!(listed(&format!("{}/zzz", scope)).is_empty());
+
+    // And a prefix must not match a key it is merely a substring of.
+    let beta = listed(&format!("{}/beta", scope));
+    assert_eq!(beta, vec![keys[2].clone()]);
+
+    for k in &keys {
+        let _ = store.delete_path(k);
+    }
+    let _ = store.delete_blob(&hash);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +752,60 @@ mod tests {
             "unbatched work pays a round trip per request"
         );
         assert_eq!(st.batch_width(), 1.0, "width 1.0 means nothing batched");
+    }
+
+    #[test]
+    fn the_local_backend_lists_by_prefix_not_by_directory() {
+        let (_d, s) = backend();
+        assert_list_paths_is_a_prefix_listing(&s, "conformance");
+    }
+
+    /// The check has to fail on a directory-only listing, or it proves nothing.
+    #[test]
+    #[should_panic(expected = "must match as a string prefix")]
+    fn the_check_rejects_a_directory_only_listing() {
+        struct DirectoryOnly<S: ObjectStore>(S);
+        impl<S: ObjectStore> ObjectStore for DirectoryOnly<S> {
+            fn list_paths(&self, prefix: &str) -> io::Result<Vec<String>> {
+                // What the local backend used to do: nothing unless the prefix
+                // names a directory.
+                if prefix.is_empty() || prefix.ends_with('/') {
+                    self.0.list_paths(prefix)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn put_blob(&self, d: &[u8]) -> io::Result<String> {
+                self.0.put_blob(d)
+            }
+            fn get_blob(&self, h: &str) -> io::Result<Vec<u8>> {
+                self.0.get_blob(h)
+            }
+            fn put_path(&self, p: &str, h: &str) -> io::Result<()> {
+                self.0.put_path(p, h)
+            }
+            fn get_path(&self, p: &str) -> Option<String> {
+                self.0.get_path(p)
+            }
+            fn put_object(&self, p: &str, b: &[u8]) -> io::Result<()> {
+                self.0.put_object(p, b)
+            }
+            fn get_object(&self, p: &str) -> Option<Vec<u8>> {
+                self.0.get_object(p)
+            }
+            fn delete_path(&self, p: &str) -> io::Result<bool> {
+                self.0.delete_path(p)
+            }
+            fn blob_exists(&self, h: &str) -> bool {
+                self.0.blob_exists(h)
+            }
+            fn delete_blob(&self, h: &str) -> io::Result<bool> {
+                self.0.delete_blob(h)
+            }
+        }
+
+        let (_d, s) = backend();
+        assert_list_paths_is_a_prefix_listing(&DirectoryOnly(s), "conformance");
     }
 
     #[test]

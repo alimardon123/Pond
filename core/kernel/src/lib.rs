@@ -23,7 +23,10 @@ pub mod object_store;
 pub mod metered;
 pub mod c_abi;
 
-pub use metered::{assert_forwards_batches, BatchProbe, Metered, ProbeCounts, StoreStats};
+pub use metered::{
+    assert_forwards_batches, assert_list_paths_is_a_prefix_listing, BatchProbe, Metered,
+    ProbeCounts, StoreStats,
+};
 pub use object_store::{
     is_blob_key, prefix_targets_blobs, LocalFSObjectStore, ObjectStore,
 };

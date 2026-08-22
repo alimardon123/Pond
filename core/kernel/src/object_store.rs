@@ -505,11 +505,37 @@ impl ObjectStore for LocalFSObjectStore {
         }
     }
 
+    /// A *prefix* listing, matching what S3 does, not a directory listing.
+    ///
+    /// This used to walk `base_dir.join(prefix)` and return nothing unless
+    /// that path was a directory — so `list_paths("heads/writer-00")` matched
+    /// keys on S3 and nothing here. Every caller happened to pass a prefix
+    /// ending in `/`, so the two agreed by convention rather than by contract,
+    /// and the divergence only surfaced when a key layout needed a partial
+    /// name.
+    ///
+    /// A store whose semantics change with the backend forks the correctness
+    /// argument in two, which is the same reason this trait has no conditional
+    /// write. `assert_list_paths_is_a_prefix_listing` checks it for any
+    /// backend.
     fn list_paths(&self, prefix: &str) -> io::Result<Vec<String>> {
-        let prefix_dir = self.base_dir.join(prefix);
+        // Walk from the deepest directory the prefix can name, then filter by
+        // the prefix as a string. For a prefix ending in `/` that is the
+        // directory itself and this costs exactly what it used to; for a
+        // partial name it is the parent, which is the smallest subtree that
+        // can contain a match.
+        let dir = match prefix.rfind('/') {
+            Some(i) => &prefix[..=i],
+            None => "",
+        };
+        let start = self.base_dir.join(dir);
+
         let mut paths = Vec::new();
-        if prefix_dir.is_dir() {
-            walk_dir(&prefix_dir, &self.base_dir, &mut paths);
+        if start.is_dir() {
+            walk_dir(&start, &self.base_dir, &mut paths);
+        }
+        if !prefix.is_empty() {
+            paths.retain(|p| p.starts_with(prefix));
         }
         if !prefix_targets_blobs(prefix) {
             paths.retain(|p| !is_blob_key(p));
