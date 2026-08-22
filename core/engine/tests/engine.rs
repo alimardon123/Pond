@@ -3,9 +3,11 @@
 // Asserts on request counts rather than timings, because against object
 // storage the round trip is the cost.
 
+use std::sync::Arc;
+
 use pond_engine::{Engine, Reader};
 use pond_index::{int, str_, Key};
-use pond_kernel::{LocalFSObjectStore, ObjectStore};
+use pond_kernel::{LocalFSObjectStore, Metered, ObjectStore};
 use pond_record::{Record, Value, Version};
 
 fn store(dir: &std::path::Path) -> LocalFSObjectStore {
@@ -367,6 +369,25 @@ fn page_lookup_cost_is_flat_as_database_grows() {
 struct FailingList<S: ObjectStore>(S);
 
 impl<S: ObjectStore> ObjectStore for FailingList<S> {
+    // Forwarded explicitly. The trait's batch defaults call the singular
+    // method on `self`, so a decorator that omits them unrolls every batch
+    // against itself and the backend's parallel implementation never runs.
+    fn put_blob_batch(&self, i: &[Vec<u8>]) -> std::io::Result<Vec<String>> {
+        self.0.put_blob_batch(i)
+    }
+    fn get_blob_batch(&self, h: &[String]) -> std::io::Result<Vec<Vec<u8>>> {
+        self.0.get_blob_batch(h)
+    }
+    fn get_object_batch(&self, p: &[String]) -> Vec<Option<Vec<u8>>> {
+        self.0.get_object_batch(p)
+    }
+    fn delete_path_batch(&self, p: &[String]) -> std::io::Result<usize> {
+        self.0.delete_path_batch(p)
+    }
+    fn delete_blob_batch(&self, h: &[String]) -> std::io::Result<usize> {
+        self.0.delete_blob_batch(h)
+    }
+
     fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
         self.0.put_blob(data)
     }
@@ -430,83 +451,17 @@ fn reader_open_fails_loudly_when_listing_fails() {
     );
 }
 
-/// Counts the round trips a backend is asked for. The counters live behind an
-/// `Arc` so the test can still read them after the store is moved into the
-/// engine.
-#[derive(Default)]
-struct Counters {
-    puts: std::sync::atomic::AtomicU64,
-    gets: std::sync::atomic::AtomicU64,
-    lists: std::sync::atomic::AtomicU64,
+/// A store that counts the round trips it is asked for.
+///
+/// `Metered` rather than a wrapper written here: this file used to define its
+/// own, seventy-odd lines of delegation that had to be kept in step with
+/// `ObjectStore` by hand — and, like every other copy in the tree, dropped the
+/// batch methods onto their sequential defaults, so it de-parallelised the
+/// very thing it was measuring.
+fn counted(inner: LocalFSObjectStore) -> Arc<Metered<LocalFSObjectStore>> {
+    Arc::new(Metered::new(inner))
 }
 
-impl Counters {
-    fn snapshot(&self) -> (u64, u64, u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        (
-            self.puts.load(Relaxed),
-            self.gets.load(Relaxed),
-            self.lists.load(Relaxed),
-        )
-    }
-    fn reset(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.puts.store(0, Relaxed);
-        self.gets.store(0, Relaxed);
-        self.lists.store(0, Relaxed);
-    }
-}
-
-struct Counting<S: ObjectStore> {
-    inner: S,
-    c: std::sync::Arc<Counters>,
-}
-
-impl<S: ObjectStore> Counting<S> {
-    fn new(inner: S, c: std::sync::Arc<Counters>) -> Self {
-        Self { inner, c }
-    }
-}
-
-impl<S: ObjectStore> ObjectStore for Counting<S> {
-    fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
-        self.c.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.put_blob(data)
-    }
-    fn get_blob(&self, hash: &str) -> std::io::Result<Vec<u8>> {
-        self.c.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.get_blob(hash)
-    }
-    fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
-        self.c.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.put_path(path, hash)
-    }
-    fn get_path(&self, path: &str) -> Option<String> {
-        self.c.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.get_path(path)
-    }
-    fn put_object(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
-        self.c.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.put_object(path, bytes)
-    }
-    fn get_object(&self, path: &str) -> Option<Vec<u8>> {
-        self.c.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.get_object(path)
-    }
-    fn delete_path(&self, path: &str) -> std::io::Result<bool> {
-        self.inner.delete_path(path)
-    }
-    fn list_paths(&self, prefix: &str) -> std::io::Result<Vec<String>> {
-        self.c.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.list_paths(prefix)
-    }
-    fn blob_exists(&self, hash: &str) -> bool {
-        self.inner.blob_exists(hash)
-    }
-    fn delete_blob(&self, hash: &str) -> std::io::Result<bool> {
-        self.inner.delete_blob(hash)
-    }
-}
 
 /// Committing costs exactly one write, however many collections it spans.
 ///
@@ -518,8 +473,8 @@ impl<S: ObjectStore> ObjectStore for Counting<S> {
 #[test]
 fn commit_is_exactly_one_write() {
     let dir = tempfile::tempdir().unwrap();
-    let c = std::sync::Arc::new(Counters::default());
-    let mut e = Engine::open(Counting::new(store(dir.path()), c.clone()), 1).unwrap();
+    let c = counted(store(dir.path()));
+    let mut e = Engine::open(Arc::clone(&c), 1).unwrap();
 
     for collection in ["users", "orders", "events"] {
         e.write_records(
@@ -534,7 +489,8 @@ fn commit_is_exactly_one_write() {
 
     c.reset();
     e.publish().unwrap();
-    let (puts, _, lists) = c.snapshot();
+    let st = c.stats();
+    let (puts, lists) = (st.puts, st.lists);
 
     assert_eq!(
         puts, 1,
@@ -565,9 +521,10 @@ fn reader_open_cost_is_one_list_plus_one_read_per_writer() {
         e.publish().unwrap();
     }
 
-    let c = std::sync::Arc::new(Counters::default());
-    let r = Reader::open(Counting::new(store(dir.path()), c.clone())).unwrap();
-    let (_, gets, lists) = c.snapshot();
+    let c = counted(store(dir.path()));
+    let r = Reader::open(Arc::clone(&c)).unwrap();
+    let st = c.stats();
+    let (gets, lists) = (st.gets, st.lists);
 
     assert_eq!(lists, 1, "one LIST discovers every writer");
     assert_eq!(
@@ -586,10 +543,9 @@ fn reader_open_cost_is_one_list_plus_one_read_per_writer() {
 #[test]
 fn a_large_row_does_not_rewrite_its_whole_leaf() {
     let dir = tempfile::tempdir().unwrap();
-    let c = std::sync::Arc::new(Counters::default());
     let big = "x".repeat(64 * 1024);
-
-    let mut e = Engine::open(Counting::new(store(dir.path()), c.clone()), 1).unwrap();
+    let c = counted(store(dir.path()));
+    let mut e = Engine::open(Arc::clone(&c), 1).unwrap();
     let rows: Vec<(pond_index::Key, Record)> = (0..200)
         .map(|i| {
             (

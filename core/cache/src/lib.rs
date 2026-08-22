@@ -534,6 +534,25 @@ mod tests {
     }
 
     impl ObjectStore for CountingStore {
+        // Forwarded explicitly. The trait's batch defaults call the singular
+        // method on `self`, so a decorator that omits them unrolls every batch
+        // against itself and the backend's parallel implementation never runs.
+        fn put_blob_batch(&self, i: &[Vec<u8>]) -> io::Result<Vec<String>> {
+            self.inner.put_blob_batch(i)
+        }
+        fn get_blob_batch(&self, h: &[String]) -> io::Result<Vec<Vec<u8>>> {
+            self.inner.get_blob_batch(h)
+        }
+        fn get_object_batch(&self, p: &[String]) -> Vec<Option<Vec<u8>>> {
+            self.inner.get_object_batch(p)
+        }
+        fn delete_path_batch(&self, p: &[String]) -> io::Result<usize> {
+            self.inner.delete_path_batch(p)
+        }
+        fn delete_blob_batch(&self, h: &[String]) -> io::Result<usize> {
+            self.inner.delete_blob_batch(h)
+        }
+
         fn put_blob(&self, data: &[u8]) -> io::Result<String> {
             self.inner.put_blob(data)
         }

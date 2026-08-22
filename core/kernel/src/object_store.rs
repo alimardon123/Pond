@@ -44,6 +44,24 @@ pub fn prefix_targets_blobs(prefix: &str) -> bool {
     is_blob_key(prefix.trim_start_matches('/'))
 }
 
+/// # A warning for decorators
+///
+/// The batch methods below have sequential default implementations, so a new
+/// *backend* is correct as soon as it implements the four required operations.
+/// For a *decorator* — a cache, a meter, a fault injector, a test probe — that
+/// default is a trap: it calls the singular method on `self`, so a decorator
+/// that does not forward a batch method unrolls it into N calls against
+/// itself, and the backend's parallel implementation never runs.
+///
+/// Nothing observable changes. The request count is identical either way, so
+/// no cost assertion catches it; only wall clock moves, by the width of the
+/// batch. `BlobCache` shipped like this, turning a 32-wide level write into 32
+/// dependent round trips on S3.
+///
+/// **Every decorator must forward all five batch methods explicitly**:
+/// `put_blob_batch`, `get_blob_batch`, `get_object_batch`, `delete_path_batch`,
+/// `delete_blob_batch`. [`crate::assert_forwards_batches`] checks it and names
+/// the first one missed.
 pub trait ObjectStore: Send + Sync {
     /// Write bytes, content-addressed. Returns the hash.
     /// Idempotent: same bytes → same hash → same key. Overwriting is safe.

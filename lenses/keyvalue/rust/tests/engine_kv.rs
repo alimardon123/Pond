@@ -109,61 +109,18 @@ fn keys_and_get_all_agree() {
 /// tree's depth however many pairs exist.
 #[test]
 fn a_point_lookup_does_not_scale_with_the_collection() {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-
-    #[derive(Default)]
-    struct Counter {
-        gets: AtomicU64,
-    }
-
-    struct Counting<S: pond_kernel::ObjectStore> {
-        inner: S,
-        c: Arc<Counter>,
-    }
-
-    impl<S: pond_kernel::ObjectStore> pond_kernel::ObjectStore for Counting<S> {
-        fn put_blob(&self, d: &[u8]) -> std::io::Result<String> {
-            self.inner.put_blob(d)
-        }
-        fn get_blob(&self, h: &str) -> std::io::Result<Vec<u8>> {
-            self.c.gets.fetch_add(1, Ordering::Relaxed);
-            self.inner.get_blob(h)
-        }
-        fn put_path(&self, p: &str, h: &str) -> std::io::Result<()> {
-            self.inner.put_path(p, h)
-        }
-        fn get_path(&self, p: &str) -> Option<String> {
-            self.inner.get_path(p)
-        }
-        fn put_object(&self, p: &str, b: &[u8]) -> std::io::Result<()> {
-            self.inner.put_object(p, b)
-        }
-        fn get_object(&self, p: &str) -> Option<Vec<u8>> {
-            self.inner.get_object(p)
-        }
-        fn delete_path(&self, p: &str) -> std::io::Result<bool> {
-            self.inner.delete_path(p)
-        }
-        fn list_paths(&self, p: &str) -> std::io::Result<Vec<String>> {
-            self.inner.list_paths(p)
-        }
-        fn blob_exists(&self, h: &str) -> bool {
-            self.inner.blob_exists(h)
-        }
-        fn delete_blob(&self, h: &str) -> std::io::Result<bool> {
-            self.inner.delete_blob(h)
-        }
-    }
 
     fn reads_for_one_get(pairs: usize) -> u64 {
         let dir = tempfile::tempdir().unwrap();
-        let c = Arc::new(Counter::default());
-        let store = Counting {
-            inner: pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),
-            c: c.clone(),
-        };
-        let k = PondKernel::new_with_store(Box::new(store));
+        // `Metered` from the kernel, not a counting wrapper written here. The
+        // one this file used to define — like every other copy in the tree —
+        // left the batch methods on their sequential defaults, so it quietly
+        // de-parallelised the reads it was counting.
+        let c = Arc::new(pond_kernel::Metered::new(
+            pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),
+        ));
+        let k = PondKernel::new_with_store(Box::new(Arc::clone(&c)));
         engine_kv::create(&k, "kv").unwrap();
 
         let batch: Vec<(String, serde_json::Value)> = (0..pairs)
@@ -171,10 +128,10 @@ fn a_point_lookup_does_not_scale_with_the_collection() {
             .collect();
         engine_kv::put_many(&k, "kv", &batch, 1).unwrap();
 
-        c.gets.store(0, Ordering::Relaxed);
+        c.reset();
         let found = engine_kv::get(&k, "kv", &format!("key-{:08}", pairs / 2)).unwrap();
         assert!(found.is_some());
-        c.gets.load(Ordering::Relaxed)
+        c.stats().gets
     }
 
     let small = reads_for_one_get(100);

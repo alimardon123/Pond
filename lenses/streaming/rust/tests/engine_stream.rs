@@ -103,53 +103,8 @@ fn empty_append_is_a_no_op() {
 /// abstract.
 #[test]
 fn append_cost_is_bounded_unlike_a_whole_collection_rewrite() {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    #[derive(Default)]
-    struct Counter {
-        bytes: AtomicU64,
-    }
-
-    struct Counting<S: pond_kernel::ObjectStore> {
-        inner: S,
-        c: Arc<Counter>,
-    }
-
-    impl<S: pond_kernel::ObjectStore> pond_kernel::ObjectStore for Counting<S> {
-        fn put_blob(&self, d: &[u8]) -> std::io::Result<String> {
-            self.c.bytes.fetch_add(d.len() as u64, Ordering::Relaxed);
-            self.inner.put_blob(d)
-        }
-        fn get_blob(&self, h: &str) -> std::io::Result<Vec<u8>> {
-            self.inner.get_blob(h)
-        }
-        fn put_path(&self, p: &str, h: &str) -> std::io::Result<()> {
-            self.inner.put_path(p, h)
-        }
-        fn get_path(&self, p: &str) -> Option<String> {
-            self.inner.get_path(p)
-        }
-        fn put_object(&self, p: &str, b: &[u8]) -> std::io::Result<()> {
-            self.c.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-            self.inner.put_object(p, b)
-        }
-        fn get_object(&self, p: &str) -> Option<Vec<u8>> {
-            self.inner.get_object(p)
-        }
-        fn delete_path(&self, p: &str) -> std::io::Result<bool> {
-            self.inner.delete_path(p)
-        }
-        fn list_paths(&self, p: &str) -> std::io::Result<Vec<String>> {
-            self.inner.list_paths(p)
-        }
-        fn blob_exists(&self, h: &str) -> bool {
-            self.inner.blob_exists(h)
-        }
-        fn delete_blob(&self, h: &str) -> std::io::Result<bool> {
-            self.inner.delete_blob(h)
-        }
-    }
 
     /// Segments large enough to spill, which is what a real stream writes.
     const SEGMENT: usize = 4096;
@@ -159,19 +114,21 @@ fn append_cost_is_bounded_unlike_a_whole_collection_rewrite() {
     where
         F: FnMut(&PondKernel, &[u8]),
     {
-        let c = Arc::new(Counter::default());
-        let store = Counting {
-            inner: pond_kernel::LocalFSObjectStore::new(dir).unwrap(),
-            c: c.clone(),
-        };
-        let k = PondKernel::new_with_store(Box::new(store));
+        // `Metered` from the kernel, not a counting wrapper written here. The
+        // one this file used to define — like every other copy in the tree —
+        // left the batch methods on their sequential defaults, so it quietly
+        // de-parallelised the very work it was measuring.
+        let c = Arc::new(pond_kernel::Metered::new(
+            pond_kernel::LocalFSObjectStore::new(dir).unwrap(),
+        ));
+        let k = PondKernel::new_with_store(Box::new(Arc::clone(&c)));
         let chunk = vec![b'x'; SEGMENT];
 
         let mut costs = Vec::new();
         for _ in 0..APPENDS {
-            c.bytes.store(0, Ordering::Relaxed);
+            c.reset();
             append(&k, &chunk);
-            costs.push(c.bytes.load(Ordering::Relaxed));
+            costs.push(c.stats().bytes_written);
         }
         let first: u64 = costs[..10].iter().sum::<u64>() / 10;
         let last: u64 = costs[APPENDS - 10..].iter().sum::<u64>() / 10;

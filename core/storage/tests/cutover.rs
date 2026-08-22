@@ -940,6 +940,15 @@ fn sealing_a_batch_does_not_fetch_a_key_per_row() {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
+    /// Counts reads of the keystore specifically, which is what this test is
+    /// about — `Metered` counts every read and cannot tell them apart.
+    ///
+    /// A purpose-built probe is fine; dropping the batch methods is not. The
+    /// trait's batch defaults call the singular method on `self`, so a
+    /// decorator that forgets to forward one unrolls it against itself and the
+    /// backend's parallel implementation never runs — invisible to any request
+    /// count, and the exact bug `BlobCache` shipped with. Everything is
+    /// forwarded here, and `assert_forwards_batches` below checks it.
     #[derive(Default)]
     struct Counter {
         key_reads: AtomicU64,
@@ -950,12 +959,29 @@ fn sealing_a_batch_does_not_fetch_a_key_per_row() {
         c: Arc<Counter>,
     }
 
+    impl<S: pond_kernel::ObjectStore> Counting<S> {
+        fn count(&self, path: &str) {
+            if path.starts_with("keys/") {
+                self.c.key_reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     impl<S: pond_kernel::ObjectStore> pond_kernel::ObjectStore for Counting<S> {
         fn put_blob(&self, d: &[u8]) -> std::io::Result<String> {
             self.inner.put_blob(d)
         }
         fn get_blob(&self, h: &str) -> std::io::Result<Vec<u8>> {
             self.inner.get_blob(h)
+        }
+        fn put_blob_batch(&self, i: &[Vec<u8>]) -> std::io::Result<Vec<String>> {
+            self.inner.put_blob_batch(i)
+        }
+        fn get_blob_batch(&self, h: &[String]) -> std::io::Result<Vec<Vec<u8>>> {
+            self.inner.get_blob_batch(h)
+        }
+        fn delete_blob_batch(&self, h: &[String]) -> std::io::Result<usize> {
+            self.inner.delete_blob_batch(h)
         }
         fn put_path(&self, p: &str, h: &str) -> std::io::Result<()> {
             self.inner.put_path(p, h)
@@ -967,13 +993,20 @@ fn sealing_a_batch_does_not_fetch_a_key_per_row() {
             self.inner.put_object(p, b)
         }
         fn get_object(&self, p: &str) -> Option<Vec<u8>> {
-            if p.starts_with("keys/") {
-                self.c.key_reads.fetch_add(1, Ordering::Relaxed);
-            }
+            self.count(p);
             self.inner.get_object(p)
+        }
+        fn get_object_batch(&self, p: &[String]) -> Vec<Option<Vec<u8>>> {
+            for path in p {
+                self.count(path);
+            }
+            self.inner.get_object_batch(p)
         }
         fn delete_path(&self, p: &str) -> std::io::Result<bool> {
             self.inner.delete_path(p)
+        }
+        fn delete_path_batch(&self, p: &[String]) -> std::io::Result<usize> {
+            self.inner.delete_path_batch(p)
         }
         fn list_paths(&self, p: &str) -> std::io::Result<Vec<String>> {
             self.inner.list_paths(p)
@@ -985,6 +1018,15 @@ fn sealing_a_batch_does_not_fetch_a_key_per_row() {
             self.inner.delete_blob(h)
         }
     }
+
+    // The probe must not be the thing that makes the measurement wrong.
+    pond_kernel::assert_forwards_batches(
+        |probe| Counting {
+            inner: probe,
+            c: Arc::new(Counter::default()),
+        },
+        pond_kernel::LocalFSObjectStore::new(tempfile::tempdir().unwrap().path()).unwrap(),
+    );
 
     const ROWS: usize = 200;
     let dir = tempfile::tempdir().unwrap();

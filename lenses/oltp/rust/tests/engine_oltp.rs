@@ -93,53 +93,8 @@ fn an_empty_flush_is_a_no_op() {
 /// still tracked the table would show up as growth between them.
 #[test]
 fn flush_cost_plateaus_instead_of_tracking_the_table() {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    #[derive(Default)]
-    struct Counter {
-        bytes: AtomicU64,
-    }
-
-    struct Counting<S: pond_kernel::ObjectStore> {
-        inner: S,
-        c: Arc<Counter>,
-    }
-
-    impl<S: pond_kernel::ObjectStore> pond_kernel::ObjectStore for Counting<S> {
-        fn put_blob(&self, d: &[u8]) -> std::io::Result<String> {
-            self.c.bytes.fetch_add(d.len() as u64, Ordering::Relaxed);
-            self.inner.put_blob(d)
-        }
-        fn get_blob(&self, h: &str) -> std::io::Result<Vec<u8>> {
-            self.inner.get_blob(h)
-        }
-        fn put_path(&self, p: &str, h: &str) -> std::io::Result<()> {
-            self.inner.put_path(p, h)
-        }
-        fn get_path(&self, p: &str) -> Option<String> {
-            self.inner.get_path(p)
-        }
-        fn put_object(&self, p: &str, b: &[u8]) -> std::io::Result<()> {
-            self.c.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-            self.inner.put_object(p, b)
-        }
-        fn get_object(&self, p: &str) -> Option<Vec<u8>> {
-            self.inner.get_object(p)
-        }
-        fn delete_path(&self, p: &str) -> std::io::Result<bool> {
-            self.inner.delete_path(p)
-        }
-        fn list_paths(&self, p: &str) -> std::io::Result<Vec<String>> {
-            self.inner.list_paths(p)
-        }
-        fn blob_exists(&self, h: &str) -> bool {
-            self.inner.blob_exists(h)
-        }
-        fn delete_blob(&self, h: &str) -> std::io::Result<bool> {
-            self.inner.delete_blob(h)
-        }
-    }
 
     /// Mean bytes written by a one-row flush against a table of `rows` rows.
     ///
@@ -152,12 +107,14 @@ fn flush_cost_plateaus_instead_of_tracking_the_table() {
     fn one_row_flush_cost(rows: usize) -> u64 {
         const PROBES: usize = 8;
         let dir = tempfile::tempdir().unwrap();
-        let c = Arc::new(Counter::default());
-        let store = Counting {
-            inner: pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),
-            c: c.clone(),
-        };
-        let k = PondKernel::new_with_store(Box::new(store));
+        // `Metered` from the kernel, not a counting wrapper written here. The
+        // one this file used to define — like every other copy in the tree —
+        // left the batch methods on their sequential defaults, so it quietly
+        // de-parallelised the very work it was measuring.
+        let c = Arc::new(pond_kernel::Metered::new(
+            pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),
+        ));
+        let k = PondKernel::new_with_store(Box::new(Arc::clone(&c)));
         engine_oltp::create(&k, "t").unwrap();
 
         let batch: HashMap<String, Option<serde_json::Value>> = (0..rows)
@@ -169,9 +126,9 @@ fn flush_cost_plateaus_instead_of_tracking_the_table() {
         for p in 0..PROBES {
             // Spread across the key space so every leaf is represented.
             let key = format!("key-{:08}", (rows / PROBES) * p);
-            c.bytes.store(0, Ordering::Relaxed);
+            c.reset();
             engine_oltp::flush(&k, "t", &memtable(&[(&key, Some(json!("x")))]), 1).unwrap();
-            total += c.bytes.load(Ordering::Relaxed);
+            total += c.stats().bytes_written;
         }
         total / PROBES as u64
     }
@@ -179,12 +136,14 @@ fn flush_cost_plateaus_instead_of_tracking_the_table() {
     /// The same, for a lens that rewrites the whole table.
     fn whole_table_flush_cost(rows: usize) -> u64 {
         let dir = tempfile::tempdir().unwrap();
-        let c = Arc::new(Counter::default());
-        let store = Counting {
-            inner: pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),
-            c: c.clone(),
-        };
-        let k = PondKernel::new_with_store(Box::new(store));
+        // `Metered` from the kernel, not a counting wrapper written here. The
+        // one this file used to define — like every other copy in the tree —
+        // left the batch methods on their sequential defaults, so it quietly
+        // de-parallelised the very work it was measuring.
+        let c = Arc::new(pond_kernel::Metered::new(
+            pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),
+        ));
+        let k = PondKernel::new_with_store(Box::new(Arc::clone(&c)));
 
         let mut all: Vec<serde_json::Value> = (0..rows)
             .map(|i| json!({"_key": format!("key-{:08}", i), "i": i}))
@@ -192,14 +151,14 @@ fn flush_cost_plateaus_instead_of_tracking_the_table() {
         let payload = serde_json::to_vec(&all).unwrap();
         pond_storage::write::write(&k, "t", "main", &payload, "seed").unwrap();
 
-        c.bytes.store(0, Ordering::Relaxed);
+        c.reset();
         // Read everything, apply one change, write everything back.
         let existing = pond_storage::read::read(&k, "t", "main").unwrap();
         all = serde_json::from_slice(&existing).unwrap();
         all.push(json!({"_key": "probe", "i": -1}));
         let payload = serde_json::to_vec(&all).unwrap();
         pond_storage::write::write(&k, "t", "main", &payload, "flush").unwrap();
-        c.bytes.load(Ordering::Relaxed)
+        c.stats().bytes_written
     }
 
     // Both sizes are past the point where leaves are full, so growth between

@@ -14,7 +14,7 @@
 //      because the row is one opaque value inside the node.
 use pond_engine::{Engine, Reader};
 use pond_index::{int, Key};
-use pond_kernel::{LocalFSObjectStore, ObjectStore};
+use pond_kernel::LocalFSObjectStore;
 use pond_record::{Record, Value, Version};
 
 fn main() {
@@ -69,7 +69,7 @@ fn main() {
             )
             .unwrap();
             e.publish().unwrap();
-            backend.bytes()
+            backend.stats().bytes_written
         };
 
         println!(
@@ -82,40 +82,10 @@ fn main() {
     }
 }
 
-/// Counts bytes written to the backend.
-struct Counting<S: ObjectStore> {
-    inner: S,
-    bytes: std::sync::atomic::AtomicU64,
-}
+/// Bytes reaching the store, counted by the kernel's `Metered` rather than by
+/// a wrapper written here. The one this file used to define left the batch
+/// methods on their sequential defaults, so it de-parallelised what it
+/// measured.
+type Counting<S> = pond_kernel::Metered<S>;
 
-impl<S: ObjectStore> Counting<S> {
-    fn new(inner: S) -> Self {
-        Self { inner, bytes: std::sync::atomic::AtomicU64::new(0) }
-    }
-    fn reset(&self) {
-        self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-    fn bytes(&self) -> u64 {
-        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-impl<S: ObjectStore> ObjectStore for Counting<S> {
-    fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
-        self.bytes.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.inner.put_blob(data)
-    }
-    fn get_blob(&self, h: &str) -> std::io::Result<Vec<u8>> { self.inner.get_blob(h) }
-    fn put_path(&self, p: &str, h: &str) -> std::io::Result<()> { self.inner.put_path(p, h) }
-    fn get_path(&self, p: &str) -> Option<String> { self.inner.get_path(p) }
-    fn put_object(&self, p: &str, b: &[u8]) -> std::io::Result<()> {
-        self.bytes.fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.inner.put_object(p, b)
-    }
-    fn get_object(&self, p: &str) -> Option<Vec<u8>> { self.inner.get_object(p) }
-    fn delete_path(&self, p: &str) -> std::io::Result<bool> { self.inner.delete_path(p) }
-    fn list_paths(&self, p: &str) -> std::io::Result<Vec<String>> { self.inner.list_paths(p) }
-    fn blob_exists(&self, h: &str) -> bool { self.inner.blob_exists(h) }
-    fn delete_blob(&self, h: &str) -> std::io::Result<bool> { self.inner.delete_blob(h) }
-}
 
