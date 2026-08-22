@@ -684,3 +684,175 @@ fn partial_update_of_a_spilled_row_preserves_other_fields() {
         "the large field must survive an update that never mentioned it"
     );
 }
+
+/// The central claim, under real concurrency.
+///
+/// Every convergence test until now opened two engines one after another,
+/// which demonstrates the merge but not the property the design actually
+/// claims: that writers running *at the same time*, with no channel between
+/// them, converge. Sequential writers cannot exhibit an interleaving bug.
+///
+/// Writers are namespace-partitioned — each owns `heads/writer-<id>` and no
+/// other — so there is nothing to serialise and nothing to lose. This asserts
+/// that holds when they genuinely race.
+#[test]
+fn concurrent_writers_all_land_and_readers_agree() {
+    const WRITERS: u64 = 8;
+    const ROWS_EACH: i64 = 25;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    std::thread::scope(|s| {
+        for w in 1..=WRITERS {
+            let root = root.clone();
+            s.spawn(move || {
+                let mut e = Engine::open(store(&root), w).unwrap();
+                let rows: Vec<(pond_index::Key, Record)> = (0..ROWS_EACH)
+                    .map(|i| {
+                        let id = w as i64 * 1000 + i;
+                        (
+                            user(id),
+                            Record::new().with_field(
+                                "writer",
+                                Value::Int(w as i64),
+                                v(100 + i as u64, w),
+                            ),
+                        )
+                    })
+                    .collect();
+                e.write_records("users", rows).unwrap();
+                e.publish().unwrap();
+            });
+        }
+    });
+
+    // Every writer's rows are visible to a single reader.
+    let mut r = Reader::open(store(&root)).unwrap();
+    let all = r.scan("users").unwrap();
+    assert_eq!(
+        all.len() as u64,
+        WRITERS * ROWS_EACH as u64,
+        "every concurrent writer's rows must survive"
+    );
+
+    // And each row carries the writer that wrote it — no cross-contamination.
+    for w in 1..=WRITERS {
+        let found = r.get("users", &user(w as i64 * 1000 + 7)).unwrap();
+        assert_eq!(
+            found.and_then(|rec| rec.get("writer").cloned()),
+            Some(Value::Int(w as i64)),
+            "writer {}'s row is missing or wrong",
+            w
+        );
+    }
+}
+
+/// Two readers that have seen the same writers compute byte-identical state.
+///
+/// This is the property that makes the merge a semilattice join rather than a
+/// heuristic: it is commutative, associative and idempotent, so the order in
+/// which heads are discovered cannot change the answer. If it could, two
+/// caches could disagree while both being "correct", and nothing above could
+/// rely on a root hash meaning anything.
+#[test]
+fn readers_converge_on_the_same_root_hash() {
+    const WRITERS: u64 = 6;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    std::thread::scope(|s| {
+        for w in 1..=WRITERS {
+            let root = root.clone();
+            s.spawn(move || {
+                let mut e = Engine::open(store(&root), w).unwrap();
+                e.write_records(
+                    "users",
+                    vec![(
+                        user(w as i64),
+                        Record::new().with_field("w", Value::Int(w as i64), v(100, w)),
+                    )],
+                )
+                .unwrap();
+                e.publish().unwrap();
+            });
+        }
+    });
+
+    // Several readers, opened independently and concurrently.
+    let roots: Vec<String> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                s.spawn(move || {
+                    let mut r = Reader::open(store(&root)).unwrap();
+                    r.root_of("users")
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let first = &roots[0];
+    assert!(
+        roots.iter().all(|r| r == first),
+        "readers disagreed about the merged state: {:?}",
+        roots
+    );
+    assert!(!first.is_empty());
+}
+
+/// Concurrent writers to the *same key* must converge rather than corrupt.
+///
+/// This is the hard case: writer-partitioned namespaces mean no two writers
+/// share a head, but they can still write the same logical row. Convergence
+/// then rests on per-field merge and version ordering, not on partitioning.
+#[test]
+fn concurrent_writers_to_one_key_converge_by_version() {
+    const WRITERS: u64 = 8;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    std::thread::scope(|s| {
+        for w in 1..=WRITERS {
+            let root = root.clone();
+            s.spawn(move || {
+                let mut e = Engine::open(store(&root), w).unwrap();
+                // Every writer sets a different field on the same row, plus a
+                // shared field at a version derived from its id.
+                e.write_records(
+                    "users",
+                    vec![(
+                        user(1),
+                        Record::new()
+                            .with_field(&format!("f{}", w), Value::Int(w as i64), v(100, w))
+                            .with_field("shared", Value::Int(w as i64), v(100 + w, w)),
+                    )],
+                )
+                .unwrap();
+                e.publish().unwrap();
+            });
+        }
+    });
+
+    let mut r = Reader::open(store(&root)).unwrap();
+    let rec = r.get("users", &user(1)).unwrap().expect("the row must exist");
+
+    // Every writer's own field survives — a merge that dropped one would be
+    // the column-dropping failure the record model exists to prevent.
+    for w in 1..=WRITERS {
+        assert_eq!(
+            rec.get(&format!("f{}", w)),
+            Some(&Value::Int(w as i64)),
+            "writer {}'s field was lost in the merge",
+            w
+        );
+    }
+
+    // The contested field resolves to the highest version, deterministically.
+    assert_eq!(
+        rec.get("shared"),
+        Some(&Value::Int(WRITERS as i64)),
+        "the contested field must resolve to the newest version"
+    );
+}
