@@ -31,7 +31,6 @@
 //   let kernel = PondKernel::new_with_store(Box::new(store));
 
 use std::io::{self, Read};
-use std::sync::Mutex;
 
 use pond_kernel::ObjectStore;
 use sha2::{Digest, Sha256};
@@ -488,19 +487,10 @@ pub struct S3ObjectStore {
     endpoint: String,
     credentials: S3Credentials,
     agent: ureq::Agent,
-    stats: Mutex<StoreStats>,
     /// Lazily-initialized async HTTP client. Only present with `feature = "async"`.
     /// `OnceLock` so we don't need to thread an `Option` through `new()`.
     #[cfg(feature = "async")]
     async_client: std::sync::OnceLock<reqwest::Client>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct StoreStats {
-    pub gets: u64,
-    pub puts: u64,
-    pub bytes_read: u64,
-    pub bytes_written: u64,
 }
 
 impl S3ObjectStore {
@@ -534,7 +524,6 @@ impl S3ObjectStore {
             endpoint: endpoint.into(),
             credentials,
             agent,
-            stats: Mutex::new(StoreStats::default()),
             #[cfg(feature = "async")]
             async_client: std::sync::OnceLock::new(),
         }
@@ -1176,9 +1165,6 @@ impl ObjectStore for S3ObjectStore {
         } else {
             let _resp = self.s3_request("PUT", &key, None, Some(data), &[])?;
         }
-        let mut s = self.stats.lock().unwrap();
-        s.puts += 1;
-        s.bytes_written += data.len() as u64;
         Ok(h)
     }
 
@@ -1189,9 +1175,6 @@ impl ObjectStore for S3ObjectStore {
         resp.into_reader()
             .read_to_end(&mut body)
             .map_err(io::Error::other)?;
-        let mut s = self.stats.lock().unwrap();
-        s.gets += 1;
-        s.bytes_read += body.len() as u64;
         Ok(body)
     }
 
@@ -1232,9 +1215,6 @@ impl ObjectStore for S3ObjectStore {
         resp.into_reader()
             .read_to_end(&mut body)
             .map_err(io::Error::other)?;
-        let mut s = self.stats.lock().unwrap();
-        s.gets += 1;
-        s.bytes_read += body.len() as u64;
         Ok(body)
     }
 
@@ -1292,12 +1272,6 @@ impl ObjectStore for S3ObjectStore {
                 return Err(e);
             }
         }
-
-        // All PUTs succeeded — update stats and return hashes
-        let total_bytes: u64 = items.iter().map(|d| d.len() as u64).sum();
-        let mut s = self.stats.lock().unwrap();
-        s.puts += n as u64;
-        s.bytes_written += total_bytes;
 
         Ok(precomputed)
     }
@@ -1370,18 +1344,13 @@ impl ObjectStore for S3ObjectStore {
 
         // Collect in order
         let mut results = Vec::with_capacity(n);
-        let mut total_bytes: u64 = 0;
         for opt in slot_map {
             let body = opt.ok_or_else(|| io::Error::other(
                 "missing result from parallel batch (should not happen)"
             ))?;
-            total_bytes += body.len() as u64;
             results.push(body);
         }
 
-        let mut s = self.stats.lock().unwrap();
-        s.gets += n as u64;
-        s.bytes_read += total_bytes;
 
         Ok(results)
     }
@@ -1390,8 +1359,6 @@ impl ObjectStore for S3ObjectStore {
         let key = self.path_key(path);
         let body = format!(r#"{{"hash":"{}"}}"#, hash).into_bytes();
         let _resp = self.s3_request("PUT", &key, None, Some(&body), &[])?;
-        let mut s = self.stats.lock().unwrap();
-        s.puts += 1;
         Ok(())
     }
 
@@ -1403,8 +1370,6 @@ impl ObjectStore for S3ObjectStore {
                 if resp.into_reader().read_to_string(&mut body).is_err() {
                     return None;
                 }
-                let mut s = self.stats.lock().unwrap();
-                s.gets += 1;
                 extract_hash_from_json(&body)
             }
             Err(_) => None,
@@ -1414,9 +1379,6 @@ impl ObjectStore for S3ObjectStore {
     fn put_object(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
         let key = self.path_key(path);
         self.s3_request("PUT", &key, None, Some(bytes), &[])?;
-        let mut s = self.stats.lock().unwrap();
-        s.puts += 1;
-        s.bytes_written += bytes.len() as u64;
         Ok(())
     }
 
@@ -1425,9 +1387,6 @@ impl ObjectStore for S3ObjectStore {
         let resp = self.s3_request("GET", &key, None, None, &[]).ok()?;
         let mut buf = Vec::new();
         resp.into_reader().read_to_end(&mut buf).ok()?;
-        let mut s = self.stats.lock().unwrap();
-        s.gets += 1;
-        s.bytes_read += buf.len() as u64;
         Some(buf)
     }
 
@@ -1626,9 +1585,6 @@ impl S3ObjectStore {
                 format!("S3 returned {}: {}", status, body),
             ));
         }
-        let mut s = self.stats.lock().unwrap();
-        s.puts += 1;
-        s.bytes_written += data.len() as u64;
         Ok(h)
     }
 
@@ -1653,9 +1609,6 @@ impl S3ObjectStore {
         let body = resp.bytes().await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("read body: {}", e)))?;
         let body = body.to_vec();
-        let mut s = self.stats.lock().unwrap();
-        s.gets += 1;
-        s.bytes_read += body.len() as u64;
         Ok(body)
     }
 
@@ -1761,8 +1714,6 @@ impl S3ObjectStore {
                 format!("S3 returned {}: {}", status, body),
             ));
         }
-        let mut s = self.stats.lock().unwrap();
-        s.puts += 1;
         Ok(())
     }
 
@@ -1781,8 +1732,6 @@ impl S3ObjectStore {
             Ok(b) => b,
             Err(_) => return None,
         };
-        let mut s = self.stats.lock().unwrap();
-        s.gets += 1;
         extract_hash_from_json(&body)
     }
 }

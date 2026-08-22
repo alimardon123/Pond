@@ -10,7 +10,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
 
 use crate::hash_bytes;
 
@@ -302,15 +302,6 @@ pub trait AsyncObjectStore: Send + Sync {
 /// use temp+rename with unique temp names.
 pub struct LocalFSObjectStore {
     base_dir: PathBuf,
-    stats: Mutex<StoreStats>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct StoreStats {
-    pub gets: u64,
-    pub puts: u64,
-    pub bytes_read: u64,
-    pub bytes_written: u64,
 }
 
 impl LocalFSObjectStore {
@@ -319,7 +310,6 @@ impl LocalFSObjectStore {
         fs::create_dir_all(base.join("blobs"))?;
         Ok(Self {
             base_dir: base.to_path_buf(),
-            stats: Mutex::new(StoreStats::default()),
         })
     }
 
@@ -405,9 +395,6 @@ impl ObjectStore for LocalFSObjectStore {
             }
             write_file_durably(&path, data)?;
         }
-        let mut s = self.stats.lock().unwrap();
-        s.puts += 1;
-        s.bytes_written += data.len() as u64;
         Ok(h)
     }
 
@@ -418,9 +405,6 @@ impl ObjectStore for LocalFSObjectStore {
                 format!("Blob '{}' not found", hash)));
         }
         let data = fs::read(&path)?;
-        let mut s = self.stats.lock().unwrap();
-        s.gets += 1;
-        s.bytes_read += data.len() as u64;
         Ok(data)
     }
 
@@ -454,9 +438,6 @@ impl ObjectStore for LocalFSObjectStore {
         let mut buf = vec![0u8; readable];
         f.read_exact(&mut buf)?;
 
-        let mut s = self.stats.lock().unwrap();
-        s.gets += 1;
-        s.bytes_read += buf.len() as u64;
         Ok(buf)
     }
 
@@ -478,8 +459,6 @@ impl ObjectStore for LocalFSObjectStore {
         // branch pointing at nothing. On S3 this is a plain PUT (already
         // atomic and durable); locally it needs the full temp→fsync→rename.
         write_file_durably(&file, body.as_bytes())?;
-        let mut s = self.stats.lock().unwrap();
-        s.puts += 1;
         Ok(())
     }
 
@@ -505,8 +484,6 @@ impl ObjectStore for LocalFSObjectStore {
             fs::create_dir_all(parent)?;
         }
         write_file_durably(&file, bytes)?;
-        let mut s = self.stats.lock().unwrap();
-        s.puts += 1;
         Ok(())
     }
 
@@ -549,8 +526,6 @@ impl ObjectStore for LocalFSObjectStore {
         let path = self.blob_path(hash);
         if path.exists() {
             fs::remove_file(&path)?;
-            let mut s = self.stats.lock().unwrap();
-            s.gets += 1; // count as a maintenance op
             Ok(true)
         } else {
             Ok(false)
@@ -624,9 +599,6 @@ impl AsyncObjectStore for LocalFSObjectStore {
             tokio::fs::write(&tmp, &data).await?;
             tokio::fs::rename(&tmp, &path).await?;
         }
-        let mut s = self.stats.lock().unwrap();
-        s.puts += 1;
-        s.bytes_written += data.len() as u64;
         Ok(h)
     }
 
@@ -640,9 +612,6 @@ impl AsyncObjectStore for LocalFSObjectStore {
             ));
         }
         let data = tokio::fs::read(&path).await?;
-        let mut s = self.stats.lock().unwrap();
-        s.gets += 1;
-        s.bytes_read += data.len() as u64;
         Ok(data)
     }
 
@@ -650,8 +619,6 @@ impl AsyncObjectStore for LocalFSObjectStore {
         let path = self.blob_path(hash);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {
-                let mut s = self.stats.lock().unwrap();
-                s.gets += 1; // count as a maintenance op (matches sync impl)
                 Ok(true)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),

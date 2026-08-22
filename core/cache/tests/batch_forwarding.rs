@@ -262,3 +262,24 @@ fn a_batch_read_served_from_disk_completes_and_is_correct() {
         "a disk-warm batch must not touch the backend"
     );
 }
+
+/// The same property, checked by the kernel's shared assertion rather than by
+/// the hand-written cases above.
+///
+/// Those cases came first and found the bug; this one is what stops it coming
+/// back in a decorator nobody thought to write a test for. The check names the
+/// first batch method that fails to forward, so a future addition to
+/// `ObjectStore` that the cache forgets shows up here by name.
+///
+/// Run with a cache configured to cache nothing, because the question is "when
+/// you do have to reach the backend, do you reach it as a batch?" — a warm
+/// cache correctly issues no request at all, which the generic check cannot
+/// distinguish from a lost one.
+#[test]
+fn the_cache_forwards_every_batch_method() {
+    let d = tempfile::tempdir().unwrap();
+    pond_kernel::assert_forwards_batches(
+        |probe| BlobCache::new(probe, CacheConfig::memory_only(0)).unwrap(),
+        LocalFSObjectStore::new(d.path()).unwrap(),
+    );
+}

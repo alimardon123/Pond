@@ -6,81 +6,21 @@
 // engine cutover has to beat, and a tripwire if the legacy path gets more
 // expensive while it is still the one every binding calls.
 
-use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use pond_kernel::{LocalFSObjectStore, ObjectStore, PondKernel};
+use pond_kernel::{LocalFSObjectStore, Metered, PondKernel};
 
-#[derive(Default)]
-struct Counters {
-    puts: AtomicU64,
-    gets: AtomicU64,
-    heads: AtomicU64,
-    lists: AtomicU64,
-}
-
-impl Counters {
-    fn total(&self) -> u64 {
-        self.puts.load(Ordering::Relaxed)
-            + self.gets.load(Ordering::Relaxed)
-            + self.heads.load(Ordering::Relaxed)
-            + self.lists.load(Ordering::Relaxed)
-    }
-    fn reset(&self) {
-        self.puts.store(0, Ordering::Relaxed);
-        self.gets.store(0, Ordering::Relaxed);
-        self.heads.store(0, Ordering::Relaxed);
-        self.lists.store(0, Ordering::Relaxed);
-    }
-}
-
-/// Counts every operation that would be a network round trip against S3.
-struct Counting {
-    inner: LocalFSObjectStore,
-    c: Arc<Counters>,
-}
-
-impl ObjectStore for Counting {
-    fn put_blob(&self, data: &[u8]) -> io::Result<String> {
-        self.c.puts.fetch_add(1, Ordering::Relaxed);
-        self.inner.put_blob(data)
-    }
-    fn get_blob(&self, hash: &str) -> io::Result<Vec<u8>> {
-        self.c.gets.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_blob(hash)
-    }
-    fn put_path(&self, path: &str, hash: &str) -> io::Result<()> {
-        self.c.puts.fetch_add(1, Ordering::Relaxed);
-        self.inner.put_path(path, hash)
-    }
-    fn get_path(&self, path: &str) -> Option<String> {
-        self.c.gets.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_path(path)
-    }
-    fn put_object(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
-        self.c.puts.fetch_add(1, Ordering::Relaxed);
-        self.inner.put_object(path, bytes)
-    }
-    fn get_object(&self, path: &str) -> Option<Vec<u8>> {
-        self.c.gets.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_object(path)
-    }
-    fn delete_path(&self, path: &str) -> io::Result<bool> {
-        self.inner.delete_path(path)
-    }
-    fn list_paths(&self, prefix: &str) -> io::Result<Vec<String>> {
-        self.c.lists.fetch_add(1, Ordering::Relaxed);
-        self.inner.list_paths(prefix)
-    }
-    fn blob_exists(&self, hash: &str) -> bool {
-        // A HEAD request on S3 — a full round trip, not a free local check.
-        self.c.heads.fetch_add(1, Ordering::Relaxed);
-        self.inner.blob_exists(hash)
-    }
-    fn delete_blob(&self, hash: &str) -> io::Result<bool> {
-        self.inner.delete_blob(hash)
-    }
+/// One metered store, shared with the kernel that writes through it.
+///
+/// [`Metered`] replaces the counting `ObjectStore` this file used to define
+/// inline — fifty lines of delegation that had to be kept in step with the
+/// trait by hand, and, like every other copy in the tree, silently dropped the
+/// batch methods onto their sequential defaults.
+fn metered_kernel() -> (tempfile::TempDir, Arc<Metered<LocalFSObjectStore>>, PondKernel) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Metered::new(LocalFSObjectStore::new(dir.path()).unwrap()));
+    let kernel = PondKernel::new_with_store(Box::new(Arc::clone(&store)));
+    (dir, store, kernel)
 }
 
 /// One legacy write, counted.
@@ -93,30 +33,29 @@ impl ObjectStore for Counting {
 /// to catch it growing, not to freeze an implementation detail.
 #[test]
 fn legacy_write_round_trip_cost_is_recorded() {
-    let dir = tempfile::tempdir().unwrap();
-    let c = Arc::new(Counters::default());
-    let store = Counting {
-        inner: LocalFSObjectStore::new(dir.path()).unwrap(),
-        c: c.clone(),
-    };
-    let kernel = PondKernel::new_with_store(Box::new(store));
+    let (_dir, store, kernel) = metered_kernel();
     let storage = pond_storage::UnifiedStorage::new(kernel);
 
     // First write, then a second one so the parent-commit read is included —
     // the steady-state cost is what matters, not the empty-collection case.
     pond_storage::write::write(storage.kernel(), "users", "main", b"row one", "first").unwrap();
 
-    c.reset();
+    store.reset();
     pond_storage::write::write(storage.kernel(), "users", "main", b"row two", "second").unwrap();
 
-    let puts = c.puts.load(Ordering::Relaxed);
-    let gets = c.gets.load(Ordering::Relaxed);
-    let heads = c.heads.load(Ordering::Relaxed);
-    let total = c.total();
+    let st = store.stats();
+    let (puts, gets, heads, total) = (st.puts, st.gets, st.heads, st.requests());
 
     println!(
-        "legacy write: {} round trips ({} PUT, {} GET, {} HEAD)",
-        total, puts, gets, heads
+        "legacy write: {} requests in {} round trips ({} PUT, {} GET, {} HEAD)",
+        total, st.round_trips, puts, gets, heads
+    );
+    // Every one of these is a separate, dependent call: nothing in the legacy
+    // path batches, so its request count and its round-trip count are the same
+    // number. That equality is the cost being recorded here.
+    assert_eq!(
+        st.round_trips, total,
+        "the legacy path issues no batches, so every request is its own wait"
     );
 
     assert!(
@@ -152,13 +91,7 @@ fn legacy_write_round_trip_cost_is_recorded() {
 /// reason the engine publishes one object.
 #[test]
 fn legacy_commit_updates_several_refs_and_so_cannot_be_atomic() {
-    let dir = tempfile::tempdir().unwrap();
-    let c = Arc::new(Counters::default());
-    let store = Counting {
-        inner: LocalFSObjectStore::new(dir.path()).unwrap(),
-        c: c.clone(),
-    };
-    let kernel = PondKernel::new_with_store(Box::new(store));
+    let (_dir, _store, kernel) = metered_kernel();
 
     pond_storage::write::write(&kernel, "users", "main", b"row", "msg").unwrap();
 
@@ -186,13 +119,7 @@ fn legacy_commit_updates_several_refs_and_so_cannot_be_atomic() {
 fn engine_write_costs_far_fewer_round_trips() {
     use pond_core::encode::TypedColumn;
 
-    let dir = tempfile::tempdir().unwrap();
-    let c = Arc::new(Counters::default());
-    let store = Counting {
-        inner: LocalFSObjectStore::new(dir.path()).unwrap(),
-        c: c.clone(),
-    };
-    let kernel = PondKernel::new_with_store(Box::new(store));
+    let (_dir, store, kernel) = metered_kernel();
 
     pond_storage::engine_path::create(&kernel, "users").unwrap();
     let columns: Vec<(&str, TypedColumn)> = vec![
@@ -204,18 +131,18 @@ fn engine_write_costs_far_fewer_round_trips() {
     // same way the legacy comparison does.
     pond_storage::engine_path::write_rows(&kernel, "users", &columns, 1).unwrap();
 
-    c.reset();
+    store.reset();
     pond_storage::engine_path::write_rows(&kernel, "users", &columns, 1).unwrap();
-    let total = c.total();
-    let heads = c.heads.load(Ordering::Relaxed);
+    let total = store.stats().requests();
+    let heads = store.stats().heads;
 
     println!(
         "engine write: {} round trips ({} PUT, {} GET, {} HEAD, {} LIST)",
         total,
-        c.puts.load(Ordering::Relaxed),
-        c.gets.load(Ordering::Relaxed),
+        store.stats().puts,
+        store.stats().gets,
         heads,
-        c.lists.load(Ordering::Relaxed),
+        store.stats().lists,
     );
 
     assert_eq!(heads, 0, "the engine path must never probe for existence");
@@ -228,9 +155,9 @@ fn engine_write_costs_far_fewer_round_trips() {
     // twelve times a GET, so trading writes for reads is a win even at equal
     // counts — and here the counts are not equal.
     assert!(
-        c.puts.load(Ordering::Relaxed) <= 3,
+        store.stats().puts <= 3,
         "the engine commits with {} writes; the legacy path uses 6",
-        c.puts.load(Ordering::Relaxed)
+        store.stats().puts
     );
 }
 
@@ -248,19 +175,16 @@ fn engine_write_costs_far_fewer_round_trips() {
 /// right-most leaf and its ancestors.
 #[test]
 fn raw_bytes_append_rewrites_the_whole_collection() {
-    let dir = tempfile::tempdir().unwrap();
-    let c = Arc::new(Counters::default());
-    let store = Counting {
-        inner: LocalFSObjectStore::new(dir.path()).unwrap(),
-        c: c.clone(),
-    };
-    let kernel = PondKernel::new_with_store(Box::new(store));
+    let (_dir, store, kernel) = metered_kernel();
 
     // Simulate the lens loop: read all, append one, write all back.
     let mut rows: Vec<String> = Vec::new();
     let mut bytes_at: Vec<usize> = Vec::new();
 
+    let mut store_bytes_at: Vec<u64> = Vec::new();
+
     for i in 0..40 {
+        store.reset();
         let existing =
             pond_storage::read::read(&kernel, "events", "main").unwrap_or_default();
         if !existing.is_empty() {
@@ -270,7 +194,32 @@ fn raw_bytes_append_rewrites_the_whole_collection() {
         let payload = serde_json::to_vec(&rows).unwrap();
         bytes_at.push(payload.len());
         pond_storage::write::write(&kernel, "events", "main", &payload, "append").unwrap();
+        store_bytes_at.push(store.stats().bytes_written);
     }
+
+    // The payload sizes above are what the lens *intended* to write. These are
+    // what the store actually received, overhead included — the number that
+    // gets billed and transferred.
+    let store_first = store_bytes_at.first().copied().unwrap_or(0);
+    let store_last = store_bytes_at.last().copied().unwrap_or(0);
+    println!(
+        "raw-bytes append, bytes reaching the store: #1 {} -> #40 {} ({:.1}x)",
+        store_first,
+        store_last,
+        store_last as f64 / store_first.max(1) as f64
+    );
+    // 2.9x measured, against ~10x growth in the payload itself: each commit
+    // also writes a manifest, a commit object and three refs whose size does
+    // not depend on the collection, and at 40 tiny rows that fixed overhead
+    // still dominates. The ratio therefore understates the problem rather than
+    // overstating it — which is the right direction for a tripwire.
+    assert!(
+        store_last > store_first * 2,
+        "the growth must show up in what the store receives, not only in the \
+         payload the lens builds: {} -> {} bytes",
+        store_first,
+        store_last
+    );
 
     let first = bytes_at.first().copied().unwrap_or(0);
     let last = bytes_at.last().copied().unwrap_or(0);
