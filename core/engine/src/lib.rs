@@ -89,6 +89,13 @@ pub fn head_key(writer_id: u64) -> String {
 
 const HEADS_PREFIX: &str = "heads/";
 
+/// How many merges of one reduction level run at once.
+///
+/// Matches the S3 backend's batch width: the requests these merges issue are
+/// grouped into batches of that size underneath, so going wider adds threads
+/// without adding parallelism at the layer that actually waits.
+const MERGE_FANOUT: usize = 32;
+
 /// Everything about a collection that decides what bytes it produces.
 ///
 /// Both fields participate in content addressing, and that is the whole reason
@@ -449,6 +456,109 @@ impl<S: ObjectStore> Reader<S> {
         self.roots.keys().cloned().collect()
     }
 
+    /// Fold every writer's root into one tree, halving the set at each step
+    /// rather than sweeping it left to right.
+    ///
+    /// # What this buys, measured
+    ///
+    /// A left fold `((a⊕b)⊕c)⊕d` and a balanced reduction `(a⊕b)⊕(c⊕d)` do the
+    /// same total work — request counts are identical. What differs is how much
+    /// of it has to *wait*: every step of a left fold needs the result of the
+    /// one before it, while the merges within a reduction level are independent
+    /// and can run at once.
+    ///
+    /// `cargo run --release -p pond_bench --bin writerscale`, with every
+    /// backend request delayed to model an object-storage round trip:
+    ///
+    /// | writers | scan requests | wall clock | fully sequential | speedup |
+    /// |---|---|---|---|---|
+    /// | 16  | 31  | 11 ms | 16 ms  | 1.5x |
+    /// | 32  | 63  | 16 ms | 32 ms  | 2.0x |
+    /// | 64  | 127 | 23 ms | 64 ms  | 2.8x |
+    /// | 128 | 255 | 44 ms | 128 ms | 2.9x |
+    /// | 256 | 511 | 86 ms | 256 ms | 3.0x |
+    ///
+    /// # Why it is a constant factor and not `log W`
+    ///
+    /// The obvious argument — `log2(W)` levels, so `log2(W)` waits — is wrong,
+    /// and the measurement is what says so. Level `k` holds `W/2^k` merges, but
+    /// each one joins trees that have grown to about `2^k` entries, and a merge
+    /// descends both trees sequentially. So the levels get cheaper in count and
+    /// more expensive in depth at the same rate, and the serial depth stays
+    /// `O(W)`. What actually improves is the wide, cheap bottom of the
+    /// reduction, and that plateaus around 3x.
+    ///
+    /// Raising [`MERGE_FANOUT`] past 32 makes it *worse* — 2.5x at 256 writers
+    /// with a fanout of 256 — because thread scheduling costs more than the
+    /// extra overlap returns.
+    ///
+    /// # What this does not fix
+    ///
+    /// Reader cost is still linear in the number of writers that have *ever*
+    /// published, because heads are never removed and never folded. 3x off a
+    /// line is still a line. Bounding it needs head compaction — periodically
+    /// merging many heads into one published root — which does not exist yet
+    /// and is the real ceiling on "any user worldwide". See `docs/REVIEW_BY_ROLE.md`.
+    ///
+    /// # Why re-associating is allowed
+    ///
+    /// Only because merge is a semilattice join: associative, so the fold can
+    /// be re-bracketed, and commutative, so the order does not matter.
+    /// `merge_is_idempotent_and_associative` in `pond_index`'s acceptance tests
+    /// asserts both on the root hash rather than on logical contents, so this
+    /// produces a byte-identical root to the left fold it replaces — and
+    /// `readers_converge_on_the_same_root_hash` would fail if it did not.
+    ///
+    /// The algebra was stated as the reason merge is *correct*. It is equally
+    /// what makes it re-orderable, and that half went unused.
+    fn reduce(&self, roots: Vec<String>) -> Tree {
+        let cfg = self.config.chunk;
+        let mut level: Vec<Tree> = roots
+            .into_iter()
+            .map(|root| Tree { root, config: cfg })
+            .collect();
+
+        if level.is_empty() {
+            return Tree::build(&self.store, Vec::new(), cfg);
+        }
+
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            // Bounded fan-out: a level can be thousands of pairs wide, and
+            // spawning a thread for each would cost more in scheduling than
+            // the round trips it saves. The width matches the backend's own
+            // batch width, since that is what the requests underneath will be
+            // grouped into anyway.
+            for group in level.chunks(MERGE_FANOUT * 2) {
+                std::thread::scope(|scope| {
+                    let store = &self.store;
+                    let handles: Vec<_> = group
+                        .chunks(2)
+                        .map(|pair| {
+                            scope.spawn(move || match pair {
+                                [a, b] => a.merge(store, b, resolve_records),
+                                // An odd one out carries to the next level
+                                // untouched. Merging it with an empty tree
+                                // would be equivalent but would cost a wave.
+                                [a] => Tree {
+                                    root: a.root.clone(),
+                                    config: cfg,
+                                },
+                                _ => unreachable!("chunks(2) yields 1 or 2"),
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        next.push(h.join().expect("a merge thread panicked"));
+                    }
+                });
+            }
+            level = next;
+        }
+
+        level.pop().expect("a non-empty level always reduces to one tree")
+    }
+
     /// Merge every writer's tree for a collection, memoised per reader.
     fn tree_for(&mut self, collection: &str) -> Tree {
         if let Some(t) = self.merged.get(collection) {
@@ -458,21 +568,7 @@ impl<S: ObjectStore> Reader<S> {
             };
         }
         let roots = self.roots.get(collection).cloned().unwrap_or_default();
-        let mut iter = roots.into_iter();
-        let mut acc = match iter.next() {
-            Some(r) => Tree {
-                root: r,
-                config: self.config.chunk,
-            },
-            None => Tree::build(&self.store, Vec::new(), self.config.chunk),
-        };
-        for r in iter {
-            let other = Tree {
-                root: r,
-                config: self.config.chunk,
-            };
-            acc = acc.merge(&self.store, &other, resolve_records);
-        }
+        let acc = self.reduce(roots);
         self.merged.insert(
             collection.to_string(),
             Tree {

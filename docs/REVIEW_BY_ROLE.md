@@ -161,6 +161,68 @@ case at all.
 row; its absence means "these are new rows". The alternative — position — was
 tried and silently made every write overwrite the previous one.
 
+**Reader cost is linear in the number of writers that have *ever* published,
+and nothing bounds it.** This is the largest open item in the design and it was
+not visible until requests and round trips were counted separately.
+
+The convergence story is that each writer publishes to its own head key and
+readers merge every head they find. That removes coordination, and it is why
+there is no CAS anywhere. What it also does is make the read path grow with the
+writer population: heads are created by `publish` and are never removed, never
+folded, and never expired. A writer that published once, years ago, is still
+read on every reader open forever.
+
+Measured (`cargo run --release -p pond_bench --bin writerscale`), holding data
+per writer constant so only the writer count varies:
+
+| writers | rows | reader open (reqs / round trips) | first scan (reqs / round trips) |
+|---|---|---|---|
+| 16  | 64   | 17 / 2  | 31 / 31   |
+| 64  | 256  | 65 / 2  | 127 / 127 |
+| 256 | 1024 | 257 / 2 | 511 / 511 |
+
+Two different things are in that table, and only one of them is a problem.
+
+*Reader open is fine.* 257 requests at 256 writers, but **2 round trips** — one
+LIST, one batched read of every head. The cost is linear in requests and flat in
+waits, which is exactly what the design intends, and it is only true because
+`get_object_batch` is genuinely batched end to end.
+
+*The first read of a collection was not fine.* 511 requests in 511 **dependent**
+round trips, because the fold over writer roots was a left fold: each merge
+needed the previous result. At an object-storage RTT that is roughly fifteen
+seconds to open a collection holding a kilobyte of data.
+
+Merge is a semilattice join — associative and commutative, asserted on the root
+hash by `merge_is_idempotent_and_associative` — so the fold can be re-associated
+into a balanced reduction whose levels are independent and run in parallel. That
+is now what `Reader::reduce` does, and it produces a byte-identical root.
+
+**It buys 3x, not `log W`, and the measurement is what corrected the estimate.**
+The tempting argument is `log2(W)` levels so `log2(W)` waits; it is wrong,
+because level `k` holds `W/2^k` merges over trees of about `2^k` entries and a
+merge descends both sequentially. Depth stays `O(W)`. What improves is the wide,
+cheap bottom of the reduction, and it plateaus:
+
+| writers | wall clock | if fully sequential | speedup |
+|---|---|---|---|
+| 32  | 16 ms | 32 ms  | 2.0x |
+| 128 | 44 ms | 128 ms | 2.9x |
+| 256 | 86 ms | 256 ms | 3.0x |
+
+Widening the fan-out past 32 makes it worse — 2.5x at a fan-out of 256 — as
+thread scheduling overtakes the overlap gained.
+
+**So the ceiling stands.** 3x off a line is still a line, and "multi-writer from
+any lens, any user worldwide" implies a writer population that grows without
+bound. The fix is head compaction: periodically merge many heads into one
+published root and delete the heads folded in, so the read path sees a number of
+heads bounded by recent activity rather than by all history. That is a real
+design question — it needs a rule for who compacts, and it must not lose a write
+that lands mid-compaction, which is the same race the key-rotation work already
+had to solve once. It does not exist yet, and until it does the writer count is
+the scaling limit, not the data volume.
+
 **Column pruning does not exist yet.** A scan that wants one field still reads
 whole records, and a spilled record is fetched whole. That is what a PAX
 segment layout would fix, and it is the remaining half of the "index
