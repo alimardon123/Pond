@@ -96,7 +96,7 @@ impl<S: ObjectStore> ObjectStore for Counting<S> {
 }
 
 /// Run a workload and return (weighted request cost, bytes).
-fn run(value_bytes: usize, threshold: usize, reads_per_write: usize) -> Outcome {
+fn run(value_bytes: usize, threshold: usize, reads_per_write: usize, warm: bool) -> Outcome {
     const SEED_ROWS: i64 = 2_000;
     const OPS: i64 = 40;
 
@@ -149,15 +149,32 @@ fn run(value_bytes: usize, threshold: usize, reads_per_write: usize) -> Outcome 
             .unwrap();
         e.publish().unwrap();
 
-        for r in 0..reads_per_write {
+        // Cold: a fresh reader per read, so nothing is cached. Warm: one
+        // reader across the batch, which is what a long-lived process
+        // actually does — and the case this design is built for, since
+        // content-addressed entries can never go stale.
+        if warm {
             let mut reader = Reader::open_with(
                 Arc::clone(&backend),
                 pond_cache::CacheConfig::default(),
                 config,
             )
             .unwrap();
-            let key = Key::new(vec![int((op * 13 + r as i64 * 31) % SEED_ROWS)]);
-            let _ = reader.get("t", &key).unwrap();
+            for r in 0..reads_per_write {
+                let key = Key::new(vec![int((op * 13 + r as i64 * 31) % SEED_ROWS)]);
+                let _ = reader.get("t", &key).unwrap();
+            }
+        } else {
+            for r in 0..reads_per_write {
+                let mut reader = Reader::open_with(
+                    Arc::clone(&backend),
+                    pond_cache::CacheConfig::default(),
+                    config,
+                )
+                .unwrap();
+                let key = Key::new(vec![int((op * 13 + r as i64 * 31) % SEED_ROWS)]);
+                let _ = reader.get("t", &key).unwrap();
+            }
         }
     }
 
@@ -165,20 +182,19 @@ fn run(value_bytes: usize, threshold: usize, reads_per_write: usize) -> Outcome 
     let gets = c.gets.load(Ordering::Relaxed) as f64;
     let bytes = c.bytes.load(Ordering::Relaxed);
 
-    let requests = puts * PUT_PER_GET + gets;
-    let millis = (puts + gets) * REQUEST_MS + (bytes as f64 / (1024.0 * 1024.0)) * MS_PER_MIB;
-    Outcome {
-        requests,
-        millis,
-        bytes,
-    }
+    // A PUT costs ~12.5x a GET, so requests are weighted rather than counted.
+    let millis =
+        (puts * PUT_PER_GET + gets) * REQUEST_MS + (bytes as f64 / (1024.0 * 1024.0)) * MS_PER_MIB;
+    Outcome { millis, bytes }
 }
 
 struct Outcome {
-    /// Requests, weighted by price.
-    requests: f64,
-    /// Modelled wall clock: a fixed cost per request plus a per-byte term.
+    /// Modelled wall clock: a price-weighted per-request cost plus a per-byte
+    /// term. Both terms matter — see [`REQUEST_MS`].
     millis: f64,
+    /// Backend bytes moved. Reported alongside the verdict because it is the
+    /// other half of the argument: spilling wins by moving less, and a reader
+    /// should be able to see how much less rather than take the ratio on faith.
     bytes: u64,
 }
 
@@ -188,33 +204,51 @@ fn main() {
 
     println!("40 writes + N reads over 2000 rows. Lower is better.");
     println!(
-        "`inline` never spills; `spill` uses a 1 KiB threshold.\n\
-         Request cost weights a PUT at {}x a GET. Modelled time is \
-         {} ms per request plus {} ms per MiB.\n",
-        PUT_PER_GET, REQUEST_MS, MS_PER_MIB
+        "`inline` never spills; `spill` uses the crate's SPILL_THRESHOLD.\n\
+         Modelled time is {} ms per request plus {} ms per MiB.\n\
+         cold = a fresh reader per read; warm = one reader across the batch,\n\
+         which is what a long-lived process does and what the cache is for.\n",
+        REQUEST_MS, MS_PER_MIB
     );
-    println!("| value | reads/write | requests inline -> spill | bytes inline -> spill | time inline -> spill |");
+    println!(
+        "| value | reads/write | bytes inline -> spill | cold: inline -> spill \
+         | warm: inline -> spill |"
+    );
     println!("|---|---|---|---|---|");
 
-    for value_bytes in [256usize, 1024, 4096, 16384, 65536] {
+    for value_bytes in [1024usize, 4096, 16384, 65536] {
         for reads_per_write in [1usize, 10, 100] {
-            let inline = run(value_bytes, never, reads_per_write);
-            let spill = run(value_bytes, 1024, reads_per_write);
-            println!(
-                "| {} B | {} | {:.0} -> {:.0} | {} -> {} | {:.0} ms -> {:.0} ms **{}** |",
-                value_bytes,
-                reads_per_write,
-                inline.requests,
-                spill.requests,
-                human(inline.bytes),
-                human(spill.bytes),
-                inline.millis,
-                spill.millis,
+            let verdict = |inline: &Outcome, spill: &Outcome| -> String {
                 if spill.millis < inline.millis {
-                    format!("{:.1}x faster", inline.millis / spill.millis.max(0.001))
+                    format!(
+                        "{:.0} -> {:.0} ms **{:.1}x faster**",
+                        inline.millis,
+                        spill.millis,
+                        inline.millis / spill.millis.max(0.001)
+                    )
                 } else {
-                    format!("{:.1}x slower", spill.millis / inline.millis.max(0.001))
+                    format!(
+                        "{:.0} -> {:.0} ms {:.1}x slower",
+                        inline.millis,
+                        spill.millis,
+                        spill.millis / inline.millis.max(0.001)
+                    )
                 }
+            };
+
+            let cold_in = run(value_bytes, never, reads_per_write, false);
+            let cold_sp = run(value_bytes, pond_engine::SPILL_THRESHOLD, reads_per_write, false);
+            let warm_in = run(value_bytes, never, reads_per_write, true);
+            let warm_sp = run(value_bytes, pond_engine::SPILL_THRESHOLD, reads_per_write, true);
+
+            println!(
+                "| {} | {} | {} -> {} | {} | {} |",
+                human(value_bytes as u64),
+                reads_per_write,
+                human(cold_in.bytes),
+                human(cold_sp.bytes),
+                verdict(&cold_in, &cold_sp),
+                verdict(&warm_in, &warm_sp),
             );
         }
     }

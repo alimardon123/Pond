@@ -100,6 +100,41 @@ pub fn create(kernel: &PondKernel, collection: &str) -> Result<()> {
     definition::store(kernel, collection, &Definition::new(Format::Engine))
 }
 
+/// Create an engine-backed collection that spills values above `threshold`.
+///
+/// [`SPILL_THRESHOLD`] is a default tuned for a mixed point-read workload. A
+/// lens that knows its own access pattern should say so instead of inheriting
+/// it: an append-only stream, for instance, reads each segment at most once per
+/// range scan and never point-reads it, which is the mix where spilling wins at
+/// every size — and if its segments stay inline, every append rewrites the
+/// whole right-most leaf and the append cost grows with the stream.
+///
+/// The value is recorded in the definition, so it survives for the life of the
+/// collection and a later change to the default cannot alter how existing data
+/// is read.
+///
+/// [`SPILL_THRESHOLD`]: pond_engine::SPILL_THRESHOLD
+pub fn create_with_spill_threshold(
+    kernel: &PondKernel,
+    collection: &str,
+    threshold: usize,
+) -> Result<()> {
+    if definition::load(kernel, collection).format == Format::Engine {
+        return Ok(());
+    }
+    if has_legacy_data(kernel, collection) {
+        return Err(format!(
+            "collection '{}' already holds data in the legacy format; \
+             create a new collection and copy into it rather than \
+             reformatting in place",
+            collection
+        ));
+    }
+    let mut def = Definition::new(Format::Engine);
+    def.spill_threshold = threshold.min(u32::MAX as usize) as u32;
+    definition::store(kernel, collection, &def)
+}
+
 /// Does this collection have legacy commits on any branch?
 fn has_legacy_data(kernel: &PondKernel, collection: &str) -> bool {
     let prefix = format!("collections/{}/_branches/", collection);

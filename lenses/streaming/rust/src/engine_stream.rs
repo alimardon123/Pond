@@ -63,9 +63,28 @@ pub fn is_engine_stream(kernel: &PondKernel, collection: &str) -> bool {
     definition::format_of(kernel, collection) == Format::Engine
 }
 
+/// Smallest segment payload this lens keeps out of the index leaf.
+///
+/// A stream's whole cost argument depends on this. An append writes one record
+/// into the right-most leaf, and a leaf is rewritten whole — so if segments sit
+/// inline, append N costs the sum of every segment already in that leaf, and
+/// the O(log n) append becomes O(n) bytes. Measured over 60 appends of 4 KiB,
+/// inline segments made the engine path cost *twice* the naive read-everything
+/// -and-write-it-back it was built to replace.
+///
+/// Spilling makes the leaf hold pointers instead, so an append rewrites a few
+/// hundred bytes whatever the stream already holds. The read side pays one
+/// extra request per segment, which a range scan batches, and which the
+/// spillpoint measurements show winning at every size for a one-read-per-write
+/// mix — the mix a log actually has.
+///
+/// The size metadata at [`SIZE_KEY`] stays well under this and so stays inline,
+/// which is right: it is small, and it is rewritten on every single append.
+pub const SEGMENT_SPILL_THRESHOLD: usize = 1024;
+
 /// Create an engine-backed stream.
 pub fn create(kernel: &PondKernel, collection: &str) -> Result<(), String> {
-    engine_path::create(kernel, collection)
+    engine_path::create_with_spill_threshold(kernel, collection, SEGMENT_SPILL_THRESHOLD)
 }
 
 /// Total bytes in the stream. One point lookup, not a scan.

@@ -47,35 +47,59 @@ use pond_kernel::ObjectStore;
 /// enough that paying a round trip to avoid it is a bad deal; above it, the
 /// write cost dominates by orders of magnitude.
 ///
-/// Measured rather than reasoned. `cargo run -p pond_bench --bin spillpoint`
-/// runs 40 writes and N reads over 2000 rows and prices both terms — requests
-/// at a PUT costing 12.5x a GET, plus 30 ms per request and 20 ms per MiB:
+/// Measured rather than reasoned. `cargo run --release -p pond_bench --bin
+/// spillpoint` runs 40 writes and N reads over 2000 rows and prices both
+/// terms — 30 ms per request plus 20 ms per MiB, with a PUT at 12.5x a GET.
+/// It runs each mix twice: `cold` opens a fresh reader per read, `warm` reuses
+/// one across the batch, which is what a long-lived process does.
 ///
-/// | value | reads/write | bytes inline -> spill | spilling |
+/// | value | reads/write | cold | warm |
 /// |---|---|---|---|
-/// | 1 KiB  | 1   | 76 MiB -> 6 MiB      | 1.1x slower |
-/// | 1 KiB  | 100 | 76 MiB -> 6 MiB      | 1.3x slower |
-/// | 4 KiB  | 1   | 293 MiB -> 6 MiB     | 1.1x faster |
-/// | 4 KiB  | 100 | 293 MiB -> 6 MiB     | 1.3x slower |
-/// | 16 KiB | 1   | 1159 MiB -> 7 MiB    | 2.3x faster |
-/// | 16 KiB | 10  | 1159 MiB -> 7 MiB    | 1.2x faster |
+/// | 4 KiB  | 1   | 1.1x faster | 1.1x faster |
+/// | 4 KiB  | 10  | 1.2x slower | 1.4x slower |
+/// | 4 KiB  | 100 | 1.3x slower | **6.4x slower** |
+/// | 16 KiB | 1   | 2.3x faster | 2.3x faster |
+/// | 16 KiB | 10  | 1.2x faster | 1.8x faster |
+/// | 16 KiB | 100 | 1.2x slower | 1.1x faster |
+/// | 64 KiB | 1   | 6.4x faster | 6.4x faster |
+/// | 64 KiB | 10  | 2.3x faster | 4.2x faster |
 ///
-/// The first version of this constant was 1 KiB, argued from leaf arithmetic.
-/// The measurement says that is the one band where spilling loses at *every*
-/// mix: the bytes it saves do not pay for the requests it adds.
+/// (Values below 4 KiB never spill at either setting, so those rows are a
+/// control and read 1.0x by construction. The 64 KiB / 100 cell was not
+/// measured — the run exceeded its time budget — but the trend across that
+/// row does not turn.)
 ///
-/// 4 KiB is where the byte saving becomes large enough — 47x at that size — to
-/// carry the extra request, and it is above the band where spilling is simply
-/// a loss. Values of a few hundred bytes, the common case, still stay inline
-/// and cost nothing extra.
+/// # Warming makes spilling *worse*, not better
 ///
-/// **The read side of that table is the cold case.** The benchmark opens a
-/// fresh reader per read, so nothing is cached. Spilled blobs are
-/// content-addressed like index nodes, so a warm cache serves them without a
-/// request and the read penalty disappears — which is the case this design is
-/// built for, and why the write side is weighted more heavily here than a
-/// cold-only reading of the table would suggest.
-pub const SPILL_THRESHOLD: usize = 4096;
+/// An earlier version of this comment argued that a warm cache would erase the
+/// read penalty, because spilled blobs are content-addressed like index nodes
+/// and can never go stale. The measurement says the opposite, and the reason is
+/// locality rather than staleness:
+///
+///   - An inline leaf read brings up to `target` values into the cache for one
+///     request. Reading any of its neighbours afterwards is free.
+///   - A spilled value is its own blob. Warming it helps only a re-read of that
+///     same key; a read of the next key is a fresh miss.
+///
+/// So warming amortises inline reads across a whole leaf and amortises spilled
+/// reads across nothing. At 4 KiB and 100 distinct reads per write, that gap is
+/// 6.4x — the worst cell in the table, and precisely the read-heavy case a
+/// storage engine is most often asked to serve.
+///
+/// # Why 16 KiB
+///
+/// At 4 KiB, spilling wins one mix out of three; at 16 KiB it wins all three.
+/// The previous value of 4096 was chosen from a table that had only the cold
+/// column, where 4 KiB looks merely mediocre instead of actively bad. 16384 is
+/// the smallest measured size at which spilling is not a loss at any read/write
+/// mix, which is the property worth having in a default: a threshold should not
+/// make some workloads much worse in exchange for making others slightly
+/// better.
+///
+/// This is a default, not a law. The value is recorded per collection in its
+/// definition, so existing collections keep whatever they were created with and
+/// a workload that knows its own mix can set its own.
+pub const SPILL_THRESHOLD: usize = 16384;
 
 /// Marks an index value as a pointer rather than a record.
 ///

@@ -219,10 +219,15 @@ fn append_cost_is_bounded_unlike_a_whole_collection_rewrite() {
     let engine_growth = engine_last as f64 / engine_first.max(1) as f64;
     let json_growth = json_last as f64 / json_first.max(1) as f64;
 
+    // Not merely "slower than linear growth" — comfortably slower. The bare
+    // `<` comparison once passed at 10.0x vs 10.0x, which is to say it caught
+    // a total regression only because the two numbers rounded apart. A factor
+    // of two of headroom makes a *partial* regression visible too, and stays
+    // comparative so the random per-collection chunk salt cannot flake it.
     assert!(
-        engine_growth < json_growth,
-        "the engine append must grow more slowly than a whole-collection \
-         rewrite: engine {:.1}x vs JSON {:.1}x",
+        engine_growth * 2.0 < json_growth,
+        "the engine append must grow far more slowly than a whole-collection \
+         rewrite, not merely marginally: engine {:.1}x vs JSON {:.1}x",
         engine_growth,
         json_growth
     );
