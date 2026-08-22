@@ -538,3 +538,44 @@ fn a_pond_with_pre_sequence_head_keys_still_reads() {
     let mut r = Reader::open(store(dir.path())).unwrap();
     assert_eq!(r.scan("t").unwrap().len(), 3);
 }
+
+/// Compaction sweeps heads, not everything that happens to sit under `heads/`.
+///
+/// The delete list comes from a listing of the head prefix, so "delete what
+/// the listing returned" would also destroy a marker written by a future
+/// version of this code, or anything else that came to live there. A sweep
+/// should remove what it recognises and leave what it does not.
+#[test]
+fn compaction_leaves_alone_what_it_does_not_recognise() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), 3, 2);
+
+    let s = store(dir.path());
+    s.put_object("heads/_marker", b"written by something else").unwrap();
+    s.put_object("heads/writer/notavalidkey", b"unparseable").unwrap();
+
+    compact(dir.path());
+
+    let after = s.list_paths("heads/").unwrap();
+    assert!(
+        after.contains(&"heads/_marker".to_string()),
+        "an unrecognised object under heads/ must survive: {:?}",
+        after
+    );
+    assert!(
+        after.contains(&"heads/writer/notavalidkey".to_string()),
+        "so must a key that looks like a head but does not parse: {:?}",
+        after
+    );
+    assert_eq!(
+        s.get_object("heads/_marker").unwrap(),
+        b"written by something else",
+        "and its contents must be untouched"
+    );
+
+    // The real heads were still folded and swept.
+    assert_eq!(
+        Reader::open(store(dir.path())).unwrap().scan("t").unwrap().len(),
+        6
+    );
+}

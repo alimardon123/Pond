@@ -1028,6 +1028,12 @@ pub fn compact_heads<S: ObjectStore>(
         .all_head_paths()
         .into_iter()
         .filter(|p| p != &key)
+        // Only keys this code recognises as heads. Deleting everything under
+        // `heads/` would make compaction destroy anything else that ever came
+        // to live there — a future marker, a stray file, a key written by a
+        // newer version of this code that this one cannot parse. A sweep
+        // should remove what it understands and leave what it does not.
+        .filter(|p| parse_head_key(p).is_some())
         .collect();
     retired.sort();
     let deleted = reader
