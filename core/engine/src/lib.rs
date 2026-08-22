@@ -79,12 +79,105 @@ impl From<io::Error> for EngineError {
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
-/// Where a writer's head lives. Derived solely from the writer id, so a writer
-/// can compute its own key and no other writer's.
-pub fn head_key(writer_id: u64) -> String {
-    // Epoch-tagged so a failover can take over by writing at a higher epoch
-    // without any compare-and-swap. See docs/POSTGRES_ON_POND.md.
-    format!("heads/writer-{:016x}", writer_id)
+/// The prefix every head of one writer shares.
+///
+/// A writer only ever writes under its own prefix, which is what makes both
+/// publishing and deleting safe without a compare-and-swap.
+pub fn head_prefix(writer_id: u64) -> String {
+    // A directory rather than a string prefix, deliberately. `list_paths` is
+    // specified as a prefix listing, and S3 implements it that way, but the
+    // local backend lists a *directory* — so `heads/writer-00…01` matches on
+    // one backend and nothing on the other. A key layout that is hierarchical
+    // reads identically under both, which is the property this system needs
+    // everywhere and the reason it refuses primitives that only some backends
+    // have.
+    // `heads/writer/<id>/`, not `heads/writer-<id>/`. The old layout put a
+    // flat object at `heads/writer-<id>`; on a local filesystem that is a
+    // *file*, and a directory cannot share its path, so an upgraded pond would
+    // fail its first publish with EISDIR. Object stores have no directories
+    // and would not have shown it. A separate segment cannot collide with any
+    // old key, and `list_paths("heads/")` still walks both.
+    format!("heads/writer/{:016x}/", writer_id)
+}
+
+/// Where one published head lives: `heads/writer-<id>.<seq>.<content hash>`.
+///
+/// # Why three parts
+///
+/// The writer id partitions the namespace, so no two writers ever contend and
+/// last-writer-wins is never wrong. That much is the original design.
+///
+/// The sequence number orders one writer's publishes, so a reader can pick the
+/// latest of them from the listing alone.
+///
+/// The content hash is what lets compaction finish its job. A compacted head
+/// records the heads it absorbed by content hash; if that hash is only inside
+/// the head object, a reader has to fetch every head to discover it can ignore
+/// it, and the read path stays linear in writers no matter how much compaction
+/// runs. Putting it in the key makes absorption decidable from the LIST, so
+/// absorbed heads are never fetched — and it makes deleting them safe, because
+/// a writer that publishes again produces different bytes, a different hash,
+/// and therefore a different key that the compactor never saw and cannot
+/// delete. That is the same argument that removes the need for a conditional
+/// write on the publish path, applied to the delete path.
+pub fn head_key(writer_id: u64, seq: u64, content_hash: &str) -> String {
+    format!("{}{:016x}.{}", head_prefix(writer_id), seq, content_hash)
+}
+
+/// A head key taken apart: (writer id, sequence, content hash).
+///
+/// Accepts the original `heads/writer-<id>` form as sequence 0 with no hash,
+/// so a pond written before head keys carried a sequence still reads. Such a
+/// head can never be recognised as absorbed — it has no hash in its key — so
+/// it is always fetched and merged, which is the safe direction.
+pub fn parse_head_key(path: &str) -> Option<(u64, u64, Option<&str>)> {
+    if let Some(rest) = path.strip_prefix("heads/writer/") {
+        let (id, tail) = rest.split_once('/')?;
+        let (seq, hash) = tail.split_once('.')?;
+        if hash.is_empty() || hash.contains('/') {
+            return None;
+        }
+        return Some((
+            u64::from_str_radix(id, 16).ok()?,
+            u64::from_str_radix(seq, 16).ok()?,
+            Some(hash),
+        ));
+    }
+    // The original flat form, `heads/writer-<id>`.
+    let id = path.strip_prefix("heads/writer-")?;
+    Some((u64::from_str_radix(id, 16).ok()?, 0, None))
+}
+
+/// The latest head of each writer, from a listing.
+///
+/// Later sequence wins. A tie — two objects for one writer at the same
+/// sequence, which only happens if two processes share a writer id — is broken
+/// by the content hash so that the choice is at least deterministic across
+/// readers, which keeps them converged even in a configuration that is already
+/// a mistake.
+pub fn latest_heads(paths: &[String]) -> Vec<(u64, u64, Option<String>, String)> {
+    // Grouped by (writer, is-current-layout) rather than by writer alone. A
+    // pre-sequence head is not a *stale* version of a current one — the writer
+    // that wrote it may never run again, and nothing else holds its rows — so
+    // it must never be superseded by one. It stays in its own group and is
+    // always read, until a compaction pass folds it in and retires it.
+    let mut best: BTreeMap<(u64, bool), (u64, Option<String>, String)> = BTreeMap::new();
+    for path in paths {
+        let Some((id, seq, hash)) = parse_head_key(path) else {
+            continue;
+        };
+        let group = (id, hash.is_some());
+        let candidate = (seq, hash.map(|h| h.to_string()), path.clone());
+        match best.get(&group) {
+            Some(current) if (current.0, &current.1) >= (candidate.0, &candidate.1) => {}
+            _ => {
+                best.insert(group, candidate);
+            }
+        }
+    }
+    best.into_iter()
+        .map(|((id, _), (seq, hash, path))| (id, seq, hash, path))
+        .collect()
 }
 
 const HEADS_PREFIX: &str = "heads/";
@@ -147,6 +240,11 @@ impl EngineConfig {
 
 /// One writer's handle on a pond.
 pub struct Engine<S: ObjectStore> {
+    /// This writer's publish counter, so its heads sort by recency.
+    seq: u64,
+    /// Key of the head currently published by this writer, if any. Kept so a
+    /// publish can retire the one it supersedes.
+    published_at: Option<String>,
     store: EngineStore<BlobCache<S>>,
     writer_id: u64,
     head: Head,
@@ -170,19 +268,54 @@ impl<S: ObjectStore> Engine<S> {
         let cached = BlobCache::new(backend, cache)?;
         let store = EngineStore::new(cached);
 
-        // Recover this writer's own head, if it has published before. One
-        // read, not two: the head lives *as* the object under its name rather
-        // than as a name pointing at a blob.
-        let head = match store.inner().get_object(&head_key(writer_id)) {
-            Some(bytes) => pond_record::decode_head(&bytes)
-                .ok_or_else(|| EngineError::Corrupt("head".into()))?,
-            None => Head::new(writer_id),
+        // Recover this writer's own head, if it has published before.
+        //
+        // One LIST of this writer's own prefix, then one read of the latest
+        // key it names. That is one round trip more than the single GET a
+        // fixed key allowed, and it is paid once per process rather than per
+        // write — `publish` is still exactly one PUT. What it buys is a key
+        // that names its own content hash, which is what lets compaction skip
+        // and then delete absorbed heads without a conditional write.
+        let own = store.inner().list_paths(&head_prefix(writer_id))?;
+        let latest = latest_heads(&own)
+            .into_iter()
+            .find(|(id, _, _, _)| *id == writer_id)
+            // Nothing under this writer's prefix may mean it has never
+            // published — or that it last published before head keys had a
+            // sequence, when its head was one flat object. Falling back keeps
+            // an upgraded pond's writer cumulative: without it the writer
+            // starts empty, publishes a head at a higher sequence, and its old
+            // head is superseded by one that does not contain its rows.
+            //
+            // One extra GET, and only on a writer's first publish under the
+            // new layout. A miss is cheap and a silent loss is not.
+            .or_else(|| {
+                let legacy = format!("heads/writer-{:016x}", writer_id);
+                store
+                    .inner()
+                    .get_object(&legacy)
+                    .map(|_| (writer_id, 0, None, legacy))
+            });
+
+        let (head, seq, published_at) = match latest {
+            Some((_, seq, _, path)) => {
+                let bytes = store
+                    .inner()
+                    .get_object(&path)
+                    .ok_or_else(|| EngineError::Corrupt("head vanished between list and read".into()))?;
+                let head = pond_record::decode_head(&bytes)
+                    .ok_or_else(|| EngineError::Corrupt("head".into()))?;
+                (head, seq, Some(path))
+            }
+            None => (Head::new(writer_id), 0, None),
         };
 
         Ok(Self {
             store,
             writer_id,
             head,
+            seq,
+            published_at,
             config,
             staged: BTreeMap::new(),
         })
@@ -340,14 +473,26 @@ impl<S: ObjectStore> Engine<S> {
             self.head.set_root(collection, &tree.root);
         }
         let bytes = pond_record::encode_head(&self.head);
-        // One write. Storing the head as a blob and then binding its name to
-        // the hash would be two sequential round trips on the commit path —
-        // and the second one is what readers would actually see, so the first
-        // buys nothing. A head is small, mutable, and owned by exactly one
-        // writer, which is the case content addressing does not help.
-        self.store
-            .inner()
-            .put_object(&head_key(self.writer_id), &bytes)?;
+        self.seq += 1;
+        let key = head_key(self.writer_id, self.seq, &pond_kernel::hash_bytes(&bytes));
+
+        // One write, and it is the one readers see. Storing the head as a blob
+        // and then binding a name to its hash would be two sequential round
+        // trips on the commit path, and the second is the one that publishes,
+        // so the first buys nothing.
+        self.store.inner().put_object(&key, &bytes)?;
+
+        // The previous head of this writer is now superseded, and is
+        // deliberately *not* deleted here. Retirement is a maintenance
+        // concern, the same as garbage collection: a superseded key is never
+        // read — `latest_heads` takes the highest sequence per writer — so it
+        // costs a listing entry and nothing else, and compaction sweeps it.
+        //
+        // Paying a round trip for it on the commit path would make every write
+        // slower to save a reader nothing, which is the wrong trade for a
+        // system whose commit is otherwise exactly one PUT.
+        self.published_at = Some(key);
+
         self.staged.clear();
         Ok(())
     }
@@ -413,6 +558,10 @@ pub struct Reader<S: ObjectStore> {
     /// too: it republishes over the previous compacted head, so it has to
     /// re-claim everything that head claimed or the coverage would shrink.
     heads: Vec<(String, Head)>,
+    /// Keys the above were read from, in the same order.
+    head_paths: Vec<String>,
+    /// Every key the listing returned, whether it was read or skipped.
+    all_head_paths: Vec<String>,
 }
 
 impl<S: ObjectStore> Reader<S> {
@@ -433,50 +582,87 @@ impl<S: ObjectStore> Reader<S> {
         // "your data is gone" — then a subsequent publish writes on top of a
         // history the reader never saw.
         let paths = store.inner().list_paths(HEADS_PREFIX)?;
+        let latest = latest_heads(&paths);
 
-        // Then one batched read of every head. Heads are independent of each
-        // other, so nothing forces a round trip per writer in sequence — S3
-        // issues the batch in parallel. Opening a reader is therefore one LIST
-        // plus one wave, whatever the number of writers.
-        let bodies = store.inner().get_object_batch(&paths);
+        // The compacted head is read first and alone, because what it says
+        // decides how much of the rest has to be read at all. It is one object
+        // however many writers there are.
+        //
+        // Its `observed` map names the heads it folded in, by the content hash
+        // of their bytes — the same hash their keys carry. So absorption is
+        // decidable from the listing, and an absorbed head is never fetched.
+        // That is what bounds the read path: after a compaction pass a reader
+        // opens in a constant number of requests no matter how many writers
+        // have ever published.
+        //
+        // Matching on content hash rather than on writer id is also what makes
+        // it safe without a compare-and-swap. A writer that published again —
+        // during the compaction or after it — wrote different bytes, so a
+        // different hash, so a different key, which is not in `observed` and is
+        // read normally. A concurrent publish cannot be skipped.
+        //
+        // If a skip were wrong in the other direction the cost is a slower
+        // read, not a wrong one: merge is idempotent, so folding a writer's
+        // root in twice yields the same tree.
+        let mut absorbed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut heads: Vec<(String, Head)> = Vec::new();
+        let mut head_paths: Vec<String> = Vec::new();
 
-        let heads: Vec<(String, Head)> = bodies
-            .into_iter()
-            .flatten()
-            // A head that does not decode is skipped, not fatal: one writer
-            // publishing a corrupt head must not make every other writer's
-            // data unreadable.
-            .filter_map(|bytes| {
+        let compacted = latest
+            .iter()
+            .find(|(id, _, _, _)| *id == COMPACTOR_WRITER_ID)
+            .and_then(|(_, _, hash, path)| {
+                let bytes = store.inner().get_object(path)?;
                 let head = pond_record::decode_head(&bytes)?;
-                Some((pond_kernel::hash_bytes(&bytes), head))
+                let own = hash
+                    .clone()
+                    .unwrap_or_else(|| pond_kernel::hash_bytes(&bytes));
+                Some((own, head, path.clone()))
+            });
+        if let Some((hash, head, path)) = compacted {
+            absorbed.extend(head.observed.values().cloned());
+            heads.push((hash, head));
+            head_paths.push(path);
+        }
+
+        // A head whose key carries no content hash was written before keys
+        // carried one. It can never be recognised as absorbed, so it is always
+        // read — a cost in requests, never in rows.
+        let unabsorbed: Vec<&(u64, u64, Option<String>, String)> = latest
+            .iter()
+            .filter(|(id, _, _, _)| *id != COMPACTOR_WRITER_ID)
+            .filter(|(_, _, hash, _)| match hash {
+                Some(h) => !absorbed.contains(h),
+                None => true,
             })
             .collect();
 
-        // A compacted head names, in `observed`, the exact heads it folded in
-        // — writer id to the content hash of that head's bytes. Any head still
-        // sitting at a hash somebody has already absorbed contributes nothing,
-        // so it is dropped before the merge rather than re-merged.
-        //
-        // Matching on the content hash rather than on the writer id is what
-        // makes this safe without a compare-and-swap. If that writer published
-        // again — during the compaction or after it — its head holds different
-        // bytes and therefore a different hash, no longer matches, and is
-        // merged normally. A concurrent publish cannot be skipped.
-        //
-        // And if the skip were wrong in the other direction, the cost would be
-        // a slower read and not a wrong one: merge is idempotent, so folding a
-        // writer's root in twice yields the same tree. The optimisation cannot
-        // corrupt the answer, only fail to speed it up.
-        let absorbed: std::collections::HashSet<(u64, &str)> = heads
+        // Then one batched read of what is left. Those heads are independent
+        // of each other, so nothing forces a round trip per writer in
+        // sequence — S3 issues the batch in parallel.
+        let to_read: Vec<String> = unabsorbed
             .iter()
-            .flat_map(|(_, h)| h.observed.iter().map(|(w, hash)| (*w, hash.as_str())))
+            .map(|(_, _, _, path)| path.clone())
             .collect();
+        let bodies = store.inner().get_object_batch(&to_read);
+
+        for (bytes, (_, _, key_hash, path)) in bodies.into_iter().zip(&unabsorbed) {
+            // A head that does not decode is skipped, not fatal: one writer
+            // publishing a corrupt head must not make every other writer's
+            // data unreadable.
+            let Some(bytes) = bytes else { continue };
+            let Some(head) = pond_record::decode_head(&bytes) else {
+                continue;
+            };
+            let hash = key_hash
+                .clone()
+                .unwrap_or_else(|| pond_kernel::hash_bytes(&bytes));
+            heads.push((hash, head));
+            head_paths.push(path.clone());
+        }
 
         let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (hash, head) in &heads {
-            if absorbed.contains(&(head.writer_id, hash.as_str())) {
-                continue;
-            }
+        for (_, head) in &heads {
             for (collection, root) in &head.collections {
                 roots
                     .entry(collection.clone())
@@ -485,12 +671,15 @@ impl<S: ObjectStore> Reader<S> {
             }
         }
 
+
         Ok(Self {
             store,
             roots,
             config,
             merged: BTreeMap::new(),
             heads,
+            head_paths,
+            all_head_paths: paths,
         })
     }
 
@@ -602,9 +791,31 @@ impl<S: ObjectStore> Reader<S> {
         level.pop().expect("a non-empty level always reduces to one tree")
     }
 
-    /// How many heads this reader read, absorbed ones included.
+    /// How many heads this reader read.
     pub fn head_count(&self) -> usize {
         self.heads.len()
+    }
+
+    /// Every head key this reader's view was built from — the compacted head
+    /// it read plus every unabsorbed head it fetched.
+    pub fn head_paths(&self) -> Vec<String> {
+        self.head_paths.clone()
+    }
+
+    /// Every head key the reader's listing returned, fetched or not.
+    ///
+    /// This is what compaction retires. It is a superset of [`head_paths`]:
+    /// it also covers heads that were skipped as already absorbed, and
+    /// superseded sequences of writers whose latest head was read.
+    ///
+    /// Crucially it is a snapshot of one listing. A head published after that
+    /// listing is not in it and therefore cannot be deleted by the pass that
+    /// took it — which is what makes retirement safe without a conditional
+    /// delete.
+    ///
+    /// [`head_paths`]: Self::head_paths
+    pub fn all_head_paths(&self) -> Vec<String> {
+        self.all_head_paths.clone()
     }
 
     /// Every head identity this reader's view covers, as (writer, content
@@ -705,6 +916,8 @@ pub struct CompactionReport {
     pub heads_absorbed: usize,
     /// Collections in the compacted head.
     pub collections: usize,
+    /// Head objects retired, now that a compacted head holds their data.
+    pub heads_deleted: usize,
 }
 
 /// Fold every writer's head into one, so readers stop paying for writers that
@@ -728,12 +941,16 @@ pub struct CompactionReport {
 /// head's bytes**. Readers drop any head sitting at an absorbed hash.
 ///
 /// Naming heads by content hash rather than by writer id is the whole safety
-/// argument. The dangerous case is a writer publishing while compaction runs:
-/// its new head has different bytes, so a different hash, so it does not match
-/// what was absorbed, so it is merged normally. There is no window in which a
-/// publish can be swallowed, and nothing is deleted — the compacted head is
-/// purely additive, which is why this needs no conditional write and behaves
-/// identically on a local filesystem and on object storage.
+/// argument, and it is what the hash in the key buys. The dangerous case is a
+/// writer publishing while compaction runs: its new head has different bytes,
+/// so a different hash, so a different key — one this pass never listed. It is
+/// therefore neither skipped by readers nor deleted by the pass. There is no
+/// window in which a publish can be swallowed, and so no need for a conditional
+/// write or a conditional delete, neither of which a local filesystem offers.
+///
+/// The pass then retires every key its own listing returned: the absorbed
+/// heads, and the superseded sequences of writers whose latest head it read.
+/// That is bounded by a snapshot, which is what makes deleting safe at all.
 ///
 /// If a head is wrongly *not* skipped, the merge just includes it twice, and
 /// merge is idempotent. The optimisation can cost time; it cannot cost
@@ -766,6 +983,7 @@ pub fn compact_heads<S: ObjectStore>(
             heads_seen: 0,
             heads_absorbed: 0,
             collections: 0,
+            heads_deleted: 0,
         });
     }
 
@@ -781,15 +999,48 @@ pub fn compact_heads<S: ObjectStore>(
     }
 
     let bytes = pond_record::encode_head(&head);
-    reader
+    let seq = pond_kernel::crdt::current_time_ms();
+    let key = head_key(
+        COMPACTOR_WRITER_ID,
+        seq,
+        &pond_kernel::hash_bytes(&bytes),
+    );
+    reader.store.inner().put_object(&key, &bytes)?;
+
+    // Retire what has been folded in — but only the exact keys this pass saw,
+    // and only after the compacted head that contains their data is durable.
+    //
+    // Deleting by key is what the content hash in the key buys. A writer that
+    // published while this ran wrote a *different* key, which is not in this
+    // list and is therefore untouched: there is no window in which a live head
+    // can be removed, and so no need for a conditional delete — which object
+    // stores do not offer and a local filesystem does not either.
+    //
+    // Every key in the listing this pass took, not only the ones it read: the
+    // rest are superseded heads of writers whose latest *was* read, and a
+    // head is cumulative, so a later sequence contains everything an earlier
+    // one did.
+    //
+    // Best-effort by design. A key that survives costs a reader one listing
+    // entry and the next pass sweeps it; failing the compaction because a
+    // delete did not land would be worse than leaving garbage.
+    let mut retired: Vec<String> = reader
+        .all_head_paths()
+        .into_iter()
+        .filter(|p| p != &key)
+        .collect();
+    retired.sort();
+    let deleted = reader
         .store
         .inner()
-        .put_object(&head_key(COMPACTOR_WRITER_ID), &bytes)?;
+        .delete_path_batch(&retired)
+        .unwrap_or(0);
 
     Ok(CompactionReport {
         heads_seen: reader.head_count(),
         heads_absorbed: absorbed.len(),
         collections: collections.len(),
+        heads_deleted: deleted,
     })
 }
 
@@ -843,4 +1094,101 @@ fn decode_pairs<S: ObjectStore>(
         out.push((key, rec));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod head_key_tests {
+    use super::*;
+
+    #[test]
+    fn a_key_round_trips_through_its_parser() {
+        let h = "a".repeat(64);
+        let k = head_key(0x1234, 7, &h);
+        assert_eq!(parse_head_key(&k), Some((0x1234, 7, Some(h.as_str()))));
+    }
+
+    /// A writer's prefix must be a path segment boundary, so that listing it
+    /// means the same thing on a backend that does prefix matching (S3) and on
+    /// one that lists a directory (local).
+    #[test]
+    fn a_writers_prefix_is_a_directory() {
+        let p = head_prefix(9);
+        assert!(p.ends_with('/'), "{} must be a directory prefix", p);
+        assert!(head_key(9, 1, "abc").starts_with(&p));
+        // And it must not also be a prefix of a *different* writer's keys,
+        // which is what a bare hex id without a separator would allow.
+        assert!(!head_key(0x99, 1, "abc").starts_with(&head_prefix(9)));
+    }
+
+    /// Ponds written before keys carried a sequence still read.
+    #[test]
+    fn the_original_flat_key_still_parses() {
+        assert_eq!(
+            parse_head_key("heads/writer-000000000000002a"),
+            Some((42, 0, None)),
+            "a head written before keys carried a sequence must still be found"
+        );
+    }
+
+    #[test]
+    fn nonsense_keys_are_rejected_rather_than_guessed_at() {
+        for bad in [
+            "heads/",
+            "heads/writer-",
+            "heads/writer/zzz/0000000000000001.abc",
+            "heads/writer/0000000000000001/0000000000000001.",
+            "heads/writer/0000000000000001/nothex.abc",
+            "heads/writer/0000000000000001",
+            "collections/users/main",
+        ] {
+            assert_eq!(parse_head_key(bad), None, "{} should not parse", bad);
+        }
+    }
+
+    #[test]
+    fn the_latest_head_of_each_writer_wins() {
+        let keys = vec![
+            head_key(1, 1, "aaa"),
+            head_key(1, 9, "bbb"),
+            head_key(1, 3, "ccc"),
+            head_key(2, 4, "ddd"),
+        ];
+        let latest = latest_heads(&keys);
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest[0].0, 1);
+        assert_eq!(latest[0].1, 9, "highest sequence wins for writer 1");
+        assert_eq!(latest[1].1, 4);
+    }
+
+    /// Sequences are hex-padded so that string order is numeric order — a
+    /// listing arrives sorted as text, and 10 must not sort before 9.
+    #[test]
+    fn sequence_order_survives_string_sorting() {
+        let mut keys: Vec<String> = (1..=20).map(|i| head_key(1, i, "x")).collect();
+        keys.sort();
+        let latest = latest_heads(&keys);
+        assert_eq!(latest[0].1, 20);
+    }
+
+    /// A pre-sequence head is never superseded by a current-layout one.
+    ///
+    /// It is not an older version of the same thing: the writer that wrote it
+    /// may never run again, and no other object holds its rows. Dropping it
+    /// because a newer key exists for the same writer id would lose them.
+    #[test]
+    fn a_legacy_head_is_not_superseded_by_a_new_one() {
+        let keys = vec![
+            "heads/writer-0000000000000001".to_string(),
+            head_key(1, 1, "new"),
+        ];
+        let latest = latest_heads(&keys);
+        assert_eq!(
+            latest.len(),
+            2,
+            "both must be read: {:?}",
+            latest
+        );
+        assert!(latest.iter().any(|(_, _, h, _)| h.is_none()));
+        assert!(latest.iter().any(|(_, _, h, _)| h.as_deref() == Some("new")));
+    }
 }

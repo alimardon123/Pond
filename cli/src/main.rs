@@ -911,7 +911,13 @@ fn cmd_compact(storage: &UnifiedStorage) {
             report.heads_absorbed
         );
     }
-    println!("nothing was deleted; run `pond gc` to reclaim space");
+    if report.heads_deleted > 0 {
+        println!(
+            "retired {} superseded head object(s)",
+            report.heads_deleted
+        );
+    }
+    println!("run `pond gc` to reclaim the blobs they held");
 }
 
 fn cmd_gc(storage: &UnifiedStorage, compute_size: bool, dry_run: bool) {

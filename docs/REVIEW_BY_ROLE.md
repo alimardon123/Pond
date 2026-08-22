@@ -237,25 +237,56 @@ There is no window in which a publish can be swallowed. Both race tests fail if
 the claim is changed to a writer id, which is how that was checked rather than
 argued.
 
-Two further properties fall out of the same choice. Nothing is deleted — the
-compacted head is purely additive, so this behaves identically on a local
-filesystem and on object storage, with no conditional write anywhere. And if a
-head is wrongly *not* skipped, merge is idempotent, so the reader folds it in
-twice and gets the same tree: the optimisation can cost time, never
-correctness.
+One further property falls out of the same choice: if a head is wrongly *not*
+skipped, merge is idempotent, so the reader folds it in twice and gets the same
+tree. The optimisation can cost time, never correctness.
 
 Anyone can run it, any number of times, concurrently. A pond that is never
 compacted is slower, never wrong.
 
-This also gives `Head::observed` its first implementation. The field, its
-encoding and its "makes fast-forward detection exact" docstring have been in the
-tree throughout, written by nothing and read by nothing.
+**The head key carries the content hash, which is what makes the skip decidable
+from the listing.** Without it a reader has to fetch every head to discover it
+can ignore one, and the read path stays linear in writers however much
+compaction runs. With it:
 
-**Remaining:** compaction does not shrink the LIST or the head reads — a reader
-still issues one request per head that has ever existed, though in two round
-trips rather than W. That is cheap in latency and not free in money, and
-bounding it needs the absorbed heads deleted, which is a harder problem than
-this one: a delete cannot be made safe by content hash the way a skip can.
+| writers | reader open + scan, after compaction |
+|---|---|
+| 4   | 3 requests |
+| 32  | 3 requests |
+| 128 | 3 requests |
+
+Flat in requests, not only in merges.
+
+The same hash makes deletion safe, so compaction retires what it absorbed
+rather than only shadowing it. A pass deletes exactly the keys its own listing
+returned; a writer publishing during the pass wrote a key that listing never
+contained, so it cannot be deleted. No conditional delete is required — which
+matters because object stores do not offer one and a local filesystem does not
+either.
+
+`publish` deliberately does *not* delete the head it supersedes. That would
+cost a round trip on the commit path to save readers nothing, since
+`latest_heads` never fetches a superseded key. Retirement is maintenance, like
+garbage collection, and compaction sweeps superseded sequences along with
+absorbed heads. The cost of the new layout on the write path is one LIST, to
+recover the writer's own head on open: 6 round trips per engine write against
+the legacy path's 8.
+
+**The migration hazard here was real and was found by testing it rather than
+reasoning about it.** The old layout put a flat object at `heads/writer-<id>`.
+The first version of the new layout used `heads/writer-<id>/<seq>.<hash>` — on
+an object store those coexist happily, because there are no directories, but on
+a local filesystem a directory cannot share a path with a file, so an upgraded
+pond failed its first publish with `EISDIR`. Keys now live under
+`heads/writer/<id>/`, which cannot collide with any old key.
+
+Two further compatibility points, both found the same way. A writer opening on
+an upgraded pond finds nothing under its new prefix, so it falls back to the
+legacy key — without that it starts empty, publishes at a higher sequence, and
+its old rows are superseded by a head that does not contain them. And
+`latest_heads` groups by (writer, layout) rather than by writer, so a
+pre-sequence head is never treated as a stale version of a current one: the
+writer that wrote it may never run again, and nothing else holds its rows.
 
 **Column pruning does not exist yet.** A scan that wants one field still reads
 whole records, and a spilled record is fetched whole. That is what a PAX

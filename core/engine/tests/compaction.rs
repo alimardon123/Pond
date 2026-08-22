@@ -189,10 +189,11 @@ fn a_publish_racing_the_compactor_is_never_swallowed() {
     for (w, hash) in &absorbed {
         head.observe(*w, hash);
     }
+    let bytes = pond_record::encode_head(&head);
     store(dir.path())
         .put_object(
-            &pond_engine::head_key(COMPACTOR_WRITER_ID),
-            &pond_record::encode_head(&head),
+            &pond_engine::head_key(COMPACTOR_WRITER_ID, 1, &pond_kernel::hash_bytes(&bytes)),
+            &bytes,
         )
         .unwrap();
 
@@ -244,29 +245,130 @@ fn compaction_is_idempotent_and_does_not_shrink_coverage() {
     );
 }
 
-/// Nothing is deleted. The compacted head is purely additive, which is what
-/// lets this work identically on a local filesystem and on object storage
-/// without a conditional write.
+/// Absorbed heads are retired, and only the exact keys the pass read.
+///
+/// This is what bounds the read path in objects as well as in merges. It is
+/// safe with no conditional delete for the same reason the skip is safe: a
+/// head key carries the content hash of its bytes, so a writer that published
+/// during the pass wrote a key this pass never saw and cannot name.
 #[test]
-fn compaction_deletes_nothing() {
+fn compaction_retires_the_heads_it_absorbed() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path(), 5, 2);
 
     let before = store(dir.path()).list_paths("heads/").unwrap();
-    compact(dir.path());
-    let after = store(dir.path()).list_paths("heads/").unwrap();
+    assert_eq!(before.len(), 5, "one head per writer before compacting");
 
-    for h in &before {
-        assert!(after.contains(h), "compaction removed head {}", h);
-    }
+    let report = compact(dir.path());
+    assert_eq!(report.heads_deleted, 5);
+
+    let after = store(dir.path()).list_paths("heads/").unwrap();
     assert_eq!(
         after.len(),
-        before.len() + 1,
-        "exactly one head is added: the compacted one"
+        1,
+        "one compacted head should be all that remains, not {:?}",
+        after
     );
     assert!(after
         .iter()
-        .any(|h| h == &pond_engine::head_key(COMPACTOR_WRITER_ID)));
+        .filter_map(|h| pond_engine::parse_head_key(h))
+        .all(|(id, _, _)| id == COMPACTOR_WRITER_ID));
+
+    // And the data is all still there, which is the only reason the deletes
+    // were permissible.
+    assert_eq!(Reader::open(store(dir.path())).unwrap().scan("t").unwrap().len(), 10);
+}
+
+/// A head published while the pass is running is not deleted by it.
+///
+/// The delete list is keys, and the racing writer's key did not exist when the
+/// pass read the listing. A scheme that deleted by writer prefix would remove
+/// this head and lose the row.
+#[test]
+fn compaction_does_not_delete_a_head_it_never_saw() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), 3, 2);
+
+    // The pass reads the heads and computes its merge.
+    let mut stale = Reader::open(store(dir.path())).unwrap();
+    let absorbed = stale.head_identities();
+    let merged_root = stale.root_of("t");
+    let seen_paths = stale.head_paths();
+    drop(stale);
+
+    // A writer publishes now, creating a key the pass has never seen.
+    let mut e = Engine::open(store(dir.path()), 2).unwrap();
+    e.write_records(
+        "t",
+        vec![(
+            key(777_777),
+            Record::new().with_field("late", Value::Int(9), Version::new(700, 2, 1)),
+        )],
+    )
+    .unwrap();
+    e.publish().unwrap();
+
+    // The pass now writes its head and retires exactly what it read.
+    let mut head = pond_record::Head::new(COMPACTOR_WRITER_ID);
+    head.set_root("t", &merged_root);
+    for (w, hash) in &absorbed {
+        head.observe(*w, hash);
+    }
+    let bytes = pond_record::encode_head(&head);
+    let s = store(dir.path());
+    s.put_object(
+        &pond_engine::head_key(COMPACTOR_WRITER_ID, 1, &pond_kernel::hash_bytes(&bytes)),
+        &bytes,
+    )
+    .unwrap();
+    s.delete_path_batch(&seen_paths).unwrap();
+
+    let mut r = Reader::open(store(dir.path())).unwrap();
+    assert_eq!(
+        r.get("t", &key(777_777))
+            .unwrap()
+            .and_then(|rec| rec.get("late").cloned()),
+        Some(Value::Int(9)),
+        "the head published during the pass must survive the pass's deletes"
+    );
+    assert_eq!(r.scan("t").unwrap().len(), 3 * 2 + 1);
+}
+
+/// The payoff: after compaction a reader opens in a constant number of
+/// requests, not one per writer that has ever published.
+#[test]
+fn reader_open_stops_growing_with_the_writer_count() {
+    let mut costs = Vec::new();
+    for writers in [4u64, 32, 128] {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), writers, 1);
+        compact(dir.path());
+
+        let m = Arc::new(Metered::new(store(dir.path())));
+        let mut r = Reader::open(Arc::clone(&m)).unwrap();
+        r.scan("t").unwrap();
+        let st = m.stats();
+        println!(
+            "{} writers, compacted: {} requests / {} round trips",
+            writers,
+            st.requests(),
+            st.round_trips
+        );
+        costs.push(st.requests());
+
+        assert_eq!(
+            r.scan("t").unwrap().len(),
+            writers as usize,
+            "every writer's row must still be readable"
+        );
+    }
+
+    assert_eq!(
+        costs[0], costs[2],
+        "opening and scanning a compacted pond must cost the same at 4 \
+         writers and at 128: {:?}",
+        costs
+    );
 }
 
 /// Multiple collections are folded in one pass, and stay independent.
@@ -309,4 +411,130 @@ fn compacting_nothing_writes_nothing() {
 
     // And a second pass still sees nothing.
     assert_eq!(compact(dir.path()).heads_seen, 0);
+}
+
+/// A publish leaves its predecessor behind; compaction is what sweeps it.
+///
+/// `publish` deliberately does not delete the head it supersedes — that would
+/// cost a round trip on the commit path to save a reader nothing, since
+/// `latest_heads` never reads a superseded key. But "never read" is not "never
+/// listed", so something has to remove them, and this is the test that says
+/// which something.
+#[test]
+fn compaction_sweeps_superseded_heads_not_just_absorbed_ones() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // One writer, five separate publishes: five head objects, one live.
+    for i in 0..5i64 {
+        let mut e = Engine::open(store(dir.path()), 1).unwrap();
+        e.write_records("t", vec![row(1, i)]).unwrap();
+        e.publish().unwrap();
+    }
+
+    let before = store(dir.path()).list_paths("heads/").unwrap();
+    assert_eq!(
+        before.len(),
+        5,
+        "each publish writes its own head object: {:?}",
+        before
+    );
+
+    // All five rows are readable, from the newest head alone — heads are
+    // cumulative, which is what makes retiring the older ones safe.
+    let mut r = Reader::open(store(dir.path())).unwrap();
+    assert_eq!(r.scan("t").unwrap().len(), 5);
+
+    compact(dir.path());
+
+    let after = store(dir.path()).list_paths("heads/").unwrap();
+    assert_eq!(
+        after.len(),
+        1,
+        "compaction must retire the superseded heads too, not only the live \
+         one it absorbed: {:?}",
+        after
+    );
+    assert_eq!(
+        Reader::open(store(dir.path())).unwrap().scan("t").unwrap().len(),
+        5,
+        "and every row must survive the sweep"
+    );
+}
+
+/// A reader never fetches a superseded head, even before compaction runs.
+#[test]
+fn superseded_heads_cost_a_listing_entry_and_no_request() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..8i64 {
+        let mut e = Engine::open(store(dir.path()), 1).unwrap();
+        e.write_records("t", vec![row(1, i)]).unwrap();
+        e.publish().unwrap();
+    }
+    assert_eq!(store(dir.path()).list_paths("heads/").unwrap().len(), 8);
+
+    // Opening only — a scan afterwards would add index-node reads, which are
+    // not what this is about.
+    let m = Arc::new(Metered::new(store(dir.path())));
+    let mut r = Reader::open(Arc::clone(&m)).unwrap();
+    let open = m.stats();
+
+    assert_eq!(
+        open.gets, 1,
+        "eight heads on the listing, one live: exactly one should be fetched"
+    );
+    assert_eq!(open.lists, 1);
+
+    // And it is the *live* one — all eight rows are there.
+    assert_eq!(r.scan("t").unwrap().len(), 8);
+}
+
+/// A pond written before head keys carried a sequence and a hash still reads.
+///
+/// The old layout was one flat, overwritten object per writer,
+/// `heads/writer-<id>`. Those keys carry no content hash, so they can never be
+/// recognised as absorbed and are always fetched — a cost in requests, never
+/// in rows. This writes one by hand, because no code path produces the old
+/// shape any more and a compatibility claim nothing exercises is a guess.
+#[test]
+fn a_pond_with_pre_sequence_head_keys_still_reads() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build a head the way the old publish path did, and put it at the old key.
+    let mut e = Engine::open(store(dir.path()), 1).unwrap();
+    e.write_records("t", vec![row(1, 1), row(1, 2)]).unwrap();
+    e.publish().unwrap();
+
+    let s = store(dir.path());
+    let new_key = s.list_paths("heads/").unwrap().remove(0);
+    let bytes = s.get_object(&new_key).unwrap();
+    s.put_object("heads/writer-0000000000000001", &bytes).unwrap();
+    s.delete_path(&new_key).unwrap();
+
+    assert_eq!(
+        s.list_paths("heads/").unwrap(),
+        vec!["heads/writer-0000000000000001".to_string()],
+        "the pond should now look exactly like one written before the change"
+    );
+
+    let mut r = Reader::open(store(dir.path())).unwrap();
+    assert_eq!(r.scan("t").unwrap().len(), 2, "old heads must still be read");
+
+    // A writer opening on top of it recovers nothing — the old key is not
+    // under its prefix — so it starts a fresh head. The old head is still
+    // there and still merged, so no row is lost.
+    let mut e = Engine::open(store(dir.path()), 1).unwrap();
+    e.write_records("t", vec![row(1, 3)]).unwrap();
+    e.publish().unwrap();
+
+    let mut r = Reader::open(store(dir.path())).unwrap();
+    assert_eq!(
+        r.scan("t").unwrap().len(),
+        3,
+        "rows from the old head and the new one must both be visible"
+    );
+
+    // And compaction folds the two together.
+    compact(dir.path());
+    let mut r = Reader::open(store(dir.path())).unwrap();
+    assert_eq!(r.scan("t").unwrap().len(), 3);
 }
