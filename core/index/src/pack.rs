@@ -222,6 +222,41 @@ mod tests {
         );
     }
 
+    /// The codec's output is frozen here, byte for byte.
+    ///
+    /// This is what "specified in this repository" has to mean. Every other
+    /// test checks that packing and unpacking agree with *each other*, which
+    /// they would continue to do after any change to the hash function, the
+    /// window, the match rule or the token layout — while producing different
+    /// bytes. Different bytes mean different node hashes, which means two
+    /// writers on different builds silently stop sharing structure. That is
+    /// the exact hazard this codec exists to avoid, and nothing detected it
+    /// until mutation testing pointed out that changing `hash4` broke no test.
+    ///
+    /// So: if this fails, the encoder changed. That is allowed, and it is a
+    /// format change — see `docs/LEAF_ENCODING.md`. It is not something to fix
+    /// by updating the expected bytes.
+    #[test]
+    fn the_encoders_output_is_frozen() {
+        let mut data = Vec::new();
+        for i in 0..40u32 {
+            data.extend_from_slice(b"PREC\x02\x00");
+            data.extend_from_slice(&i.to_le_bytes());
+            data.extend_from_slice(b"idstatuspending");
+        }
+        assert_eq!(data.len(), 1000);
+
+        let packed = pack(&data);
+        let hex: String = packed.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(
+            hex,
+            "055052454302008001000e696473746174757370656e64696e678219000001941900             8034009119000003941900000494190000059419000006941900000794190000089419             000009941900000a941900000b941900000c941900000d941900000e941900000f9419             000010941900001194190000129419000013941900001494190000159419000016941900             001794190000189419000019941900001a941900001b941900001c941900001d94190000             1e941900001f941900002094190000219419000022941900002394190000249419000025             941900002694190000278e1900"
+                .replace(['\n', ' '], ""),
+            "the packed bytes changed — see this test's comment before touching it"
+        );
+        assert_eq!(unpack(&packed, data.len()).as_deref(), Some(data.as_slice()));
+    }
+
     #[test]
     fn round_trips_the_edges() {
         round_trip(b"");

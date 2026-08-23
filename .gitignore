@@ -39,3 +39,8 @@ target/
 *.exe
 bindings/go/pond.test
 .pond/
+
+# cargo-mutants working output. Mutation runs are reproducible from the
+# committed source; their scratch directory is not worth versioning.
+mutants.out/
+mutants.out.old/

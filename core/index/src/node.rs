@@ -31,9 +31,16 @@ const TAG_INTERNAL: u8 = 1;
 /// internal tags so a reader can tell from the first byte, and so nodes
 /// written before packing existed still decode unchanged.
 const TAG_PACKED: u8 = 2;
-/// Largest plain encoding a packed node may claim. Far above any real node;
-/// it exists so a corrupt length cannot ask for an allocation the process
-/// cannot satisfy.
+/// Largest plain encoding a packed node may claim.
+///
+/// It exists so a corrupt length cannot ask for an allocation the process
+/// cannot satisfy — and it has to sit above the largest node the chunking
+/// rules can actually produce, or valid data would be refused. A leaf holds at
+/// most [`crate::chunk::MAX_ENTRIES_PER_CHUNK`] entries, and an entry's value
+/// is bounded by the spill threshold that pushes large values out of the leaf.
+/// `the_node_size_bound_admits_the_largest_leaf_chunking_can_produce` pins that
+/// relationship, since the two live in different modules and neither would
+/// notice the other moving.
 const MAX_NODE_BYTES: usize = 512 * 1024 * 1024;
 
 /// Cap on a single node's declared entry count, used to reject malformed
@@ -247,6 +254,142 @@ mod tests {
             })
             .collect();
         Node::Leaf { entries }
+    }
+
+    /// A node's encoded bytes are its identity, so they are frozen too.
+    ///
+    /// `pack`'s own output is frozen in its module; this covers the layer
+    /// above — the framing, and the rule deciding when packing is used. A
+    /// change to either moves every node hash in every pond, which is a format
+    /// change and not a tidy-up.
+    /// The largest value a leaf entry is expected to hold before it spills.
+    ///
+    /// `pond_engine::SPILL_THRESHOLD` is the real figure; the index cannot
+    /// depend on the engine, so this records the assumption `MAX_NODE_BYTES`
+    /// is derived from. Generous on purpose: a collection may pin a higher
+    /// threshold than the default.
+    const ASSUMED_MAX_ENTRY_BYTES: usize = 64 * 1024;
+
+    /// The size bound must admit the largest leaf chunking can produce.
+    ///
+    /// Too small and valid nodes are refused as malformed, which is a data
+    /// loss dressed as a validation error. Mutation testing found that nothing
+    /// held this: `512 * 1024 * 1024` could become `512 * 1024 + 1024` and
+    /// every test still passed, because no test node came near either figure.
+    #[test]
+    fn the_node_size_bound_admits_the_largest_leaf_chunking_can_produce() {
+        let largest_leaf = crate::chunk::MAX_ENTRIES_PER_CHUNK * ASSUMED_MAX_ENTRY_BYTES;
+        assert!(
+            MAX_NODE_BYTES >= largest_leaf,
+            "a leaf may hold {} entries of up to {} bytes — {} — but the bound \
+             is {}, so a legitimate node would be refused as malformed",
+            crate::chunk::MAX_ENTRIES_PER_CHUNK,
+            ASSUMED_MAX_ENTRY_BYTES,
+            largest_leaf,
+            MAX_NODE_BYTES
+        );
+        // And not absurdly above it either: a bound that admits everything
+        // admits a corrupt length asking for an allocation that fails.
+        assert!(
+            MAX_NODE_BYTES <= largest_leaf * 16,
+            "the bound is so far above any real node that it stops being one"
+        );
+    }
+
+    #[test]
+    fn a_nodes_encoded_bytes_are_frozen() {
+        let node = Node::Leaf {
+            entries: (0..8u32)
+                .map(|i| {
+                    (
+                        format!("user:{:04}", i).into_bytes(),
+                        format!("status=pending,region=eu-west-{}", i % 3).into_bytes(),
+                    )
+                })
+                .collect(),
+        };
+        let encoded = node.encode();
+        let hex: String = encoded.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(
+            hex,
+            "028501000034000800000009000000757365723a303030301f0000007374617475733d\
+             70656e64696e672c726567696f6e3d65752d776573742d3088300000319e3000003188\
+             300000329e3000003288300000339e300089900000349e300089900000359e30008990\
+             0000369e300089900000379e30000031"
+                .replace(['\n', ' '], ""),
+            "a node's bytes changed — that moves every node hash in every pond"
+        );
+        assert_eq!(Node::decode(&encoded).as_ref(), Some(&node));
+    }
+
+    /// The pack-or-not decision is a size comparison, and its boundary is part
+    /// of the format: a node that sits exactly on it must land the same way on
+    /// every build.
+    #[test]
+    fn packing_is_used_only_when_it_is_strictly_smaller() {
+        // Something that compresses a little, so the two sizes are close.
+        for n in 1..40usize {
+            let node = Node::Leaf {
+                entries: (0..n)
+                    .map(|i| (vec![i as u8], b"abcd".to_vec()))
+                    .collect(),
+            };
+            let plain = node.encode_plain();
+            let packed_body = crate::pack::pack(&plain);
+            let encoded = node.encode();
+            if packed_body.len() + 5 < plain.len() {
+                assert_eq!(encoded.first(), Some(&TAG_PACKED), "n = {}", n);
+                assert_eq!(encoded.len(), packed_body.len() + 5);
+            } else {
+                assert_eq!(encoded, plain, "n = {} should not be packed", n);
+            }
+            assert_eq!(Node::decode(&encoded).as_ref(), Some(&node));
+        }
+    }
+
+    /// The refusal boundaries, at the boundary rather than far past it.
+    ///
+    /// Mutation testing found these: every test used absurd values, so
+    /// `len > MAX` and `len >= MAX` were indistinguishable, and so were
+    /// `buf.len() < 5` and `<= 5`.
+    #[test]
+    fn the_refusal_boundaries_are_exact() {
+        // A packed frame is 5 bytes of header. Four is too few; five is a
+        // header with an empty body, which is only valid for an empty payload.
+        assert_eq!(Node::decode(&[TAG_PACKED, 0, 0, 0]), None);
+
+        let mut at_limit = vec![TAG_PACKED];
+        at_limit.extend_from_slice(&(MAX_NODE_BYTES as u32).to_le_bytes());
+        // Exactly at the limit is permitted by the length check and then fails
+        // on the body, not on the bound.
+        assert_eq!(Node::decode(&at_limit), None);
+
+        let mut over = vec![TAG_PACKED];
+        over.extend_from_slice(&((MAX_NODE_BYTES + 1) as u32).to_le_bytes());
+        assert_eq!(Node::decode(&over), None);
+
+        // The declared-entry bound, at its edge.
+        let mut n_at = vec![TAG_LEAF];
+        n_at.extend_from_slice(&(MAX_DECLARED_ENTRIES as u32).to_le_bytes());
+        assert_eq!(Node::decode(&n_at), None, "no entries follow the count");
+        let mut n_over = vec![TAG_LEAF];
+        n_over.extend_from_slice(&((MAX_DECLARED_ENTRIES + 1) as u32).to_le_bytes());
+        assert_eq!(Node::decode(&n_over), None);
+    }
+
+    #[test]
+    fn is_empty_reports_what_it_says() {
+        assert!(Node::Leaf { entries: vec![] }.is_empty());
+        assert!(Node::Internal { children: vec![] }.is_empty());
+        assert!(!leaf_of(1).is_empty());
+        assert!(!Node::Internal {
+            children: vec![ChildRef {
+                max_key: b"k".to_vec(),
+                hash: "h".repeat(64),
+                count: 1,
+            }]
+        }
+        .is_empty());
     }
 
     #[test]
