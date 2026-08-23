@@ -477,13 +477,47 @@ impl<'a> GarbageCollector<'a> {
                 }
             }
             pond_index::Node::Leaf { entries } => {
-                // A value may be a pointer to a spilled blob rather than the
-                // record itself. That blob is live too.
+                // Two levels of indirection, and missing either deletes live
+                // data.
+                //
+                // A leaf value may be a pointer to the whole record. It may
+                // also *be* the record and still name field payloads stored
+                // elsewhere — per-field spilling means a row with one large
+                // attachment encodes small enough to sit inline while its
+                // attachment does not. Following only the record level marks
+                // those payloads dead, and the row then reads back with its
+                // largest field missing.
                 for (_, value) in &entries {
-                    if let Some(target) = pond_engine::spill::pointer_target(value) {
-                        live.insert(target.to_string());
-                    }
+                    let record_bytes = match pond_engine::spill::pointer_target(value) {
+                        Some(target) => {
+                            live.insert(target.to_string());
+                            match store.get_blob(target) {
+                                Ok(b) => b,
+                                // A pointer that does not resolve is already
+                                // broken; refusing to guess is safer than
+                                // treating its fields as dead.
+                                Err(_) => continue,
+                            }
+                        }
+                        None => value.clone(),
+                    };
+                    self.walk_record_fields(&record_bytes, live);
                 }
+            }
+        }
+    }
+
+    /// Add every payload a record's fields point at.
+    ///
+    /// A field whose value is stored elsewhere is reachable only from inside
+    /// the record, so nothing above this level can see it.
+    fn walk_record_fields(&self, record_bytes: &[u8], live: &mut HashSet<String>) {
+        let Some(record) = pond_record::decode_record(record_bytes) else {
+            return;
+        };
+        for field in record.fields.values() {
+            if let pond_record::Value::Spilled { hash, .. } = &field.value {
+                live.insert(hash.clone());
             }
         }
     }

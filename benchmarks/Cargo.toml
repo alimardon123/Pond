@@ -7,6 +7,10 @@ description = "Pond benchmarks — measures the storage claims against real obje
 publish = false
 
 [[bin]]
+name = "fieldspill"
+path = "src/fieldspill.rs"
+
+[[bin]]
 name = "writerscale"
 path = "src/writerscale.rs"
 

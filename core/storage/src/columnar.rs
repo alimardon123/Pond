@@ -228,6 +228,15 @@ fn default_vtype(v: &Value) -> u8 {
         Value::Bool(_) => VT_BOOLEAN,
         Value::Vector(_) => VT_VECTOR,
         Value::Null => VT_STRING,
+        // Unreachable by construction: the engine resolves every spilled field
+        // before returning a record, and
+        // `no_read_path_returns_a_spilled_placeholder` holds that line. The
+        // assert makes a regression fail loudly in tests; the fallback keeps
+        // production from panicking on a value it merely cannot describe.
+        Value::Spilled { .. } => {
+            debug_assert!(false, "a spilled placeholder reached the columnar layer");
+            VT_BINARY
+        }
     }
 }
 
@@ -322,6 +331,13 @@ fn scalar_to_string(v: &Value) -> String {
         Value::Str(s) | Value::Json(s) => s.clone(),
         Value::Null => String::new(),
         Value::Bytes(_) | Value::Vector(_) => String::new(),
+        // See `default_vtype`. Rendering a placeholder as text would put an
+        // empty string where real data belongs, so this is a bug to catch in
+        // tests rather than a case to handle.
+        Value::Spilled { .. } => {
+            debug_assert!(false, "a spilled placeholder reached the columnar layer");
+            String::new()
+        }
     }
 }
 

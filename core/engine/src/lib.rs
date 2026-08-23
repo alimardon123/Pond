@@ -435,13 +435,19 @@ impl<S: ObjectStore> Engine<S> {
         let tree = self.tree_for(collection);
 
         let mut keys: Vec<Vec<u8>> = Vec::with_capacity(records.len());
-        let mut values: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+        let mut merged_records: Vec<Record> = Vec::with_capacity(records.len());
         for (key, incoming) in records {
             let k = key.encode();
             // Merge with what is already there rather than replacing, so a
             // caller that knows about two fields cannot delete a third. The
             // existing value may be a spill pointer, so it is resolved first —
             // merging a pointer would produce nonsense.
+            // The stored value may be a whole-record pointer, and its fields
+            // may be pointers too. Only the record pointer has to be followed
+            // here: a *field* pointer merges perfectly well as itself, and
+            // following it would fetch a payload only to write it straight
+            // back — which is exactly the cost per-field spilling exists to
+            // avoid.
             let existing = tree
                 .get(&self.store, &k)
                 .map(|bytes| spill::resolve(self.store.inner(), bytes))
@@ -452,10 +458,23 @@ impl<S: ObjectStore> Engine<S> {
                 None => incoming,
             };
             keys.push(k);
-            values.push(encode_record(&merged));
+            merged_records.push(merged);
         }
 
-        // Spill the large ones before they reach a leaf. One batched write.
+        // Large *fields* become pointers first, so a record with one big
+        // attachment beside small columns encodes small — and a later write
+        // that touches only a small column carries the pointer through
+        // untouched instead of rewriting the attachment.
+        spill::spill_fields(
+            self.store.inner(),
+            &mut merged_records,
+            self.config.spill_threshold,
+        )?;
+        let values: Vec<Vec<u8>> = merged_records.iter().map(encode_record).collect();
+
+        // Then the whole record, if it is *still* large — many medium fields
+        // add up to a leaf-bloating row that no single field would have
+        // triggered.
         let values = spill::store_batch(self.store.inner(), values, self.config.spill_threshold)?;
         let updates: Vec<(Vec<u8>, Vec<u8>)> = keys.into_iter().zip(values).collect();
 
@@ -479,10 +498,10 @@ impl<S: ObjectStore> Engine<S> {
             return Ok(());
         }
         let tree = self.tree_for(collection);
-        let (keys, values): (Vec<Vec<u8>>, Vec<Vec<u8>>) = records
-            .into_iter()
-            .map(|(k, r)| (k.encode(), encode_record(&r)))
-            .unzip();
+        let (keys, mut recs): (Vec<Vec<u8>>, Vec<Record>) =
+            records.into_iter().map(|(k, r)| (k.encode(), r)).unzip();
+        spill::spill_fields(self.store.inner(), &mut recs, self.config.spill_threshold)?;
+        let values: Vec<Vec<u8>> = recs.iter().map(encode_record).collect();
         let values = spill::store_batch(self.store.inner(), values, self.config.spill_threshold)?;
         let updates: Vec<(Vec<u8>, Vec<u8>)> = keys.into_iter().zip(values).collect();
         let new_tree = tree.insert_batch(&self.store, updates);
@@ -502,7 +521,15 @@ impl<S: ObjectStore> Engine<S> {
                 let bytes = spill::resolve(self.store.inner(), bytes)?;
                 let rec = decode_record(&bytes)
                     .ok_or_else(|| EngineError::Corrupt(format!("record in {}", collection)))?;
-                Ok(rec.is_visible().then_some(rec))
+                if !rec.is_visible() {
+                    return Ok(None);
+                }
+                // Fields stored elsewhere are fetched before returning, so a
+                // caller never sees a placeholder it would have to know about.
+                let mut one = [rec];
+                spill::resolve_fields(self.store.inner(), &mut one, None)?;
+                let [rec] = one;
+                Ok(Some(rec))
             }
             None => Ok(None),
         }
@@ -998,7 +1025,15 @@ impl<S: ObjectStore> Reader<S> {
                 let bytes = spill::resolve(self.store.inner(), bytes)?;
                 let rec = decode_record(&bytes)
                     .ok_or_else(|| EngineError::Corrupt(format!("record in {}", collection)))?;
-                Ok(rec.is_visible().then_some(rec))
+                if !rec.is_visible() {
+                    return Ok(None);
+                }
+                // Fields stored elsewhere are fetched before returning, so a
+                // caller never sees a placeholder it would have to know about.
+                let mut one = [rec];
+                spill::resolve_fields(self.store.inner(), &mut one, None)?;
+                let [rec] = one;
+                Ok(Some(rec))
             }
             None => Ok(None),
         }
@@ -1018,6 +1053,39 @@ impl<S: ObjectStore> Reader<S> {
         let tree = self.tree_for(collection);
         let raw = tree.scan_range(&self.store, &start.encode(), &end.encode());
         decode_pairs(self.store.inner(), raw, collection)
+    }
+
+    /// Every record in a collection, resolving only the named fields.
+    ///
+    /// # What this saves, and what it does not
+    ///
+    /// It saves fetching the payloads of fields nobody asked for. A row with a
+    /// 256 KiB attachment beside two small columns costs, for a scan that
+    /// wants the small ones, the small ones — the attachment's blob is never
+    /// requested. Measured over 200 such rows (`pond_bench --bin fieldspill`),
+    /// that is the difference between 50 MiB and a few hundred kilobytes.
+    ///
+    /// It does *not* save reading the leaves. Records still live in the index,
+    /// so the small fields of every row come across whether or not they were
+    /// asked for. Skipping those needs the values laid out by column rather
+    /// than by row, which is a storage-format change this is not.
+    ///
+    /// A field that was not asked for is **absent** from the returned record,
+    /// not present-but-empty. Handing back a placeholder would push the
+    /// question of what one means onto every consumer; handing back an empty
+    /// value would be a lie about the data.
+    pub fn scan_projected(
+        &mut self,
+        collection: &str,
+        fields: &[&str],
+    ) -> Result<Vec<(Key, Record)>> {
+        let tree = self.tree_for(collection);
+        decode_pairs_projected(
+            self.store.inner(),
+            tree.scan(&self.store),
+            collection,
+            Some(fields),
+        )
     }
 
     /// Every record at a specific root, rather than at the merged current
@@ -1278,6 +1346,16 @@ fn decode_pairs<S: ObjectStore>(
     raw: Vec<(Vec<u8>, Vec<u8>)>,
     collection: &str,
 ) -> Result<Vec<(Key, Record)>> {
+    decode_pairs_projected(backend, raw, collection, None)
+}
+
+/// As [`decode_pairs`], resolving only the fields named in `wanted`.
+fn decode_pairs_projected<S: ObjectStore>(
+    backend: &S,
+    raw: Vec<(Vec<u8>, Vec<u8>)>,
+    collection: &str,
+    wanted: Option<&[&str]>,
+) -> Result<Vec<(Key, Record)>> {
     let (keys, values): (Vec<Vec<u8>>, Vec<Vec<u8>>) = raw.into_iter().unzip();
 
     // Resolve every spilled value in one batch rather than one round trip
@@ -1287,6 +1365,7 @@ fn decode_pairs<S: ObjectStore>(
     let values = spill::resolve_batch(backend, values)?;
 
     let mut out = Vec::with_capacity(keys.len());
+    let mut recs = Vec::with_capacity(keys.len());
     for (k, v) in keys.into_iter().zip(values) {
         let key = Key::decode(&k)
             .ok_or_else(|| EngineError::Corrupt(format!("key in {}", collection)))?;
@@ -1295,9 +1374,21 @@ fn decode_pairs<S: ObjectStore>(
         if !rec.is_visible() {
             continue;
         }
-        out.push((key, rec));
+        out.push(key);
+        recs.push(rec);
     }
-    Ok(out)
+
+    // Fields stored elsewhere are fetched here, in one batch across every
+    // record — a scan that touched a thousand rows with a large field would
+    // otherwise pay a thousand sequential GETs.
+    //
+    // `None` means "all of them", which keeps this path exactly as it was.
+    // What per-field spilling adds is the *option* not to, taken by
+    // `scan_projected`; nothing observes a placeholder because this resolves
+    // before returning.
+    spill::resolve_fields(backend, &mut recs, wanted)?;
+
+    Ok(out.into_iter().zip(recs).collect())
 }
 
 #[cfg(test)]

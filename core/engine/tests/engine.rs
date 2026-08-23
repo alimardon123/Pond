@@ -874,3 +874,116 @@ fn two_processes_sharing_a_writer_id_do_not_lose_rows() {
         rows.iter().map(|(k, _)| k).collect::<Vec<_>>()
     );
 }
+
+/// A `Value::Spilled` placeholder must never leave the engine.
+///
+/// It is a storage detail: it says where a payload lives, not what it is.
+/// Every consumer downstream — the columnar bridge, SQL, JSON, the Python
+/// bindings — would have to learn what one means, and the ones with a
+/// catch-all arm would quietly render it as an empty value instead. So the
+/// engine resolves before returning, and this is the test that says so rather
+/// than a comment claiming it.
+#[test]
+fn no_read_path_returns_a_spilled_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let big = "q".repeat(128 * 1024);
+
+    let mut e = Engine::open(store(&root), 1).unwrap();
+    e.write_records(
+        "docs",
+        (0..5i64)
+            .map(|i| {
+                (
+                    user(i),
+                    Record::new()
+                        .with_field("small", Value::Int(i), v(100, 1))
+                        .with_field("big", Value::Str(big.clone()), v(100, 1)),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    e.publish().unwrap();
+
+    let unresolved = |rec: &Record| rec.fields.values().any(|f| f.value.is_spilled());
+
+    // Through the writer's own view.
+    let mut e = Engine::open(store(&root), 1).unwrap();
+    let got = e.get("docs", &user(2)).unwrap().expect("row 2");
+    assert!(!unresolved(&got), "Engine::get returned a placeholder");
+    assert_eq!(got.get("big"), Some(&Value::Str(big.clone())));
+
+    // Through a reader's merged view, point and scan.
+    let mut r = Reader::open(store(&root)).unwrap();
+    let got = r.get("docs", &user(3)).unwrap().expect("row 3");
+    assert!(!unresolved(&got), "Reader::get returned a placeholder");
+    assert_eq!(got.get("big"), Some(&Value::Str(big.clone())));
+
+    for (key, rec) in r.scan("docs").unwrap() {
+        assert!(!unresolved(&rec), "Reader::scan returned a placeholder at {:?}", key);
+        assert_eq!(rec.get("big"), Some(&Value::Str(big.clone())));
+    }
+}
+
+/// A large field survives a write that only touches its neighbours.
+///
+/// This is the property per-field spilling exists for: the pointer merges as
+/// itself, so editing a small column does not re-encode, re-spill, or corrupt
+/// the large one.
+#[test]
+fn editing_a_small_field_leaves_a_large_neighbour_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let big = "w".repeat(200 * 1024);
+
+    let mut e = Engine::open(store(&root), 1).unwrap();
+    e.write_records(
+        "docs",
+        vec![(
+            user(1),
+            Record::new()
+                .with_field("status", Value::Str("new".into()), v(100, 1))
+                .with_field("attachment", Value::Str(big.clone()), v(100, 1)),
+        )],
+    )
+    .unwrap();
+    e.publish().unwrap();
+
+    // A second write naming only `status`.
+    let m = Arc::new(Metered::new(store(&root)));
+    let mut e = Engine::open(Arc::clone(&m), 1).unwrap();
+    m.reset();
+    e.write_records(
+        "docs",
+        vec![(
+            user(1),
+            Record::new().with_field("status", Value::Str("done".into()), v(200, 1)),
+        )],
+    )
+    .unwrap();
+    e.publish().unwrap();
+    let written = m.stats().bytes_written;
+
+    let mut r = Reader::open(store(&root)).unwrap();
+    let got = r.get("docs", &user(1)).unwrap().expect("the row");
+    assert_eq!(got.get("status"), Some(&Value::Str("done".into())));
+    assert_eq!(
+        got.get("attachment"),
+        Some(&Value::Str(big.clone())),
+        "the untouched field must come back whole"
+    );
+
+    println!(
+        "editing one small field beside a {} KiB attachment wrote {} bytes",
+        big.len() / 1024,
+        written
+    );
+    assert!(
+        written < big.len() as u64 / 2,
+        "editing a small field must not rewrite the attachment: {} bytes \
+         written against an attachment of {}",
+        written,
+        big.len()
+    );
+}

@@ -216,6 +216,133 @@ pub fn resolve_batch<S: ObjectStore>(
     Ok(out)
 }
 
+/// Replace every field large enough to be worth it with a pointer, across a
+/// batch of records, in one write.
+///
+/// # Why per field rather than per record
+///
+/// Spilling a whole record makes a row with one large attachment expensive in
+/// both directions, and the sizes are not marginal. Measured over 200 rows
+/// with a 256 KiB attachment beside two small columns
+/// (`pond_bench --bin fieldspill`):
+///
+/// | attachment | bytes to change one small field | bytes to scan the small fields |
+/// |---|---|---|
+/// | 16 KiB  | 32.8 KiB  | 3.2 MiB  |
+/// | 64 KiB  | 80.8 KiB  | 12.5 MiB |
+/// | 256 KiB | 272.8 KiB | 50.0 MiB |
+///
+/// The small fields being asked for weigh 2.1 KiB in every row of that table.
+/// Editing `status` cost the whole attachment because the record is re-encoded
+/// and re-spilled whole; scanning cost every attachment because they are
+/// inside the records.
+///
+/// Per field, a large payload becomes a pointer that a merge carries through
+/// untouched, so editing a neighbour rewrites bytes proportional to that
+/// neighbour — and a reader can decline to resolve what it did not ask for.
+///
+/// # Why the batch is across records
+///
+/// The spills are independent, so there is no reason to pay a round trip per
+/// field or per row. One batch covers every large field in the write, which is
+/// what keeps a bulk load bounded by bandwidth rather than by latency.
+pub fn spill_fields<S: ObjectStore>(
+    backend: &S,
+    records: &mut [pond_record::Record],
+    threshold: usize,
+) -> std::io::Result<()> {
+    // Where each payload came from, so the hashes can be put back in place.
+    let mut sites: Vec<(usize, String)> = Vec::new();
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+
+    for (i, rec) in records.iter().enumerate() {
+        for (name, field) in &rec.fields {
+            if field.value.is_spilled() {
+                // Already a pointer — carried through from a previous write,
+                // which is the whole point.
+                continue;
+            }
+            if pond_record::encode::payload_len(&field.value) < threshold {
+                continue;
+            }
+            let (_, bytes) = pond_record::encode::spill_payload(&field.value);
+            sites.push((i, name.clone()));
+            payloads.push(bytes);
+        }
+    }
+
+    if payloads.is_empty() {
+        return Ok(());
+    }
+
+    let hashes = backend.put_blob_batch(&payloads)?;
+    for ((i, name), hash) in sites.into_iter().zip(hashes) {
+        if let Some(field) = records[i].fields.get_mut(&name) {
+            let type_tag = pond_record::encode::type_tag_of(&field.value);
+            field.value = pond_record::Value::Spilled { type_tag, hash };
+        }
+    }
+    Ok(())
+}
+
+/// Fetch the payloads behind a record's pointers, in one batch.
+///
+/// `wanted` names the fields to resolve; `None` resolves all of them. A field
+/// left unresolved is *removed* rather than handed back as a placeholder, so a
+/// `Value::Spilled` never escapes into code that would have to know what one
+/// is — the reason projection is worth anything is that it does not fetch, and
+/// the reason it is safe is that it does not lie about what it returned.
+pub fn resolve_fields<S: ObjectStore>(
+    backend: &S,
+    records: &mut [pond_record::Record],
+    wanted: Option<&[&str]>,
+) -> std::io::Result<()> {
+    let mut sites: Vec<(usize, String)> = Vec::new();
+    let mut hashes: Vec<String> = Vec::new();
+    let mut drop_at: Vec<(usize, String)> = Vec::new();
+
+    for (i, rec) in records.iter().enumerate() {
+        for (name, field) in &rec.fields {
+            let pond_record::Value::Spilled { hash, .. } = &field.value else {
+                continue;
+            };
+            let asked_for = wanted.is_none_or(|w| w.contains(&name.as_str()));
+            if asked_for {
+                sites.push((i, name.clone()));
+                hashes.push(hash.clone());
+            } else {
+                drop_at.push((i, name.clone()));
+            }
+        }
+    }
+
+    for (i, name) in drop_at {
+        records[i].fields.remove(&name);
+    }
+
+    if hashes.is_empty() {
+        return Ok(());
+    }
+
+    let bodies = backend.get_blob_batch(&hashes)?;
+    if bodies.len() != sites.len() {
+        return Err(std::io::Error::other(format!(
+            "backend returned {} payloads for {} spilled fields",
+            bodies.len(),
+            sites.len()
+        )));
+    }
+    for ((i, name), body) in sites.into_iter().zip(bodies) {
+        let value = pond_record::encode::unspill_payload(&body).ok_or_else(|| {
+            std::io::Error::other(format!("spilled field '{}' did not decode", name))
+        })?;
+        if let Some(field) = records[i].fields.get_mut(&name) {
+            field.value = value;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

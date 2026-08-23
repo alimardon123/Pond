@@ -41,6 +41,8 @@ const T_STR: u8 = 4;
 const T_BYTES: u8 = 5;
 const T_VECTOR: u8 = 6;
 const T_JSON: u8 = 7;
+/// A field stored elsewhere: the tag it stands for, then its content hash.
+const T_SPILLED: u8 = 8;
 
 /// Reject a declared field count that the buffer could not possibly hold.
 /// The smallest encodable field is well over 8 bytes, so this is generous.
@@ -167,7 +169,60 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
             out.extend_from_slice(&(s.len() as u32).to_le_bytes());
             out.extend_from_slice(s.as_bytes());
         }
+        Value::Spilled { type_tag, hash } => {
+            out.push(T_SPILLED);
+            out.push(*type_tag);
+            out.extend_from_slice(&(hash.len() as u16).to_le_bytes());
+            out.extend_from_slice(hash.as_bytes());
+        }
     }
+}
+
+/// The tag a value encodes under — what a [`Value::Spilled`] placeholder has
+/// to remember so a reader knows what resolving it will produce.
+pub fn type_tag_of(v: &Value) -> u8 {
+    match v {
+        Value::Null => T_NULL,
+        Value::Bool(_) => T_BOOL,
+        Value::Int(_) => T_INT,
+        Value::F64(_) => T_F64,
+        Value::Str(_) => T_STR,
+        Value::Bytes(_) => T_BYTES,
+        Value::Vector(_) => T_VECTOR,
+        Value::Json(_) => T_JSON,
+        Value::Spilled { type_tag, .. } => *type_tag,
+    }
+}
+
+/// How many bytes a value's payload weighs, without encoding it.
+///
+/// Used to decide whether a field is worth spilling. Only the variable-length
+/// kinds can be: a bool or an int is smaller than the pointer replacing it,
+/// and spilling one would cost a request to save nothing.
+pub fn payload_len(v: &Value) -> usize {
+    match v {
+        Value::Str(s) | Value::Json(s) => s.len(),
+        Value::Bytes(b) => b.len(),
+        Value::Vector(f) => f.len() * 4,
+        _ => 0,
+    }
+}
+
+/// The bytes a spilled field's payload is stored as, and the tag to remember.
+///
+/// Encoded with the same `put_value` a inline field uses, so resolving one
+/// yields a value byte-identical to the one that was stored — the round trip
+/// is the encoder's own, not a second implementation of it.
+pub fn spill_payload(v: &Value) -> (u8, Vec<u8>) {
+    let mut out = Vec::new();
+    put_value(&mut out, v);
+    (type_tag_of(v), out)
+}
+
+/// Read back what [`spill_payload`] wrote.
+pub fn unspill_payload(bytes: &[u8]) -> Option<Value> {
+    let mut r = Reader { buf: bytes, pos: 0 };
+    r.value()
 }
 
 /// Bounds-checked reader. Every accessor returns None instead of panicking,
@@ -234,6 +289,12 @@ impl<'a> Reader<'a> {
             T_JSON => {
                 let n = self.u32()? as usize;
                 Value::Json(String::from_utf8(self.take(n)?.to_vec()).ok()?)
+            }
+            T_SPILLED => {
+                let type_tag = self.u8()?;
+                let n = self.u16()? as usize;
+                let hash = String::from_utf8(self.take(n)?.to_vec()).ok()?;
+                Value::Spilled { type_tag, hash }
             }
             _ => return None,
         })

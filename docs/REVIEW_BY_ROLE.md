@@ -306,10 +306,46 @@ its old rows are superseded by a head that does not contain them. And
 pre-sequence head is never treated as a stale version of a current one: the
 writer that wrote it may never run again, and nothing else holds its rows.
 
-**Column pruning does not exist yet.** A scan that wants one field still reads
-whole records, and a spilled record is fetched whole. That is what a PAX
-segment layout would fix, and it is the remaining half of the "index
-descriptors, not rows" argument.
+**Spilling is per field now, and the reason was measured rather than assumed.**
+It used to be per record: a row whose encoding passed the threshold went to one
+blob, whole. Over 200 rows with a 256 KiB attachment beside two small columns
+(`pond_bench --bin fieldspill`):
+
+| attachment | update one small field | projected scan | full scan | the small fields weigh |
+|---|---|---|---|---|
+| 16 KiB  | 272.8 -> 40.7 KiB | 3.2 MiB -> 40.7 KiB  | 3.2 MiB  | 2.1 KiB |
+| 64 KiB  | 272.8 -> 40.7 KiB | 12.5 MiB -> 40.7 KiB | 12.5 MiB | 2.1 KiB |
+| 256 KiB | 272.8 -> 40.7 KiB | 50.0 MiB -> 40.7 KiB | 50.0 MiB | 2.1 KiB |
+
+Both costs are now flat in the attachment. Editing a neighbouring column no
+longer re-encodes and re-spills the attachment — 278 bytes beside a 200 KiB
+field — because the pointer merges as itself. And `Reader::scan_projected` does
+not fetch payloads nobody asked for: 50 MiB to 40.7 KiB.
+
+A field that was not asked for is *absent* from the returned record rather than
+present-but-empty. Handing back a placeholder would push "what is a spilled
+value" onto every consumer, and handing back an empty one would be a lie about
+the data.
+
+**Column pruning is still not complete**, and the table says exactly what is
+left: 40.7 KiB against a 2.1 KiB floor. Records live in the index, so every
+row's small fields cross the wire whether or not they were asked for. Removing
+that needs values laid out by column rather than by row — a storage-format
+change this is not, and the remaining half of the "index descriptors, not rows"
+argument.
+
+**`Value::Spilled` never leaves the engine.** It says where a payload lives,
+not what it is, and every consumer downstream — the columnar bridge, SQL, JSON,
+the Python bindings — would otherwise have to learn what one means, with the
+catch-all arms quietly rendering it as empty.
+`no_read_path_returns_a_spilled_placeholder` holds that line across
+`Engine::get`, `Reader::get` and `Reader::scan`.
+
+**Garbage collection needed a third fix for the same reason as the first two.**
+A record that sits inline in a leaf can still name payloads stored elsewhere,
+so a live-set walk that stops at the record level deletes them and the row
+reads back with its largest field missing — which is what the new test caught
+before the fix, as a hard read failure rather than a quiet truncation.
 
 ---
 

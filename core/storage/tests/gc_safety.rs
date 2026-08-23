@@ -323,3 +323,70 @@ fn gc_does_not_delete_the_trees_a_history_points_at() {
         );
     }
 }
+
+/// A field stored in its own object is live, and garbage collection has to
+/// know that.
+///
+/// Spilling used to be per record: a leaf value was either the record or a
+/// pointer to it, and following the pointer was enough. Per-field spilling
+/// adds a second level — a record that sits *inline* in the leaf can still
+/// name payloads stored elsewhere, and a record behind a pointer can too.
+///
+/// A live-set walk that stops at the record level marks those payloads dead
+/// and deletes them, and the row then reads back with its largest field
+/// missing. Third instance of the same shape in this file, so it gets its own
+/// test rather than an assumption.
+#[test]
+fn gc_does_not_delete_a_fields_spilled_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = kernel(dir.path());
+
+    engine_path::create(&s, "docs").unwrap();
+    // Small columns beside one large one: the record encodes small once the
+    // large field becomes a pointer, so it stays inline in the leaf and the
+    // payload is reachable only through the field.
+    let big = "z".repeat(64 * 1024);
+    engine_path::write_rows(
+        &s,
+        "docs",
+        &[
+            ("id", TypedColumn::Int64(vec![1, 2])),
+            ("tag", TypedColumn::String(vec!["a".into(), "b".into()])),
+            (
+                "attachment",
+                TypedColumn::String(vec![big.clone(), big.clone()]),
+            ),
+        ],
+        1,
+    )
+    .unwrap();
+
+    let read_back = |what: &str| -> Vec<String> {
+        match engine_path::read_rows(&s, "docs")
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n == what)
+        {
+            Some((_, TypedColumn::String(v))) => v,
+            _ => Vec::new(),
+        }
+    };
+    assert_eq!(read_back("attachment").len(), 2, "both attachments present");
+    assert_eq!(read_back("attachment")[0].len(), big.len());
+
+    let report = GarbageCollector::new(&s).vacuum(None, 0, false);
+    println!("gc over field-spilled rows: {:?}", report);
+
+    assert_eq!(rows_of(&s, "docs"), vec![1, 2], "the rows must survive");
+    let after = read_back("attachment");
+    assert_eq!(
+        after.len(),
+        2,
+        "both attachments must still resolve after gc"
+    );
+    assert_eq!(
+        after[0].len(),
+        big.len(),
+        "the payload must come back whole, not truncated or empty"
+    );
+}

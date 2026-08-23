@@ -64,6 +64,34 @@ pub enum Value {
     /// Semi-structured payload, stored verbatim. The lens that wrote it knows
     /// how to read it; every other lens carries it through untouched.
     Json(String),
+    /// A field whose payload lives in its own object, named by content hash.
+    ///
+    /// # Why a field and not a record
+    ///
+    /// Spilling used to be per *record*: a row whose encoding passed a
+    /// threshold went to one blob, whole. That makes a row with one large
+    /// attachment expensive in both directions. Measured over 200 rows
+    /// (`pond_bench --bin fieldspill`), with a 256 KiB attachment beside two
+    /// small columns:
+    ///
+    ///   - changing only the small `status` column moved 272 KiB, because the
+    ///     record is re-encoded whole and re-spilled;
+    ///   - scanning the collection moved 50 MiB to deliver 2.1 KiB of small
+    ///     fields, because the attachment is inside every record.
+    ///
+    /// Per field, the large payload becomes a pointer that survives a merge
+    /// untouched, so editing a neighbouring field rewrites bytes proportional
+    /// to that field — and a reader that does not want the attachment never
+    /// fetches it.
+    ///
+    /// # This is a placeholder, not a value
+    ///
+    /// It carries the tag of the value it stands for so a reader knows what it
+    /// will get back. It exists only between decoding a record and resolving
+    /// it, and the engine resolves before returning anything, so no consumer
+    /// outside `pond_engine` should ever observe one. `no_read_path_returns_a_
+    /// spilled_placeholder` holds that line.
+    Spilled { type_tag: u8, hash: String },
 }
 
 impl Value {
@@ -77,7 +105,15 @@ impl Value {
             Value::Bytes(_) => "bytes",
             Value::Vector(_) => "vector",
             Value::Json(_) => "json",
+            // Named for what it stands for rather than what it is: callers ask
+            // this to describe data, and "spilled" describes storage.
+            Value::Spilled { .. } => "spilled",
         }
+    }
+
+    /// Is this a placeholder for a payload stored elsewhere?
+    pub fn is_spilled(&self) -> bool {
+        matches!(self, Value::Spilled { .. })
     }
 }
 
