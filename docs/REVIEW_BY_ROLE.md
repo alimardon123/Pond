@@ -363,12 +363,31 @@ it should. When a predicate cannot be parsed the projection is abandoned and
 everything is read, so the query fails for its real reason rather than for an
 empty column.
 
+**The floor was mostly not what it looked like.** "40.7 KiB to deliver 2.1 KiB"
+reads as "we still fetch columns nobody wanted", and the implied fix is a
+column store. Asking what those bytes actually *are* first
+(`pond_bench --bin recordbytes`) gave a different answer for a typical row:
+
+| part | v1 bytes | share |
+|---|---|---|
+| field versions | 72 | 38% |
+| the spilled hash, as hex text | 66 | 34% |
+| field names | 24 | 12% |
+| real payload | 12 | 6% |
+
+Record format v2 stores each distinct version once in a table the fields index,
+and a hash as the 32 bytes it is rather than the 64 characters it prints as.
+192 bytes to 119, and the floor with it: **40.7 KiB to 26.5 KiB**. Neither
+change touches how values are laid out.
+
+v1 stays decodable forever — records are content-addressed, so a format change
+cannot rewrite what is already stored.
+
 **Column pruning is still not complete**, and the table says exactly what is
-left: 40.7 KiB against a 2.1 KiB floor. Records live in the index, so every
-row's small fields cross the wire whether or not they were asked for. Removing
-that needs values laid out by column rather than by row — a storage-format
-change this is not, and the remaining half of the "index descriptors, not rows"
-argument.
+left: 26.5 KiB against a 2.1 KiB floor. What remains is field names and
+per-field framing, repeated once per row. A column store would factor those
+across a whole chunk — that is the remaining idea, and now the only one that
+needs values laid out differently.
 
 **`Value::Spilled` never leaves the engine.** It says where a payload lives,
 not what it is, and every consumer downstream — the columnar bridge, SQL, JSON,

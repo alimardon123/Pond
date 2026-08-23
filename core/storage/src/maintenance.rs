@@ -233,6 +233,18 @@ pub struct VacuumResult {
     pub preserved: usize,
     pub freed_bytes: i64,
     pub dry_run: bool,
+    /// Set when the live-set walk met bytes it could not interpret, in which
+    /// case nothing was deleted.
+    ///
+    /// Garbage collection is the one operation here where being wrong cannot
+    /// be undone. A record that will not decode is not evidence that it names
+    /// no payloads — it is evidence that this build cannot tell, and the two
+    /// look identical to a walk that treats a decode failure as "nothing
+    /// reachable". A build with a decoder regression would quietly convert
+    /// live data into garbage and then delete it; that is not hypothetical,
+    /// it is what an intermediate build of the record format change did to a
+    /// scratch pond before this existed.
+    pub incomplete: bool,
 }
 
 /// Garbage collector for Pond's content-addressed storage.
@@ -255,11 +267,20 @@ pub struct VacuumResult {
 /// ```
 pub struct GarbageCollector<'a> {
     kernel: &'a PondKernel,
+    /// Whether the live-set walk met bytes it could not interpret.
+    ///
+    /// `Cell` rather than a return value threaded through every walk method:
+    /// the walks are deep and recursive, and a flag that every one of them has
+    /// to remember to propagate is a flag one of them will forget.
+    incomplete: std::cell::Cell<bool>,
 }
 
 impl<'a> GarbageCollector<'a> {
     pub fn new(kernel: &'a PondKernel) -> Self {
-        Self { kernel }
+        Self {
+            kernel,
+            incomplete: std::cell::Cell::new(false),
+        }
     }
 
     /// Analyze reachability and return GC stats (read-only).
@@ -312,7 +333,24 @@ impl<'a> GarbageCollector<'a> {
         _preserve_days: u32,
         dry_run: bool,
     ) -> VacuumResult {
+        self.incomplete.set(false);
         let live_set = self.build_live_set(collections.map(|v| v.to_vec()));
+
+        // A walk that met bytes it could not interpret has not proved anything
+        // is dead. Deleting on the strength of it is how a decoder regression
+        // becomes permanent data loss, so this refuses instead — the operator
+        // gets an unswept pond, which costs space, rather than a swept one
+        // missing rows, which costs everything.
+        if self.incomplete.get() {
+            return VacuumResult {
+                deleted: 0,
+                preserved: 0,
+                freed_bytes: 0,
+                dry_run,
+                incomplete: true,
+            };
+        }
+
         let all_blobs = self.list_all_blob_hashes();
         let dead: Vec<String> = all_blobs.into_iter()
             .filter(|h| !live_set.contains(h))
@@ -344,6 +382,7 @@ impl<'a> GarbageCollector<'a> {
         }
 
         VacuumResult {
+            incomplete: false,
             deleted,
             preserved,
             freed_bytes,
@@ -513,6 +552,9 @@ impl<'a> GarbageCollector<'a> {
     /// the record, so nothing above this level can see it.
     fn walk_record_fields(&self, record_bytes: &[u8], live: &mut HashSet<String>) {
         let Some(record) = pond_record::decode_record(record_bytes) else {
+            // Cannot tell what this names, so the walk is no longer complete
+            // and nothing may be deleted on the strength of it.
+            self.incomplete.set(true);
             return;
         };
         for field in record.fields.values() {

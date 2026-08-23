@@ -30,8 +30,33 @@ use std::collections::BTreeMap;
 use crate::{Field, Record, Value, Version};
 
 const MAGIC: &[u8; 4] = b"PREC";
-const FORMAT_VERSION: u8 = 1;
+/// The format a new record is written in.
+///
+/// v1 wrote a full 24-byte version stamp beside every field and a spilled
+/// field's hash as 64 characters of hex. Measured on a typical row — two small
+/// columns and one spilled field, 192 bytes — that is 72 bytes of versions and
+/// 64 bytes of hex against 12 bytes of actual payload
+/// (`pond_bench --bin recordbytes`).
+///
+/// v2 changes neither what a record means nor how values are laid out. It
+/// stores each distinct version once in a table and has fields reference it,
+/// and it stores a hash as the 32 bytes it is rather than the 64 characters it
+/// prints as. The same row encodes in 115 bytes.
+///
+/// v1 stays decodable forever: records are content-addressed, so a format
+/// change cannot rewrite what is already stored, and anything that could not
+/// read v1 would be unable to read data it wrote itself last week.
+const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION_V1: u8 = 1;
 const FLAG_TOMBSTONE: u8 = 0x01;
+/// The version table is counted and indexed with 32 bits rather than 16.
+///
+/// Set only when a record holds more than 65,535 *distinct* versions, which
+/// takes more than 65,535 fields. It exists so the encoder never has to fall
+/// back to an older framing: a record written with v1 framing but current
+/// value encoding would be internally inconsistent and unreadable, which is
+/// what the first version of this did.
+const FLAG_WIDE_VERSIONS: u8 = 0x02;
 
 const T_NULL: u8 = 0;
 const T_BOOL: u8 = 1;
@@ -49,41 +74,113 @@ const T_SPILLED: u8 = 8;
 const MIN_FIELD_BYTES: usize = 8;
 
 pub fn encode_record(r: &Record) -> Vec<u8> {
+    // The version table is built by walking fields in name order, which a
+    // `BTreeMap` fixes, and keeping first-seen order. That makes the table a
+    // pure function of the record — two writers holding the same record
+    // produce the same table and therefore the same bytes, which is the
+    // property content addressing rests on.
+    let mut table: Vec<Version> = Vec::new();
+    for field in r.fields.values() {
+        if !table.contains(&field.version) {
+            table.push(field.version);
+        }
+    }
+
+    // More distinct versions than a 16-bit index can name widens the index
+    // rather than changing framing. Both the flag and the table are pure
+    // functions of the record, so canonical encoding is unaffected.
+    let wide = table.len() > u16::MAX as usize;
+
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.push(FORMAT_VERSION);
 
-    let flags = if r.deleted.is_some() { FLAG_TOMBSTONE } else { 0 };
+    let mut flags = if r.deleted.is_some() { FLAG_TOMBSTONE } else { 0 };
+    if wide {
+        flags |= FLAG_WIDE_VERSIONS;
+    }
     out.push(flags);
 
     if let Some(tomb) = r.deleted {
         put_version(&mut out, tomb);
     }
 
+    if wide {
+        out.extend_from_slice(&(table.len() as u32).to_le_bytes());
+    } else {
+        out.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    }
+    for v in &table {
+        put_version(&mut out, *v);
+    }
+
+    // Where each version sits, so the per-field lookup is not a linear scan of
+    // the table — which would make encoding a wide record quadratic.
+    let mut index_of: BTreeMap<Version, usize> = BTreeMap::new();
+    for (i, v) in table.iter().enumerate() {
+        index_of.insert(*v, i);
+    }
+
     out.extend_from_slice(&(r.fields.len() as u32).to_le_bytes());
     for (name, field) in &r.fields {
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name.as_bytes());
-        put_version(&mut out, field.version);
+        let idx = *index_of
+            .get(&field.version)
+            .expect("every field's version is in the table by construction");
+        if wide {
+            out.extend_from_slice(&(idx as u32).to_le_bytes());
+        } else {
+            out.extend_from_slice(&(idx as u16).to_le_bytes());
+        }
         put_value(&mut out, &field.value);
     }
     out
 }
 
 pub fn decode_record(buf: &[u8]) -> Option<Record> {
-    let mut r = Reader { buf, pos: 0 };
+    let mut r = Reader {
+        buf,
+        pos: 0,
+        format: FORMAT_VERSION,
+    };
     if r.take(4)? != MAGIC {
         return None;
     }
-    if r.u8()? != FORMAT_VERSION {
-        return None;
-    }
+    // v1 records are still out there and always will be: a record is
+    // content-addressed, so nothing rewrites what is already stored.
+    let format = match r.u8()? {
+        FORMAT_VERSION_V1 => FORMAT_VERSION_V1,
+        FORMAT_VERSION => FORMAT_VERSION,
+        _ => return None,
+    };
+    // The value decoder needs this: `T_SPILLED` is laid out differently in the
+    // two formats.
+    r.format = format;
     let flags = r.u8()?;
 
     let deleted = if flags & FLAG_TOMBSTONE != 0 {
         Some(r.version()?)
     } else {
         None
+    };
+
+    // v2 stores each distinct version once and has fields index into it.
+    let wide = flags & FLAG_WIDE_VERSIONS != 0;
+    let table: Vec<Version> = if format == FORMAT_VERSION {
+        let n = if wide { r.u32()? as usize } else { r.u16()? as usize };
+        // 24 bytes each; refuse a count the buffer cannot hold rather than
+        // pre-allocating for it.
+        if n.saturating_mul(24) > r.remaining() {
+            return None;
+        }
+        let mut t = Vec::with_capacity(n);
+        for _ in 0..n {
+            t.push(r.version()?);
+        }
+        t
+    } else {
+        Vec::new()
     };
 
     let n_fields = r.u32()? as usize;
@@ -97,7 +194,15 @@ pub fn decode_record(buf: &[u8]) -> Option<Record> {
     for _ in 0..n_fields {
         let name_len = r.u16()? as usize;
         let name = String::from_utf8(r.take(name_len)?.to_vec()).ok()?;
-        let version = r.version()?;
+        let version = if format == FORMAT_VERSION {
+            // An index outside the table is malformed. Substituting a default
+            // version would silently change how this field merges, which is a
+            // worse outcome than refusing the record.
+            let idx = if wide { r.u32()? as usize } else { r.u16()? as usize };
+            *table.get(idx)?
+        } else {
+            r.version()?
+        };
         let value = r.value()?;
         fields.insert(name, Field { value, version });
     }
@@ -128,7 +233,11 @@ pub fn encode_value(v: &Value) -> Vec<u8> {
 /// panicking: these bytes may have come back from storage, or from a
 /// decryption that produced the wrong plaintext.
 pub fn decode_value(bytes: &[u8]) -> Option<Value> {
-    let mut r = Reader { buf: bytes, pos: 0 };
+    let mut r = Reader {
+        buf: bytes,
+        pos: 0,
+        format: FORMAT_VERSION,
+    };
     r.value()
 }
 
@@ -172,10 +281,65 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
         Value::Spilled { type_tag, hash } => {
             out.push(T_SPILLED);
             out.push(*type_tag);
-            out.extend_from_slice(&(hash.len() as u16).to_le_bytes());
-            out.extend_from_slice(hash.as_bytes());
+            // A hash prints as hex and *is* bytes. Storing the 64 characters
+            // rather than the 32 bytes doubles the largest non-payload item in
+            // a row that has a spilled field — 64 of 192 bytes on the row the
+            // floor was measured on.
+            //
+            // Anything that is not a clean 32-byte hex string is written as
+            // text, so a future digest of another width still round-trips
+            // rather than being silently truncated.
+            match decode_hex32(hash) {
+                Some(raw) => {
+                    out.push(1u8);
+                    out.extend_from_slice(&raw);
+                }
+                None => {
+                    out.push(0u8);
+                    out.extend_from_slice(&(hash.len() as u16).to_le_bytes());
+                    out.extend_from_slice(hash.as_bytes());
+                }
+            }
         }
     }
+}
+
+/// A 64-character lowercase hex string as the 32 bytes it stands for.
+///
+/// Returns `None` for anything else, so a hash of a different width or casing
+/// is stored as text rather than mangled.
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, chunk) in b.chunks_exact(2).enumerate() {
+        let hi = hex_val(chunk[0])?;
+        let lo = hex_val(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// The inverse of [`decode_hex32`], always lowercase so a round trip is
+/// byte-identical and two writers cannot disagree on casing.
+fn encode_hex32(raw: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for b in raw {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
 /// The tag a value encodes under — what a [`Value::Spilled`] placeholder has
@@ -221,7 +385,11 @@ pub fn spill_payload(v: &Value) -> (u8, Vec<u8>) {
 
 /// Read back what [`spill_payload`] wrote.
 pub fn unspill_payload(bytes: &[u8]) -> Option<Value> {
-    let mut r = Reader { buf: bytes, pos: 0 };
+    let mut r = Reader {
+        buf: bytes,
+        pos: 0,
+        format: FORMAT_VERSION,
+    };
     r.value()
 }
 
@@ -230,6 +398,15 @@ pub fn unspill_payload(bytes: &[u8]) -> Option<Value> {
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Which record format the value decoder should expect.
+    ///
+    /// `T_SPILLED` is laid out differently in v1 and v2, and a value decoder
+    /// that does not know which it is reading misreads every spilled field in
+    /// every record written before the change. That is not a theoretical
+    /// break: a pond written by the previous build failed its first read with
+    /// "corrupt data", and the unit test missed it because the v1 record it
+    /// built by hand had no spilled field in it.
+    format: u8,
 }
 
 impl<'a> Reader<'a> {
@@ -292,8 +469,21 @@ impl<'a> Reader<'a> {
             }
             T_SPILLED => {
                 let type_tag = self.u8()?;
-                let n = self.u16()? as usize;
-                let hash = String::from_utf8(self.take(n)?.to_vec()).ok()?;
+                let hash = if self.format == FORMAT_VERSION_V1 {
+                    // v1 wrote a length-prefixed hex string and no form
+                    // marker.
+                    let n = self.u16()? as usize;
+                    String::from_utf8(self.take(n)?.to_vec()).ok()?
+                } else {
+                    match self.u8()? {
+                        1 => encode_hex32(self.take(32)?.try_into().ok()?),
+                        0 => {
+                            let n = self.u16()? as usize;
+                            String::from_utf8(self.take(n)?.to_vec()).ok()?
+                        }
+                        _ => return None,
+                    }
+                };
                 Value::Spilled { type_tag, hash }
             }
             _ => return None,
@@ -303,6 +493,290 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// A complete v1 encoder, for compatibility tests only.
+    ///
+    /// Production has none: a record written with v1 framing but current value
+    /// encoding is internally inconsistent and unreadable, which is exactly
+    /// what the first attempt at a >65,535-version fallback produced. The
+    /// encoder now widens its index instead of changing framing, so this lives
+    /// here and nowhere else.
+    fn encode_record_v1(r: &Record) -> Vec<u8> {
+        let mut out = Vec::from(*MAGIC);
+        out.push(FORMAT_VERSION_V1);
+        out.push(if r.deleted.is_some() { FLAG_TOMBSTONE } else { 0 });
+        if let Some(tomb) = r.deleted {
+            put_version(&mut out, tomb);
+        }
+        out.extend_from_slice(&(r.fields.len() as u32).to_le_bytes());
+        for (name, field) in &r.fields {
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            put_version(&mut out, field.version);
+            put_value_v1(&mut out, &field.value);
+        }
+        out
+    }
+
+    /// v1's value encoding. Identical to the current one except for
+    /// `T_SPILLED`, which is the tag that changed.
+    fn put_value_v1(out: &mut Vec<u8>, v: &Value) {
+        match v {
+            Value::Spilled { type_tag, hash } => {
+                out.push(T_SPILLED);
+                out.push(*type_tag);
+                out.extend_from_slice(&(hash.len() as u16).to_le_bytes());
+                out.extend_from_slice(hash.as_bytes());
+            }
+            other => put_value(out, other),
+        }
+    }
+
+    /// The change that pays for itself: a version stamp is written once per
+    /// distinct version, not once per field.
+    #[test]
+    fn fields_written_together_share_one_version_stamp() {
+        let v = Version::new(1_700_000_000_000, 0, 7);
+        let one = Record::new().with_field("a", Value::Int(1), v);
+        let three = Record::new()
+            .with_field("a", Value::Int(1), v)
+            .with_field("b", Value::Int(2), v)
+            .with_field("c", Value::Int(3), v);
+
+        let grew_by = encode_record(&three).len() - encode_record(&one).len();
+        // Two more fields: name (2+1), version index (2), tag (1), payload (8)
+        // — 14 each, and no second or third 24-byte stamp.
+        assert_eq!(
+            grew_by, 28,
+            "two extra fields sharing a version should cost 14 bytes each, \
+             not 38"
+        );
+    }
+
+    /// Fields written at different times keep their own versions — the sharing
+    /// is an encoding detail and must not merge two distinct stamps.
+    #[test]
+    fn distinct_versions_survive_the_table() {
+        let a = Version::new(100, 0, 1);
+        let b = Version::new(200, 0, 2);
+        let r = Record::new()
+            .with_field("x", Value::Int(1), a)
+            .with_field("y", Value::Int(2), b);
+        let back = decode_record(&encode_record(&r)).unwrap();
+        assert_eq!(back.fields["x"].version, a);
+        assert_eq!(back.fields["y"].version, b);
+        assert_eq!(back, r);
+    }
+
+    /// A hash is stored as the 32 bytes it is, not the 64 characters it prints
+    /// as — and comes back identical.
+    #[test]
+    fn a_spilled_hash_round_trips_through_its_bytes() {
+        let hash = "0123456789abcdef".repeat(4);
+        assert_eq!(hash.len(), 64);
+        let r = Record::new().with_field(
+            "big",
+            Value::Spilled {
+                type_tag: 4,
+                hash: hash.clone(),
+            },
+            Version::new(1, 0, 1),
+        );
+        let encoded = encode_record(&r);
+        let back = decode_record(&encoded).unwrap();
+        assert_eq!(back, r);
+        assert!(
+            !encoded.windows(64).any(|w| w == hash.as_bytes()),
+            "the hex text must not appear in the encoding"
+        );
+    }
+
+    /// A digest that is not 32 bytes of lowercase hex is stored as text rather
+    /// than mangled — a future hash of another width still round-trips.
+    #[test]
+    fn an_unusual_hash_falls_back_to_text() {
+        for odd in ["short", &"a".repeat(128), &"A".repeat(64), ""] {
+            let r = Record::new().with_field(
+                "big",
+                Value::Spilled {
+                    type_tag: 4,
+                    hash: odd.to_string(),
+                },
+                Version::new(1, 0, 1),
+            );
+            assert_eq!(
+                decode_record(&encode_record(&r)).as_ref(),
+                Some(&r),
+                "a hash of {:?} must survive a round trip",
+                odd
+            );
+        }
+    }
+
+    /// A v1 record still decodes, and means exactly what it meant.
+    ///
+    /// Built by hand: no encoder in the tree produces v1 for an ordinary
+    /// record any more, and a compatibility claim nothing exercises is a
+    /// guess. Records are content-addressed, so every v1 record ever written
+    /// is still out there byte-for-byte.
+    #[test]
+    fn a_v1_record_still_decodes() {
+        let mut bytes = Vec::from(*MAGIC);
+        bytes.push(FORMAT_VERSION_V1);
+        bytes.push(0u8); // no tombstone
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        for (name, val) in [("age", 30i64), ("id", 7)] {
+            bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&100u64.to_le_bytes());
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+            bytes.extend_from_slice(&9u64.to_le_bytes());
+            bytes.push(T_INT);
+            bytes.extend_from_slice(&val.to_le_bytes());
+        }
+
+        let r = decode_record(&bytes).expect("a v1 record must decode");
+        assert_eq!(r.fields.len(), 2);
+        assert_eq!(r.fields["age"].value, Value::Int(30));
+        assert_eq!(r.fields["id"].value, Value::Int(7));
+        assert_eq!(r.fields["age"].version, Version::new(100, 0, 9));
+    }
+
+    /// A v1 record holding a *spilled* field still decodes.
+    ///
+    /// This is the case the first compatibility test missed, and missing it
+    /// broke every existing pond that had a large field: `T_SPILLED` is laid
+    /// out differently in the two formats, so a decoder that does not know
+    /// which one it is reading misreads the hash and reports the whole record
+    /// as corrupt. The hand-built v1 record in the test above carried only
+    /// integers, so it exercised nothing that had changed.
+    ///
+    /// Found by reading a pond written by the previous build, not by the
+    /// suite. This is the suite catching up.
+    #[test]
+    fn a_v1_record_with_a_spilled_field_still_decodes() {
+        let hash = "0123456789abcdef".repeat(4);
+        let mut bytes = Vec::from(*MAGIC);
+        bytes.push(FORMAT_VERSION_V1);
+        bytes.push(0u8);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(4u16).to_le_bytes());
+        bytes.extend_from_slice(b"body");
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.push(T_SPILLED);
+        bytes.push(T_STR); // the tag it stands for
+        // v1 layout: a length-prefixed hex string, with no form marker.
+        bytes.extend_from_slice(&(hash.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(hash.as_bytes());
+
+        let r = decode_record(&bytes).expect("a v1 spilled field must decode");
+        assert_eq!(
+            r.fields["body"].value,
+            Value::Spilled {
+                type_tag: T_STR,
+                hash: hash.clone()
+            },
+            "the hash must come back exactly, or the payload cannot be found"
+        );
+
+        // And re-encoding it produces the smaller v2 form with the same
+        // meaning — an old record read and written back is not corrupted.
+        let round = decode_record(&encode_record(&r)).unwrap();
+        assert_eq!(round, r);
+    }
+
+    /// Every value type survives a v1 round trip, so no other tag has the same
+    /// problem `T_SPILLED` had.
+    #[test]
+    fn every_value_type_decodes_from_v1() {
+        let cases = [
+            Value::Null,
+            Value::Bool(true),
+            Value::Int(-5),
+            Value::F64(2.5),
+            Value::Str("hi".into()),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::Vector(vec![1.0, 2.0]),
+            Value::Json("{}".into()),
+            Value::Spilled {
+                type_tag: T_BYTES,
+                hash: "f".repeat(64),
+            },
+        ];
+        for value in cases {
+            let r = Record::new().with_field("f", value.clone(), Version::new(1, 0, 1));
+            let v1 = encode_record_v1(&r);
+            assert_eq!(
+                decode_record(&v1).as_ref(),
+                Some(&r),
+                "{:?} must survive a v1 round trip",
+                value.type_name()
+            );
+        }
+    }
+
+    /// A v1 record and a v2 record with the same contents mean the same thing,
+    /// even though their bytes differ.
+    #[test]
+    fn v1_and_v2_agree_on_meaning_while_differing_in_bytes() {
+        let v = Version::new(100, 0, 9);
+        let r = Record::new()
+            .with_field("a", Value::Int(1), v)
+            .with_field("b", Value::Str("x".into()), v);
+
+        let v2 = encode_record(&r);
+        let v1 = encode_record_v1(&r);
+        assert_ne!(v1, v2, "v2 exists because it is smaller");
+        assert!(v2.len() < v1.len());
+        assert_eq!(decode_record(&v1), decode_record(&v2));
+        assert_eq!(decode_record(&v2).as_ref(), Some(&r));
+    }
+
+    /// A version index outside the table is malformed. Defaulting it would
+    /// silently change how that field merges, which is worse than refusing.
+    #[test]
+    fn an_out_of_range_version_index_is_refused() {
+        let r = Record::new().with_field("a", Value::Int(1), Version::new(1, 0, 1));
+        let mut bytes = encode_record(&r);
+        // The index sits after magic(4) ver(1) flags(1) n_versions(2)
+        // version(24) n_fields(4) name_len(2) name(1).
+        let idx_at = 4 + 1 + 1 + 2 + 24 + 4 + 2 + 1;
+        bytes[idx_at] = 0xff;
+        bytes[idx_at + 1] = 0xff;
+        assert_eq!(decode_record(&bytes), None);
+    }
+
+    /// A version-table count the buffer cannot hold must be refused without
+    /// allocating for it.
+    #[test]
+    fn an_absurd_version_count_is_refused() {
+        let mut bytes = Vec::from(*MAGIC);
+        bytes.push(FORMAT_VERSION);
+        bytes.push(0u8);
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(decode_record(&bytes), None);
+    }
+
+    /// Canonical encoding: the same record always produces the same bytes,
+    /// whatever order its fields were added in.
+    #[test]
+    fn the_version_table_is_a_pure_function_of_the_record() {
+        let a = Version::new(100, 0, 1);
+        let b = Version::new(200, 0, 2);
+        let one = Record::new()
+            .with_field("z", Value::Int(1), b)
+            .with_field("a", Value::Int(2), a);
+        let two = Record::new()
+            .with_field("a", Value::Int(2), a)
+            .with_field("z", Value::Int(1), b);
+        assert_eq!(
+            encode_record(&one),
+            encode_record(&two),
+            "field insertion order must not reach the bytes"
+        );
+    }
+
     use super::*;
 
     fn v(p: u64) -> Version {

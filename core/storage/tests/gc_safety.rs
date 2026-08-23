@@ -390,3 +390,78 @@ fn gc_does_not_delete_a_fields_spilled_payload() {
         "the payload must come back whole, not truncated or empty"
     );
 }
+
+/// Bytes the walk cannot interpret stop the sweep, rather than being read as
+/// "nothing reachable here".
+///
+/// This is the failure that turns a decoder regression into permanent data
+/// loss, and it is not hypothetical: an intermediate build during the record
+/// format change could not decode v1 records holding a spilled field, so the
+/// walk found no field pointers, and `pond gc` deleted payloads that were very
+/// much alive. The read afterwards failed with "Blob ... not found".
+///
+/// A record that will not decode is not evidence that it names no payloads. It
+/// is evidence that this build cannot tell. The two are indistinguishable to a
+/// walk that treats a decode failure as an empty answer, so the walk now
+/// reports itself incomplete and nothing is deleted.
+#[test]
+fn gc_refuses_to_sweep_when_it_cannot_read_a_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = kernel(dir.path());
+
+    engine_path::create(&s, "docs").unwrap();
+    engine_path::write_rows(
+        &s,
+        "docs",
+        &[
+            ("id", TypedColumn::Int64(vec![1, 2])),
+            ("tag", TypedColumn::String(vec!["a".into(), "b".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+
+    // A healthy pond sweeps.
+    let clean = GarbageCollector::new(&s).vacuum(None, 0, true);
+    assert!(!clean.incomplete, "a readable pond must not report incomplete");
+
+    // Now plant a leaf value that is not a decodable record. Content
+    // addressing means we cannot corrupt an existing node in place, so this
+    // writes a new leaf and points a head at it — the same shape as a node
+    // written by a version this build does not understand.
+    let store = s.store_handle();
+    let garbage = store.put_blob(b"PREC\xff not a record this build knows").unwrap();
+    // A valid key, so the failure under test is the *value* not decoding
+    // rather than the key. And a collection of its own, so `docs` stays
+    // readable and the assertions below are about the sweep, not about a
+    // broken read.
+    let key = pond_index::Key::new(vec![pond_index::int(1)]).encode();
+    let leaf = pond_index::Node::Leaf {
+        entries: vec![(key, format!("PSPL{}", garbage).into_bytes())],
+    };
+    let leaf_hash = store.put_blob(&leaf.encode()).unwrap();
+
+    let mut head = pond_record::Head::new(0xDEAD_BEEF);
+    head.set_root("from_a_future_version", &leaf_hash);
+    let bytes = pond_record::encode_head(&head);
+    store
+        .put_object(
+            &pond_engine::head_key(0xDEAD_BEEF, 1, &pond_kernel::hash_bytes(&bytes)),
+            &bytes,
+        )
+        .unwrap();
+
+    let report = GarbageCollector::new(&s).vacuum(None, 0, false);
+    assert!(
+        report.incomplete,
+        "a walk that met unreadable bytes must say so: {:?}",
+        report
+    );
+    assert_eq!(
+        report.deleted, 0,
+        "and it must delete nothing, because it has proved nothing dead"
+    );
+
+    // The readable data is untouched.
+    assert_eq!(rows_of(&s, "docs"), vec![1, 2]);
+}

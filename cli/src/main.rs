@@ -1175,6 +1175,18 @@ fn cmd_gc(storage: &UnifiedStorage, compute_size: bool, dry_run: bool) {
         }
     } else if stats.dead > 0 {
         let result = gc.vacuum(None, 0, false);
+        if result.incomplete {
+            eprintln!(
+                "\nNothing was deleted: the reachability walk met data this build \
+                 cannot read."
+            );
+            eprintln!(
+                "That is not proof the data is dead — it is proof this build cannot \
+                 tell, so sweeping would risk deleting live rows."
+            );
+            eprintln!("Check that this binary is not older than the pond it is reading.");
+            std::process::exit(1);
+        }
         println!("\nVacuumed: deleted {} blobs, preserved {}", result.deleted, result.preserved);
     } else {
         println!("\nNo dead blobs to clean up.");
@@ -1197,6 +1209,14 @@ fn cmd_vacuum(storage: &UnifiedStorage, preserve_days: u32, dry_run: bool) {
         println!("  Would delete {} blobs (preserving last {} days)", stats.dead, preserve_days);
     } else if stats.dead > 0 {
         let result = gc.vacuum(None, preserve_days, false);
+        if result.incomplete {
+            eprintln!(
+                "\nNothing was deleted: the reachability walk met data this build \
+                 cannot read, so sweeping would risk deleting live rows."
+            );
+            eprintln!("Check that this binary is not older than the pond it is reading.");
+            std::process::exit(1);
+        }
         println!("\nVacuum complete:");
         println!("  Deleted:   {} blobs", result.deleted);
         println!("  Preserved: {} blobs", result.preserved);
