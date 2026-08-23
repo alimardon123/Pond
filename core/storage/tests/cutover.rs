@@ -1680,3 +1680,89 @@ fn merging_collections_keeps_per_field_resolution() {
          would have dropped one of them"
     );
 }
+
+/// A projected read must return the same values as an unprojected one, and
+/// cost less.
+///
+/// The cost is the point, but correctness is the precondition: a projection
+/// that changes an answer is worse than no projection at all.
+#[test]
+fn projecting_a_read_changes_the_cost_and_not_the_answer() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(pond_kernel::Metered::new(
+        pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),
+    ));
+    let k = pond_kernel::PondKernel::new_with_store(Box::new(Arc::clone(&store)));
+
+    engine_path::create(&k, "docs").unwrap();
+    let big = "y".repeat(64 * 1024);
+    engine_path::write_rows(
+        &k,
+        "docs",
+        &[
+            ("id", TypedColumn::Int64(vec![1, 2, 3])),
+            (
+                "tag",
+                TypedColumn::String(vec!["a".into(), "b".into(), "c".into()]),
+            ),
+            (
+                "attachment",
+                TypedColumn::String(vec![big.clone(), big.clone(), big.clone()]),
+            ),
+        ],
+        1,
+    )
+    .unwrap();
+
+    let value_of = |cols: &[(String, TypedColumn)], name: &str| -> Vec<String> {
+        match cols.iter().find(|(n, _)| n == name) {
+            Some((_, TypedColumn::String(v))) => v.clone(),
+            Some((_, TypedColumn::Int64(v))) => v.iter().map(|i| i.to_string()).collect(),
+            _ => Vec::new(),
+        }
+    };
+
+    store.reset();
+    let full = engine_path::read_rows(&k, "docs").unwrap();
+    let full_bytes = store.stats().bytes_read;
+
+    store.reset();
+    let projected = engine_path::read_rows_projected(&k, "docs", &["id", "tag"]).unwrap();
+    let projected_bytes = store.stats().bytes_read;
+
+    // Same answers for the columns that were asked for.
+    assert_eq!(value_of(&full, "id"), value_of(&projected, "id"));
+    assert_eq!(value_of(&full, "tag"), value_of(&projected, "tag"));
+    // Sorted before comparing: rows are keyed by UUIDv7, so scan order is key
+    // order and not insertion order. Asserting insertion order would be
+    // asserting something the engine does not promise.
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    assert_eq!(sorted(value_of(&projected, "id")), vec!["1", "2", "3"]);
+    assert_eq!(sorted(value_of(&projected, "tag")), vec!["a", "b", "c"]);
+
+    // The column that was not asked for is absent, not blank — a blank would
+    // be indistinguishable from a row that genuinely has no attachment.
+    assert!(
+        !projected.iter().any(|(n, _)| n == "attachment"),
+        "an unprojected column must be absent, not empty: {:?}",
+        projected.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert_eq!(value_of(&full, "attachment").len(), 3);
+
+    println!(
+        "read of 3 rows with a 64 KiB attachment: {} bytes full, {} bytes projected",
+        full_bytes, projected_bytes
+    );
+    assert!(
+        projected_bytes * 4 < full_bytes,
+        "a projection that does not fetch the large column should cost far \
+         less: {} vs {} bytes",
+        projected_bytes,
+        full_bytes
+    );
+}

@@ -327,6 +327,18 @@ present-but-empty. Handing back a placeholder would push "what is a spilled
 value" onto every consumer, and handing back an empty one would be a lie about
 the data.
 
+**The projection reaches the CLI**, not only the library. `--columns` used to
+filter after reading — the right answer at the wrong price, since every
+unwanted payload was fetched, decoded and discarded. It is now pushed down to
+the scan: 197,703 bytes to 1,080 for three rows with a 64 KiB attachment.
+
+The columns a `WHERE` names are pulled into the fetch set, because filtering
+happens before projection and a predicate on a column that was never fetched
+would silently match nothing. `--columns tag --where "id = 2"` returns the row
+it should. When a predicate cannot be parsed the projection is abandoned and
+everything is read, so the query fails for its real reason rather than for an
+empty column.
+
 **Column pruning is still not complete**, and the table says exactly what is
 left: 40.7 KiB against a 2.1 KiB floor. Records live in the index, so every
 row's small fields cross the wire whether or not they were asked for. Removing
