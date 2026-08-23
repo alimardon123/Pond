@@ -327,6 +327,30 @@ present-but-empty. Handing back a placeholder would push "what is a spilled
 value" onto every consumer, and handing back an empty one would be a lie about
 the data.
 
+**SQL pushes the projection down too.** `SELECT id, tag FROM docs` over three
+rows with a 64 KiB column: 197,737 bytes to 1,114. The column set is taken from
+the select list, the WHERE, the HAVING, the GROUP BY and the ORDER BY, and the
+whole thing is abandoned — everything read — whenever that set cannot be known
+exactly: `SELECT *`, a join, or a table alias, since both rewrite column names
+and a projection computed from the query text would ask for a column the scan
+has never heard of.
+
+The timidity is the point. A projection that fetches too little does not
+produce a slower answer, it produces a wrong one, and nothing about it looks
+like an error.
+
+**Seven of the eight tests written for that were not load-bearing**, which is
+worth recording because it is the second time in this review. Breaking the rule
+deliberately — projecting the select list only, ignoring WHERE and ORDER BY —
+left all seven passing. The reason is that projection drops the payloads of
+*spilled* fields only; small columns ride along inside the record whether asked
+for or not, so a predicate on a small unselected column works by accident.
+
+The test that bites filters on a **large** unselected column, whose payload is
+exactly what a naive projection declines to fetch. Under the broken rule it
+returns `silently empty: 0`. That is the failure mode, and now one test
+actually reaches it.
+
 **The projection reaches the CLI**, not only the library. `--columns` used to
 filter after reading — the right answer at the wrong price, since every
 unwanted payload was fetched, decoded and discarded. It is now pushed down to

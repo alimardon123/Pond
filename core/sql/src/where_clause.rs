@@ -64,6 +64,38 @@ pub enum WhereExpr {
 }
 
 impl WhereExpr {
+    /// Every column this expression reads.
+    ///
+    /// Used to decide what a scan has to fetch. Filtering happens before
+    /// projection, so a predicate on a column that was never fetched would
+    /// evaluate against a missing value and silently match nothing — a wrong
+    /// answer shaped like an empty result. Anything named here is therefore
+    /// added to the projection.
+    ///
+    /// A `Subquery` node contributes its own column, and the subquery's
+    /// columns belong to a different table, so they are not this table's
+    /// concern.
+    pub fn columns(&self, out: &mut Vec<String>) {
+        let mut add = |c: &String| {
+            if !out.contains(c) {
+                out.push(c.clone());
+            }
+        };
+        match self {
+            WhereExpr::Compare { col, .. }
+            | WhereExpr::In { col, .. }
+            | WhereExpr::Like { col, .. }
+            | WhereExpr::IsNull { col, .. }
+            | WhereExpr::Subquery { col, .. } => add(col),
+            WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+                a.columns(out);
+                b.columns(out);
+            }
+            WhereExpr::Not(e) => e.columns(out),
+            WhereExpr::True => {}
+        }
+    }
+
     /// Evaluate this expression against a JSON row object.
     ///
     /// Subquery nodes always evaluate to `false` here — they MUST be

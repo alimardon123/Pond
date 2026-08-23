@@ -121,7 +121,19 @@ fn execute_select(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<SqlResult, String> {
-    let mut result_rows = read_table_rows(storage, table)?;
+    // Push the projection into the scan when the query makes the column set
+    // certain. For a row with a large field beside small ones this is the
+    // whole cost of the query.
+    let projection = projection_for(
+        alias,
+        select_items,
+        joins,
+        where_expr,
+        groups,
+        having,
+        orders,
+    );
+    let mut result_rows = read_table_rows_projected(storage, table, projection.as_deref())?;
 
     // If there's an alias, prefix all columns with the alias.
     if let Some(al) = alias {
@@ -761,13 +773,101 @@ fn execute_join(
 // Table reading
 // ---------------------------------------------------------------------------
 
+/// The columns a SELECT provably touches, or `None` if that cannot be
+/// determined exactly.
+///
+/// # Why this is deliberately timid
+///
+/// A projection that fetches too little does not produce a slower answer, it
+/// produces a *wrong* one: a predicate on a missing column matches nothing, an
+/// ORDER BY on a missing column sorts arbitrarily, and neither fails loudly.
+/// The cost of reading a column nobody wanted is bounded and visible; the cost
+/// of a silently empty result is not. So anything that makes the column set
+/// uncertain falls back to reading everything.
+///
+/// Uncertain means:
+///
+///   - `SELECT *`, which is every column by definition;
+///   - a join or a table alias, because both rewrite column names — a
+///     projection computed from the query text would ask for `u.name` and the
+///     scan would look for a column called that;
+///   - `COUNT(*)`, whose argument is no column in particular.
+fn projection_for(
+    alias: &Option<String>,
+    select_items: &[SelectItem],
+    joins: &[JoinClause],
+    where_expr: &WhereExpr,
+    groups: &[String],
+    having: &WhereExpr,
+    orders: &[OrderByItem],
+) -> Option<Vec<String>> {
+    if alias.is_some() || !joins.is_empty() {
+        return None;
+    }
+
+    fn add(wanted: &mut Vec<String>, c: &str) {
+        if !wanted.iter().any(|w| w == c) {
+            wanted.push(c.to_string());
+        }
+    }
+
+    let mut wanted: Vec<String> = Vec::new();
+    for item in select_items {
+        match item {
+            SelectItem::Star => return None,
+            SelectItem::Column(c) => add(&mut wanted, c),
+            SelectItem::Aggregate(a) => {
+                // COUNT(*) names no column; it still needs rows, and the rows
+                // arrive whatever is projected, so this is not by itself a
+                // reason to give up.
+                if let Some(c) = &a.arg {
+                    add(&mut wanted, c);
+                }
+            }
+        }
+    }
+
+    where_expr.columns(&mut wanted);
+    having.columns(&mut wanted);
+    for g in groups {
+        add(&mut wanted, g);
+    }
+    for o in orders {
+        add(&mut wanted, &o.col);
+    }
+
+    // Nothing named at all — a bare `SELECT COUNT(*)`. Reading no columns is
+    // correct but the row count still has to come from somewhere, so ask for
+    // the row identity and nothing else.
+    if wanted.is_empty() {
+        wanted.push("_rowid".to_string());
+    }
+    Some(wanted)
+}
+
 fn read_table_rows(storage: &UnifiedStorage, table: &TableRef) -> Result<Vec<JsonValue>, String> {
+    read_table_rows_projected(storage, table, None)
+}
+
+/// As [`read_table_rows`], fetching only the payloads of `wanted` when the
+/// query is one where that is provably safe.
+///
+/// `None` means everything, and is the right answer whenever the set of
+/// columns a query touches cannot be determined exactly — see
+/// [`projection_for`].
+fn read_table_rows_projected(
+    storage: &UnifiedStorage,
+    table: &TableRef,
+    wanted: Option<&[String]>,
+) -> Result<Vec<JsonValue>, String> {
     match table {
         TableRef::Collection(name) => {
             let kc = vec!["_rowid".to_string()];
-            let all_rows = read_collection_as_json_rows(storage, name, &kc)?;
+            let all_rows = read_collection_as_json_rows_projected(storage, name, &kc, wanted)?;
             Ok(crdt_merge_rows(all_rows))
         }
+        // A file is read whole whatever the query wants: there is no index to
+        // push a projection into.
         TableRef::File(path) => read_file_rows(path),
     }
 }
@@ -1058,6 +1158,15 @@ fn read_collection_as_json_rows(
     collection: &str,
     key_fields: &[String],
 ) -> Result<Vec<(String, JsonValue)>, String> {
+    read_collection_as_json_rows_projected(storage, collection, key_fields, None)
+}
+
+fn read_collection_as_json_rows_projected(
+    storage: &UnifiedStorage,
+    collection: &str,
+    key_fields: &[String],
+    wanted: Option<&[String]>,
+) -> Result<Vec<(String, JsonValue)>, String> {
     let kernel = storage.kernel();
     let mut rows: Vec<(String, JsonValue)> = Vec::new();
 
@@ -1072,7 +1181,13 @@ fn read_collection_as_json_rows(
     if pond_storage::definition::format_of(kernel, collection)
         == pond_storage::definition::Format::Engine
     {
-        let blob = pond_storage::engine_path::read_pnd2(kernel, collection)?;
+        let blob = match wanted {
+            Some(cols) => {
+                let refs: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+                pond_storage::engine_path::read_pnd2_projected(kernel, collection, &refs)?
+            }
+            None => pond_storage::engine_path::read_pnd2(kernel, collection)?,
+        };
         let cols = pnd2_decode(&blob).map_err(|e| format!("Failed to decode PND2: {}", e))?;
         return Ok(decode_cols_to_rows(&cols, key_fields));
     }
