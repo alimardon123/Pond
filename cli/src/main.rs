@@ -347,21 +347,68 @@ fn main() {
                     cmd_branch(&storage, &collection, &branch_name);
                 }
                 Commands::Checkout { collection, branch_name, new } => {
+                    if pond_storage::definition::format_of(storage.kernel(), &collection)
+                        == pond_storage::definition::Format::Engine
+                    {
+                        // A branch here *is* a collection, so there is nothing
+                        // to switch to — you address it by name. Saying
+                        // "branch does not exist" about one `pond branches`
+                        // just listed was the misleading answer.
+                        eprintln!(
+                            "'{}' is engine-backed, where a branch is an independent \
+                             collection rather than a ref inside one.",
+                            collection
+                        );
+                        eprintln!("There is nothing to switch to: address '{}' by name.", branch_name);
+                        eprintln!("  pond read-rows {}", branch_name);
+                        eprintln!("  pond merge {} {}   # fold it back in", collection, branch_name);
+                        std::process::exit(1);
+                    }
                     cmd_checkout(&storage, &collection, &branch_name, new);
                 }
                 Commands::Merge { collection, source_branch, into, message } => {
+                    if pond_storage::definition::format_of(storage.kernel(), &collection)
+                        == pond_storage::definition::Format::Engine
+                    {
+                        match pond_storage::engine_path::merge(
+                            storage.kernel(),
+                            &collection,
+                            &source_branch,
+                            pond_kernel::crdt::writer_id_from_env(),
+                        ) {
+                            Ok(()) => println!(
+                                "merged '{}' into '{}'\n\
+                                 '{}' is unchanged; merging again would change nothing",
+                                source_branch, collection, source_branch
+                            ),
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                        return;
+                    }
                     cmd_merge(&storage, &collection, &source_branch, into, message);
                 }
                 Commands::Branches { collection } => {
                     cmd_branches(&storage, &collection);
                 }
                 Commands::History { collection, limit } => {
+                    if engine_has_no_commit_chain(&storage, &collection, "history") {
+                        return;
+                    }
                     cmd_history(&storage, &collection, limit);
                 }
                 Commands::Undo { collection, steps } => {
+                    if engine_has_no_commit_chain(&storage, &collection, "undo") {
+                        return;
+                    }
                     cmd_undo(&storage, &collection, steps);
                 }
                 Commands::Revert { collection, commit_hash } => {
+                    if engine_has_no_commit_chain(&storage, &collection, "revert") {
+                        return;
+                    }
                     cmd_revert(&storage, &collection, &commit_hash);
                 }
                 Commands::Ls => { cmd_ls(&storage); }
@@ -803,6 +850,29 @@ fn cmd_merge(storage: &UnifiedStorage, collection: &str, source_branch: &str,
         Ok(hash) => println!("Merge commit {} ('{}' → '{}')", &hash[..12], source_branch, target),
         Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     }
+}
+
+/// Engine collections publish heads, not a chain of commits.
+///
+/// Reporting "(no commits)" or "no commits to undo" for one is not wrong so
+/// much as misleading: it suggests an empty history where there is no commit
+/// chain at all, and sends the reader looking for the commits rather than for
+/// the model. Returns true when it has handled the command.
+fn engine_has_no_commit_chain(storage: &UnifiedStorage, collection: &str, what: &str) -> bool {
+    if pond_storage::definition::format_of(storage.kernel(), collection)
+        != pond_storage::definition::Format::Engine
+    {
+        return false;
+    }
+    eprintln!(
+        "'{}' is engine-backed: it publishes heads, not a chain of commits, so \
+         there is no {} to show.",
+        collection, what
+    );
+    eprintln!("What it does have:");
+    eprintln!("  pond branches {}   # collections branched from this one", collection);
+    eprintln!("  pond branch {} <name>   # an O(1) copy you can diverge freely", collection);
+    true
 }
 
 fn cmd_branches(storage: &UnifiedStorage, collection: &str) {

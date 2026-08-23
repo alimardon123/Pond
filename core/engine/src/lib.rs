@@ -976,6 +976,17 @@ impl<S: ObjectStore> Reader<S> {
         decode_pairs(self.store.inner(), raw, collection)
     }
 
+    /// The root produced by merging `source`'s tree into `target`'s.
+    ///
+    /// Neither collection is modified — this computes the result and leaves
+    /// publishing it to the caller, so a merge is staged and published like any
+    /// other write and is atomic for the same reason.
+    pub fn merge_roots(&mut self, target: &str, source: &str) -> String {
+        let a = self.tree_for(target);
+        let b = self.tree_for(source);
+        a.merge(&self.store, &b, resolve_records).root
+    }
+
     /// Root hash of the merged view — the identity of what this reader sees.
     /// Two readers that have seen the same heads produce the same hash.
     pub fn root_of(&mut self, collection: &str) -> String {

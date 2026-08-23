@@ -1550,3 +1550,133 @@ fn a_branch_records_its_source_and_still_diverges_freely() {
         Some("feature")
     );
 }
+
+/// Merging one engine collection into another, and the properties that make
+/// it safe to do more than once.
+#[test]
+fn merging_a_branch_back_is_idempotent_and_leaves_the_source_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = pond_kernel::PondKernel::new_local(dir.path()).unwrap();
+
+    let ids = |c: &str| -> Vec<i64> {
+        match engine_path::read_rows(&k, c)
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n == "id")
+        {
+            Some((_, TypedColumn::Int64(mut v))) => {
+                v.sort();
+                v
+            }
+            _ => Vec::new(),
+        }
+    };
+
+    engine_path::create(&k, "trunk").unwrap();
+    engine_path::write_rows(&k, "trunk", &[("id", TypedColumn::Int64(vec![1, 2]))], 1).unwrap();
+    engine_path::branch(&k, "trunk", "feature", 1).unwrap();
+
+    // Each side gains a row the other has never seen.
+    engine_path::write_rows(&k, "feature", &[("id", TypedColumn::Int64(vec![3]))], 2).unwrap();
+    engine_path::write_rows(&k, "trunk", &[("id", TypedColumn::Int64(vec![4]))], 1).unwrap();
+    assert_eq!(ids("trunk"), vec![1, 2, 4]);
+    assert_eq!(ids("feature"), vec![1, 2, 3]);
+
+    engine_path::merge(&k, "trunk", "feature", 1).unwrap();
+    assert_eq!(ids("trunk"), vec![1, 2, 3, 4], "the union, by key");
+    assert_eq!(
+        ids("feature"),
+        vec![1, 2, 3],
+        "a merge *into* trunk must leave the source exactly as it was"
+    );
+
+    // Idempotent — which is what makes it safe to retry after a failure.
+    engine_path::merge(&k, "trunk", "feature", 1).unwrap();
+    assert_eq!(ids("trunk"), vec![1, 2, 3, 4]);
+
+    // And the other direction converges on the same set, because merge is a
+    // semilattice join rather than an ordered replay.
+    engine_path::merge(&k, "feature", "trunk", 2).unwrap();
+    assert_eq!(ids("feature"), vec![1, 2, 3, 4]);
+    assert_eq!(ids("trunk"), vec![1, 2, 3, 4]);
+}
+
+/// A merge refuses the cases where it would look like work and do none.
+#[test]
+fn merge_refuses_what_it_cannot_meaningfully_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = pond_kernel::PondKernel::new_local(dir.path()).unwrap();
+
+    engine_path::create(&k, "a").unwrap();
+    engine_path::write_rows(&k, "a", &[("id", TypedColumn::Int64(vec![1]))], 1).unwrap();
+
+    let err = engine_path::merge(&k, "a", "a", 1).unwrap_err();
+    assert!(err.contains("itself"), "self-merge should say so: {}", err);
+
+    let err = engine_path::merge(&k, "a", "nonexistent", 1).unwrap_err();
+    assert!(
+        err.contains("nothing to merge") || err.contains("not engine-backed"),
+        "merging from a collection that does not exist should say so: {}",
+        err
+    );
+
+    // Merging into an empty collection is a copy; it should point at the
+    // operation that means "copy" rather than silently performing one.
+    engine_path::create(&k, "empty").unwrap();
+    let err = engine_path::merge(&k, "empty", "a", 1).unwrap_err();
+    assert!(err.contains("branch"), "should suggest branch: {}", err);
+}
+
+/// Per-field merge survives a collection merge, which is the property that
+/// makes it a join rather than a last-writer-wins overwrite.
+#[test]
+fn merging_collections_keeps_per_field_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = pond_kernel::PondKernel::new_local(dir.path()).unwrap();
+
+    engine_path::create(&k, "trunk").unwrap();
+    engine_path::write_rows(
+        &k,
+        "trunk",
+        &[
+            ("_rowid", TypedColumn::String(vec!["r1".into()])),
+            ("left", TypedColumn::String(vec!["from-trunk".into()])),
+        ],
+        1,
+    )
+    .unwrap();
+    engine_path::branch(&k, "trunk", "feature", 1).unwrap();
+
+    // The branch sets a *different* field on the same row.
+    engine_path::write_rows(
+        &k,
+        "feature",
+        &[
+            ("_rowid", TypedColumn::String(vec!["r1".into()])),
+            ("right", TypedColumn::String(vec!["from-branch".into()])),
+        ],
+        2,
+    )
+    .unwrap();
+
+    engine_path::merge(&k, "trunk", "feature", 1).unwrap();
+
+    let cols = engine_path::read_rows(&k, "trunk").unwrap();
+    let field = |name: &str| -> Option<String> {
+        cols.iter().find(|(n, _)| n == name).and_then(|(_, c)| match c {
+            TypedColumn::String(v) => v.first().cloned(),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        field("left").as_deref(),
+        Some("from-trunk"),
+        "the field only trunk set must survive the merge"
+    );
+    assert_eq!(
+        field("right").as_deref(),
+        Some("from-branch"),
+        "and so must the field only the branch set — a whole-record overwrite \
+         would have dropped one of them"
+    );
+}

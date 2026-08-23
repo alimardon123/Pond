@@ -147,6 +147,70 @@ fn has_legacy_data(kernel: &PondKernel, collection: &str) -> bool {
             .is_some()
 }
 
+/// Merge one engine collection into another.
+///
+/// # Why this is the cheap operation and a commit chain would not be
+///
+/// Merging two collections is merging two trees, and that is the operation
+/// this whole design is built on: a semilattice join over content-addressed
+/// nodes, so it touches only the subtrees that differ and shares everything
+/// else by hash. Two collections that were branched from a common root and
+/// then diverged in one leaf merge by rewriting that leaf's path and nothing
+/// else.
+///
+/// It is also why merging needs no conflict resolution to *complete*. Merge is
+/// commutative, associative and idempotent, and disagreements about a single
+/// record are settled per field by version rather than by asking. Merging the
+/// same source twice changes nothing the second time, which is what makes this
+/// safe to retry after a failure.
+///
+/// The source is left exactly as it was — this is a merge *into* `target`, not
+/// a join producing a third thing.
+pub fn merge(kernel: &PondKernel, target: &str, source: &str, writer_id: u64) -> Result<()> {
+    let def = definition::load(kernel, target);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", target));
+    }
+    if definition::load(kernel, source).format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", source));
+    }
+    if target == source {
+        return Err(format!(
+            "'{}' cannot be merged into itself; merge is idempotent, so this \
+             would be a no-op that looks like work",
+            target
+        ));
+    }
+
+    let merged = {
+        let mut reader =
+            Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
+                .map_err(|e| format!("failed to open reader: {}", e))?;
+        let known = reader.collections();
+        if !known.iter().any(|c| c == source) {
+            return Err(format!("collection '{}' has nothing to merge", source));
+        }
+        if !known.iter().any(|c| c == target) {
+            // Merging into an empty target is a copy, and saying so is more
+            // useful than silently producing one.
+            return Err(format!(
+                "collection '{}' holds nothing yet; use `pond branch {} {}` to \
+                 make a copy instead",
+                target, source, target
+            ));
+        }
+        reader.merge_roots(target, source)
+    };
+
+    let mut engine = open_engine(kernel, &def, writer_id)?;
+    engine
+        .branch_from_root(target, merged)
+        .map_err(|e| format!("failed to stage merge: {}", e))?;
+    engine
+        .publish()
+        .map_err(|e| format!("failed to publish merge: {}", e))
+}
+
 /// Write typed columns to an engine-backed collection and publish them.
 ///
 /// The write is staged and then published as a single object write, so a

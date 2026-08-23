@@ -357,8 +357,24 @@ yet:
   their source, and branches of branches chain. Provenance confers no
   behaviour: a branch diverges, is written and is deleted exactly like any
   other collection.
-- **Show history.** The engine publishes heads rather than a commit chain, so
-  `pond history` reports "(no commits)". Honest, but the feature is missing
-  rather than inapplicable: the head chain could carry it.
+- **Merge.** Implemented for engine collections. Merging two collections is
+  merging two trees, which is the operation the whole design is built on: a
+  semilattice join over content-addressed nodes, touching only the subtrees
+  that differ. Because merge is commutative, associative and idempotent, it
+  needs no conflict resolution to complete and is safe to retry — the tests
+  merge twice, merge in both directions, and check that a row edited on both
+  sides keeps both fields rather than losing one to a whole-record overwrite.
 
-Both are gaps rather than defects, and both undersell the architecture.
+- **Show history, checkout, undo, revert.** These do not exist under the engine
+  model, and what they used to say about it was misleading rather than merely
+  unhelpful. `pond history` reported "(no commits)", which sends the reader
+  looking for commits instead of for the model; `pond checkout trunk feature`
+  reported that a branch did not exist that `pond branches` had just listed.
+  Each now says what the model does have and points at it. Being told the
+  operation does not apply is a worse answer than having it, and a much better
+  one than being told something false.
+
+The remaining gap is real: engine collections have no history surface at all.
+Superseded head sequences exist until compaction sweeps them, so the
+information is there to expose — it is just not a commit chain, and pretending
+otherwise is what produced the misleading messages in the first place.
