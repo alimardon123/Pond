@@ -308,7 +308,11 @@ fn main() {
                             &branch_name,
                             pond_kernel::crdt::stable_writer_id(),
                         ) {
-                            Ok(()) => println!("{}\t<- {}", branch_name, collection),
+                            Ok(()) => println!(
+                                "created collection '{}' branched from '{}'\n\
+                                 it shares storage until one of them diverges",
+                                branch_name, collection
+                            ),
                             Err(e) => {
                                 eprintln!("Error: {}", e);
                                 std::process::exit(1);
@@ -779,6 +783,31 @@ fn cmd_merge(storage: &UnifiedStorage, collection: &str, source_branch: &str,
 
 fn cmd_branches(storage: &UnifiedStorage, collection: &str) {
     let kernel = storage.kernel();
+
+    // An engine collection does not hold branches inside itself — branching
+    // copies a root into a *new* collection, which is what makes it O(1). So
+    // the branches of one are the collections that record it as their source.
+    // Without this the two commands contradicted each other: `pond branch`
+    // reported success and `pond branches` reported none, each describing a
+    // different model.
+    if pond_storage::definition::format_of(kernel, collection)
+        == pond_storage::definition::Format::Engine
+    {
+        println!("* {}", collection);
+        let mut found = 0usize;
+        for name in collection_names(storage) {
+            let def = pond_storage::definition::load(kernel, &name);
+            if def.branched_from.as_deref() == Some(collection) {
+                println!("  {}\t<- {}", name, collection);
+                found += 1;
+            }
+        }
+        if found == 0 {
+            println!("(no branches — `pond branch {} <name>` makes one)", collection);
+        }
+        return;
+    }
+
     let branches = branch::list_branches(kernel, collection);
     let active = storage.get_active_branch(collection);
     if branches.is_empty() {
@@ -836,11 +865,11 @@ fn cmd_revert(storage: &UnifiedStorage, collection: &str, commit_hash: &str) {
     }
 }
 
-fn cmd_ls(storage: &UnifiedStorage) {
-    let kernel = storage.kernel();
-    let names = kernel.list_names();
-    if names.is_empty() { println!("(no collections)"); return; }
-    let mut collections: Vec<String> = names.iter()
+/// Every collection in the pond, by name.
+fn collection_names(storage: &UnifiedStorage) -> Vec<String> {
+    let names = storage.kernel().list_names();
+    let mut collections: Vec<String> = names
+        .iter()
         .filter(|n| n.starts_with("collections/"))
         .filter_map(|n| n.strip_prefix("collections/").and_then(|s| s.split('/').next()))
         .map(|s| s.to_string())
@@ -850,7 +879,15 @@ fn cmd_ls(storage: &UnifiedStorage) {
             collections.push(n.clone());
         }
     }
-    collections.sort(); collections.dedup();
+    collections.sort();
+    collections.dedup();
+    collections
+}
+
+fn cmd_ls(storage: &UnifiedStorage) {
+    let kernel = storage.kernel();
+    let collections = collection_names(storage);
+    if collections.is_empty() { println!("(no collections)"); return; }
     for name in collections {
         let active = storage.get_active_branch(&name);
         let hash = kernel.resolve(&pond_storage::branch_ref(&name, &active))

@@ -42,63 +42,67 @@ use pond_kernel::ObjectStore;
 
 /// Values at or above this size are spilled to their own object.
 ///
-/// The trade is one extra GET on read against `target` times the value size on
-/// every write to the same leaf. Below the threshold the write cost is small
-/// enough that paying a round trip to avoid it is a bad deal; above it, the
-/// write cost dominates by orders of magnitude.
+/// The trade is one extra request on read against `target` times the value
+/// size on every write to the same leaf, plus — the term that turns out to
+/// dominate — the whole leaf crossing the network on every *cold* read.
 ///
-/// Measured rather than reasoned. `cargo run --release -p pond_bench --bin
-/// spillpoint` runs 40 writes and N reads over 2000 rows and prices both
-/// terms — 30 ms per request plus 20 ms per MiB, with a PUT at 12.5x a GET.
-/// It runs each mix twice: `cold` opens a fresh reader per read, `warm` reuses
-/// one across the batch, which is what a long-lived process does.
+/// Measured, not reasoned. `cargo run --release -p pond_bench --bin spillpoint`
+/// runs 40 writes and N reads over 2000 rows and prices requests at 30 ms each
+/// (a PUT weighted at 12.5x a GET) plus 20 ms per MiB in either direction. Each
+/// row spills at its own size, so each answers "should a value of this size
+/// spill?" independently of what this constant currently is:
 ///
-/// | value | reads/write | cold | warm |
-/// |---|---|---|---|
-/// | 4 KiB  | 1   | 1.1x faster | 1.1x faster |
-/// | 4 KiB  | 10  | 1.2x slower | 1.4x slower |
-/// | 4 KiB  | 100 | 1.3x slower | **6.4x slower** |
-/// | 16 KiB | 1   | 2.3x faster | 2.3x faster |
-/// | 16 KiB | 10  | 1.2x faster | 1.8x faster |
-/// | 16 KiB | 100 | 1.2x slower | 1.1x faster |
-/// | 64 KiB | 1   | 6.4x faster | 6.4x faster |
-/// | 64 KiB | 10  | 2.3x faster | 4.2x faster |
+/// | value | reads/write | bytes inline -> spill | cold | warm |
+/// |---|---|---|---|---|
+/// | 1 KiB  | 1   | 180 MiB -> 14 MiB       | 1.2x slower | 1.2x slower |
+/// | 1 KiB  | 10  | 440 MiB -> 35 MiB       | 1.2x slower | 1.3x slower |
+/// | 1 KiB  | 100 | 4.1 GiB -> 328 MiB      | 1.1x slower | 2.7x slower |
+/// | 4 KiB  | 1   | 690 MiB -> 15 MiB       | 1.0x slower | 1.0x slower |
+/// | 4 KiB  | 10  | 1.7 GiB -> 37 MiB       | 1.0x faster | 1.2x slower |
+/// | 4 KiB  | 100 | 15.4 GiB -> 340 MiB     | 1.3x faster | 2.3x slower |
+/// | 16 KiB | 1   | 3.5 GiB -> 16 MiB       | **1.6x faster** | **1.6x faster** |
+/// | 16 KiB | 10  | 7.3 GiB -> 42 MiB       | **1.9x faster** | **2.4x faster** |
+/// | 16 KiB | 100 | 61.6 GiB -> 387 MiB     | **3.0x faster** | **6.9x faster** |
+/// | 64 KiB | 1   | 13.8 GiB -> 22 MiB      | **4.1x faster** | **4.1x faster** |
+/// | 64 KiB | 10  | 29.2 GiB -> 65 MiB      | **5.4x faster** | **6.9x faster** |
+/// | 64 KiB | 100 | 245.8 GiB -> 579 MiB    | **9.5x faster** | **24.6x faster** |
 ///
-/// (Values below 4 KiB never spill at either setting, so those rows are a
-/// control and read 1.0x by construction. The 64 KiB / 100 cell was not
-/// measured — the run exceeded its time budget — but the trend across that
-/// row does not turn.)
+/// 16 KiB is the smallest size that wins in *every* cell. 4 KiB is genuinely
+/// mixed — cold favours spilling, warm opposes it — and 1 KiB loses
+/// everywhere. A default should not make some workloads much worse to make
+/// others slightly better, so the threshold goes where the sign stops
+/// changing.
 ///
-/// # Warming makes spilling *worse*, not better
+/// # Why the crossover is exactly here
 ///
-/// An earlier version of this comment argued that a warm cache would erase the
-/// read penalty, because spilled blobs are content-addressed like index nodes
-/// and can never go stale. The measurement says the opposite, and the reason is
-/// locality rather than staleness:
+/// It is not a coincidence, and it is not a property of spilling. Leaves hold
+/// between [`min_entries_for`](pond_index::min_entries_for)`(target)` and
+/// `target` entries — 512 to 2048 at the default. The cache admits an entry to
+/// memory only if it is at most `CacheConfig::max_memory_entry_bytes`, 8 MiB by
+/// default. So the smallest leaf a value of size `v` can produce is `512 * v`,
+/// and it stops being cacheable when `512 * v > 8 MiB` — that is, when `v`
+/// exceeds **16384 bytes**, this constant, exactly.
 ///
-///   - An inline leaf read brings up to `target` values into the cache for one
-///     request. Reading any of its neighbours afterwards is free.
-///   - A spilled value is its own blob. Warming it helps only a re-read of that
-///     same key; a read of the next key is a fresh miss.
+/// Below it, inline leaves fit in cache, a warm reader serves neighbours of
+/// anything it has read for free, and spilling gives that up for a per-value
+/// miss — which is why warming makes spilling *worse* at 1 and 4 KiB. Above
+/// it, no leaf fits, warming cannot help an inline read at all, and spilled
+/// values are small enough to cache on their own — which is why warming makes
+/// spilling *better* at 16 and 64 KiB, up to 24.6x.
 ///
-/// So warming amortises inline reads across a whole leaf and amortises spilled
-/// reads across nothing. At 4 KiB and 100 distinct reads per write, that gap is
-/// 6.4x — the worst cell in the table, and precisely the read-heavy case a
-/// storage engine is most often asked to serve.
+/// An earlier version of this comment claimed a warm cache erases the spill
+/// read penalty. It does the opposite below the threshold and much better than
+/// that above it; the single-sentence version was wrong in both directions.
 ///
-/// # Why 16 KiB
-///
-/// At 4 KiB, spilling wins one mix out of three; at 16 KiB it wins all three.
-/// The previous value of 4096 was chosen from a table that had only the cold
-/// column, where 4 KiB looks merely mediocre instead of actively bad. 16384 is
-/// the smallest measured size at which spilling is not a loss at any read/write
-/// mix, which is the property worth having in a default: a threshold should not
-/// make some workloads much worse in exchange for making others slightly
-/// better.
+/// The relationship is asserted by `the_threshold_is_where_leaves_stop_fitting_the_cache`,
+/// because it spans three crates: change the chunk target, the minimum leaf
+/// fraction, or the cache's entry cap, and this number stops being the right
+/// one.
 ///
 /// This is a default, not a law. The value is recorded per collection in its
-/// definition, so existing collections keep whatever they were created with and
-/// a workload that knows its own mix can set its own.
+/// definition, so existing collections keep whatever they were created with,
+/// and a lens that knows its own access pattern sets its own — the streaming
+/// lens does.
 pub const SPILL_THRESHOLD: usize = 16384;
 
 /// Marks an index value as a pointer rather than a record.
@@ -221,6 +225,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = LocalFSObjectStore::new(dir.path()).unwrap();
         (dir, s)
+    }
+
+    /// The threshold is not a tuned magic number — it is where a leaf stops
+    /// fitting in the cache, and that is what the measurement found.
+    ///
+    /// The smallest leaf a value of size `v` can produce is
+    /// `min_entries_for(target) * v`. The cache admits an entry to memory only
+    /// up to `max_memory_entry_bytes`. Where those cross is where warming stops
+    /// being able to help an inline read at all — and the spillpoint table
+    /// changes sign at exactly that value.
+    ///
+    /// This spans three crates, so nothing else would notice it breaking. If
+    /// the chunk target, the minimum-leaf fraction, or the cache's entry cap
+    /// moves, this fails and the comment above `SPILL_THRESHOLD` needs redoing
+    /// along with the constant.
+    #[test]
+    fn the_threshold_is_where_leaves_stop_fitting_the_cache() {
+        let min_entries = pond_index::min_entries_for(pond_index::DEFAULT_TARGET_ENTRIES);
+        let cap = pond_cache::CacheConfig::default().max_memory_entry_bytes as usize;
+
+        assert_eq!(
+            cap / min_entries,
+            SPILL_THRESHOLD,
+            "the smallest cacheable leaf holds {} entries and the cache admits \
+             {} bytes, so leaves stop fitting above {} bytes per value — but \
+             SPILL_THRESHOLD is {}. One of the three has moved; re-run \
+             `pond_bench --bin spillpoint` and redo the table in the doc \
+             comment rather than adjusting this assertion.",
+            min_entries,
+            cap,
+            cap / min_entries,
+            SPILL_THRESHOLD
+        );
+
+        // And the direction that matters: a value at the threshold produces a
+        // smallest-leaf that is exactly at the cap, so anything larger cannot
+        // be cached inline.
+        assert!(
+            min_entries * SPILL_THRESHOLD <= cap,
+            "a value at the threshold must still be able to sit in a cacheable leaf"
+        );
+        assert!(
+            min_entries * (SPILL_THRESHOLD + 1) > cap,
+            "and anything above it must not"
+        );
     }
 
     #[test]

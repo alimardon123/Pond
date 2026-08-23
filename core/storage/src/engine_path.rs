@@ -286,6 +286,13 @@ pub fn branch(kernel: &PondKernel, from: &str, to: &str, writer_id: u64) -> Resu
     // The branch inherits the source's schema and its pinned configuration.
     // A branch that chunked differently from its source would share no nodes
     // with it, which would defeat the entire point of branching.
+    //
+    // It also records where it came from. A branch here is an independent
+    // collection sharing structure, not a ref inside one, so without this the
+    // relationship exists only in the user's memory — and `pond branches` had
+    // no way to tell a branch from any other collection.
+    let mut def = def;
+    def.branched_from = Some(from.to_string());
     definition::store(kernel, to, &def)?;
 
     let mut engine = open_engine(kernel, &def, writer_id)?;

@@ -326,10 +326,19 @@ An engine-backed collection can be created, written, read, queried with SQL,
 and reached from Python and the lenses that speak columns. What it cannot do
 yet:
 
-- **Branch.** `Engine::branch` exists and is tested, but `pond branch` still
-  goes through the legacy commit chain and reports "no commits to branch from".
-  Branching is one of the more compelling things this design makes cheap — an
-  O(1) pointer copy — and it is currently unreachable from the CLI.
+- **Branch.** Reachable now, and coherent. `pond branch` dispatches to the
+  engine, and the failure it used to have was worse than being unreachable: it
+  reported success while `pond branches` reported none. Both were telling the
+  truth about a different model. A branch here is an independent collection
+  that shares structure with its source — that is what makes it an O(1)
+  pointer copy — so there is nothing inside the source to list.
+
+  The definition now records `branched_from` (format v4; v3 reads back as "not
+  branched", and a hand-built v3 definition is decoded in the tests rather than
+  assumed to work). `pond branches` lists the collections that name this one as
+  their source, and branches of branches chain. Provenance confers no
+  behaviour: a branch diverges, is written and is deleted exactly like any
+  other collection.
 - **Show history.** The engine publishes heads rather than a commit chain, so
   `pond history` reports "(no commits)". Honest, but the feature is missing
   rather than inapplicable: the head chain could carry it.

@@ -1492,3 +1492,61 @@ fn a_survivors_value_reads_through_pnd2_after_someone_else_is_erased() {
         cols.iter().map(|c| c.name.to_string_lossy().into_owned()).collect::<Vec<_>>()
     );
 }
+
+/// Branching records where the branch came from.
+///
+/// A branch in the engine model is an independent collection that shares
+/// structure with its source, not a ref inside one — which is what makes it an
+/// O(1) pointer copy. The cost of that model is that nothing in the store knew
+/// the relationship, so `pond branch` reported success while `pond branches`
+/// reported none, each describing a different model truthfully.
+#[test]
+fn a_branch_records_its_source_and_still_diverges_freely() {
+    let dir = tempfile::tempdir().unwrap();
+    let k = pond_kernel::PondKernel::new_local(dir.path()).unwrap();
+
+    engine_path::create(&k, "trunk").unwrap();
+    engine_path::write_rows(
+        &k,
+        "trunk",
+        &[("id", TypedColumn::Int64(vec![1, 2]))],
+        1,
+    )
+    .unwrap();
+
+    engine_path::branch(&k, "trunk", "feature", 1).unwrap();
+
+    let trunk = pond_storage::definition::load(&k, "trunk");
+    let feature = pond_storage::definition::load(&k, "feature");
+    assert_eq!(trunk.branched_from, None, "a trunk was not branched from anything");
+    assert_eq!(feature.branched_from.as_deref(), Some("trunk"));
+
+    // The branch inherits the pinned configuration — a branch that chunked
+    // differently would share no nodes with its source.
+    assert_eq!(feature.chunk_salt, trunk.chunk_salt);
+    assert_eq!(feature.chunk_target, trunk.chunk_target);
+    assert_eq!(feature.spill_threshold, trunk.spill_threshold);
+
+    // Provenance confers no behaviour: the branch diverges like any other
+    // collection, and the source is untouched.
+    engine_path::write_rows(&k, "feature", &[("id", TypedColumn::Int64(vec![3]))], 1).unwrap();
+    let count = |c: &str| match engine_path::read_rows(&k, c)
+        .unwrap()
+        .into_iter()
+        .find(|(n, _)| n == "id")
+    {
+        Some((_, TypedColumn::Int64(v))) => v.len(),
+        _ => 0,
+    };
+    assert_eq!(count("feature"), 3);
+    assert_eq!(count("trunk"), 2, "writing to a branch must not touch its source");
+
+    // And a branch of a branch chains rather than flattening.
+    engine_path::branch(&k, "feature", "nested", 1).unwrap();
+    assert_eq!(
+        pond_storage::definition::load(&k, "nested")
+            .branched_from
+            .as_deref(),
+        Some("feature")
+    );
+}

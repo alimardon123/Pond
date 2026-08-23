@@ -113,6 +113,18 @@ pub struct Definition {
     /// `None` means the collection holds no subject data and nothing is
     /// sealed, which is what every collection written before this existed is.
     pub subject_column: Option<String>,
+    /// The collection this one was branched from, if it was.
+    ///
+    /// A branch in the engine model is an independent collection that shares
+    /// structure with its source rather than a ref inside one, which is what
+    /// makes branching an O(1) pointer copy. The consequence is that nothing
+    /// in the store records the relationship — so `pond branch` could report
+    /// success while `pond branches` reported none, each telling the truth
+    /// about a different model. This is the missing half.
+    ///
+    /// Provenance only. It confers no behaviour: a branch diverges freely and
+    /// is deleted, read and written exactly like any other collection.
+    pub branched_from: Option<String>,
     /// `(column name, PND2 value type)`, in declaration order.
     pub columns: Vec<(String, u8)>,
 }
@@ -123,7 +135,8 @@ const MAGIC: &[u8; 4] = b"PDEF";
 const VERSION_V1: u8 = 1;
 /// v2 predates per-subject encryption; it reads back with no subject column.
 const VERSION_V2: u8 = 2;
-const VERSION: u8 = 3;
+const VERSION_V3: u8 = 3;
+const VERSION: u8 = 4;
 
 /// What v1 definitions were built with, and what they must keep using.
 pub const LEGACY_CHUNK_TARGET: u32 = 512;
@@ -136,6 +149,7 @@ impl Definition {
             chunk_salt: random_salt(),
             spill_threshold: pond_engine::SPILL_THRESHOLD as u32,
             subject_column: None,
+            branched_from: None,
             columns: Vec::new(),
         }
     }
@@ -147,6 +161,7 @@ impl Definition {
             chunk_salt: random_salt(),
             spill_threshold: pond_engine::SPILL_THRESHOLD as u32,
             subject_column: None,
+            branched_from: None,
             columns,
         }
     }
@@ -203,6 +218,9 @@ impl Definition {
         let subject = self.subject_column.as_deref().unwrap_or("");
         out.extend_from_slice(&(subject.len() as u32).to_le_bytes());
         out.extend_from_slice(subject.as_bytes());
+        let parent = self.branched_from.as_deref().unwrap_or("");
+        out.extend_from_slice(&(parent.len() as u32).to_le_bytes());
+        out.extend_from_slice(parent.as_bytes());
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for (name, vtype) in &self.columns {
             let bytes = name.as_bytes();
@@ -229,7 +247,7 @@ impl Definition {
             // a threshold of "never spill" is what keeps those collections
             // producing the bytes they already contain.
             VERSION_V1 => (LEGACY_CHUNK_TARGET, 0u64, u32::MAX, 6usize),
-            VERSION_V2 | VERSION => {
+            VERSION_V2 | VERSION_V3 | VERSION => {
                 if bytes.len() < 26 {
                     return None;
                 }
@@ -245,7 +263,7 @@ impl Definition {
 
         // v2 has no subject column, so it reads back as a collection holding
         // no subject data — which is what it is.
-        let subject_column = if bytes[4] == VERSION {
+        let subject_column = if bytes[4] >= VERSION_V3 {
             if pos + 4 > bytes.len() {
                 return None;
             }
@@ -264,6 +282,28 @@ impl Definition {
         } else {
             None
         };
+        // v3 has no provenance field, so it reads back as a collection that
+        // was not branched — which is all that can honestly be said about it.
+        let branched_from = if bytes[4] >= VERSION {
+            if pos + 4 > bytes.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+            pos += 4;
+            if pos + len > bytes.len() {
+                return None;
+            }
+            let name = String::from_utf8(bytes[pos..pos + len].to_vec()).ok()?;
+            pos += len;
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
+        } else {
+            None
+        };
+
         if chunk_target == 0 {
             return None;
         }
@@ -296,6 +336,7 @@ impl Definition {
             chunk_salt,
             spill_threshold,
             subject_column,
+            branched_from,
             columns,
         })
     }
@@ -326,6 +367,7 @@ fn legacy() -> Definition {
         chunk_salt: 0,
         spill_threshold: u32::MAX,
         subject_column: None,
+        branched_from: None,
         columns: Vec::new(),
     }
 }
@@ -432,5 +474,81 @@ mod tests {
             .encode();
         bytes.truncate(bytes.len() - 1);
         assert!(Definition::decode(&bytes).is_none());
+    }
+
+    /// A v3 definition — written before provenance existed — must still
+    /// decode, with everything else intact.
+    ///
+    /// Built by hand rather than by an old encoder, because no old encoder
+    /// remains in the tree and a compatibility claim nothing exercises is a
+    /// guess. This is the byte layout v3 actually produced.
+    #[test]
+    fn a_v3_definition_still_decodes() {
+        let mut bytes = Vec::from(MAGIC);
+        bytes.push(VERSION_V3);
+        bytes.push(Format::Engine.tag());
+        bytes.extend_from_slice(&2048u32.to_le_bytes());
+        bytes.extend_from_slice(&0xDEADBEEFu64.to_le_bytes());
+        bytes.extend_from_slice(&4096u32.to_le_bytes());
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(b"owner");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(b"id");
+        bytes.push(1u8);
+
+        let d = Definition::decode(&bytes).expect("a v3 definition must decode");
+        assert_eq!(d.format, Format::Engine);
+        assert_eq!(d.chunk_target, 2048);
+        assert_eq!(d.chunk_salt, 0xDEADBEEF);
+        assert_eq!(d.spill_threshold, 4096, "v3 keeps the threshold it was made with");
+        assert_eq!(d.subject_column.as_deref(), Some("owner"));
+        assert_eq!(d.columns, vec![("id".to_string(), 1u8)]);
+        assert_eq!(
+            d.branched_from, None,
+            "v3 recorded no provenance, so the honest reading is 'not branched'"
+        );
+    }
+
+    #[test]
+    fn provenance_survives_a_round_trip() {
+        let mut d = Definition::new(Format::Engine);
+        d.branched_from = Some("trunk".to_string());
+        let back = Definition::decode(&d.encode()).unwrap();
+        assert_eq!(back.branched_from.as_deref(), Some("trunk"));
+        assert_eq!(back, d, "nothing else may shift when provenance is set");
+    }
+
+    #[test]
+    fn a_collection_that_was_not_branched_says_so() {
+        let d = Definition::new(Format::Engine);
+        assert_eq!(d.branched_from, None);
+        let back = Definition::decode(&d.encode()).unwrap();
+        assert_eq!(back.branched_from, None);
+    }
+
+    /// An empty name must not read back as `Some("")`, which would make a
+    /// collection claim to be branched from one with no name.
+    #[test]
+    fn an_empty_provenance_name_is_none_not_empty() {
+        let mut d = Definition::new(Format::Engine);
+        d.branched_from = Some(String::new());
+        assert_eq!(Definition::decode(&d.encode()).unwrap().branched_from, None);
+    }
+
+    /// Truncation anywhere in the new field must be refused, not guessed at.
+    #[test]
+    fn a_truncated_provenance_field_is_rejected() {
+        let mut d = Definition::new(Format::Engine);
+        d.branched_from = Some("trunk".to_string());
+        let full = d.encode();
+        for cut in 1..=8 {
+            let bytes = &full[..full.len().saturating_sub(cut)];
+            assert!(
+                Definition::decode(bytes).is_none(),
+                "a definition truncated by {} bytes must be refused",
+                cut
+            );
+        }
     }
 }

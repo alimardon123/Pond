@@ -45,7 +45,7 @@ pub mod node;
 pub mod store;
 pub mod tree;
 
-pub use chunk::{fingerprint, ChunkConfig, DEFAULT_TARGET_ENTRIES};
+pub use chunk::{fingerprint, min_entries_for, ChunkConfig, DEFAULT_TARGET_ENTRIES};
 pub use key::{bool_, bytes, f64_, int, str_, Key, KeyPart};
 pub use node::{ChildRef, Node};
 pub use store::{hash_bytes, CachingStore, Hash, MemStore, NodeStore};
