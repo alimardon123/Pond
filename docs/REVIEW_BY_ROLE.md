@@ -134,6 +134,24 @@ order and states the costs — no cross-subject dedup, deterministic encryption
 confirms guesses for key holders, and erasure is exactly as complete as the
 destruction of the last copy of the key.
 
+**Credentials cannot be committed again, and the ones already committed still
+need rotating.** Live R2 credentials were pasted into a review document and
+committed. The working tree was redacted afterwards, which does nothing: `git
+log -S` still finds the value in two commits. Redaction is not revocation, and
+the only real remedy — rotating the token — belongs to whoever owns it.
+
+What was missing was anything preventing a repeat. `scripts/secretscan.sh` now
+runs first in the gate and in CI, over tracked files only, since those are the
+ones that become permanent. It is deliberately narrow: a scanner with false
+positives gets switched off, and a scanner that is off catches nothing. The
+first version fired on `AKIAIOSFODNN7EXAMPLE` — the key printed in AWS's own
+documentation — and on an S3 pagination continuation token, so the
+placeholder filter now applies to every rule and a bare `token` is not treated
+as a credential name.
+
+It was verified against the real leaked value, planted in a markdown file in
+the same shape it originally leaked, and it caught it.
+
 ---
 
 ## Data architect

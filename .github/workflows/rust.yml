@@ -21,6 +21,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Before anything expensive, and before anything can merge. A credential
+      # that reaches a commit cannot be removed by a later commit — the value
+      # stays in history — so the only useful place to catch one is here.
+      - name: Secret scan
+        run: ./scripts/secretscan.sh
+
       # The CLI integration tests spawn the `pond` binary and resolve it via
       # CARGO_BIN_EXE_pond, which cargo sets for integration tests — no
       # separate release build is needed.

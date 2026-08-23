@@ -178,41 +178,29 @@ pub fn current_time_ms() -> u64 {
 // Shard naming
 // ---------------------------------------------------------------------------
 
-/// Generate a shard-name suffix that is unique across writers.
+/// This machine's writer identity, stable across restarts.
 ///
-/// Shards are the coordination-free write path: every writer PUTs its own
-/// shard object and readers union them. That is only safe as long as two
-/// writers never choose the same shard name — a collision means one writer's
-/// ref silently overwrites the other's, and those rows are lost with no error.
+/// # The precondition, and how easy it is to break
 ///
-/// This used to be a bare nanosecond timestamp in two separate copies (the SQL
-/// executor and the Python binding), which does not carry that guarantee: two
-/// processes writing in the same nanosecond produced the same name, and coarse
-/// platform clocks make that far likelier than nanosecond resolution suggests.
+/// A writer id must belong to **one live process**. That is not a style rule:
+/// it is what makes a head safe to publish with a plain PUT and no
+/// compare-and-swap, because nobody else writes under that writer's prefix.
 ///
-/// The suffix is `{timestamp}-{writer_id}-{counter}`:
-///   - timestamp keeps names roughly time-ordered, so listings stay readable
-///     and compaction can work oldest-first;
-///   - writer_id is drawn once per process from the OS CSPRNG, so no two
-///     writers share it;
-///   - counter disambiguates writes within one process, which can easily emit
-///     several shards inside a single clock tick.
-/// A writer id that is the same on every run for the same machine and user.
+/// This derives the id from hostname and username, which is stable — a writer
+/// that restarts recovers its own head — and which two processes on one
+/// machine therefore *share*. Two containers built from one image share it
+/// too. That is a misconfiguration, not an exotic one.
 ///
-/// Writer identity is not a nicety here — it is what bounds the store's
-/// metadata. Every distinct writer id becomes one head object, and every head
-/// object is read when a reader opens. A process that invented a fresh random
-/// id each run would leave a head behind on every write, so opening a reader
-/// would get steadily slower forever, for a collection that never grew.
+/// Violating it used to lose rows silently: both processes published at the
+/// same sequence, and a reader kept one head. It no longer does — readers keep
+/// every head at a writer's highest sequence, and a writer reopening folds in
+/// every head at its own prefix, so the collision heals on the next publish.
+/// It still costs an extra read and it is still worth avoiding.
 ///
-/// Derived from hostname and username rather than persisted, so there is no
-/// state file to lose or to disagree with. Two users on one machine are two
-/// writers, which is the right granularity: they are exactly the parties whose
-/// concurrent edits need to be told apart.
-///
-/// Falls back to a random id when neither is readable. That is the safe
-/// direction — a random id costs an extra head object, while a colliding id
-/// would let two writers overwrite each other's heads.
+/// Set `POND_WRITER_ID` (or `pond --writer`) to give a process its own
+/// identity. Use it whenever more than one process writes the same pond from
+/// one machine, or when hostname and username are not unique across the
+/// machines that do.
 pub fn stable_writer_id() -> u64 {
     let host = std::env::var("HOSTNAME")
         .ok()
@@ -234,6 +222,61 @@ pub fn stable_writer_id() -> u64 {
             let out = hasher.finalize();
             u64::from_be_bytes(out[..8].try_into().unwrap_or([0u8; 8]))
         }
+    }
+}
+
+/// The writer identity a process should use: `POND_WRITER_ID` if set,
+/// otherwise [`stable_writer_id`].
+///
+/// The value is a *name*, not a number — it is hashed, so "laptop" and "7" are
+/// both fine and neither is special. Hashing rather than parsing avoids the
+/// ambiguity of a name that happens to be numeric, and makes accidental
+/// collisions between hand-picked ids as unlikely as between derived ones: two
+/// people who both reach for `1` do not collide, whereas with parsing they
+/// would.
+pub fn writer_id_from_env() -> u64 {
+    if let Some(id) = EXPLICIT_WRITER_ID.get() {
+        return *id;
+    }
+    match std::env::var("POND_WRITER_ID") {
+        Ok(name) if !name.trim().is_empty() => writer_id_from_name(name.trim()),
+        _ => stable_writer_id(),
+    }
+}
+
+/// Set by an entry point that was given an identity on its command line.
+static EXPLICIT_WRITER_ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Name this process's writer identity, once, at startup.
+///
+/// Exists so a `--writer` flag and the `POND_WRITER_ID` variable resolve to
+/// the same id through the same function, rather than the flag being read in
+/// one place and the variable in another — which is how the two drift apart
+/// and one of them silently stops working.
+///
+/// Returns the id in force. Later calls do not override an earlier one: an
+/// identity that could change mid-process is worse than one that is wrong,
+/// because the writer would publish under two prefixes and supersede neither.
+pub fn set_writer_id(name: &str) -> u64 {
+    let id = writer_id_from_name(name);
+    let _ = EXPLICIT_WRITER_ID.set(id);
+    *EXPLICIT_WRITER_ID.get().unwrap_or(&id)
+}
+
+/// Derive a writer id from a name.
+pub fn writer_id_from_name(name: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pond-writer\x00");
+    hasher.update(name.as_bytes());
+    let out = hasher.finalize();
+    let id = u64::from_be_bytes(out[..8].try_into().unwrap_or([0u8; 8]));
+    // `u64::MAX` is reserved for compacted heads, so a name must never land on
+    // it. One in 2^64, and a silent collision there would make a writer's heads
+    // indistinguishable from a compaction's.
+    if id == u64::MAX {
+        id - 1
+    } else {
+        id
     }
 }
 
@@ -394,6 +437,43 @@ impl Default for HLC {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_writer_name_is_hashed_not_parsed() {
+        // "7" is a name like any other. Parsing it as an id would mean two
+        // people who both reach for a small number collide, while hashing
+        // makes hand-picked ids exactly as safe as derived ones.
+        assert_ne!(writer_id_from_name("7"), 7);
+        assert_eq!(writer_id_from_name("7"), writer_id_from_name("7"));
+        assert_ne!(writer_id_from_name("alice"), writer_id_from_name("bob"));
+    }
+
+    #[test]
+    fn a_name_never_collides_with_the_compaction_identity() {
+        // u64::MAX is reserved. A name landing there would make that writer's
+        // heads indistinguishable from a compaction's, which readers treat
+        // very differently.
+        assert_ne!(writer_id_from_name("compactor"), u64::MAX);
+        assert_ne!(writer_id_from_name(""), u64::MAX);
+    }
+
+    #[test]
+    fn distinct_names_give_distinct_prefixes() {
+        let names = ["alice", "bob", "carol", "laptop-1", "laptop-2", "0", "1"];
+        let mut ids: Vec<u64> = names.iter().map(|n| writer_id_from_name(n)).collect();
+        let before = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "names must not share an identity");
+    }
+
+    /// Without an explicit identity, the id is derived and therefore stable —
+    /// which is what lets a writer recover its own head after a restart, and
+    /// also what makes two processes on one machine share one.
+    #[test]
+    fn the_derived_identity_is_stable_across_calls() {
+        assert_eq!(stable_writer_id(), stable_writer_id());
+    }
+
     use super::*;
     use std::thread;
     use std::time::Duration;

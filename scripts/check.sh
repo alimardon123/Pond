@@ -38,6 +38,12 @@ if [ "$avail_kb" -lt 10485760 ]; then
   echo "         try: rm -rf target/debug/incremental"
 fi
 
+echo "== secrets =="
+# First, and cheap. A credential that reaches a commit is not fixable by a
+# later commit — the value stays in history and `git log -S` finds it — so the
+# only useful place to catch one is before it lands.
+./scripts/secretscan.sh || fail "secrets"
+
 echo "== build =="
 cargo build --workspace 2>&1 | grep -E "^error" -A 5 && fail "build"
 

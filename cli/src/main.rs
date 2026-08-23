@@ -47,6 +47,20 @@ struct Cli {
     #[arg(long, env = "POND_ROOT", global = true)]
     root: Option<String>,
 
+    /// This process's writer identity — any name, e.g. `--writer laptop`.
+    ///
+    /// A writer id must belong to one live process: that is what lets a
+    /// commit be a single PUT with no compare-and-swap, because nobody else
+    /// writes under that writer's keys. Without this the id is derived from
+    /// hostname and username, so two processes on one machine — or two
+    /// containers from one image — share one.
+    ///
+    /// Set it whenever more than one process writes the same pond from a
+    /// machine, or when hostname and username are not unique across the
+    /// machines that do.
+    #[arg(long, env = "POND_WRITER_ID", global = true)]
+    writer: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -199,6 +213,16 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Before anything touches storage, so every later `writer_id_from_env()`
+    // sees the same answer whether the identity arrived on the command line or
+    // in the environment.
+    if let Some(name) = cli.writer.as_deref() {
+        if !name.trim().is_empty() {
+            pond_kernel::crdt::set_writer_id(name.trim());
+        }
+    }
+
     match cli.command {
         Commands::Init { location } => {
             cmd_init(&location, cli.root.as_deref());
@@ -306,7 +330,7 @@ fn main() {
                             storage.kernel(),
                             &collection,
                             &branch_name,
-                            pond_kernel::crdt::stable_writer_id(),
+                            pond_kernel::crdt::writer_id_from_env(),
                         ) {
                             Ok(()) => println!(
                                 "created collection '{}' branched from '{}'\n\
@@ -1096,7 +1120,7 @@ fn cmd_write_rows(
     if pond_storage::definition::format_of(storage.kernel(), collection)
         == pond_storage::definition::Format::Engine
     {
-        let writer_id = pond_kernel::crdt::stable_writer_id();
+        let writer_id = pond_kernel::crdt::writer_id_from_env();
         let masks = json_null_masks(&parsed, &typed);
         match pond_storage::engine_path::write_rows_with_nulls(
             storage.kernel(),

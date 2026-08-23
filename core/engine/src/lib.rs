@@ -148,47 +148,61 @@ pub fn parse_head_key(path: &str) -> Option<(u64, u64, Option<&str>)> {
     Some((u64::from_str_radix(id, 16).ok()?, 0, None))
 }
 
-/// The latest head of each writer, from a listing.
+/// The live heads from a listing: for each writer, every head at its highest
+/// sequence.
 ///
-/// Later sequence wins. A tie — two objects for one writer at the same
-/// sequence, which only happens if two processes share a writer id — is broken
-/// by the content hash so that the choice is at least deterministic across
-/// readers, which keeps them converged even in a configuration that is already
-/// a mistake.
+/// Usually that is exactly one per writer, and superseded sequences are
+/// dropped without being read — which is what keeps the read path flat.
+///
+/// *Every* head at the highest sequence, not one of them, because a tie is not
+/// a duplicate. Two heads at the same sequence under one writer id are two
+/// processes that computed the same next sequence from the same view — which
+/// happens whenever two processes share an id, and `stable_writer_id` hashes
+/// hostname and username, so two containers from one image share one. Keeping
+/// a single head there silently discarded one process's writes. They are
+/// concurrent publishes and merging both is correct: merge is a commutative,
+/// idempotent join.
+///
+/// Compacted heads are never collapsed against each other at all — see the
+/// grouping below.
 pub fn latest_heads(paths: &[String]) -> Vec<(u64, u64, Option<String>, String)> {
     // Grouped by (writer, is-current-layout) rather than by writer alone. A
     // pre-sequence head is not a *stale* version of a current one — the writer
     // that wrote it may never run again, and nothing else holds its rows — so
     // it must never be superseded by one. It stays in its own group and is
     // always read, until a compaction pass folds it in and retires it.
-    let mut best: BTreeMap<(u64, bool, u64), (u64, Option<String>, String)> = BTreeMap::new();
+    // Compacted heads are never collapsed against each other, because they are
+    // not versions of one another. A writer's heads are cumulative — sequence
+    // N+1 contains everything N did — so keeping the newest is right. Two
+    // compaction passes that overlapped are not: each merged the heads *it*
+    // listed, so a later one can be missing a writer an earlier one absorbed
+    // and already deleted. Giving each its own group keeps them all.
+    let group_of = |id: u64, seq: u64, has_hash: bool| {
+        (id, has_hash, if id == COMPACTOR_WRITER_ID { seq } else { 0 })
+    };
+
+    // Highest sequence seen per group.
+    let mut top: BTreeMap<(u64, bool, u64), u64> = BTreeMap::new();
     for path in paths {
-        let Some((id, seq, hash)) = parse_head_key(path) else {
-            continue;
-        };
-        // Compacted heads are never collapsed against each other, because they
-        // are not versions of one another. A writer's heads are cumulative —
-        // sequence N+1 contains everything N did — so keeping the newest is
-        // right. Two compaction passes that overlapped are not: each merged the
-        // heads *it* listed, so a later one can be missing a writer an earlier
-        // one absorbed and already deleted. Taking only the newest loses that
-        // writer's rows outright.
-        //
-        // Merging them all instead is correct and costs nothing: merge is
-        // idempotent, and a pass retires every compacted head it read, so they
-        // do not accumulate.
-        let group = (id, hash.is_some(), if id == COMPACTOR_WRITER_ID { seq } else { 0 });
-        let candidate = (seq, hash.map(|h| h.to_string()), path.clone());
-        match best.get(&group) {
-            Some(current) if (current.0, &current.1) >= (candidate.0, &candidate.1) => {}
-            _ => {
-                best.insert(group, candidate);
-            }
+        if let Some((id, seq, hash)) = parse_head_key(path) {
+            let g = group_of(id, seq, hash.is_some());
+            let e = top.entry(g).or_insert(seq);
+            *e = (*e).max(seq);
         }
     }
-    best.into_iter()
-        .map(|((id, _, _), (seq, hash, path))| (id, seq, hash, path))
-        .collect()
+
+    let mut out: Vec<(u64, u64, Option<String>, String)> = paths
+        .iter()
+        .filter_map(|path| {
+            let (id, seq, hash) = parse_head_key(path)?;
+            (top.get(&group_of(id, seq, hash.is_some())) == Some(&seq))
+                .then(|| (id, seq, hash.map(|h| h.to_string()), path.clone()))
+        })
+        .collect();
+    // Deterministic order, so two readers build the same view from the same
+    // listing however the backend happened to return it.
+    out.sort();
+    out
 }
 
 const HEADS_PREFIX: &str = "heads/";
@@ -288,37 +302,80 @@ impl<S: ObjectStore> Engine<S> {
         // that names its own content hash, which is what lets compaction skip
         // and then delete absorbed heads without a conditional write.
         let own = store.inner().list_paths(&head_prefix(writer_id))?;
-        let latest = latest_heads(&own)
+        let mut mine: Vec<(u64, String)> = latest_heads(&own)
             .into_iter()
-            .find(|(id, _, _, _)| *id == writer_id)
-            // Nothing under this writer's prefix may mean it has never
-            // published — or that it last published before head keys had a
-            // sequence, when its head was one flat object. Falling back keeps
-            // an upgraded pond's writer cumulative: without it the writer
-            // starts empty, publishes a head at a higher sequence, and its old
-            // head is superseded by one that does not contain its rows.
-            //
-            // One extra GET, and only on a writer's first publish under the
-            // new layout. A miss is cheap and a silent loss is not.
-            .or_else(|| {
-                let legacy = format!("heads/writer-{:016x}", writer_id);
-                store
-                    .inner()
-                    .get_object(&legacy)
-                    .map(|_| (writer_id, 0, None, legacy))
-            });
+            .filter(|(id, _, _, _)| *id == writer_id)
+            .map(|(_, seq, _, path)| (seq, path))
+            .collect();
 
-        let (head, seq, published_at) = match latest {
-            Some((_, seq, _, path)) => {
-                let bytes = store
-                    .inner()
-                    .get_object(&path)
-                    .ok_or_else(|| EngineError::Corrupt("head vanished between list and read".into()))?;
-                let head = pond_record::decode_head(&bytes)
-                    .ok_or_else(|| EngineError::Corrupt("head".into()))?;
-                (head, seq, Some(path))
+        // Nothing under this writer's prefix may mean it has never published —
+        // or that it last published before head keys had a sequence, when its
+        // head was one flat object. Falling back keeps an upgraded pond's
+        // writer cumulative: without it the writer starts empty, publishes a
+        // head at a higher sequence, and its old head is superseded by one that
+        // does not contain its rows.
+        //
+        // One extra GET, and only on a writer's first publish under the new
+        // layout. A miss is cheap and a silent loss is not.
+        if mine.is_empty() {
+            let legacy = format!("heads/writer-{:016x}", writer_id);
+            if store.inner().get_object(&legacy).is_some() {
+                mine.push((0, legacy));
             }
-            None => (Head::new(writer_id), 0, None),
+        }
+
+        let seq = mine.iter().map(|(s, _)| *s).max().unwrap_or(0);
+        let published_at = mine.first().map(|(_, p)| p.clone());
+
+        // Usually one head. More than one means two processes are publishing
+        // under the same writer id — which the design says must not happen, and
+        // which `stable_writer_id` makes easy to do by accident since it hashes
+        // only hostname and username. Recovering just one of them would be the
+        // worst response: this writer's next publish takes a higher sequence
+        // and supersedes a head whose rows it never contained.
+        //
+        // So every head at the prefix is folded in, and the collision heals
+        // itself on the next publish instead of quietly costing rows. It is
+        // still a misconfiguration — see `stable_writer_id` — but it is a
+        // recoverable one.
+        let paths: Vec<String> = mine.iter().map(|(_, p)| p.clone()).collect();
+        let bodies = store.inner().get_object_batch(&paths);
+        let recovered: Vec<Head> = bodies
+            .into_iter()
+            .flatten()
+            .filter_map(|b| pond_record::decode_head(&b))
+            .collect();
+        if !paths.is_empty() && recovered.is_empty() {
+            return Err(EngineError::Corrupt("head".into()));
+        }
+
+        let head = match recovered.len() {
+            0 => Head::new(writer_id),
+            1 => recovered.into_iter().next().unwrap(),
+            _ => {
+                let mut merged = Head::new(writer_id);
+                let mut by_collection: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for h in &recovered {
+                    for (c, root) in &h.collections {
+                        by_collection.entry(c.clone()).or_default().push(root.clone());
+                    }
+                    for (w, hash) in &h.observed {
+                        merged.observe(*w, hash);
+                    }
+                }
+                for (collection, roots) in by_collection {
+                    let mut iter = roots.into_iter().map(|root| Tree {
+                        root,
+                        config: config.chunk,
+                    });
+                    let mut acc = iter.next().expect("a collection has at least one root");
+                    for other in iter {
+                        acc = acc.merge(&store, &other, resolve_records);
+                    }
+                    merged.set_root(&collection, &acc.root);
+                }
+                merged
+            }
         };
 
         Ok(Self {

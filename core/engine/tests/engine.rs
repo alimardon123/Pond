@@ -812,3 +812,65 @@ fn concurrent_writers_to_one_key_converge_by_version() {
         "the contested field must resolve to the newest version"
     );
 }
+
+/// Two processes that share a writer id must not lose each other's rows.
+///
+/// `stable_writer_id` hashes hostname and username, so two processes on one
+/// machine — or two containers built from the same image, which is the common
+/// case rather than the exotic one — compute the *same* id. The design says a
+/// writer owns its key and nobody else writes it, and that is the whole reason
+/// no compare-and-swap is needed; sharing an id violates the precondition.
+///
+/// The question is what happens when it is violated anyway. Silently dropping
+/// one process's writes is the answer nobody can debug.
+#[test]
+fn two_processes_sharing_a_writer_id_do_not_lose_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Both "processes" open before either publishes — they each see an empty
+    // prefix and pick the same next sequence.
+    let mut a = Engine::open(store(&root), 7).unwrap();
+    let mut b = Engine::open(store(&root), 7).unwrap();
+
+    a.write_records(
+        "t",
+        vec![(user(1), Record::new().with_field("from", Value::Int(1), v(100, 7)))],
+    )
+    .unwrap();
+    b.write_records(
+        "t",
+        vec![(user(2), Record::new().with_field("from", Value::Int(2), v(101, 7)))],
+    )
+    .unwrap();
+    a.publish().unwrap();
+    b.publish().unwrap();
+
+    let mut r = Reader::open(store(&root)).unwrap();
+    assert_eq!(
+        r.scan("t").unwrap().len(),
+        2,
+        "both processes' rows must be readable"
+    );
+
+    // And the next process to open under that id must carry both forward, or
+    // its publish supersedes a head whose rows it does not contain.
+    let mut c = Engine::open(store(&root), 7).unwrap();
+    c.write_records(
+        "t",
+        vec![(user(3), Record::new().with_field("from", Value::Int(3), v(102, 7)))],
+    )
+    .unwrap();
+    c.publish().unwrap();
+
+    let mut r = Reader::open(store(&root)).unwrap();
+    let rows = r.scan("t").unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "a writer reopening under a shared id must recover every head at its \
+         own prefix, not just one of them — otherwise its next publish \
+         supersedes rows it never had. Got {:?}",
+        rows.iter().map(|(k, _)| k).collect::<Vec<_>>()
+    );
+}
