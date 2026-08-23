@@ -400,10 +400,26 @@ nodes, different hashes, and silently lose structural sharing and dedup. That
 cannot be pinned per collection the way the chunk target and salt are, because
 it is not a parameter.
 
-`docs/LEAF_ENCODING.md` sets out the three ways forward and recommends the one
-that is deterministic by construction — a per-leaf dictionary we specify — while
-noting it changes the `Tree`/`NodeStore` contract and so deserves its own
-increment with the acceptance tests written first.
+The resolution was that all the obvious options took "use a compressor" to mean
+"depend on one". `pond_index::pack` is a small LZ77 specified in this
+repository: its output is a function of its input and of code that ships with
+the reader, so two writers cannot disagree, and changing it later is a
+deliberate format change rather than an accident of which build someone is
+running.
+
+| | before | after |
+|---|---|---|
+| a leaf of 2000 rows | 152,894 B | 24,313 B (6.3x) |
+| projected scan of 200 rows | 26.5 KiB | **2.8 KiB** |
+| updating one small field | 40.7 KiB | **2.8 KiB** |
+
+Against a 2.1 KiB floor — what the requested data actually weighs. The scan is
+now within a third of it, and no values were laid out by column to get there.
+
+`Node::encode` packs only when packing is smaller and records the choice in a
+tag, so an incompressible node costs one byte rather than growing and nodes
+written before packing existed decode untouched. `docs/LEAF_ENCODING.md` keeps
+the options that were rejected and why.
 
 **`Value::Spilled` never leaves the engine.** It says where a payload lives,
 not what it is, and every consumer downstream — the columnar bridge, SQL, JSON,

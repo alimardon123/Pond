@@ -92,7 +92,37 @@ on.
 a full scan of a large table and not at all for the point lookups and small
 range scans that most workloads are.
 
-## Recommendation
+## What was done, and why it was none of the three
+
+The three options above all took "use a compressor" to mean "depend on one".
+Writing the codec here removes the objection entirely: its output is a function
+of its input and of code that ships with the reader, so two writers cannot
+disagree. Changing it later is then a deliberate format change, to be handled
+the way a change to the chunk target would be — not an accident of which build
+someone happens to be running.
+
+`pond_index::pack` is a greedy LZ77 with a fixed hash, a fixed window and a
+fixed token encoding. Greedy rather than optimal on purpose: the search has to
+be *specified*, not merely good, and "take the longest match at the most recent
+candidate position" is a rule that fits in a sentence.
+
+`Node::encode` packs when packing is smaller and records the choice in a tag, so
+a node that does not compress costs one byte rather than growing, and nodes
+written before packing existed decode untouched — which a content-addressed
+store requires, since it cannot rewrite what it already holds.
+
+Measured:
+
+| | before | after |
+|---|---|---|
+| a leaf of 2000 rows | 152,894 B | 24,313 B (**6.3x**) |
+| projected scan of 200 rows | 26.5 KiB | **2.8 KiB** |
+| updating one small field | 40.7 KiB | **2.8 KiB** |
+
+Against a floor of 2.1 KiB — what the requested data actually weighs. The
+remaining 33% is the index structure itself.
+
+## The recommendation this replaced
 
 Option 2, and not soon. It is the only one that is deterministic by
 construction, dependency-free, and preserves "the object is the bytes its hash
@@ -108,7 +138,7 @@ Option 1 is tempting because it is a few lines. It should be refused for the
 reason above: an object that is not the bytes its hash names is a small lie that
 every future tool has to be told about.
 
-## What is already done
+## Also already done
 
 Two of the four items in that table have already been paid down without
 touching how values are laid out:

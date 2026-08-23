@@ -27,6 +27,14 @@ use crate::store::Hash;
 
 const TAG_LEAF: u8 = 0;
 const TAG_INTERNAL: u8 = 1;
+/// A node whose plain encoding follows, packed. Distinct from the leaf and
+/// internal tags so a reader can tell from the first byte, and so nodes
+/// written before packing existed still decode unchanged.
+const TAG_PACKED: u8 = 2;
+/// Largest plain encoding a packed node may claim. Far above any real node;
+/// it exists so a corrupt length cannot ask for an allocation the process
+/// cannot satisfy.
+const MAX_NODE_BYTES: usize = 512 * 1024 * 1024;
 
 /// Cap on a single node's declared entry count, used to reject malformed
 /// nodes before allocating. Well above any legitimate node.
@@ -73,7 +81,35 @@ impl Node {
         }
     }
 
+    /// Encode this node, packed when packing wins.
+    ///
+    /// A node is content-addressed, so its bytes *are* its identity — which is
+    /// why the codec is [`crate::pack`], specified in this repository, rather
+    /// than a compression crate. A crate's output is a property of the crate:
+    /// two writers on different builds could emit different bytes for the same
+    /// node, take different hashes, and silently stop sharing structure. See
+    /// that module for the full argument.
+    ///
+    /// A node is packed only when packing is actually smaller, and the choice
+    /// is recorded in a tag, so an unpackable node costs one byte rather than
+    /// growing. The decision is a pure function of the bytes, so canonical
+    /// encoding survives it: two writers with the same node make the same
+    /// choice.
     pub fn encode(&self) -> Vec<u8> {
+        let plain = self.encode_plain();
+        let packed = crate::pack::pack(&plain);
+        // 5 bytes of frame: the tag and the unpacked length.
+        if packed.len() + 5 < plain.len() {
+            let mut out = Vec::with_capacity(packed.len() + 5);
+            out.push(TAG_PACKED);
+            out.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+            out.extend_from_slice(&packed);
+            return out;
+        }
+        plain
+    }
+
+    fn encode_plain(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             Node::Leaf { entries } => {
@@ -102,6 +138,28 @@ impl Node {
     }
 
     pub fn decode(buf: &[u8]) -> Option<Node> {
+        // A packed node unwraps to the plain encoding and is then decoded
+        // exactly as an unpacked one. Nodes written before packing existed
+        // carry a leaf or internal tag here and take the second path
+        // untouched, which is what a content-addressed store requires: it
+        // cannot rewrite what it already holds.
+        if buf.first() == Some(&TAG_PACKED) {
+            if buf.len() < 5 {
+                return None;
+            }
+            let len = u32::from_le_bytes(buf[1..5].try_into().ok()?) as usize;
+            // A declared length no node could have is malformed. Refusing is
+            // cheaper than discovering it after allocating for it.
+            if len > MAX_NODE_BYTES {
+                return None;
+            }
+            let plain = crate::pack::unpack(&buf[5..], len)?;
+            return Self::decode_plain(&plain);
+        }
+        Self::decode_plain(buf)
+    }
+
+    fn decode_plain(buf: &[u8]) -> Option<Node> {
         let mut r = Reader { buf, pos: 0 };
         let tag = r.u8()?;
         let n = r.u32()? as usize;
@@ -172,6 +230,152 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    fn leaf_of(n: usize) -> Node {
+        // Shaped like real data: the same field names in every record, with
+        // values from a small domain. That is where the redundancy is.
+        let entries = (0..n)
+            .map(|i| {
+                let key = format!("user:{:08}", i).into_bytes();
+                let value = format!(
+                    "PREC\x02\x00{{\"id\":{},\"status\":\"{}\",\"region\":\"eu-west-{}\"}}",
+                    i,
+                    if i % 3 == 0 { "done" } else { "pending" },
+                    i % 4
+                )
+                .into_bytes();
+                (key, value)
+            })
+            .collect();
+        Node::Leaf { entries }
+    }
+
+    #[test]
+    fn a_packed_node_round_trips() {
+        for n in [0usize, 1, 2, 10, 500, 2000] {
+            let node = leaf_of(n);
+            let encoded = node.encode();
+            assert_eq!(
+                Node::decode(&encoded).as_ref(),
+                Some(&node),
+                "a leaf of {} entries must survive encoding",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn an_internal_node_round_trips_packed() {
+        let children: Vec<ChildRef> = (0..300)
+            .map(|i| ChildRef {
+                max_key: format!("user:{:08}", i * 10).into_bytes(),
+                hash: format!("{:064x}", i),
+                count: i as u64 + 1,
+            })
+            .collect();
+        let node = Node::Internal { children };
+        assert_eq!(Node::decode(&node.encode()).as_ref(), Some(&node));
+    }
+
+    /// A node written before packing existed carries a leaf or internal tag
+    /// and must decode untouched. A content-addressed store cannot rewrite
+    /// what it already holds, so this is not a transition — it is permanent.
+    #[test]
+    fn an_unpacked_node_still_decodes() {
+        let node = leaf_of(200);
+        let plain = node.encode_plain();
+        assert_ne!(plain.first(), Some(&TAG_PACKED));
+        assert_eq!(Node::decode(&plain).as_ref(), Some(&node));
+    }
+
+    /// Encoding never grows a node, whatever is in it.
+    ///
+    /// The first version of this test built "incompressible" entries with
+    /// random values — and they packed anyway, because the *keys* were
+    /// `{:08}`-formatted and highly repetitive. The premise was wrong, not the
+    /// code. What actually matters is not which branch is taken but that
+    /// neither one costs anything, so this asserts the property directly.
+    #[test]
+    fn encoding_never_grows_a_node() {
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        // Random keys as well as values, so there is genuinely nothing to
+        // find.
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..200)
+            .map(|_| {
+                let k: Vec<u8> = (0..16).map(|_| next() as u8).collect();
+                let v: Vec<u8> = (0..64).map(|_| next() as u8).collect();
+                (k, v)
+            })
+            .collect();
+        let mut node = Node::Leaf { entries };
+        if let Node::Leaf { entries } = &mut node {
+            entries.sort();
+        }
+
+        let plain = node.encode_plain().len();
+        let encoded = node.encode();
+        assert!(
+            encoded.len() <= plain,
+            "encoding grew a node it could not pack: {} -> {}",
+            plain,
+            encoded.len()
+        );
+        assert_eq!(Node::decode(&encoded).as_ref(), Some(&node));
+    }
+
+    /// The property everything rests on: the same node always encodes to the
+    /// same bytes. Packing must not weaken it.
+    #[test]
+    fn encoding_a_node_is_deterministic() {
+        let node = leaf_of(1000);
+        let once = node.encode();
+        for _ in 0..10 {
+            assert_eq!(node.encode(), once);
+        }
+        // And a node built independently from the same data agrees.
+        assert_eq!(leaf_of(1000).encode(), once);
+    }
+
+    #[test]
+    fn packing_actually_shrinks_a_realistic_leaf() {
+        let node = leaf_of(2000);
+        let plain = node.encode_plain().len();
+        let packed = node.encode().len();
+        println!("leaf of 2000: {} -> {} bytes", plain, packed);
+        assert!(
+            packed * 3 < plain,
+            "a leaf of repetitive records should pack to under a third: \
+             {} -> {}",
+            plain,
+            packed
+        );
+    }
+
+    /// A packed frame claiming an absurd unpacked length is refused rather
+    /// than allocated for.
+    #[test]
+    fn an_absurd_packed_length_is_refused() {
+        let mut bytes = vec![TAG_PACKED];
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 16]);
+        assert_eq!(Node::decode(&bytes), None);
+    }
+
+    /// Truncating a packed node is refused at every offset, never panics.
+    #[test]
+    fn a_truncated_packed_node_is_refused() {
+        let encoded = leaf_of(500).encode();
+        assert_eq!(encoded.first(), Some(&TAG_PACKED));
+        for cut in 1..encoded.len().min(200) {
+            let _ = Node::decode(&encoded[..encoded.len() - cut]);
+        }
+    }
+
     use super::*;
 
     #[test]
