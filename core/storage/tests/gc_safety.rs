@@ -240,7 +240,10 @@ fn gc_does_not_delete_a_compacted_head() {
         "compaction alone must not change the rows"
     );
 
-    let report = GarbageCollector::new(&s).collect(None, false);
+    // `collect` only reports; `vacuum` is what deletes. Asserting after
+    // `collect` proves nothing, which is how this test passed for a while
+    // without exercising the thing it names.
+    let report = GarbageCollector::new(&s).vacuum(None, 0, false);
     println!("gc over a compacted pond: {:?}", report);
 
     assert_eq!(
@@ -254,4 +257,69 @@ fn gc_does_not_delete_a_compacted_head() {
     // through the storage path.
     let mut r = pond_engine::Reader::open(s.store_handle()).unwrap();
     assert_eq!(r.scan("users").unwrap().len(), 4);
+}
+
+/// A retained history survives garbage collection.
+///
+/// History entries name roots the collection *used* to have. Those nodes are
+/// unreachable from any live head — that is precisely what makes them look
+/// like garbage — so a live-set walk that only follows heads deletes exactly
+/// the trees the history exists to preserve, and time travel resolves to
+/// missing blobs.
+///
+/// Same shape as the bug at the top of this file: a new way of reaching data
+/// that the walk did not know about. It gets its own test rather than an
+/// assumption that walking heads covers it.
+#[test]
+fn gc_does_not_delete_the_trees_a_history_points_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = kernel(dir.path());
+
+    engine_path::create(&s, "users").unwrap();
+    // Several publishes, so there are superseded heads for compaction to turn
+    // into history.
+    for i in 1..=5i64 {
+        engine_path::write_rows(
+            &s,
+            "users",
+            &[
+                ("id", TypedColumn::Int64(vec![i])),
+                ("name", TypedColumn::String(vec![format!("n{}", i)])),
+            ],
+            1,
+        )
+        .unwrap();
+    }
+
+    pond_engine::compact_heads(
+        s.store_handle(),
+        pond_cache::CacheConfig::default(),
+        pond_storage::definition::load(&s, "users").engine_config(),
+    )
+    .unwrap();
+
+    let log = pond_engine::history::load(&*s.store_handle(), "users");
+    assert!(
+        log.entries.len() >= 2,
+        "compaction should have recorded the superseded roots, got {:?}",
+        log.entries.len()
+    );
+    let historic: Vec<String> = log.roots().map(|r| r.to_string()).collect();
+
+    let report = GarbageCollector::new(&s).vacuum(None, 0, false);
+    println!("gc with a retained history: {:?}", report);
+
+    // Current data is intact.
+    assert_eq!(rows_of(&s, "users"), vec![1, 2, 3, 4, 5]);
+
+    // And every root the history names is still readable, which is the whole
+    // point of retaining it.
+    let store = s.store_handle();
+    for root in &historic {
+        assert!(
+            store.get_blob(root).is_ok(),
+            "gc deleted a node the history points at: {}",
+            root
+        );
+    }
 }

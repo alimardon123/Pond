@@ -19,7 +19,8 @@
 // ```text
 // <collection>/index/<hash>      immutable index nodes
 // <collection>/segments/<hash>   immutable data
-// heads/<writer_id>              {collection -> root} — the publish unit
+// heads/writer/<id>/<seq>.<hash> {collection -> root} — the publish unit
+// history/<collection>           the roots it has been published at
 // ```
 //
 // # Why the head spans collections
@@ -46,6 +47,8 @@ use pond_record::{decode_record, encode_record, merge_records, Head, Record};
 
 pub mod spill;
 pub mod store;
+pub mod history;
+pub use history::{Entry as HistoryEntry, History};
 pub use spill::SPILL_THRESHOLD;
 pub use store::EngineStore;
 
@@ -84,23 +87,22 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 /// A writer only ever writes under its own prefix, which is what makes both
 /// publishing and deleting safe without a compare-and-swap.
 pub fn head_prefix(writer_id: u64) -> String {
-    // A directory rather than a string prefix, deliberately. `list_paths` is
-    // specified as a prefix listing, and S3 implements it that way, but the
-    // local backend lists a *directory* — so `heads/writer-00…01` matches on
-    // one backend and nothing on the other. A key layout that is hierarchical
-    // reads identically under both, which is the property this system needs
-    // everywhere and the reason it refuses primitives that only some backends
-    // have.
-    // `heads/writer/<id>/`, not `heads/writer-<id>/`. The old layout put a
-    // flat object at `heads/writer-<id>`; on a local filesystem that is a
-    // *file*, and a directory cannot share its path, so an upgraded pond would
-    // fail its first publish with EISDIR. Object stores have no directories
-    // and would not have shown it. A separate segment cannot collide with any
-    // old key, and `list_paths("heads/")` still walks both.
+    // `heads/writer/<id>/`, not `heads/writer-<id>/`. The old layout put a flat
+    // object at `heads/writer-<id>`; on a local filesystem that is a *file*,
+    // and a directory cannot share its path, so an upgraded pond failed its
+    // first publish with EISDIR. Object stores have no directories and would
+    // never have shown it. A separate path segment cannot collide with any old
+    // key, and `list_paths("heads/")` still walks both.
+    //
+    // It is a directory prefix rather than a string prefix for a second
+    // reason: `list_paths` is specified as a prefix listing and S3 implements
+    // one, while the local backend once listed a directory, so a partial name
+    // matched on one backend and nothing on the other. That divergence is
+    // fixed, but a hierarchical layout reads the same under either.
     format!("heads/writer/{:016x}/", writer_id)
 }
 
-/// Where one published head lives: `heads/writer-<id>.<seq>.<content hash>`.
+/// Where one published head lives: `heads/writer/<id>/<seq>.<content hash>`.
 ///
 /// # Why three parts
 ///
@@ -882,6 +884,48 @@ impl<S: ObjectStore> Reader<S> {
         self.head_paths.clone()
     }
 
+    /// Every (writer, sequence, collection, root) the store's heads name,
+    /// **including the superseded ones this reader did not fetch**.
+    ///
+    /// A publish deliberately leaves its predecessor in place — retiring it
+    /// would cost a round trip on the commit path to save readers nothing,
+    /// since a superseded key is listed and never fetched. So between
+    /// compactions the superseded heads are the record of every root the
+    /// collection has had.
+    ///
+    /// Reading them costs one batched request and is done in exactly one
+    /// place: the compaction pass that is about to delete them. Paying to read
+    /// what is being destroyed is the honest price of recording it, and it
+    /// stays off the read path entirely — an ordinary reader still fetches
+    /// only live heads.
+    pub fn all_published_roots(&self) -> Vec<(u64, u64, String, String)> {
+        let keys: Vec<(u64, u64, String)> = self
+            .all_head_paths
+            .iter()
+            .filter_map(|p| {
+                let (id, seq, _) = parse_head_key(p)?;
+                // A compacted head is a merge of others, not a state any
+                // writer ever published, so it is not history.
+                (id != COMPACTOR_WRITER_ID).then(|| (id, seq, p.clone()))
+            })
+            .collect();
+
+        let paths: Vec<String> = keys.iter().map(|(_, _, p)| p.clone()).collect();
+        let bodies = self.store.inner().get_object_batch(&paths);
+
+        let mut out = Vec::new();
+        for (bytes, (id, seq, _)) in bodies.into_iter().zip(&keys) {
+            let Some(bytes) = bytes else { continue };
+            let Some(head) = pond_record::decode_head(&bytes) else {
+                continue;
+            };
+            for (collection, root) in &head.collections {
+                out.push((*id, *seq, collection.clone(), root.clone()));
+            }
+        }
+        out
+    }
+
     /// Every head key the reader's listing returned, fetched or not.
     ///
     /// This is what compaction retires. It is a superset of [`head_paths`]:
@@ -974,6 +1018,39 @@ impl<S: ObjectStore> Reader<S> {
         let tree = self.tree_for(collection);
         let raw = tree.scan_range(&self.store, &start.encode(), &end.encode());
         decode_pairs(self.store.inner(), raw, collection)
+    }
+
+    /// Every record at a specific root, rather than at the merged current
+    /// state.
+    ///
+    /// This is what makes a retained history worth retaining: without it the
+    /// log is a list of hashes nobody can do anything with. A root names a
+    /// complete immutable tree, so reading one back is an ordinary scan that
+    /// starts somewhere else — no snapshot machinery, no undo log, no special
+    /// case in the write path. That is a property of content addressing rather
+    /// than a feature bolted onto it.
+    ///
+    /// The root must still exist. `pond gc` keeps the ones a history names;
+    /// one evicted by the history cap is gone, and this returns whatever the
+    /// store says rather than pretending otherwise.
+    pub fn scan_at(&self, root: &str, collection: &str) -> Result<Vec<(Key, Record)>> {
+        // A root that is not there must be an error, not an empty scan. The
+        // tree walk returns nothing for a missing node, which reads as "the
+        // collection was empty at that point" — a wrong answer that looks like
+        // a right one, and the failure mode this codebase has been bitten by
+        // more than once.
+        if !root.is_empty() && !self.store.inner().blob_exists(root) {
+            return Err(EngineError::Corrupt(format!(
+                "no such root '{}' — it was never published, or it has been \
+                 reclaimed since",
+                root
+            )));
+        }
+        let tree = Tree {
+            root: root.to_string(),
+            config: self.config.chunk,
+        };
+        decode_pairs(self.store.inner(), tree.scan(&self.store), collection)
     }
 
     /// The root produced by merging `source`'s tree into `target`'s.
@@ -1119,6 +1196,24 @@ pub fn compact_heads<S: ObjectStore>(
     // can be removed, and so no need for a conditional delete — which object
     // stores do not offer and a local filesystem does not either.
     //
+    // Record what is about to be destroyed. A superseded head is the only
+    // evidence a collection was ever at that root, and this pass is what
+    // removes it — so the history is written before the deletes, and a failure
+    // to write it stops the deletes rather than losing the record silently.
+    let mut by_collection: BTreeMap<String, Vec<history::Entry>> = BTreeMap::new();
+    for (writer_id, seq, collection, root) in reader.all_published_roots() {
+        by_collection.entry(collection).or_default().push(history::Entry {
+            seq,
+            writer_id,
+            root,
+        });
+    }
+    for (collection, entries) in by_collection {
+        let mut log = history::load(reader.store.inner(), &collection);
+        log.absorb(entries);
+        history::store_history(reader.store.inner(), &collection, &log)?;
+    }
+
     // Every key in the listing this pass took, not only the ones it read: the
     // rest are superseded heads of writers whose latest *was* read, and a
     // head is cumulative, so a later sequence contains everything an earlier

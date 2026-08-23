@@ -171,6 +171,14 @@ enum Commands {
     ///   pond read-rows users --format table
     ReadRows {
         collection: String,
+        /// Read the collection as it was at this root, from `pond history`.
+        ///
+        /// A root names a complete immutable tree, so reading one back is an
+        /// ordinary scan that starts somewhere else. Only roots a retained
+        /// history still names are guaranteed to exist — `pond gc` keeps
+        /// those and reclaims the rest.
+        #[arg(long)]
+        at: Option<String>,
         /// Simple WHERE filter: "col op val [AND col op val ...]"
         /// e.g. "age > 30", "city = 'NYC' AND age < 40"
         #[arg(long)]
@@ -394,7 +402,10 @@ fn main() {
                     cmd_branches(&storage, &collection);
                 }
                 Commands::History { collection, limit } => {
-                    if engine_has_no_commit_chain(&storage, &collection, "history") {
+                    if pond_storage::definition::format_of(storage.kernel(), &collection)
+                        == pond_storage::definition::Format::Engine
+                    {
+                        cmd_engine_history(&storage, &collection, limit);
                         return;
                     }
                     cmd_history(&storage, &collection, limit);
@@ -425,7 +436,11 @@ fn main() {
                 Commands::WriteRows { collection, json, file, message } => {
                     cmd_write_rows(&storage, &collection, json, file, message);
                 }
-                Commands::ReadRows { collection, r#where, columns, limit, format } => {
+                Commands::ReadRows { collection, at, r#where, columns, limit, format } => {
+                    if let Some(root) = at {
+                        cmd_read_rows_at(&storage, &collection, &root, &format);
+                        return;
+                    }
                     cmd_read_rows(&storage, &collection, r#where, columns, limit, &format);
                 }
                 Commands::Sql { query } => {
@@ -850,6 +865,88 @@ fn cmd_merge(storage: &UnifiedStorage, collection: &str, source_branch: &str,
         Ok(hash) => println!("Merge commit {} ('{}' → '{}')", &hash[..12], source_branch, target),
         Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
     }
+}
+
+/// Read a collection as it was at one root.
+fn cmd_read_rows_at(storage: &UnifiedStorage, collection: &str, root: &str, format: &str) {
+    let blob = match pond_storage::engine_path::read_pnd2_at(storage.kernel(), collection, root) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            eprintln!(
+                "the root must be one `pond history {}` still lists — older \
+                 states are reclaimed by `pond gc`",
+                collection
+            );
+            std::process::exit(1);
+        }
+    };
+    // The same decoder the current read uses, so a past state and a present
+    // one are presented identically rather than nearly so.
+    match pnd2_blob_to_json(&blob) {
+        Ok(rows) => print_rows(&rows, format),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Every root a collection has been published at, oldest first.
+///
+/// Not a commit chain — the engine has none, and inventing one is what made
+/// the old message misleading. These are the states writers actually
+/// published, recovered from two places: the superseded heads still in the
+/// store, which a publish deliberately leaves behind, and the retained log
+/// that compaction writes before it deletes them.
+fn cmd_engine_history(storage: &UnifiedStorage, collection: &str, limit: usize) {
+    let store = storage.kernel().store_handle();
+    let mut entries = pond_engine::history::load(&*store, collection).entries;
+
+    // Anything published since the last compaction is still sitting in the
+    // store as a superseded head and has not been written to the log yet.
+    match pond_engine::Reader::open(std::sync::Arc::clone(&store)) {
+        Ok(reader) => {
+            let mut live: Vec<pond_engine::HistoryEntry> = reader
+                .all_published_roots()
+                .into_iter()
+                .filter(|(_, _, c, _)| c == collection)
+                .map(|(writer_id, seq, _, root)| pond_engine::HistoryEntry {
+                    seq,
+                    writer_id,
+                    root,
+                })
+                .collect();
+            entries.append(&mut live);
+        }
+        Err(e) => eprintln!("warning: could not read live heads: {}", e),
+    }
+
+    entries.sort_by_key(|e| (e.seq, e.writer_id));
+    entries.dedup_by(|a, b| a.seq == b.seq && a.writer_id == b.writer_id);
+
+    if entries.is_empty() {
+        println!("(nothing published yet)");
+        return;
+    }
+
+    let skip = entries.len().saturating_sub(limit);
+    for e in entries.iter().skip(skip) {
+        println!(
+            "{:016x}\twriter {:016x}\tseq {}",
+            e.root.get(..16).and_then(|h| u64::from_str_radix(h, 16).ok()).unwrap_or(0),
+            e.writer_id,
+            e.seq
+        );
+    }
+    if skip > 0 {
+        println!("... {} earlier, use --limit to see more", skip);
+    }
+    println!(
+        "\n{} state(s) retained. Older ones are dropped by compaction — a kept\n\
+         root pins its whole tree against `pond gc`.",
+        entries.len()
+    );
 }
 
 /// Engine collections publish heads, not a chain of commits.

@@ -726,3 +726,104 @@ fn overlapping_compacted_heads_converge_back_to_one() {
         3
     );
 }
+
+/// A retained history is only worth keeping if the states it names can be read
+/// back.
+#[test]
+fn a_past_root_reads_back_as_the_state_it_named() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Three publishes, each adding a row.
+    for i in 0..3i64 {
+        let mut e = Engine::open(store(dir.path()), 1).unwrap();
+        e.write_records("t", vec![row(1, i)]).unwrap();
+        e.publish().unwrap();
+    }
+
+    let roots: Vec<String> = {
+        let r = Reader::open(store(dir.path())).unwrap();
+        let mut v: Vec<(u64, String)> = r
+            .all_published_roots()
+            .into_iter()
+            .filter(|(_, _, c, _)| c == "t")
+            .map(|(_, seq, _, root)| (seq, root))
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, root)| root).collect()
+    };
+    assert_eq!(roots.len(), 3, "one root per publish");
+
+    let r = Reader::open(store(dir.path())).unwrap();
+    for (i, root) in roots.iter().enumerate() {
+        assert_eq!(
+            r.scan_at(root, "t").unwrap().len(),
+            i + 1,
+            "the state at publish {} should hold {} row(s)",
+            i + 1,
+            i + 1
+        );
+    }
+
+    // Compaction records the history and deletes the heads; the roots must
+    // still read.
+    compact(dir.path());
+    let r = Reader::open(store(dir.path())).unwrap();
+    for (i, root) in roots.iter().enumerate() {
+        assert_eq!(
+            r.scan_at(root, "t").unwrap().len(),
+            i + 1,
+            "a past state must survive the compaction that recorded it"
+        );
+    }
+}
+
+/// A root that was never published must fail, not read as empty.
+///
+/// An empty scan for a missing node is a wrong answer wearing the costume of a
+/// right one: it says "the collection was empty then" about a point in time
+/// that never existed.
+#[test]
+fn reading_at_a_root_that_does_not_exist_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), 1, 2);
+
+    let r = Reader::open(store(dir.path())).unwrap();
+    let err = r.scan_at(&"0".repeat(64), "t").unwrap_err();
+    assert!(
+        format!("{}", err).contains("no such root"),
+        "expected a clear failure, got {}",
+        err
+    );
+}
+
+/// Compaction writes the history before it deletes the heads that are its only
+/// source.
+#[test]
+fn compaction_records_history_before_retiring_the_heads() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..4i64 {
+        let mut e = Engine::open(store(dir.path()), 1).unwrap();
+        e.write_records("t", vec![row(1, i)]).unwrap();
+        e.publish().unwrap();
+    }
+
+    let s = store(dir.path());
+    assert!(
+        pond_engine::history::load(&s, "t").entries.is_empty(),
+        "nothing is recorded until a compaction runs"
+    );
+
+    compact(dir.path());
+
+    let log = pond_engine::history::load(&s, "t");
+    assert_eq!(
+        log.entries.len(),
+        4,
+        "every superseded root must be recorded, not just the last: {:?}",
+        log.entries.len()
+    );
+
+    // A second pass must not duplicate what it already recorded.
+    compact(dir.path());
+    assert_eq!(pond_engine::history::load(&s, "t").entries.len(), 4);
+}

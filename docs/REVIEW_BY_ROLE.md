@@ -374,7 +374,28 @@ yet:
   operation does not apply is a worse answer than having it, and a much better
   one than being told something false.
 
-The remaining gap is real: engine collections have no history surface at all.
-Superseded head sequences exist until compaction sweeps them, so the
-information is there to expose — it is just not a commit chain, and pretending
-otherwise is what produced the misleading messages in the first place.
+- **History and time travel.** Now real, and it costs nothing on the write
+  path. A publish deliberately leaves its predecessor in place, so between
+  compactions the superseded heads *are* the record of every root a collection
+  has had. Compaction is what deletes them — so compaction is where they get
+  written down, in `history/<collection>`, by a pass that is already reading
+  every head. Full granularity, not one entry per pass: a compaction after a
+  hundred publishes records all hundred roots.
+
+  `pond history <collection>` reads the retained log plus anything published
+  since the last compaction. `pond read-rows <c> --at <root>` reads that state
+  back — a root names a complete immutable tree, so this is an ordinary scan
+  starting somewhere else, with no snapshot machinery and no special case in
+  the write path. Content addressing gives it rather than a feature bolted on.
+
+  Two things it deliberately does not do. It keeps a bounded number of entries,
+  because a retained root pins its whole tree against `pond gc` — that is the
+  real cost of time travel, and every system with it has an expiry policy
+  rather than a promise. And it stamps no wall-clock time, because there is no
+  global clock to trust and a fabricated one invites ordering events across
+  writers by it.
+
+  `pond gc` walks history roots as live. Without that it deletes exactly the
+  trees the history exists to preserve, which is the same shape as the bug that
+  once deleted every engine collection — so it has its own test, verified to
+  fail when the walk is removed.

@@ -147,6 +147,38 @@ fn has_legacy_data(kernel: &PondKernel, collection: &str) -> bool {
             .is_some()
 }
 
+/// Read a collection as it was at `root`, encoded exactly as a current read
+/// would be.
+///
+/// The state a history entry names, read back. A root is a complete immutable
+/// tree, so this is an ordinary scan starting somewhere other than the current
+/// merged view — content addressing gives it for free, with no snapshot
+/// machinery and nothing extra on the write path.
+///
+/// It returns PND2 for the same reason [`read_pnd2`] does: a row read at a
+/// past root and the same row read now must be presented identically, and the
+/// surest way to guarantee that is for one encoder to do the presenting.
+pub fn read_pnd2_at(kernel: &PondKernel, collection: &str, root: &str) -> Result<Vec<u8>> {
+    let def = definition::load(kernel, collection);
+    if def.format != Format::Engine {
+        return Err(format!("collection '{}' is not engine-backed", collection));
+    }
+    let reader = Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
+        .map_err(|e| format!("failed to open reader: {}", e))?;
+    let pairs = reader
+        .scan_at(root, collection)
+        .map_err(|e| format!("failed to read at root {}: {}", root, e))?;
+
+    let (columns, nulls) = crate::columnar::records_to_columns_with_nulls(&pairs, &def);
+    let borrowed: Vec<(&str, TypedColumn)> = columns
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.clone()))
+        .collect();
+    Ok(pond_core::encode::pnd2_encode_multi_typed_with_nulls(
+        &borrowed, &nulls,
+    ))
+}
+
 /// Merge one engine collection into another.
 ///
 /// # Why this is the cheap operation and a commit chain would not be

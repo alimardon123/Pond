@@ -399,6 +399,7 @@ impl<'a> GarbageCollector<'a> {
         // has to know about every way data is reachable, not just the ways it
         // was written to know about.
         self.walk_engine_heads(&mut live);
+        self.walk_history(&mut live);
 
         live
     }
@@ -425,6 +426,29 @@ impl<'a> GarbageCollector<'a> {
                 continue;
             };
             for root in head.collections.values() {
+                self.walk_index_node(&store, root, live);
+            }
+        }
+    }
+
+    /// Add everything a retained history keeps reachable.
+    ///
+    /// A history entry names a root the collection used to have, and the whole
+    /// point of keeping it is being able to read that state back. Its nodes are
+    /// unreachable from any *live* head — that is what makes them look like
+    /// garbage — so without this walk, `pond gc` would delete exactly the trees
+    /// the history exists to preserve, and time travel would resolve to missing
+    /// blobs.
+    ///
+    /// This is the same shape as the bug that once deleted every engine
+    /// collection: a new way of reaching data that the live-set walk did not
+    /// know about. It gets its own walk and its own test rather than an
+    /// assumption that heads cover it.
+    fn walk_history(&self, live: &mut HashSet<String>) {
+        let store = self.kernel.store_handle();
+        for collection in pond_engine::history::collections(&*store) {
+            let log = pond_engine::history::load(&*store, &collection);
+            for root in log.roots() {
                 self.walk_index_node(&store, root, live);
             }
         }
