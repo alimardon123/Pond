@@ -385,9 +385,25 @@ cannot rewrite what is already stored.
 
 **Column pruning is still not complete**, and the table says exactly what is
 left: 26.5 KiB against a 2.1 KiB floor. What remains is field names and
-per-field framing, repeated once per row. A column store would factor those
-across a whole chunk — that is the remaining idea, and now the only one that
-needs values laid out differently.
+per-field framing, repeated once per row.
+
+Measuring how much is actually there: a real leaf of 2000 rows, 362,399 bytes,
+compresses to 51,492 with gzip and 34,928 with xz — **7x to 10x**. So the
+remaining gap is genuine and is available without laying values out by column,
+because the redundancy a column store exploits is exactly what an LZ window
+finds.
+
+The obvious fix — compress the node bytes — is wrong, and not for a performance
+reason. Compressed output is a property of the compressor, not of the data, so
+two writers on different builds would produce different bytes for identical
+nodes, different hashes, and silently lose structural sharing and dedup. That
+cannot be pinned per collection the way the chunk target and salt are, because
+it is not a parameter.
+
+`docs/LEAF_ENCODING.md` sets out the three ways forward and recommends the one
+that is deterministic by construction — a per-leaf dictionary we specify — while
+noting it changes the `Tree`/`NodeStore` contract and so deserves its own
+increment with the acceptance tests written first.
 
 **`Value::Spilled` never leaves the engine.** It says where a payload lives,
 not what it is, and every consumer downstream — the columnar bridge, SQL, JSON,
