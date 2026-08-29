@@ -175,6 +175,21 @@ impl<S: ObjectStore> Metered<S> {
     fn trip(&self) {
         self.round_trips.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// A round trip for a batch, which an empty batch is not.
+    ///
+    /// A batch method called with nothing in it issues no request and waits
+    /// for no response — the backend's implementations return immediately.
+    /// Counting it anyway put `round_trips` above `requests`, which is not a
+    /// state the world can be in, and inflated every measured figure in the
+    /// tree by however many empty batches the caller happened to make. The
+    /// round-trip profile showed `open` costing three waits for two requests
+    /// before this was fixed.
+    fn trip_batch(&self, width: usize) {
+        if width > 0 {
+            self.trip();
+        }
+    }
 }
 
 impl<S: ObjectStore> ObjectStore for Metered<S> {
@@ -210,13 +225,13 @@ impl<S: ObjectStore> ObjectStore for Metered<S> {
             items.iter().map(|i| i.len() as u64).sum::<u64>(),
             Ordering::Relaxed,
         );
-        self.trip();
+        self.trip_batch(items.len());
         self.inner.put_blob_batch(items)
     }
 
     fn get_blob_batch(&self, hashes: &[String]) -> io::Result<Vec<Vec<u8>>> {
         self.gets.fetch_add(hashes.len() as u64, Ordering::Relaxed);
-        self.trip();
+        self.trip_batch(hashes.len());
         let out = self.inner.get_blob_batch(hashes)?;
         self.bytes_read.fetch_add(
             out.iter().map(|b| b.len() as u64).sum::<u64>(),
@@ -257,7 +272,7 @@ impl<S: ObjectStore> ObjectStore for Metered<S> {
 
     fn get_object_batch(&self, paths: &[String]) -> Vec<Option<Vec<u8>>> {
         self.gets.fetch_add(paths.len() as u64, Ordering::Relaxed);
-        self.trip();
+        self.trip_batch(paths.len());
         let out = self.inner.get_object_batch(paths);
         self.bytes_read.fetch_add(
             out.iter().flatten().map(|b| b.len() as u64).sum::<u64>(),
@@ -275,7 +290,7 @@ impl<S: ObjectStore> ObjectStore for Metered<S> {
     fn delete_path_batch(&self, paths: &[String]) -> io::Result<usize> {
         self.deletes
             .fetch_add(paths.len() as u64, Ordering::Relaxed);
-        self.trip();
+        self.trip_batch(paths.len());
         self.inner.delete_path_batch(paths)
     }
 
@@ -300,7 +315,7 @@ impl<S: ObjectStore> ObjectStore for Metered<S> {
     fn delete_blob_batch(&self, hashes: &[String]) -> io::Result<usize> {
         self.deletes
             .fetch_add(hashes.len() as u64, Ordering::Relaxed);
-        self.trip();
+        self.trip_batch(hashes.len());
         self.inner.delete_blob_batch(hashes)
     }
 }
@@ -815,5 +830,61 @@ mod tests {
         m.put_blob(b"setup").unwrap();
         m.reset();
         assert_eq!(m.stats(), StoreStats::default());
+    }
+
+    /// A batch with nothing in it costs nothing.
+    ///
+    /// It issues no request and waits for no response, so counting it as a
+    /// round trip put `round_trips` above `requests` — a state that cannot
+    /// occur, since every wait is a wait for at least one request. The
+    /// round-trip profile reported `open` as three waits for two requests
+    /// until this was fixed, and every figure derived from a run that made an
+    /// empty batch call was inflated by one wait per call.
+    #[test]
+    fn an_empty_batch_is_not_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Metered::new(LocalFSObjectStore::new(dir.path()).unwrap());
+
+        m.put_blob_batch(&[]).unwrap();
+        m.get_blob_batch(&[]).unwrap();
+        m.get_object_batch(&[]);
+        m.delete_path_batch(&[]).unwrap();
+        m.delete_blob_batch(&[]).unwrap();
+
+        assert_eq!(m.stats(), StoreStats::default(), "empty batches cost nothing");
+    }
+
+    /// You cannot wait more times than you ask.
+    ///
+    /// The general form of the bug above: `round_trips` counts dependent
+    /// waits and `requests()` counts the operations those waits are for, so
+    /// the first can never exceed the second. Asserted over a mixture of
+    /// singular and batch calls, empty batches included, because it was
+    /// exactly the empty ones that broke it.
+    #[test]
+    fn waits_never_exceed_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Metered::new(LocalFSObjectStore::new(dir.path()).unwrap());
+
+        let h = m.put_blob(b"one").unwrap();
+        m.get_blob(&h).unwrap();
+        m.put_blob_batch(&[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        m.get_blob_batch(std::slice::from_ref(&h)).unwrap();
+        m.get_blob_batch(&[]).unwrap();
+        m.put_path("p", &h).unwrap();
+        m.get_path("p");
+        m.get_object_batch(&[]);
+        m.list_paths("").unwrap();
+        m.blob_exists(&h);
+        m.delete_path_batch(&[]).unwrap();
+
+        let s = m.stats();
+        assert!(
+            s.round_trips <= s.requests(),
+            "{} waits for {} requests: a wait with no request in it",
+            s.round_trips,
+            s.requests()
+        );
+        assert!(s.batch_width() >= 1.0, "batch width below 1 is not a number a run can have");
     }
 }
