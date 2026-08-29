@@ -24,8 +24,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned, not `stable`. With `-D warnings`, a floating toolchain means a
+      # new clippy release turns a green branch red with no code change: the
+      # first run of this workflow failed on two `chunks_exact_to_as_chunks`
+      # lints that did not exist in the version the tree was developed
+      # against. Both were real and both were fixed — but a gate that changes
+      # its own rules between runs is not a gate. Bump this deliberately, in
+      # its own commit, and fix whatever the new release finds there.
+      #
+      # scripts/check.sh reads this exact line, so local and CI cannot
+      # silently disagree about which compiler "passing" refers to.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.94.1"
           components: clippy
 
       - uses: Swatinem/rust-cache@v2

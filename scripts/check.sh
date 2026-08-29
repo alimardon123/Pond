@@ -38,6 +38,18 @@ if [ "$avail_kb" -lt 10485760 ]; then
   echo "         try: rm -rf target/debug/incremental"
 fi
 
+# Which compiler does "passing" refer to? CI pins one; if this machine has a
+# different one, a green run here does not predict a green run there — the
+# first CI run of this workflow failed on lints the local toolchain did not
+# have. Read the pin from the workflow so there is one source of truth.
+pinned=$(sed -n 's/^ *toolchain: "\(.*\)"/\1/p' .github/workflows/rust.yml | head -1)
+local_rustc=$(rustc --version 2>/dev/null | awk '{print $2}')
+if [ -n "$pinned" ] && [ -n "$local_rustc" ] && [ "$pinned" != "$local_rustc" ]; then
+  echo "warning: CI pins rustc $pinned, this machine has $local_rustc."
+  echo "         clippy lints differ between releases, so a pass here may"
+  echo "         still fail there. rustup toolchain install $pinned"
+fi
+
 echo "== workflows =="
 # Cheap, and first alongside the secret scan, for the same reason: a workflow
 # file is never run locally, so a syntax error in one is invisible until CI

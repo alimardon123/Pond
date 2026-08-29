@@ -314,7 +314,10 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     }
     let b = s.as_bytes();
     let mut out = [0u8; 32];
-    for (i, chunk) in b.chunks_exact(2).enumerate() {
+    // `as_chunks` rather than `chunks_exact`: the chunk width is a constant,
+    // so it belongs in the type, and each chunk arrives as `[u8; 2]` instead
+    // of a slice that has to be indexed and could in principle be short.
+    for (i, chunk) in b.as_chunks::<2>().0.iter().enumerate() {
         let hi = hex_val(chunk[0])?;
         let lo = hex_val(chunk[1])?;
         out[i] = (hi << 4) | lo;
@@ -458,8 +461,11 @@ impl<'a> Reader<'a> {
                 // looping, so a bogus count cannot drive a long loop.
                 let raw = self.take(n.checked_mul(4)?)?;
                 let mut v = Vec::new();
-                for c in raw.chunks_exact(4) {
-                    v.push(f32::from_bits(u32::from_le_bytes(c.try_into().ok()?)));
+                // Each chunk is `[u8; 4]` by type, so the conversion that
+                // used to need `try_into().ok()?` cannot fail and no longer
+                // has an error path to get wrong.
+                for c in raw.as_chunks::<4>().0 {
+                    v.push(f32::from_bits(u32::from_le_bytes(*c)));
                 }
                 Value::Vector(v)
             }
