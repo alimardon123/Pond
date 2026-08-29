@@ -38,6 +38,13 @@ if [ "$avail_kb" -lt 10485760 ]; then
   echo "         try: rm -rf target/debug/incremental"
 fi
 
+echo "== workflows =="
+# Cheap, and first alongside the secret scan, for the same reason: a workflow
+# file is never run locally, so a syntax error in one is invisible until CI
+# reports a failure that never started. That happened here — see
+# scripts/workflowlint.py.
+python3 ./scripts/workflowlint.py || fail "workflows"
+
 echo "== secrets =="
 # First, and cheap. A credential that reaches a commit is not fixable by a
 # later commit — the value stays in history and `git log -S` finds it — so the
