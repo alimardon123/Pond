@@ -325,6 +325,15 @@ mod tests {
     /// The pack-or-not decision is a size comparison, and its boundary is part
     /// of the format: a node that sits exactly on it must land the same way on
     /// every build.
+    ///
+    /// The tie is the case that matters. When packing saves exactly the frame
+    /// size, the two encodings are the same *length* and different *bytes* —
+    /// so a build that broke the tie the other way would produce a different
+    /// hash for an identical node, and silently stop sharing structure with
+    /// every other writer. The rule is that a tie keeps the plain encoding;
+    /// `a_node_at_the_pack_decision_tie_keeps_the_plain_encoding` holds it,
+    /// because mutation testing showed `<` and `<=` were otherwise
+    /// indistinguishable.
     #[test]
     fn packing_is_used_only_when_it_is_strictly_smaller() {
         // Something that compresses a little, so the two sizes are close.
@@ -345,6 +354,40 @@ mod tests {
             }
             assert_eq!(Node::decode(&encoded).as_ref(), Some(&node));
         }
+    }
+
+    /// A node sitting exactly on the pack-or-not boundary keeps the plain
+    /// encoding.
+    ///
+    /// Found by search: one entry with an 11-byte-padded key packs to exactly
+    /// five bytes less than it encodes plainly, which is the frame size, which
+    /// is the tie. Both encodings are 32 bytes; only one of them is the node's
+    /// identity.
+    #[test]
+    fn a_node_at_the_pack_decision_tie_keeps_the_plain_encoding() {
+        let mut key = b"0000".to_vec();
+        key.extend(std::iter::repeat_n(b'k', 11));
+        let node = Node::Leaf {
+            entries: vec![(key, b"vvvv".to_vec())],
+        };
+
+        let plain = node.encode_plain();
+        let packed_body = crate::pack::pack(&plain);
+        assert_eq!(
+            packed_body.len() + 5,
+            plain.len(),
+            "this node no longer sits on the tie — re-run the search in the \
+             git history for this test and pick a new one"
+        );
+
+        let encoded = node.encode();
+        assert_eq!(
+            encoded, plain,
+            "a tie must keep the plain encoding: the two are the same length \
+             and different bytes, so breaking the tie the other way changes \
+             this node's hash and nothing else"
+        );
+        assert_eq!(Node::decode(&encoded).as_ref(), Some(&node));
     }
 
     /// The refusal boundaries, at the boundary rather than far past it.

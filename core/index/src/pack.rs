@@ -45,6 +45,28 @@
 // than optimal on purpose: the search has to be *specified*, not merely good,
 // and "take the longest match at the most recent candidate position" is a rule
 // that can be written down in a sentence.
+//
+// # Mutants that survive here, and why they are meant to
+//
+// `cargo mutants -p pond_index --file core/index/src/pack.rs` leaves three
+// surviving mutants in this module. All three are equivalent — they change the
+// source without changing any output — and the note is here so nobody has to
+// work that out twice:
+//
+//   - `pos > candidate` -> `>=`. A candidate is always a strictly earlier
+//     position, since the table is read before it is written, so the two
+//     comparisons never differ.
+//   - `0x80 | short` -> `^` in `emit_match`. `short` is capped at
+//     `MAX_SHORT_LEN` = `0x7f`, so the high bit is always clear and the two
+//     operations are the same.
+//   - the registration range `(pos + 1)..(pos + len)` -> `(pos - 1)..`. Both
+//     extra positions were already registered with the same values earlier in
+//     the same loop, so re-registering them is a no-op. Checked against 90
+//     varied inputs; none produced different output.
+//
+// Two others were not equivalent and are gone: a redundant short-input guard
+// and a redundant mask in `hash4`, both removed rather than tested, because a
+// branch no input can distinguish is a branch that should not exist.
 
 /// Bytes below which a match is not worth its three-byte token.
 const MIN_MATCH: usize = 4;
@@ -63,9 +85,16 @@ const HASH_SIZE: usize = 1 << HASH_BITS;
 
 /// Hash of the four bytes at `i`. Fixed here, because a different hash finds
 /// different matches and therefore produces different output.
+///
+/// The shift alone bounds the result to `HASH_BITS` bits, so no mask follows
+/// it. There used to be one; mutation testing showed that replacing its `&`
+/// with `^` changed nothing observable, which is what a redundant operation
+/// looks like from the outside — the mask could not narrow a value that was
+/// already narrow, and inverting bits of a table index is a bijection that
+/// leaves every collision exactly where it was.
 fn hash4(buf: &[u8], i: usize) -> usize {
     let v = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
-    (v.wrapping_mul(2_654_435_761) >> (32 - HASH_BITS as u32)) as usize & (HASH_SIZE - 1)
+    (v.wrapping_mul(2_654_435_761) >> (32 - HASH_BITS as u32)) as usize
 }
 
 /// Compress `input`.
@@ -75,10 +104,13 @@ fn hash4(buf: &[u8], i: usize) -> usize {
 /// above.
 pub fn pack(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() / 2 + 16);
-    if input.len() < MIN_MATCH {
-        emit_literals(&mut out, input);
-        return out;
-    }
+
+    // No short-input special case: the loop below cannot run when there are
+    // fewer than MIN_MATCH bytes, and the trailing `emit_literals` then emits
+    // the whole input — which is exactly what a special case would have done.
+    // There used to be one. Mutation testing showed that neither weakening its
+    // comparison nor narrowing it to a single length changed any output, which
+    // is what a branch that cannot matter looks like from the outside.
 
     // Most recent position at which each 4-byte hash was seen. `usize::MAX`
     // means "never".
@@ -222,7 +254,60 @@ mod tests {
         );
     }
 
-    /// The codec's output is frozen here, byte for byte.
+    /// Deterministic inputs chosen to make the encoder's decisions visible.
+    ///
+    /// One frozen input was not enough. The first version of this test froze a
+    /// single very regular sequence, and mutation testing showed that changing
+    /// `hash4` — the match finder itself — still produced identical bytes for
+    /// it. A codec is only "specified" to the extent its output is pinned on
+    /// inputs that discriminate.
+    ///
+    /// So: several inputs, spanning the branches. Sizes either side of
+    /// `MIN_MATCH`, data with a small alphabet where match choice is
+    /// sensitive, runs where matches overlap, and data with no matches at all.
+    fn golden_inputs() -> Vec<(&'static str, Vec<u8>)> {
+        // Record-shaped: what a leaf actually holds.
+        let mut records = Vec::new();
+        for i in 0..40u32 {
+            records.extend_from_slice(b"PREC\x02\x00");
+            records.extend_from_slice(&i.to_le_bytes());
+            records.extend_from_slice(b"idstatuspending");
+        }
+
+        // One stream, drawn in this order, so the two pseudorandom inputs stay
+        // fixed. Reordering these two loops changes the second input's bytes
+        // and therefore its frozen digest.
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        // A small alphabet: matches are everywhere and *which* one the finder
+        // picks changes the output. This is the case a regular input hides.
+        let noisy: Vec<u8> = (0..4000).map(|_| (next() % 5) as u8 + b'a').collect();
+
+        // Nothing to find: exercises the literal path end to end.
+        let incompressible: Vec<u8> = (0..1500).map(|_| next() as u8).collect();
+
+        vec![
+            ("empty", Vec::new()),
+            // Either side of the shortest match, which decides whether the
+            // match loop runs at all.
+            ("three", b"abc".to_vec()),
+            ("four", b"abcd".to_vec()),
+            ("five", b"abcde".to_vec()),
+            ("records", records),
+            ("small alphabet", noisy),
+            // Overlapping runs, where distance is shorter than length.
+            ("one repeated byte", vec![b'z'; 3000]),
+            ("incompressible", incompressible),
+        ]
+    }
+
+    /// The codec's output is frozen, on inputs that discriminate.
     ///
     /// This is what "specified in this repository" has to mean. Every other
     /// test checks that packing and unpacking agree with *each other*, which
@@ -233,28 +318,44 @@ mod tests {
     /// the exact hazard this codec exists to avoid, and nothing detected it
     /// until mutation testing pointed out that changing `hash4` broke no test.
     ///
-    /// So: if this fails, the encoder changed. That is allowed, and it is a
-    /// format change — see `docs/LEAF_ENCODING.md`. It is not something to fix
-    /// by updating the expected bytes.
+    /// The expected values are digests rather than hex dumps, so the test
+    /// stays readable while pinning every byte.
+    ///
+    /// If this fails, the encoder changed. That is allowed, and it is a format
+    /// change — see `docs/LEAF_ENCODING.md`. It is not something to fix by
+    /// updating the expected digests.
     #[test]
     fn the_encoders_output_is_frozen() {
-        let mut data = Vec::new();
-        for i in 0..40u32 {
-            data.extend_from_slice(b"PREC\x02\x00");
-            data.extend_from_slice(&i.to_le_bytes());
-            data.extend_from_slice(b"idstatuspending");
-        }
-        assert_eq!(data.len(), 1000);
+        use sha2::{Digest, Sha256};
 
-        let packed = pack(&data);
-        let hex: String = packed.iter().map(|b| format!("{:02x}", b)).collect();
-        assert_eq!(
-            hex,
-            "055052454302008001000e696473746174757370656e64696e678219000001941900             8034009119000003941900000494190000059419000006941900000794190000089419             000009941900000a941900000b941900000c941900000d941900000e941900000f9419             000010941900001194190000129419000013941900001494190000159419000016941900             001794190000189419000019941900001a941900001b941900001c941900001d94190000             1e941900001f941900002094190000219419000022941900002394190000249419000025             941900002694190000278e1900"
-                .replace(['\n', ' '], ""),
-            "the packed bytes changed — see this test's comment before touching it"
-        );
-        assert_eq!(unpack(&packed, data.len()).as_deref(), Some(data.as_slice()));
+        let expected: &[(&str, &str)] = &[
+            ("empty", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("three", "909ac45e439911193205994d09399c29fede977ab212605f29ead5250a812e73"),
+            ("four", "6c4cfe52b3df8856cdc78552d2cdd8fed278436caac3eeaf556bd1f2df138975"),
+            ("five", "09d5553309841962565b3950d06dd5b8765a70c7514e8955bc7104b1cf4a68d5"),
+            ("records", "460130eca183db6685a3069c3c562bf8f9607bf0112b722e1d607a1cd099a0c2"),
+            ("small alphabet", "724e8bdf07d4a08ccd91c60e84d0517cb95d932e03561250c657421b10a6a8b1"),
+            ("one repeated byte", "a1e8986c273cc967e5059735ec0fdfe0dd583bdd6aa871e0a04448cda62488c8"),
+            ("incompressible", "d7ef9056482ff18fa99bd93c7adb7b803d92aa5ccabf6dccadda75ca2b092174"),
+        ];
+
+        for ((name, data), (ename, digest)) in golden_inputs().iter().zip(expected) {
+            assert_eq!(name, ename, "golden inputs and expectations drifted apart");
+            let packed = pack(data);
+            let got = format!("{:x}", Sha256::digest(&packed));
+            assert_eq!(
+                &got, digest,
+                "packed bytes for {:?} changed — see this test's comment before \
+                 touching it",
+                name
+            );
+            assert_eq!(
+                unpack(&packed, data.len()).as_deref(),
+                Some(data.as_slice()),
+                "{:?} must still round trip",
+                name
+            );
+        }
     }
 
     #[test]
