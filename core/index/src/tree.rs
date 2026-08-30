@@ -105,7 +105,34 @@ impl Tree {
     }
 
     /// Look up one key. Costs one node read per level.
+    /// A tree with no entries and no stored node.
+    ///
+    /// `build` with no entries writes an empty leaf — five bytes carrying no
+    /// information — and returns its hash. That is a PUT, and PUTs on a read
+    /// path are not merely wasteful: asking a *reader* for the root of a
+    /// collection that does not exist performed one, so a read-only query
+    /// created state, and would have failed outright on a read-only
+    /// credential.
+    ///
+    /// This is the same tree without the write. The empty root is recognised
+    /// by every walk below and answers as an empty tree would, so nothing has
+    /// to exist in the store for it to behave correctly.
+    pub fn empty(config: ChunkConfig) -> Tree {
+        Tree {
+            root: String::new(),
+            config,
+        }
+    }
+
+    /// True if this tree has no stored root — see [`Tree::empty`].
+    pub fn is_unmaterialised(&self) -> bool {
+        self.root.is_empty()
+    }
+
     pub fn get<S: NodeStore>(&self, store: &S, key: &[u8]) -> Option<Vec<u8>> {
+        if self.is_unmaterialised() {
+            return None;
+        }
         let mut hash = self.root.clone();
         loop {
             let node = Node::decode(&store.get(&hash)?)?;
@@ -132,6 +159,9 @@ impl Tree {
 
     /// Total entries, read from the root's child counts without touching leaves.
     pub fn len<S: NodeStore>(&self, store: &S) -> u64 {
+        if self.is_unmaterialised() {
+            return 0;
+        }
         store
             .get(&self.root)
             .and_then(|b| Node::decode(&b))
@@ -141,6 +171,9 @@ impl Tree {
 
     /// Depth in levels (1 = a single leaf).
     pub fn depth<S: NodeStore>(&self, store: &S) -> usize {
+        if self.is_unmaterialised() {
+            return 0;
+        }
         let mut d = 1;
         let mut hash = self.root.clone();
         while let Some(Node::Internal { children }) =
@@ -780,6 +813,10 @@ pub fn get_from_roots<S: NodeStore>(store: &S, roots: &[String], key: &[u8]) -> 
 }
 
 fn collect<S: NodeStore>(store: &S, hash: &str, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    // An unmaterialised empty tree — see `Tree::empty` — has no node to read.
+    if hash.is_empty() {
+        return;
+    }
     let mut frontier = vec![hash.to_string()];
     while !frontier.is_empty() {
         let mut next = Vec::new();
@@ -816,6 +853,9 @@ fn collect_range<S: NodeStore>(
     end: &[u8],
     out: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) {
+    if hash.is_empty() {
+        return;
+    }
     let mut frontier = vec![hash.to_string()];
     while !frontier.is_empty() {
         let mut next = Vec::new();

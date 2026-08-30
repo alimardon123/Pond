@@ -165,6 +165,19 @@ misreading; nothing goes above this line until it has been reproduced.
   because merging a value with itself is that value — idempotence, one of the
   three laws the record merge is tested against.
 
+- **A reader could write.** Two ways, both closed. Merging is a write and a
+  reader's view is the merge of every writer's tree, so point reads and scans
+  stored merged nodes — fixed by walking the roots together. And `Tree::build`
+  with no entries writes a five-byte empty leaf, so `root_of` on a collection
+  that does not exist performed a PUT: a question that created state, and one
+  a read-only credential would have rejected outright. `Tree::empty` now
+  returns a tree with no stored root and the walks recognise it, so nothing has
+  to exist for an empty tree to behave like one. On object storage this also
+  paid the worst rate available — a PUT is roughly 12.5× a GET — for work
+  nobody asked for. `core/engine/tests/reader_is_read_only.rs` checks every
+  read entry point against both an existing and a missing collection; the
+  missing case is where it hid.
+
 - **Scans waited once per node instead of once per level.** A cold full scan of
   100,000 rows was 51 sequential round trips at batch width 1.0 — nothing in
   the read path issued a parallel request — although every leaf hash is known

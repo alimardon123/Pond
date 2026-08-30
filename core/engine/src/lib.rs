@@ -874,7 +874,12 @@ impl<S: ObjectStore> Reader<S> {
             .collect();
 
         if level.is_empty() {
-            return Tree::build(&self.store, Vec::new(), cfg);
+            // No writer has published this collection. Return the empty tree
+            // *without* storing a node: this is a read path, and building an
+            // empty tree writes one. `root_of` on a collection that does not
+            // exist performed a PUT — a read-only query creating state, which
+            // a read-only credential would have rejected outright.
+            return Tree::empty(cfg);
         }
 
         while level.len() > 1 {
