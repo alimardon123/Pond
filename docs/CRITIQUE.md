@@ -161,6 +161,15 @@ misreading; nothing goes above this line until it has been reproduced.
   keeping its cost in build time and storage. The fix is for the index to own
   its vectors — as IVF now does for its cluster blobs — so a search reads only
   what it visits. Not done.
+
+  The share that is vector payload rises with dimension, which is what makes
+  this worth fixing rather than tolerating: 24% at 8 dimensions, 55% at 32,
+  83% at 128, **93% at 384** — and 384 is an ordinary sentence-embedding width.
+
+  The kernel-level blob cache added since keeps a *repeated* query off the
+  network — measured 1199 KiB to 0 for a second reader over a warm disk cache
+  — but the query still reads every vector, from local disk rather than across
+  a network. A cache is not a layout.
 - The canonical URI is not percent-encoded, so a collection named `a?b` signs
   and writes to a different key than intended.
 - `engine_kv`, `engine_oltp` and `engine_stream` have no callers outside their
@@ -240,6 +249,20 @@ misreading; nothing goes above this line until it has been reproduced.
   many clusters and probing one used to fetch every group containing a member.
   `lenses/vector/rust/tests/search_paths_agree.rs` compares all three paths
   against brute force on both formats.
+
+- **Nothing outside the engine cached anything.** `PondKernel` had no cache at
+  all, so every `read_blob` went to the object store every time — the legacy
+  storage path, both vector index extensions, the streaming and keyvalue
+  lenses, and the CLI. The disk cache added earlier lived inside `engine_path`,
+  so it covered the engine's own reads and nothing else, which was easy to miss
+  because the engine is where every round-trip measurement was pointed: the
+  instrumented path was cached and the uninstrumented ones were not. Measured
+  on a repeated HNSW query from a fresh reader: **1199 KiB from the store on
+  every query, down to 0**. `pond_storage::cached_kernel` is now used by
+  `UnifiedStorage::new_local`, both CLI paths and both Python entry points.
+  Safe for the usual reason — `BlobCache` caches only hash-keyed blobs, so an
+  entry cannot go stale, and refs, named objects and listings pass straight
+  through.
 
 - **A reader could write.** Two ways, both closed. Merging is a write and a
   reader's view is the merge of every writer's tree, so point reads and scans
