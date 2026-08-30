@@ -65,6 +65,22 @@ const MS_PER_MIB: f64 = 20.0;
 /// descent that 10^9 would, since depth grows as log(n).
 const SCALES: &[usize] = &[1_000, 10_000, 100_000];
 
+/// Writer counts to profile the multi-writer read cost at.
+///
+/// A separate axis from `SCALES`, because they answer different questions.
+/// Row count asks whether cost grows with data; writer count asks whether it
+/// grows with *concurrency*, which is the property the design actually claims
+/// — any number of writers converging without coordination. A reader that
+/// paid per writer would make that convergence worthless, and for a while it
+/// did: a point read cost 141 round trips and 100 PUTs at 64 writers.
+///
+/// Held at a fixed, small row count per writer so the writer axis is not
+/// confounded by the data axis.
+const WRITER_COUNTS: &[usize] = &[1, 4, 16, 64];
+
+/// Rows each writer publishes in the multi-writer profile.
+const ROWS_PER_WRITER: usize = 200;
+
 /// One measured operation.
 struct Row {
     op: &'static str,
@@ -246,6 +262,49 @@ fn main() {
         }
     }
 
+    // The writer axis. Reported with `scale` holding the writer count, since
+    // that is what varies; the row count per writer is fixed.
+    for &w in WRITER_COUNTS {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        for writer in 0..w {
+            let store = Arc::new(Metered::new(LocalFSObjectStore::new(path).unwrap()));
+            let mut engine = Engine::open_with(
+                store,
+                writer as u64 + 1,
+                Default::default(),
+                EngineConfig::default(),
+            )
+            .unwrap();
+            let rows: Vec<(Key, Record)> = (0..ROWS_PER_WRITER)
+                .map(|i| {
+                    let key = (writer * ROWS_PER_WRITER + i) as i64;
+                    (k(key), record(i as u64, 8))
+                })
+                .collect();
+            engine.write_records("t", rows).unwrap();
+            engine.publish().unwrap();
+        }
+
+        let caches = tempfile::tempdir().unwrap();
+        out.push(Row {
+            op: "point read @writers",
+            scale: w,
+            warm: false,
+            stats: measure(path, &cache_dir(caches.path(), "pw"), false, |r| {
+                assert!(r.get("t", &k(10)).unwrap().is_some());
+            }),
+        });
+        out.push(Row {
+            op: "full scan @writers",
+            scale: w,
+            warm: false,
+            stats: measure(path, &cache_dir(caches.path(), "sw"), false, |r| {
+                assert_eq!(r.scan("t").unwrap().len(), w * ROWS_PER_WRITER);
+            }),
+        });
+    }
+
     if markdown {
         print_markdown(&out);
     } else {
@@ -256,7 +315,7 @@ fn main() {
 fn print_table(rows: &[Row]) {
     println!(
         "{:<20} {:>8} {:>6} {:>7} {:>9} {:>7} {:>10} {:>9}",
-        "operation", "rows", "cache", "waits", "requests", "width", "KiB", "ms"
+        "operation", "rows/W", "cache", "waits", "requests", "width", "KiB", "ms"
     );
     for r in rows {
         println!(
@@ -284,7 +343,7 @@ fn print_markdown(rows: &[Row]) {
         by_op.entry(r.op).or_default().push(r);
     }
 
-    println!("| operation | rows | cache | round trips | requests | batch width | KiB | modelled ms |");
+    println!("| operation | rows (or writers, for the @writers rows) | cache | round trips | requests | batch width | KiB | modelled ms |");
     println!("| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |");
     for op in order {
         for r in &by_op[op] {

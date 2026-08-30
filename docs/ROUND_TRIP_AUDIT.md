@@ -58,7 +58,7 @@ stated rate. Same-region S3 is faster and cross-region slower — multiply.
 
 ## Measurements
 
-| operation | rows | cache | round trips | requests | batch width | KiB | modelled ms |
+| operation | rows (or writers, for the @writers rows) | cache | round trips | requests | batch width | KiB | modelled ms |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
 | open | 1000 | cold | 2 | 2 | 1.0 | 0.1 | 60.0 |
 | open | 1000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
@@ -96,6 +96,14 @@ stated rate. Same-region S3 is faster and cross-region slower — multiply.
 | write 1k rows | 1000 | cold | 3 | 4 | 1.3 | 45.5 | 90.9 |
 | write 1k rows | 10000 | cold | 2 | 2 | 1.0 | 44.0 | 60.9 |
 | write 1k rows | 100000 | cold | 2 | 2 | 1.0 | 44.9 | 60.9 |
+| point read @writers | 1 | cold | 3 | 3 | 1.0 | 10.7 | 90.2 |
+| point read @writers | 4 | cold | 3 | 9 | 3.0 | 43.7 | 90.9 |
+| point read @writers | 16 | cold | 3 | 33 | 11.0 | 172.7 | 93.4 |
+| point read @writers | 64 | cold | 3 | 129 | 43.0 | 688.5 | 103.4 |
+| full scan @writers | 1 | cold | 3 | 3 | 1.0 | 10.7 | 90.2 |
+| full scan @writers | 4 | cold | 3 | 9 | 3.0 | 43.7 | 90.9 |
+| full scan @writers | 16 | cold | 3 | 33 | 11.0 | 172.7 | 93.4 |
+| full scan @writers | 64 | cold | 3 | 129 | 43.0 | 688.5 | 103.4 |
 
 ## What this says
 
@@ -116,6 +124,21 @@ and nothing more — and the open is now the whole warm cost.
 **Point reads are flat: 4 cold round trips at 1k, 10k and 100k rows.** Two for
 the open, two for the descent. The constant-depth claim holds over the range
 measured.
+
+**And flat in writers, which is the harder claim.** The `@writers` rows hold
+the data fixed at 200 rows per writer and vary the writer count instead,
+because those are different questions: row count asks whether cost grows with
+data, writer count asks whether it grows with concurrency. Concurrency is what
+this design actually promises — any number of writers converging without
+coordination — and for a while a reader paid for it: a point read cost 141
+round trips and **100 PUTs** at 64 writers, because a reader's view is the
+merge of every writer's tree and merging is a write.
+
+Reads now descend every root together instead of merging first: **3 round
+trips at 1 writer and at 64**, with batch width rising 1.0 → 43.0 and no PUTs
+at all. Requests still grow with writers — that is the bill, and batching does
+not reduce it — while the wait does not. Those two numbers separating is the
+whole point.
 
 **Scans now wait per level, not per node.** They did not. A cold full scan of
 100k rows was 51 sequential waits at batch width 1.0 — 1.6 s modelled — even
@@ -150,4 +173,6 @@ staging read before them. Two-digit milliseconds needs this at 2.
 | Two-digit-ms reads and writes | cold: closer — 120–200 ms, down from 120–1600. warm: 60 ms, all of it the open |
 | Single-digit-ms warm reads | **not reachable today** — the open alone is 2 round trips, and no cache can remove it |
 | The disk cache is on the shipped read path | now yes — it was not when this was first published; 22 round trips to 3 through `read_rows` |
+| Read cost flat in the number of writers | holds — 3 round trips and 0 PUTs at 1 writer and at 64, down from 141 waits and 100 PUTs |
+| Reads never write | holds — 0 PUTs on every read path measured |
 | Column projection reduces I/O | **no** — a 2-of-8 projection reads 100% of the bytes |
