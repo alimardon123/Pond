@@ -73,6 +73,27 @@ impl LakehouseLens {
         _key_col: &str,
         message: &str,
     ) -> Result<String, String> {
+        // Dispatch on the collection's format, exactly as the read side does.
+        //
+        // This used to call the legacy writer unconditionally. On an
+        // engine-backed collection the rows went into a legacy manifest, the
+        // call returned `Ok` with a commit hash, and `read_table` — which does
+        // dispatch — read the engine and found nothing. Measured:
+        // `create_table` returned Ok("59845710…") and the following
+        // `read_table` returned `Ok([])`. Rows accepted, acknowledged, and
+        // invisible, with no error anywhere.
+        if pond_storage::definition::format_of(self.storage.kernel(), table_name)
+            == pond_storage::definition::Format::Engine
+        {
+            pond_storage::engine_path::write_rows(
+                self.storage.kernel(),
+                table_name,
+                columns,
+                pond_kernel::crdt::stable_writer_id(),
+            )?;
+            return pond_storage::engine_path::root_of(self.storage.kernel(), table_name);
+        }
+
         let active = self.storage.get_active_branch(table_name);
         storage_write::write_rows(
             self.storage.kernel(),
@@ -100,9 +121,29 @@ impl LakehouseLens {
         new_columns: &[(&str, TypedColumn)],
         message: &str,
     ) -> Result<String, String> {
+        // The engine appends natively, so it needs neither the read nor the
+        // merge below — writing the new rows *is* the append. Doing the
+        // read-modify-write anyway does not merely waste an O(table) read: a
+        // write with no `_rowid` appends, so re-writing the merged set adds a
+        // second copy of every existing row. Measured, before this dispatch
+        // moved above the merge: inserting [3, 4] into [1, 2] produced
+        // [1, 1, 2, 2, 3, 4].
+        if pond_storage::definition::format_of(self.storage.kernel(), table_name)
+            == pond_storage::definition::Format::Engine
+        {
+            pond_storage::engine_path::write_rows(
+                self.storage.kernel(),
+                table_name,
+                new_columns,
+                pond_kernel::crdt::stable_writer_id(),
+            )?;
+            return pond_storage::engine_path::root_of(self.storage.kernel(), table_name);
+        }
+
         let active = self.storage.get_active_branch(table_name);
 
-        // Read existing data
+        // Read existing data. The legacy path stores a whole snapshot per
+        // commit, so appending means rewriting the union.
         let existing = self.read_table(table_name)?;
 
         // Merge: append new values to existing

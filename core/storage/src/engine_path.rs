@@ -333,6 +333,20 @@ pub fn merge(kernel: &PondKernel, target: &str, source: &str, writer_id: u64) ->
 /// reader sees the whole batch or none of it. That is the transaction, and it
 /// needs no transaction subsystem — it is one object, and object stores make
 /// one object atomic.
+/// The hash identifying this collection's current committed state.
+///
+/// The engine publishes a head rather than a commit chain, so there is no
+/// commit hash. The root is the closest true equivalent: it names the tree the
+/// collection currently is, it changes when the data changes, and it is equal
+/// across writers who hold equal data. Callers whose signature promises a
+/// "commit hash" hand this back rather than inventing one.
+pub fn root_of(kernel: &PondKernel, collection: &str) -> Result<String> {
+    let def = definition::load(kernel, collection);
+    let mut reader = Reader::open_with(store_of(kernel), pond_cache_config(), def.engine_config())
+        .map_err(|e| format!("failed to open reader: {}", e))?;
+    Ok(reader.root_of(collection))
+}
+
 pub fn write_rows(
     kernel: &PondKernel,
     collection: &str,

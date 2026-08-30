@@ -95,15 +95,29 @@ Versions order on physical time first. A writer 60 s behind that writes *later*
 in real time still loses to the earlier write, silently. Bounded by however far
 apart the clocks in a deployment can drift.
 
+## Open, reproduced here
+
+- **The two formats disagree about row order.** A legacy collection returns
+  rows in insertion order; an engine collection orders by key, and a row
+  written without an explicit `_rowid` gets a generated one, so `[1, 2, 3]`
+  comes back as `[2, 3, 1]`. Every row and value is intact — only the order
+  differs. It is a real gap in "any lens can read any collection": a caller
+  that moves a table from one format to the other gets the same rows in a
+  different sequence, with nothing to warn it. Recorded rather than fixed,
+  because the fix is a design decision — either the engine preserves an
+  insertion sequence, or the lens documents that order is not guaranteed and
+  callers who need it sort.
+
 ## Reported by review, not yet verified here
 
 Recorded so they are not lost, and marked so nobody treats them as established.
 The last review asserted a lost-update bug that turned out to be a
 misreading; nothing goes above this line until it has been reproduced.
 
-- Lakehouse and Vector lenses write legacy manifests into engine collections,
-  return `Ok`, and lose the data — `create_table` succeeds, `read_table`
-  returns `[]`.
+- The **Vector** lens still writes legacy manifests into engine collections.
+  The Lakehouse half of this was verified and is fixed below; the vector write
+  path has not been reproduced here yet.
+- Reported: `VectorLens` bulk load of 25,000 keeps 5,000. Not reproduced here.
 - HNSW reportedly reads the whole collection per query — bytes measured linear
   in N. The dimension-ordering half of this finding was verified and is fixed
   below; the per-query cost is not yet reproduced here.
@@ -122,6 +136,19 @@ misreading; nothing goes above this line until it has been reproduced.
   logical counter, and the merge kept whichever argument came first. Fixed by
   breaking the tie on the canonical encoding of the value; the laws are now
   tested as laws in `core/record/src/lib.rs`.
+
+- **The lakehouse lens wrote rows that could not be read back.** Verified:
+  against an engine-backed collection, `create_table` returned `Ok` with a
+  commit hash and the following `read_table` returned `Ok([])`. The read path
+  dispatched on the collection's format and the write path did not — it called
+  the legacy writer unconditionally, so the rows went into a legacy manifest
+  while the reader looked at the engine. Both halves looked correct in
+  isolation, and every test that used one format alone passed. `create_table`
+  and `insert` now dispatch as the read side does. `insert` also stops doing a
+  read-modify-write on the engine path: the engine appends natively, so
+  rewriting the merged set added a second copy of every existing row —
+  inserting [3, 4] into [1, 2] gave [1, 1, 2, 2, 3, 4] — and skipping it also
+  removes an O(table) read from every insert.
 
 - **Vector search returned the wrong answers above ten dimensions.** Verified:
   with the previous ordering, 0 of 40 exact-match queries at 11 and at 32
