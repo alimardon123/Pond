@@ -114,9 +114,17 @@ Recorded so they are not lost, and marked so nobody treats them as established.
 The last review asserted a lost-update bug that turned out to be a
 misreading; nothing goes above this line until it has been reproduced.
 
-- HNSW reportedly reads the whole collection per query — bytes measured linear
-  in N. The dimension-ordering half of this finding was verified and is fixed
-  below; the per-query cost is not yet reproduced here.
+- **HNSW reads every vector in the collection on every query.** Reproduced and
+  measured: bytes read are exactly linear in N — ~256 bytes per vector at 500,
+  1000, 2000 and 4000 vectors, so a 10-nearest-neighbour query over 4000
+  vectors reads the whole 999 KiB collection. The graph walk itself is
+  constant (17 round trips at every size); it is the vector fetch that is
+  linear, at `extensions/indexes/hnsw/rust/src/lib.rs`, where the search loads
+  all vectors "for distance computation". Sublinear search is the entire
+  reason an HNSW index exists, so this cancels its benefit in bytes while
+  keeping its cost in build time and storage. The fix is for the index to own
+  its vectors — as IVF now does for its cluster blobs — so a search reads only
+  what it visits. Not done.
 - The canonical URI is not percent-encoded, so a collection named `a?b` signs
   and writes to a different key than intended.
 - A head is ~85 bytes per collection and is rewritten in full on every publish,
@@ -164,6 +172,40 @@ misreading; nothing goes above this line until it has been reproduced.
   than 16 requests rather than exactly 16. Collapsing duplicates is safe
   because merging a value with itself is that value — idempotence, one of the
   three laws the record merge is tested against.
+
+- **Four ways the three vector search paths disagreed.** `VectorLens::search`
+  picks HNSW if an index exists, else IVF, else a linear scan — the caller does
+  not choose and usually cannot tell which ran, so they must agree. They did
+  not, and each fault was invisible from inside a single path:
+
+  1. Both index extensions read the collection through the legacy manifest
+     only, so building either on an engine-backed collection failed with "no
+     commits" and search silently fell back to scanning.
+  2. HNSW read ids from the `Int64` column alone. Ids are stored as strings
+     when they do not all parse as numbers, so every result on a string-keyed
+     collection came back with an **empty id** — correct distances, unusable
+     answers.
+  3. IVF *iterated* that same column, so on the same collection its loop body
+     never ran and search returned **no results at all**, indistinguishable
+     from "nothing is near your query".
+  4. HNSW returned **squared** Euclidean distance while the linear scan
+     returned the real one. Squaring is monotone, so neighbours and their order
+     were identical and no recall test could see it; only a caller filtering on
+     a distance threshold would notice, and only once someone built an index.
+     Its own unit test asserted 25 for the 3-4-5 triangle, pinning the bug.
+
+  Also: the two builders accepted different spellings of the same metric —
+  HNSW `"l2"`, IVF `"euclidean"` — each rejecting the other's, through an API
+  that presents them as interchangeable.
+
+  Fixed with shared helpers rather than parallel edits, since divergence was
+  the fault: `pond_core::id_strings` reads an id column of either type,
+  `pond_storage::read_all_pnd2` dispatches on format and handles all three
+  legacy head shapes, and IVF now writes one blob per cluster that it owns —
+  which also prunes better, because a collection row group holds vectors from
+  many clusters and probing one used to fetch every group containing a member.
+  `lenses/vector/rust/tests/search_paths_agree.rs` compares all three paths
+  against brute force on both formats.
 
 - **A reader could write.** Two ways, both closed. Merging is a write and a
   reader's view is the merge of every writer's tree, so point reads and scans

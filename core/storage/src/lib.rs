@@ -76,6 +76,69 @@ pub fn definition_ref(collection: &str) -> String {
     format!("collections/{}/definition", collection)
 }
 
+/// Every PND2 blob a collection holds, whichever format wrote it.
+///
+/// # Why this is not each caller's own loop
+///
+/// A collection is either legacy-format or engine-format, and reading one
+/// means taking the matching path. Callers that wrote their own loop against
+/// `branch_ref` and the manifest work on legacy collections and return nothing
+/// on engine ones — with no error, because "no commits" and "no rows" are the
+/// same empty answer. Both vector index extensions did exactly that, so
+/// building an index on an engine-backed collection failed and searching it
+/// silently fell back.
+///
+/// One loader, dispatching once, is the fix. New callers get both formats by
+/// construction rather than by remembering.
+pub fn read_all_pnd2(
+    kernel: &pond_kernel::PondKernel,
+    collection: &str,
+) -> Result<Vec<Vec<u8>>, String> {
+    if definition::format_of(kernel, collection) == definition::Format::Engine {
+        return Ok(vec![engine_path::read_pnd2(kernel, collection)?]);
+    }
+
+    let head = kernel
+        .resolve(&branch_ref(collection, "main"))
+        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+    let head_data = kernel
+        .read_blob(&head)
+        .map_err(|e| format!("Failed to read HEAD: {}", e))?;
+
+    // A legacy head is one of three shapes, and a loader that knows only one
+    // of them fails on the others with no clue why. A PondPack carries the
+    // manifest inside it; otherwise the head is either the manifest itself or
+    // a commit that points at one. Both plain shapes exist in the tree — the
+    // vector lens assumed the first and the index extensions the second — so
+    // this tries the direct decode and falls back to the indirection.
+    let manifest_bytes = if pond_pack::is_pack(&head_data) {
+        let (_, m, _) = pond_pack::decode_pack(&head_data)
+            .ok_or_else(|| "Failed to decode PondPack".to_string())?;
+        m
+    } else if manifest::CollectionManifest::decode(&head_data).is_some() {
+        head_data
+    } else {
+        let commit = commit::read_commit(kernel, &head)
+            .ok_or_else(|| "Failed to read commit".to_string())?;
+        kernel
+            .read_blob(&commit.manifest)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?
+    };
+
+    let m = manifest::CollectionManifest::decode(&manifest_bytes)
+        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+    let mut out = Vec::with_capacity(m.row_groups.len());
+    for rg in &m.row_groups {
+        out.push(
+            kernel
+                .read_blob(&rg.blob_hash)
+                .map_err(|e| format!("Failed to read data blob: {}", e))?,
+        );
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // UnifiedStorage — the main struct
 // ---------------------------------------------------------------------------

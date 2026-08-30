@@ -24,7 +24,6 @@
 //   let results = hnsw.search("vectors", &query, 10, 50)?;
 
 use pond_kernel::PondKernel;
-use pond_storage::manifest::CollectionManifest;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
@@ -70,10 +69,17 @@ impl<'a> HNSWIndex<'a> {
         }
 
         let n_dims = n_dimensions.unwrap_or(vectors[0].len());
+        // "l2" and "euclidean" name the same metric — see the matching note
+        // in the IVF extension. Each used to accept only its own spelling.
         let _metric_code = match distance_metric {
-            "l2" => METRIC_L2,
+            "l2" | "euclidean" => METRIC_L2,
             "cosine" => METRIC_COSINE,
-            _ => return Err(format!("unknown metric: {}", distance_metric)),
+            _ => {
+                return Err(format!(
+                    "unknown metric: {} (expected \"l2\"/\"euclidean\" or \"cosine\")",
+                    distance_metric
+                ))
+            }
         };
 
         // 2. Build the hierarchical graph
@@ -225,66 +231,49 @@ impl<'a> HNSWIndex<'a> {
     // -----------------------------------------------------------------------
 
     /// Read all vectors from a collection's manifest.
+    /// Every vector in the collection, with its id, in row order.
+    ///
+    /// Two things this had wrong, both silent:
+    ///
+    /// It read the collection through `branch_ref` and the manifest, which is
+    /// the legacy path only, so an engine-backed collection produced "no
+    /// commits" and index building failed. `pond_storage::read_all_pnd2`
+    /// dispatches on the format.
+    ///
+    /// And it read ids from `i64_data` alone. The id column is `Int64` when
+    /// every id parses as a number and `String` otherwise, so every result on
+    /// a string-keyed collection came back with an empty id — right distances,
+    /// unusable answers. `pond_core::id_strings` reads whichever is there.
     fn read_all_vectors(
         &self,
         collection: &str,
         _n_dimensions: Option<usize>,
     ) -> Result<(Vec<Vec<f64>>, Vec<String>), String> {
-        let branch = "main";
-        let head = self.kernel.resolve(&pond_storage::branch_ref(collection, branch))
-            .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
-
-        let head_data = self.kernel.read_blob(&head)
-            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-
-        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
-                .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-            manifest_bytes
-        } else {
-            let commit = pond_storage::commit::read_commit(self.kernel, &head)
-                .ok_or_else(|| "Failed to read commit".to_string())?;
-            self.kernel.read_blob(&commit.manifest)
-                .map_err(|e| format!("Failed to read manifest: {}", e))?
-        };
-
-        let manifest = CollectionManifest::decode(&manifest_bytes)
-            .ok_or_else(|| "Failed to decode manifest".to_string())?;
-
         let mut vectors: Vec<Vec<f64>> = Vec::new();
         let mut ids: Vec<String> = Vec::new();
 
-        for rg in &manifest.row_groups {
-            let blob_data = self.kernel.read_blob(&rg.blob_hash)
-                .map_err(|e| format!("Failed to read data blob: {}", e))?;
+        for blob in pond_storage::read_all_pnd2(self.kernel, collection)? {
+            let Ok(cols) = pond_core::pnd2_decode(&blob) else {
+                continue;
+            };
+            let dim_cols = pond_core::dim_columns_in_order(&cols);
+            let n_rows = dim_cols.first().map(|c| c.f64_data.len()).unwrap_or(0);
 
-            if let Ok(cols) = pond_core::pnd2_decode(&blob_data) {
-                // Find ID column
-                let id_col = cols.iter().find(|c| c.name.to_string_lossy() == "id");
-
-                // Find dimension columns (dim_0, dim_1, ...)
-                let dim_cols = pond_core::dim_columns_in_order(&cols);
-
-                let n_rows = dim_cols.first().map(|c| c.f64_data.len()).unwrap_or(0);
-
-                for i in 0..n_rows {
-                    let vec: Vec<f64> = dim_cols.iter()
+            let blob_ids = pond_core::id_strings(&cols, n_rows);
+            for i in 0..n_rows {
+                vectors.push(
+                    dim_cols
+                        .iter()
                         .filter_map(|c| c.f64_data.get(i).copied())
-                        .collect();
-                    vectors.push(vec);
-
-                    let id = if let Some(idc) = id_col {
-                        idc.i64_data.get(i).map(|v| v.to_string()).unwrap_or_default()
-                    } else {
-                        i.to_string()
-                    };
-                    ids.push(id);
-                }
+                        .collect(),
+                );
+                ids.push(blob_ids[i].clone());
             }
         }
 
         Ok((vectors, ids))
     }
+
 }
 
 /// Statistics about an HNSW index.
@@ -551,11 +540,28 @@ fn distance(a: &[f64], b: &[f64], metric: &str) -> f64 {
     }
 }
 
-/// L2 (squared Euclidean) distance.
+/// L2 (Euclidean) distance.
+///
+/// The square root matters, even though ranking does not need it. This
+/// returned the *squared* distance while `VectorLens::linear_scan` — the path
+/// taken when no index exists — returned the true Euclidean one, so the same
+/// query against the same data returned different numbers depending on whether
+/// an index happened to have been built. A caller filtering on a distance
+/// threshold would silently change behaviour the moment someone indexed the
+/// collection.
+///
+/// No recall test could catch it: squaring is monotone, so the neighbours and
+/// their order are identical either way. Only the values differ, and only the
+/// two paths side by side show it.
+///
+/// The cost is one square root per comparison, against a search that reads
+/// hundreds of kilobytes. That is not the term to optimise.
 fn l2_dist(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b.iter())
+    a.iter()
+        .zip(b.iter())
         .map(|(x, y)| (x - y).powi(2))
-        .sum()
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// Cosine distance (1 - cosine similarity).
@@ -657,9 +663,21 @@ mod tests {
         (storage, dir)
     }
 
+    /// The 3-4-5 triangle, which is the point: the answer is 5, not 25.
+    ///
+    /// This asserted 25 — the squared distance — and so pinned the bug rather
+    /// than the behaviour. `VectorLens::linear_scan`, the path taken when no
+    /// index exists, returned the true Euclidean distance, so the same query
+    /// against the same data reported different numbers depending on whether
+    /// an index happened to have been built.
+    ///
+    /// Squaring is monotone, so no ranking or recall test could see it; the
+    /// neighbours and their order were identical either way. Only a caller
+    /// comparing the reported distance against a threshold would notice, and
+    /// only after someone built an index.
     #[test]
     fn test_l2_distance() {
-        assert!((l2_dist(&[0.0, 0.0], &[3.0, 4.0]) - 25.0).abs() < 1e-10);
+        assert!((l2_dist(&[0.0, 0.0], &[3.0, 4.0]) - 5.0).abs() < 1e-10);
     }
 
     #[test]

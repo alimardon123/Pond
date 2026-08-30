@@ -187,3 +187,101 @@ mod dim_order_tests {
         assert_eq!(ordered, vec!["dim_0", "dim_1", "dim_x"]);
     }
 }
+
+/// The `id` column as strings, whatever type it is stored in.
+///
+/// # Why this exists
+///
+/// An id column is `Int64` when every id parses as a number and `String`
+/// otherwise — the writer picks per commit. A reader that looks at only one of
+/// those fields does not get an error when it guesses wrong; it gets an empty
+/// vector, and what happens next depends on how it uses it:
+///
+///   - The HNSW index read `i64_data` and mapped a miss to `unwrap_or_default`,
+///     so every search result on a string-keyed collection came back with an
+///     empty id. The distances were right and the answers were unusable.
+///   - The IVF index *iterated* `i64_data`, so on the same collection the loop
+///     body never ran and search returned no results at all — an empty answer
+///     that looks exactly like "nothing matched".
+///
+/// Neither failed loudly, and both are the same mistake: assuming one
+/// representation of something stored in two.
+///
+/// Rows with no id at all get their ordinal, so a caller always has as many
+/// ids as it has rows and positional correspondence is never broken by a gap.
+pub fn id_strings(cols: &[PondColumn], n_rows: usize) -> Vec<String> {
+    let id_col = cols.iter().find(|c| c.name.to_string_lossy() == "id");
+    (0..n_rows)
+        .map(|i| match id_col {
+            Some(c) if !c.str_data.is_empty() => c
+                .str_data
+                .get(i)
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| i.to_string()),
+            Some(c) if !c.i64_data.is_empty() => c
+                .i64_data
+                .get(i)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| i.to_string()),
+            _ => i.to_string(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod id_string_tests {
+    use super::*;
+
+    fn int_ids(v: &[i64]) -> PondColumn {
+        let mut c = PondColumn::empty_named("id", 1);
+        c.i64_data = v.to_vec();
+        c
+    }
+
+    fn str_ids(v: &[&str]) -> PondColumn {
+        let mut c = PondColumn::empty_named("id", 4);
+        c.str_data = v
+            .iter()
+            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .collect();
+        c
+    }
+
+    #[test]
+    fn integer_ids_read_back_as_their_digits() {
+        assert_eq!(id_strings(&[int_ids(&[7, 8, 9])], 3), vec!["7", "8", "9"]);
+    }
+
+    /// The case both index extensions got wrong.
+    #[test]
+    fn string_ids_are_not_lost() {
+        assert_eq!(
+            id_strings(&[str_ids(&["a", "b"])], 2),
+            vec!["a", "b"],
+            "a string id column must not read as empty — HNSW returned blank \
+             ids and IVF returned no rows at all"
+        );
+    }
+
+    #[test]
+    fn a_missing_id_column_falls_back_to_ordinals() {
+        assert_eq!(id_strings(&[], 3), vec!["0", "1", "2"]);
+    }
+
+    /// Never fewer ids than rows: a caller zips these with vectors, so a
+    /// short id column must not silently shorten the answer and shift every
+    /// pairing after the gap.
+    ///
+    /// The filler is the row's ordinal, which can in principle collide with a
+    /// real id — `[1]` over three rows yields `1, 1, 2`. That is accepted
+    /// rather than solved: the column is malformed if it is shorter than the
+    /// data, no filler is correct, and losing positional correspondence is
+    /// worse than a duplicate. This asserts the property that matters, not
+    /// the particular filler.
+    #[test]
+    fn short_id_columns_do_not_shorten_the_result() {
+        let got = id_strings(&[int_ids(&[7])], 3);
+        assert_eq!(got.len(), 3, "one id per row, always");
+        assert_eq!(got[0], "7", "the ids that are present must be preserved");
+    }
+}

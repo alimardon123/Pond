@@ -37,7 +37,6 @@
 // This is O(n_probe × cluster_size) I/O instead of O(n_total) I/O.
 
 use pond_kernel::PondKernel;
-use pond_storage::manifest::CollectionManifest;
 
 const PIVF_MAGIC: &[u8; 4] = b"PIVF";
 const PIVF_VERSION: u8 = 2;
@@ -75,33 +74,68 @@ impl<'a> IVFIndex<'a> {
         n_clusters: usize,
         metric: &str,
     ) -> Result<String, String> {
-        // 1. Read all vectors from the collection's manifest
-        let (vectors, blob_hashes) = self.read_all_vectors(collection)?;
+        // 1. Read all vectors from the collection, whichever format wrote it
+        let (vectors, ids) = self.read_all_vectors(collection)?;
 
         if vectors.is_empty() {
             return Err("no vectors found in collection".to_string());
         }
 
         let n_dims = vectors[0].len();
+        // "l2" and "euclidean" name the same metric. They are both accepted
+        // because the two index extensions accepted different ones: HNSW took
+        // "l2" and this took "euclidean", so the same spelling that built one
+        // index was rejected by the other — through a lens API that presents
+        // them as interchangeable and picks between them itself.
         let metric_code = match metric {
-            "euclidean" => METRIC_EUCLIDEAN,
+            "euclidean" | "l2" => METRIC_EUCLIDEAN,
             "cosine" => METRIC_COSINE,
-            _ => return Err(format!("unknown metric: {}", metric)),
+            _ => {
+                return Err(format!(
+                    "unknown metric: {} (expected \"l2\"/\"euclidean\" or \"cosine\")",
+                    metric
+                ))
+            }
         };
 
         // 2. Run k-means clustering
         let centroids = kmeans(&vectors, n_clusters, n_dims);
         let assignments = assign_clusters(&vectors, &centroids, metric_code);
 
-        // 3. Build per-cluster blob references
-        // For each cluster, which blob hashes contain its vectors?
+        // 3. Write one blob per cluster, owned by the index.
+        //
+        // This used to record, per cluster, which of the *collection's* row
+        // groups held its vectors. That tied the index to the legacy manifest
+        // layout, so building one on an engine-backed collection failed with
+        // "no commits" — and a row group holds vectors from many clusters, so
+        // probing one cluster fetched every group that happened to contain a
+        // member of it and threw most of the rows away.
+        //
+        // Owning the blobs fixes both. A cluster's blob holds exactly that
+        // cluster's vectors, so probing reads only what it needs, and the
+        // index no longer cares how the collection is stored. The cost is a
+        // copy of the vectors, which is what an index is.
+        let n_clusters_actual = centroids.len();
         let mut cluster_blob_refs: Vec<std::collections::HashSet<String>> =
-            vec![std::collections::HashSet::new(); n_clusters];
+            vec![std::collections::HashSet::new(); n_clusters_actual.max(n_clusters)];
 
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); cluster_blob_refs.len()];
         for (i, &cluster) in assignments.iter().enumerate() {
-            if let Some(blob_hash) = blob_hashes.get(i) {
-                cluster_blob_refs[cluster].insert(blob_hash.clone());
+            if cluster < members.len() {
+                members[cluster].push(i);
             }
+        }
+
+        for (cluster, rows) in members.iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let blob = encode_cluster_blob(&vectors, &ids, rows, n_dims);
+            let hash = self
+                .kernel
+                .write(&blob)
+                .map_err(|e| format!("Failed to write cluster blob: {}", e))?;
+            cluster_blob_refs[cluster].insert(hash);
         }
 
         // 4. Encode the index
@@ -192,25 +226,33 @@ impl<'a> IVFIndex<'a> {
         for blob_data in &blob_data_list {
             // Try to decode as PND2
             if let Ok(cols) = pond_core::pnd2_decode(blob_data) {
-                // Extract vectors from PND2 columns
-                // Assuming columns: id (INT64), dim_0, dim_1, ... (FLOAT64)
-                let id_col = cols.iter().find(|c| c.name.to_string_lossy() == "id");
-                if let Some(id_col) = id_col {
-                    for (i, id) in id_col.i64_data.iter().enumerate() {
-                        // Reassemble vector from dim_0, dim_1, ...
-                        // Numeric dimension order, shared with the build
-                        // path. This site used to take whatever order the
-                        // decoder returned, while the build path sorted by
-                        // name — so the two indexed and searched in different
-                        // coordinate frames.
-                        let vec: Vec<f64> = pond_core::dim_columns_in_order(&cols)
+                // Numeric dimension order, shared with the build path. This
+                // site used to take whatever order the decoder returned while
+                // the build path sorted by name, so the two indexed and
+                // searched in different coordinate frames.
+                let dim_cols = pond_core::dim_columns_in_order(&cols);
+                let n_rows = dim_cols.first().map(|c| c.f64_data.len()).unwrap_or(0);
+
+                // Row count comes from the dimension columns, and ids are read
+                // whichever type they are stored in.
+                //
+                // This loop used to iterate `id_col.i64_data`. The id column is
+                // `Int64` only when every id parses as a number and `String`
+                // otherwise, so on a string-keyed collection the loop body
+                // never ran and search returned **no results at all** — an
+                // empty answer indistinguishable from "nothing matched".
+                let ids = pond_core::id_strings(&cols, n_rows);
+
+                {
+                    for i in 0..n_rows {
+                        let vec: Vec<f64> = dim_cols
                             .iter()
                             .filter_map(|c| c.f64_data.get(i).copied())
                             .collect();
 
                         if vec.len() == query.len() {
                             let dist = distance(query, &vec, index.metric_code);
-                            scored.push((dist, id.to_string()));
+                            scored.push((dist, ids[i].clone()));
                         }
                     }
                 }
@@ -254,53 +296,41 @@ impl<'a> IVFIndex<'a> {
     ///
     /// Returns (vectors, blob_hashes) where blob_hashes[i] is the blob
     /// that contains vector i.
+    /// Every vector in the collection, with its id, in row order.
+    ///
+    /// Reads through `pond_storage::read_all_pnd2`, which dispatches on the
+    /// collection's format. It used to walk `branch_ref` and the manifest
+    /// directly — the legacy layout only — so building an index on an
+    /// engine-backed collection failed with "no commits".
+    ///
+    /// Ids come back as strings whatever column type holds them. The search
+    /// path used to *iterate* the Int64 column, so on a string-keyed
+    /// collection its loop body never ran and search returned no results at
+    /// all.
     fn read_all_vectors(&self, collection: &str) -> Result<(Vec<Vec<f64>>, Vec<String>), String> {
-        let branch = "main";
-        let head = self.kernel.resolve(&pond_storage::branch_ref(collection, branch))
-            .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
-
-        // Check if HEAD is a PondPack
-        let head_data = self.kernel.read_blob(&head)
-            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-
-        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
-                .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-            manifest_bytes
-        } else {
-            let commit = pond_storage::commit::read_commit(self.kernel, &head)
-                .ok_or_else(|| "Failed to read commit".to_string())?;
-            self.kernel.read_blob(&commit.manifest)
-                .map_err(|e| format!("Failed to read manifest: {}", e))?
-        };
-
-        let manifest = CollectionManifest::decode(&manifest_bytes)
-            .ok_or_else(|| "Failed to decode manifest".to_string())?;
-
         let mut vectors: Vec<Vec<f64>> = Vec::new();
-        let mut blob_hashes: Vec<String> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
 
-        for rg in &manifest.row_groups {
-            let blob_data = self.kernel.read_blob(&rg.blob_hash)
-                .map_err(|e| format!("Failed to read data blob: {}", e))?;
+        for blob in pond_storage::read_all_pnd2(self.kernel, collection)? {
+            let Ok(cols) = pond_core::pnd2_decode(&blob) else {
+                continue;
+            };
+            let dim_cols = pond_core::dim_columns_in_order(&cols);
+            let n_rows = dim_cols.first().map(|c| c.f64_data.len()).unwrap_or(0);
+            let blob_ids = pond_core::id_strings(&cols, n_rows);
 
-            if let Ok(cols) = pond_core::pnd2_decode(&blob_data) {
-                // Find dimension columns (dim_0, dim_1, ...)
-                let dim_cols = pond_core::dim_columns_in_order(&cols);
-
-                let n_rows = dim_cols.first().map(|c| c.f64_data.len()).unwrap_or(0);
-
-                for i in 0..n_rows {
-                    let vec: Vec<f64> = dim_cols.iter()
+            for i in 0..n_rows {
+                vectors.push(
+                    dim_cols
+                        .iter()
                         .filter_map(|c| c.f64_data.get(i).copied())
-                        .collect();
-                    vectors.push(vec);
-                    blob_hashes.push(rg.blob_hash.clone());
-                }
+                        .collect(),
+                );
+                ids.push(blob_ids[i].clone());
             }
         }
 
-        Ok((vectors, blob_hashes))
+        Ok((vectors, ids))
     }
 
     /// Encode the IVF index as a binary blob (v2 format with blob references).
@@ -444,6 +474,42 @@ struct DecodedIndex {
 // ---------------------------------------------------------------------------
 // K-means clustering + distance functions
 // ---------------------------------------------------------------------------
+
+/// One cluster's vectors and ids, as a PND2 blob the index owns.
+///
+/// Encoded in the same shape the collection uses — an `id` column plus
+/// `dim_0..dim_n` — so the search path decodes an index-owned blob and a
+/// collection row group with the same code. Ids are written as strings
+/// unconditionally: they round-trip whatever the collection stored, and
+/// `pond_core::id_strings` reads either.
+fn encode_cluster_blob(
+    vectors: &[Vec<f64>],
+    ids: &[String],
+    rows: &[usize],
+    n_dims: usize,
+) -> Vec<u8> {
+    let mut columns: Vec<(&str, pond_core::TypedColumn)> = Vec::new();
+
+    let id_vals: Vec<String> = rows
+        .iter()
+        .map(|&r| ids.get(r).cloned().unwrap_or_else(|| r.to_string()))
+        .collect();
+    columns.push(("id", pond_core::TypedColumn::String(id_vals)));
+
+    let names: Vec<String> = (0..n_dims).map(|d| format!("dim_{}", d)).collect();
+    let dim_data: Vec<Vec<f64>> = (0..n_dims)
+        .map(|d| {
+            rows.iter()
+                .map(|&r| vectors.get(r).and_then(|v| v.get(d)).copied().unwrap_or(0.0))
+                .collect()
+        })
+        .collect();
+    for (name, data) in names.iter().zip(dim_data) {
+        columns.push((name.as_str(), pond_core::TypedColumn::Float64(data)));
+    }
+
+    pond_core::pnd2_encode_multi_typed(&columns)
+}
 
 /// Simple k-means clustering.
 fn kmeans(vectors: &[Vec<f64>], n_clusters: usize, n_dims: usize) -> Vec<Vec<f64>> {
