@@ -198,8 +198,13 @@ impl<'a> IVFIndex<'a> {
                 if let Some(id_col) = id_col {
                     for (i, id) in id_col.i64_data.iter().enumerate() {
                         // Reassemble vector from dim_0, dim_1, ...
-                        let vec: Vec<f64> = cols.iter()
-                            .filter(|c| c.name.to_string_lossy().starts_with("dim_"))
+                        // Numeric dimension order, shared with the build
+                        // path. This site used to take whatever order the
+                        // decoder returned, while the build path sorted by
+                        // name — so the two indexed and searched in different
+                        // coordinate frames.
+                        let vec: Vec<f64> = pond_core::dim_columns_in_order(&cols)
+                            .iter()
                             .filter_map(|c| c.f64_data.get(i).copied())
                             .collect();
 
@@ -281,10 +286,7 @@ impl<'a> IVFIndex<'a> {
 
             if let Ok(cols) = pond_core::pnd2_decode(&blob_data) {
                 // Find dimension columns (dim_0, dim_1, ...)
-                let mut dim_cols: Vec<&pond_core::PondColumn> = cols.iter()
-                    .filter(|c| c.name.to_string_lossy().starts_with("dim_"))
-                    .collect();
-                dim_cols.sort_by_key(|c| c.name.to_string_lossy().to_string());
+                let dim_cols = pond_core::dim_columns_in_order(&cols);
 
                 let n_rows = dim_cols.first().map(|c| c.f64_data.len()).unwrap_or(0);
 

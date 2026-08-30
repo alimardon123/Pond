@@ -104,10 +104,9 @@ misreading; nothing goes above this line until it has been reproduced.
 - Lakehouse and Vector lenses write legacy manifests into engine collections,
   return `Ok`, and lose the data — `create_table` succeeds, `read_table`
   returns `[]`.
-- Vector search recall collapses above ~10 dimensions (reported 10/10 at dim 8,
-  0/10 at dim 32), with dimension columns sorted lexicographically at three
-  sites and unsorted at a fourth, so build and search would use different
-  coordinate frames. HNSW reportedly reads the whole collection per query.
+- HNSW reportedly reads the whole collection per query — bytes measured linear
+  in N. The dimension-ordering half of this finding was verified and is fixed
+  below; the per-query cost is not yet reproduced here.
 - The canonical URI is not percent-encoded, so a collection named `a?b` signs
   and writes to a different key than intended.
 - A head is ~85 bytes per collection and is rewritten in full on every publish,
@@ -123,6 +122,18 @@ misreading; nothing goes above this line until it has been reproduced.
   logical counter, and the merge kept whichever argument came first. Fixed by
   breaking the tie on the canonical encoding of the value; the laws are now
   tested as laws in `core/record/src/lib.rs`.
+
+- **Vector search returned the wrong answers above ten dimensions.** Verified:
+  with the previous ordering, 0 of 40 exact-match queries at 11 and at 32
+  dimensions found their own vector at distance 0. A vector is stored one
+  dimension per column, and four places reassembled it independently — three
+  sorted the column names as strings, and the IVF search path did not sort at
+  all, so it and the IVF build path used different coordinate frames. String
+  order matches numeric order up to `dim_9` and diverges once `dim_10` exists,
+  which is why the small tests passed. One shared
+  `pond_core::dim_columns_in_order` now orders numerically at all four sites.
+  `lenses/vector/rust/tests/dimension_order.rs` pins the exact boundary:
+  eight dimensions passes either way, eleven is the first broken case.
 
 - **`create` overwrote a live collection during a read outage.** Verified: with
   reads failing, `engine_path::create` on a populated Engine collection

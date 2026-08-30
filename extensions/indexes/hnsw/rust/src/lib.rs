@@ -263,10 +263,7 @@ impl<'a> HNSWIndex<'a> {
                 let id_col = cols.iter().find(|c| c.name.to_string_lossy() == "id");
 
                 // Find dimension columns (dim_0, dim_1, ...)
-                let mut dim_cols: Vec<&pond_core::PondColumn> = cols.iter()
-                    .filter(|c| c.name.to_string_lossy().starts_with("dim_"))
-                    .collect();
-                dim_cols.sort_by_key(|c| c.name.to_string_lossy().to_string());
+                let dim_cols = pond_core::dim_columns_in_order(&cols);
 
                 let n_rows = dim_cols.first().map(|c| c.f64_data.len()).unwrap_or(0);
 

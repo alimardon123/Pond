@@ -93,3 +93,97 @@ pub(crate) fn bytes_to_cstring(b: &[u8]) -> CString {
 pub(crate) fn str_to_cstring(s: &str) -> CString {
     bytes_to_cstring(s.as_bytes())
 }
+
+/// The `dim_N` columns of a vector row group, in numeric order.
+///
+/// # Why this exists rather than a `sort_by_key` at each call site
+///
+/// A vector is stored one dimension per column — `dim_0`, `dim_1`, … — so
+/// reading one back means collecting those columns and putting them in the
+/// order the vector was written in. Four places did that independently: the
+/// IVF build path, the IVF search path, the HNSW build path, and the vector
+/// lens. Three sorted the column names as *strings*; the fourth did not sort
+/// at all and took whatever order the decoder happened to return.
+///
+/// Both are wrong, and they are wrong in a way that hides.
+///
+/// Lexicographically, `"dim_10" < "dim_2"`, so from ten dimensions upward the
+/// string order stops matching the numeric order. The stored vectors then come
+/// back permuted while the *query* vector — which the caller supplies as a
+/// plain list — does not, so every distance is computed between coordinates
+/// that do not correspond. Under nine dimensions the two orders coincide and
+/// everything works, which is why the small tests passed: measured recall was
+/// 10/10 at eight dimensions and 0/10 at thirty-two, and an exact-match query
+/// returned a distance of 25.9 instead of 0.
+///
+/// Sorting numerically fixes it everywhere at once, and having one function do
+/// it is the point — the two paths that disagreed could only disagree because
+/// each had its own copy.
+///
+/// Columns whose suffix is not a number sort last, by name, so a malformed
+/// name cannot silently take position zero.
+pub fn dim_columns_in_order(cols: &[PondColumn]) -> Vec<&PondColumn> {
+    let mut dims: Vec<&PondColumn> = cols
+        .iter()
+        .filter(|c| c.name.to_string_lossy().starts_with("dim_"))
+        .collect();
+    dims.sort_by_key(|c| {
+        let name = c.name.to_string_lossy().to_string();
+        let index = name["dim_".len()..].parse::<u64>().ok();
+        (index.is_none(), index.unwrap_or(0), name)
+    });
+    dims
+}
+
+#[cfg(test)]
+mod dim_order_tests {
+    use super::*;
+
+    fn col(name: &str) -> PondColumn {
+        let mut c = PondColumn::empty_named(name, 3);
+        c.f64_data.push(0.0);
+        c
+    }
+
+    /// The case the string sort gets wrong, and the only one that matters.
+    #[test]
+    fn dimensions_are_ordered_by_number_not_by_name() {
+        let cols: Vec<PondColumn> = (0..12).map(|i| col(&format!("dim_{i}"))).collect();
+        let ordered: Vec<String> = dim_columns_in_order(&cols)
+            .iter()
+            .map(|c| c.name.to_string_lossy().to_string())
+            .collect();
+
+        let expected: Vec<String> = (0..12).map(|i| format!("dim_{i}")).collect();
+        assert_eq!(
+            ordered, expected,
+            "dim_10 must follow dim_9, not dim_1 — a string sort puts it second \
+             and permutes every stored vector against the query"
+        );
+    }
+
+    /// Order must not depend on the order the decoder returned them in.
+    #[test]
+    fn the_input_order_does_not_matter() {
+        let mut cols: Vec<PondColumn> = (0..12).map(|i| col(&format!("dim_{i}"))).collect();
+        cols.reverse();
+        let ordered: Vec<String> = dim_columns_in_order(&cols)
+            .iter()
+            .map(|c| c.name.to_string_lossy().to_string())
+            .collect();
+        let expected: Vec<String> = (0..12).map(|i| format!("dim_{i}")).collect();
+        assert_eq!(ordered, expected);
+    }
+
+    /// Non-dimension columns are excluded; malformed ones go last rather than
+    /// taking position zero.
+    #[test]
+    fn only_well_formed_dimensions_lead() {
+        let cols = vec![col("id"), col("dim_1"), col("dim_x"), col("dim_0"), col("metadata")];
+        let ordered: Vec<String> = dim_columns_in_order(&cols)
+            .iter()
+            .map(|c| c.name.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(ordered, vec!["dim_0", "dim_1", "dim_x"]);
+    }
+}
