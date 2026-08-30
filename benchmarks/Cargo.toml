@@ -54,6 +54,10 @@ path = "src/headscale.rs"
 name = "vectorscale"
 path = "src/vectorscale.rs"
 
+[[bin]]
+name = "projection"
+path = "src/projection.rs"
+
 [dependencies]
 tempfile = { workspace = true }
 pond_index = { path = "../core/index" }

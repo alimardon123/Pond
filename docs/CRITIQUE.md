@@ -97,6 +97,23 @@ apart the clocks in a deployment can drift.
 
 ## Open, reproduced here
 
+- **A projected scan reads every byte it discards.** Selecting two columns out
+  of fifty reads all fifty — not approximately, the same number of bytes to the
+  byte, because a record is stored whole as its leaf entry and reaching any
+  field means reading the leaf. Measured by `pond_bench --bin projection` over
+  20,000 rows: **6085.7 KiB read against an ideal of 243.4**, 178.9 ms against
+  64.8. Twenty-five times more bytes than the query needs.
+
+  The cheap fix does not exist, and the arithmetic is worth keeping so nobody
+  tries it: spilling every field would leave a 33-byte pointer per field per
+  row *inside the leaf*, so fifty ten-byte columns would go from 500 bytes a
+  row to 1,650 — three times worse before fetching anything. The pointer has to
+  be per leaf, not per record, which is a leaf format change.
+
+  Designed in `docs/COLUMNAR_LAYOUT.md`, with the costs stated: a point read
+  gets slower, which is the central trade, and every measurement so far is a
+  scan. Not implemented.
+
 - **A publish moves bytes proportional to every collection the writer owns.**
   Measured by `cargo run --release -p pond_bench --bin headscale`: a single-row
   write into one collection, at increasing collection counts.
