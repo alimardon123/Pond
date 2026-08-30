@@ -1033,9 +1033,35 @@ impl<S: ObjectStore> Reader<S> {
     /// written by a different writer than the one that created the record,
     /// which is the case a delete has to survive.
     pub fn get(&mut self, collection: &str, key: &Key) -> Result<Option<Record>> {
-        let tree = self.tree_for(collection);
+        // Descend every writer's tree at once rather than merging them first.
+        //
+        // `tree_for` builds the merged view, and merging is a write: on a
+        // fresh reader a point read was materialising W-1 merged trees and
+        // storing their nodes. Measured at 64 writers — 141 round trips, 100
+        // PUTs, 4.3 s modelled, against 1 round trip at a single writer, on
+        // the path a key-value or OLTP workload takes for every operation.
+        //
+        // A point read does not need the merge. It needs the values under one
+        // key, at most one per tree. Descending the trees together costs one
+        // wait per level and writes nothing; the values are folded here with
+        // the same `resolve_records` the merge would have applied, so the
+        // answer is identical.
+        //
+        // If the merged tree is already built — a scan ran first — use it,
+        // since descending one tree beats descending W.
         let before = self.store.read_failures();
-        let found = tree.get(&self.store, &key.encode());
+        let found = if let Some(t) = self.merged.get(collection) {
+            let tree = Tree {
+                root: t.root.clone(),
+                config: self.config.chunk,
+            };
+            tree.get(&self.store, &key.encode())
+        } else {
+            let roots = self.roots.get(collection).cloned().unwrap_or_default();
+            pond_index::get_from_roots(&self.store, &roots, &key.encode())
+                .into_iter()
+                .reduce(|a, b| resolve_records(&a, &b))
+        };
         if let Some(e) = self.store.failure_since(before) {
             return Err(e.into());
         }

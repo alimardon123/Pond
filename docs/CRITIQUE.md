@@ -133,6 +133,27 @@ misreading; nothing goes above this line until it has been reproduced.
   breaking the tie on the canonical encoding of the value; the laws are now
   tested as laws in `core/record/src/lib.rs`.
 
+- **A point read cost a round trip and a PUT per writer.** Every writer
+  publishes its own tree and a reader's view is their merge — and merging is a
+  *write*, so a point read on a fresh reader materialised W-1 merged trees and
+  stored their nodes. Measured: 1 wait and 0 PUTs at one writer; 141 waits, 100
+  PUTs and 4.3 s modelled at 64. Linear in writers, on the path a KV or OLTP
+  workload takes for every operation, against a design whose headline property
+  is that any number of writers converge without coordination.
+
+  A point read does not need the merge — it needs the values under one key, at
+  most one per tree. `pond_index::get_from_roots` descends every root in
+  lockstep, one batch per level, and the caller folds the results with the same
+  `resolve_records` the merge would have applied. **141 waits to 1, 100 PUTs to
+  0**, flat in writer count. The fold is only safe because the record merge was
+  made unconditionally commutative and associative earlier — with the old
+  tie-break, fold order would have changed the answer.
+  `core/engine/tests/writer_scaling.rs` pins both the cost and the agreement
+  with the merged scan.
+
+  Scans still go through the merged tree and still pay for it. That is the
+  remaining half of this finding.
+
 - **Scans waited once per node instead of once per level.** A cold full scan of
   100,000 rows was 51 sequential round trips at batch width 1.0 — nothing in
   the read path issued a parallel request — although every leaf hash is known

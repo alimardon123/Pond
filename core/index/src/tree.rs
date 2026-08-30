@@ -587,6 +587,67 @@ fn collect_leaf_refs<S: NodeStore>(
 /// Order is preserved because a level is decoded left to right and each node's
 /// children are appended in order, so the frontier is always in key order and
 /// leaves are drained in the order they are met.
+/// Look one key up in several trees at once, one wait per level.
+///
+/// # Why this exists
+///
+/// Every writer publishes its own tree, and a reader's view is the merge of
+/// all of them. Building that merge to answer a point read is the obvious
+/// implementation and the expensive one: merging is a write, so a *read* on a
+/// fresh reader was materialising W-1 merged trees and storing their nodes.
+/// Measured at 64 writers: 141 round trips, 100 PUTs, 4.3 s modelled, against
+/// 1 round trip at a single writer. Linear in the number of writers, on the
+/// path a key-value or OLTP workload takes for every operation.
+///
+/// A point read does not need the merge. It needs the handful of values
+/// stored under one key, which is at most one per tree. Descending all the
+/// trees in lockstep — batch the current level, take each node's one relevant
+/// child, batch the next — costs one wait per *level* and writes nothing. The
+/// caller merges the values it gets back, which for a single key is cheap and
+/// needs no storage.
+///
+/// Returns one value per tree that holds the key, in the order the roots were
+/// given, so a caller can fold them with the same resolution it would have
+/// used inside the merge.
+///
+/// The pruning and the leaf lookup are the same rules as [`Tree::get`]: the
+/// first child whose `max_key` is not below the key, then a binary search in
+/// the leaf. They have to stay the same rules — a point read that descended
+/// differently from the merge would answer differently, which is worse than
+/// being slow.
+pub fn get_from_roots<S: NodeStore>(store: &S, roots: &[String], key: &[u8]) -> Vec<Vec<u8>> {
+    let mut frontier: Vec<String> = roots.to_vec();
+    let mut found = Vec::new();
+
+    while !frontier.is_empty() {
+        let mut next = Vec::with_capacity(frontier.len());
+        for bytes in store.get_batch(&frontier) {
+            let Some(node) = bytes.and_then(|b| Node::decode(&b)) else {
+                continue;
+            };
+            match node {
+                Node::Leaf { entries } => {
+                    if let Ok(i) = entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                        found.push(entries[i].1.clone());
+                    }
+                }
+                Node::Internal { children } => {
+                    // The first child whose range can contain the key. If none
+                    // can, this tree has nothing under it and drops out of the
+                    // descent — which is how the frontier narrows.
+                    let idx = children.partition_point(|c| c.max_key.as_slice() < key);
+                    if let Some(c) = children.get(idx) {
+                        next.push(c.hash.clone());
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    found
+}
+
 fn collect<S: NodeStore>(store: &S, hash: &str, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
     let mut frontier = vec![hash.to_string()];
     while !frontier.is_empty() {
