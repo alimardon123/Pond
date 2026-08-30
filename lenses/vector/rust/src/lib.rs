@@ -35,7 +35,7 @@ use pond_core::{TypedColumn, VT_INT64};
 use pond_storage::UnifiedStorage;
 use pond_storage::write as storage_write;
 use pond_storage::manifest::CollectionManifest;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// VectorLens — vector storage with auto-accelerated ANN search.
@@ -106,13 +106,52 @@ impl VectorLens {
             return Err("Cannot commit: vectors have 0 dimensions".to_string());
         }
 
+        let engine = pond_storage::definition::format_of(self.storage.kernel(), collection)
+            == pond_storage::definition::Format::Engine;
+
+        // What actually gets written.
+        //
+        // On the engine this is just the buffer: `write_rows` appends, so
+        // flushing the buffer *is* the append.
+        //
+        // The legacy writer stores a whole-collection snapshot, so writing the
+        // buffer alone would discard everything committed before it. That was
+        // not hypothetical — `insert` auto-commits every 10,000 rows, so a
+        // 25,000-row load committed the first 10,000, replaced them with the
+        // second 10,000, and replaced those with the final 5,000. Measured: 8
+        // of 40 sampled vectors survived. Every call returned success. So the
+        // legacy path reads what is there and writes the union.
+        let mut rows: Vec<(String, Vec<f64>, String)> = buffer;
+        if !engine {
+            // A collection with no commits yet has nothing to preserve, which
+            // is not an error here.
+            if let Ok(existing) = self.get_all(collection) {
+                let staged: std::collections::HashSet<&String> =
+                    rows.iter().map(|(id, _, _)| id).collect::<HashSet<_>>();
+                let carried: Vec<(String, Vec<f64>, String)> = existing
+                    .into_iter()
+                    .filter(|(id, _)| !staged.contains(id))
+                    .map(|(id, (v, m))| (id, v, m))
+                    .collect();
+                rows.extend(carried);
+            }
+        }
+
         // Build PND2 columns: id (INT64 or STRING) + dim_0..dim_N (FLOAT64) + metadata (STRING)
+        //
+        // The dimension names are owned by `dim_names` and borrowed from it.
+        // They used to be `Box::leak`ed, described in a comment as a known
+        // pattern for dynamic column names. It is not one: the leak is per
+        // commit, so a 128-dimension collection committed a thousand times
+        // leaks a hundred and twenty-eight thousand strings that are never
+        // reachable again. A local that outlives the borrow does the same job.
+        let dim_names: Vec<String> = (0..n_dims).map(|d| format!("dim_{}", d)).collect();
         let mut columns: Vec<(&str, TypedColumn)> = Vec::new();
 
         // Try to use INT64 IDs (if all IDs are numeric)
-        let all_numeric = buffer.iter().all(|(id, _, _)| id.parse::<i64>().is_ok());
+        let all_numeric = rows.iter().all(|(id, _, _)| id.parse::<i64>().is_ok());
 
-        let ids: Vec<String> = buffer.iter().map(|(id, _, _)| id.clone()).collect();
+        let ids: Vec<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
         let id_col = if all_numeric {
             let id_vals: Vec<i64> = ids.iter().map(|id| id.parse::<i64>().unwrap()).collect();
             TypedColumn::Int64(id_vals)
@@ -121,20 +160,28 @@ impl VectorLens {
         };
         columns.push(("id", id_col));
 
-        // Dimension columns
-        for d in 0..n_dims {
-            let dim_vals: Vec<f64> = buffer.iter().map(|(_, v, _)| v[d]).collect();
-            let col_name = format!("dim_{}", d);
-            // Need to leak the name — this is a known pattern for dynamic column names
-            // In production, we'd use a different API that owns the names
-            let leaked = Box::leak(col_name.into_boxed_str());
-            columns.push((leaked, TypedColumn::Float64(dim_vals)));
+        for (d, name) in dim_names.iter().enumerate() {
+            let dim_vals: Vec<f64> = rows.iter().map(|(_, v, _)| v[d]).collect();
+            columns.push((name.as_str(), TypedColumn::Float64(dim_vals)));
         }
 
-        // Metadata column
-        let meta_vals: Vec<String> = buffer.iter().map(|(_, _, m)| m.clone()).collect();
-        let leaked_meta = Box::leak("metadata".to_string().into_boxed_str());
-        columns.push((leaked_meta, TypedColumn::String(meta_vals)));
+        let meta_vals: Vec<String> = rows.iter().map(|(_, _, m)| m.clone()).collect();
+        columns.push(("metadata", TypedColumn::String(meta_vals)));
+
+        // Write where the search path reads. This used to call the legacy
+        // writer unconditionally while `search` and `get_all` dispatch on the
+        // format, so on an engine-backed collection the vectors went into a
+        // legacy manifest and nothing could find them: 0 of 50 sampled
+        // vectors were retrievable after a successful 100-row commit.
+        if engine {
+            pond_storage::engine_path::write_rows(
+                self.storage.kernel(),
+                collection,
+                &columns,
+                pond_kernel::crdt::stable_writer_id(),
+            )?;
+            return pond_storage::engine_path::root_of(self.storage.kernel(), collection);
+        }
 
         let active = self.storage.get_active_branch(collection);
         storage_write::write_rows(

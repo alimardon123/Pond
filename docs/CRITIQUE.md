@@ -114,10 +114,6 @@ Recorded so they are not lost, and marked so nobody treats them as established.
 The last review asserted a lost-update bug that turned out to be a
 misreading; nothing goes above this line until it has been reproduced.
 
-- The **Vector** lens still writes legacy manifests into engine collections.
-  The Lakehouse half of this was verified and is fixed below; the vector write
-  path has not been reproduced here yet.
-- Reported: `VectorLens` bulk load of 25,000 keeps 5,000. Not reproduced here.
 - HNSW reportedly reads the whole collection per query — bytes measured linear
   in N. The dimension-ordering half of this finding was verified and is fixed
   below; the per-query cost is not yet reproduced here.
@@ -136,6 +132,23 @@ misreading; nothing goes above this line until it has been reproduced.
   logical counter, and the merge kept whichever argument came first. Fixed by
   breaking the tie on the canonical encoding of the value; the laws are now
   tested as laws in `core/record/src/lib.rs`.
+
+- **The vector lens lost vectors three different ways.** All three verified in
+  one function, `VectorLens::commit`. (a) It called the legacy writer while
+  `search` and `get_all` dispatch on format, so on an engine-backed collection
+  0 of 50 sampled vectors were retrievable after a successful 100-row commit.
+  (b) `insert` auto-commits every 10,000 rows and the legacy writer stores a
+  whole-collection snapshot, so a 25,000-row load committed the first 10,000,
+  replaced them with the second 10,000, then replaced those with the final
+  5,000 — 8 of 40 sampled vectors survived, matching the reported 5,000 of
+  25,000. The legacy path now writes the union of what is stored and what is
+  staged; the engine path appends natively and needs no read. (c) Every
+  dimension name was `Box::leak`ed on every commit — a comment called it "a
+  known pattern for dynamic column names", but the leak is per commit, so a
+  128-dimension collection committed a thousand times leaks 128,000
+  unreachable strings. A local that outlives the borrow does the same job.
+  `lenses/vector/rust/tests/bulk_and_dispatch.rs` covers both formats either
+  side of the 10,000 boundary, which is where the existing tests stopped.
 
 - **The lakehouse lens wrote rows that could not be read back.** Verified:
   against an engine-backed collection, `create_table` returned `Ok` with a
