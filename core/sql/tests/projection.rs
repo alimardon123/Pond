@@ -14,7 +14,23 @@ use pond_core::encode::TypedColumn;
 use pond_kernel::{LocalFSObjectStore, Metered, PondKernel};
 use pond_storage::{engine_path, UnifiedStorage};
 
+/// These tests count bytes at the *backend*, so the disk cache has to be off.
+///
+/// With it on, the seed's writes populate the cache and both queries then read
+/// the same 209 bytes from the store — the projection saving is real but
+/// invisible at this layer, because the cache absorbed it. Measuring the
+/// storage layer's I/O means reading the storage layer, not the cache in front
+/// of it.
+///
+/// Every test in this binary wants the same thing, and each integration test
+/// file is its own process, so setting it once per test is safe: the value is
+/// identical whoever writes it.
+fn cold_backend() {
+    std::env::set_var("POND_CACHE_DIR", "off");
+}
+
 fn pond(dir: &std::path::Path) -> (Arc<Metered<LocalFSObjectStore>>, UnifiedStorage) {
+    cold_backend();
     let store = Arc::new(Metered::new(LocalFSObjectStore::new(dir).unwrap()));
     let kernel = PondKernel::new_with_store(Box::new(Arc::clone(&store)));
     (store, UnifiedStorage::new(kernel))

@@ -516,7 +516,12 @@ impl<S: ObjectStore> Engine<S> {
     /// why a delete cannot erase them and still merge.
     pub fn get(&mut self, collection: &str, key: &Key) -> Result<Option<Record>> {
         let tree = self.tree_for(collection);
-        match tree.get(&self.store, &key.encode()) {
+        let before = self.store.read_failures();
+        let found = tree.get(&self.store, &key.encode());
+        if let Some(e) = self.store.failure_since(before) {
+            return Err(e.into());
+        }
+        match found {
             Some(bytes) => {
                 let bytes = spill::resolve(self.store.inner(), bytes)?;
                 let rec = decode_record(&bytes)
@@ -546,14 +551,23 @@ impl<S: ObjectStore> Engine<S> {
         end: &Key,
     ) -> Result<Vec<(Key, Record)>> {
         let tree = self.tree_for(collection);
+        let before = self.store.read_failures();
         let raw = tree.scan_range(&self.store, &start.encode(), &end.encode());
+        if let Some(e) = self.store.failure_since(before) {
+            return Err(e.into());
+        }
         decode_pairs(self.store.inner(), raw, collection)
     }
 
     /// Every record in a collection, in key order.
     pub fn scan(&mut self, collection: &str) -> Result<Vec<(Key, Record)>> {
         let tree = self.tree_for(collection);
-        decode_pairs(self.store.inner(), tree.scan(&self.store), collection)
+        let before = self.store.read_failures();
+        let raw = tree.scan(&self.store);
+        if let Some(e) = self.store.failure_since(before) {
+            return Err(e.into());
+        }
+        decode_pairs(self.store.inner(), raw, collection)
     }
 
     /// Publish every staged collection **atomically**.
@@ -1020,7 +1034,12 @@ impl<S: ObjectStore> Reader<S> {
     /// which is the case a delete has to survive.
     pub fn get(&mut self, collection: &str, key: &Key) -> Result<Option<Record>> {
         let tree = self.tree_for(collection);
-        match tree.get(&self.store, &key.encode()) {
+        let before = self.store.read_failures();
+        let found = tree.get(&self.store, &key.encode());
+        if let Some(e) = self.store.failure_since(before) {
+            return Err(e.into());
+        }
+        match found {
             Some(bytes) => {
                 let bytes = spill::resolve(self.store.inner(), bytes)?;
                 let rec = decode_record(&bytes)
@@ -1041,7 +1060,12 @@ impl<S: ObjectStore> Reader<S> {
 
     pub fn scan(&mut self, collection: &str) -> Result<Vec<(Key, Record)>> {
         let tree = self.tree_for(collection);
-        decode_pairs(self.store.inner(), tree.scan(&self.store), collection)
+        let before = self.store.read_failures();
+        let raw = tree.scan(&self.store);
+        if let Some(e) = self.store.failure_since(before) {
+            return Err(e.into());
+        }
+        decode_pairs(self.store.inner(), raw, collection)
     }
 
     pub fn scan_range(
@@ -1051,7 +1075,11 @@ impl<S: ObjectStore> Reader<S> {
         end: &Key,
     ) -> Result<Vec<(Key, Record)>> {
         let tree = self.tree_for(collection);
+        let before = self.store.read_failures();
         let raw = tree.scan_range(&self.store, &start.encode(), &end.encode());
+        if let Some(e) = self.store.failure_since(before) {
+            return Err(e.into());
+        }
         decode_pairs(self.store.inner(), raw, collection)
     }
 
@@ -1080,9 +1108,14 @@ impl<S: ObjectStore> Reader<S> {
         fields: &[&str],
     ) -> Result<Vec<(Key, Record)>> {
         let tree = self.tree_for(collection);
+        let before = self.store.read_failures();
+        let raw = tree.scan(&self.store);
+        if let Some(e) = self.store.failure_since(before) {
+            return Err(e.into());
+        }
         decode_pairs_projected(
             self.store.inner(),
-            tree.scan(&self.store),
+            raw,
             collection,
             Some(fields),
         )
@@ -1118,7 +1151,12 @@ impl<S: ObjectStore> Reader<S> {
             root: root.to_string(),
             config: self.config.chunk,
         };
-        decode_pairs(self.store.inner(), tree.scan(&self.store), collection)
+        let before = self.store.read_failures();
+        let raw = tree.scan(&self.store);
+        if let Some(e) = self.store.failure_since(before) {
+            return Err(e.into());
+        }
+        decode_pairs(self.store.inner(), raw, collection)
     }
 
     /// The root produced by merging `source`'s tree into `target`'s.

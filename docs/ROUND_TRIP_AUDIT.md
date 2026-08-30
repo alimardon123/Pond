@@ -36,6 +36,21 @@ one process, which answers from its own memory and reports zero; that number
 is true and useless. This is what a second process, a restarted process, or a
 second query over overlapping data actually pays.
 
+> **This column used to be unreachable.** When it was first published, the
+> benchmark constructed the disk cache itself, and nothing on the shipped read
+> path did: `pond_cache_config()` returned `CacheConfig::default()`, whose
+> `disk_dir` is `None`, and `with_disk` had no caller outside benchmarks and
+> tests. So the warm numbers were real for the benchmark and unobtainable
+> through `read_rows`, which is the API everything else uses. Measured through
+> that API, four consecutive scans of a 50,000-row collection each cost 22
+> round trips and 2447 KiB — no caching whatsoever, every pass identical.
+>
+> The disk cache is now on by default, under the platform cache directory, and
+> `POND_CACHE_DIR=off` disables it. The same four scans now cost **3 round
+> trips and 0.1 KiB each**. Content addressing is what makes switching it on
+> safe: an entry is named by the hash of its own bytes, so it cannot go stale
+> and cannot collide, and `verify_on_read` re-hashes on the way out.
+
 **Modelled ms** — `round_trips × 30 ms + MiB × 20 ms`, the arithmetic priced
 at this repository's own R2 measurements (`docs/R2_VALIDATION.md`). The counts
 are exact and are the real result; the milliseconds are those counts at a
@@ -128,5 +143,6 @@ staging read before them. Two-digit milliseconds needs this at 2.
 | Point read cost flat in data | holds — 4 cold round trips at every scale |
 | Minimum round trips | **not yet** — batch width is 1.0 everywhere; a 100k scan takes 51 sequential waits |
 | Two-digit-ms reads and writes | cold: no (120–1600 ms). warm: 60 ms, all of it the open |
-| Single-digit-ms warm reads | **not reachable today** — the open alone is 2 round trips |
+| Single-digit-ms warm reads | **not reachable today** — the open alone is 2 round trips, and no cache can remove it |
+| The disk cache is on the shipped read path | now yes — it was not when this was first published; 22 round trips to 3 through `read_rows` |
 | Column projection reduces I/O | **no** — a 2-of-8 projection reads 100% of the bytes |

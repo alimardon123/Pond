@@ -50,6 +50,14 @@ if [ -n "$pinned" ] && [ -n "$local_rustc" ] && [ "$pinned" != "$local_rustc" ];
   echo "         still fail there. rustup toolchain install $pinned"
 fi
 
+# The disk cache defaults to the platform cache directory, which is right for
+# a real run and wrong for a test suite: the suite would write into the
+# developer's home, share state between runs, and grow without anyone asking.
+# Point it somewhere disposable for the duration.
+POND_CACHE_DIR="$(mktemp -d)"
+export POND_CACHE_DIR
+trap 'rm -rf "$POND_CACHE_DIR"' EXIT
+
 echo "== workflows =="
 # Cheap, and first alongside the secret scan, for the same reason: a workflow
 # file is never run locally, so a syntax error in one is invisible until CI

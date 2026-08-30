@@ -16,6 +16,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The disk cache defaults to the platform cache directory. A CI run should
+  # not write into the runner's home or carry state between steps, so it is
+  # pointed at a disposable path — the same thing scripts/check.sh does.
+  POND_CACHE_DIR: /tmp/pond-cache-ci
 
 jobs:
   build-and-test:

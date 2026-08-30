@@ -1690,6 +1690,13 @@ fn merging_collections_keeps_per_field_resolution() {
 fn projecting_a_read_changes_the_cost_and_not_the_answer() {
     use std::sync::Arc;
 
+    // Counted at the backend, so the disk cache has to be off. With it on, the
+    // write below populates the cache and both reads then fetch the same bytes
+    // from the store — the saving is real but invisible from here, because the
+    // cache absorbed it. This measures the storage layer, not the cache in
+    // front of it.
+    std::env::set_var("POND_CACHE_DIR", "off");
+
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(pond_kernel::Metered::new(
         pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),

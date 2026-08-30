@@ -95,6 +95,30 @@ Versions order on physical time first. A writer 60 s behind that writes *later*
 in real time still loses to the earlier write, silently. Bounded by however far
 apart the clocks in a deployment can drift.
 
+## Reported by review, not yet verified here
+
+Recorded so they are not lost, and marked so nobody treats them as established.
+The last review asserted a lost-update bug that turned out to be a
+misreading; nothing goes above this line until it has been reproduced.
+
+- Lakehouse and Vector lenses write legacy manifests into engine collections,
+  return `Ok`, and lose the data — `create_table` succeeds, `read_table`
+  returns `[]`.
+- Vector search recall collapses above ~10 dimensions (reported 10/10 at dim 8,
+  0/10 at dim 32), with dimension columns sorted lexicographically at three
+  sites and unsorted at a fourth, so build and search would use different
+  coordinate frames. HNSW reportedly reads the whole collection per query.
+- `S3ObjectStore::get_object` maps every failure — 403, 500, DNS — to `None`,
+  the same read-error-becomes-wrong-answer shape fixed below for nodes, but at
+  the definition layer, where it reportedly lets `create` install a new
+  `chunk_salt` and an empty schema over live rows.
+- The canonical URI is not percent-encoded, so a collection named `a?b` signs
+  and writes to a different key than intended.
+- A head is ~85 bytes per collection and is rewritten in full on every publish,
+  so a single-row write at 10^6 collections would move ~85 MB.
+- `engine_kv`, `engine_oltp` and `engine_stream` have no callers outside their
+  own tests, and `KeyValueLens::get` is still a full scan.
+
 ## Fixed, kept here for the record
 
 - **Merging was not commutative when versions tied exactly.** Two processes
@@ -103,6 +127,23 @@ apart the clocks in a deployment can drift.
   logical counter, and the merge kept whichever argument came first. Fixed by
   breaking the tie on the canonical encoding of the value; the laws are now
   tested as laws in `core/record/src/lib.rs`.
+
+- **A failed node read became a short answer.** `EngineStore::get` mapped every
+  backend error to `None`, which a traversal reads as "empty subtree", so one
+  failed GET on a 20,000-row collection returned `Ok` with **0 rows**. The
+  write path already refused this — `put` panics rather than let a failed write
+  become a hash referencing nothing — and the read path did the opposite two
+  lines below. Failures are now counted, and every read path refuses a result
+  a failure passed through. `core/engine/tests/read_errors.rs`; four of its
+  five tests fail without the fix, and the fifth exists to show that an
+  honestly empty result is still `Ok`.
+
+- **Nothing on the shipped read path cached anything.** `pond_cache_config()`
+  returned `CacheConfig::default()`, which has no disk tier, so four identical
+  scans each paid full price and the warm column of the round-trip audit was
+  unreachable through the public API. Now on by default under the platform
+  cache directory, with `POND_CACHE_DIR=off` to disable: measured 22 round
+  trips and 2447 KiB down to 3 and 0.1 KiB, per scan, through `read_rows`.
 
 - **A later write could be discarded inside one millisecond.** The columnar
   path used the row index within the batch as the logical clock, which

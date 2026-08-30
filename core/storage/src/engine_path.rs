@@ -922,8 +922,66 @@ fn store_of(kernel: &PondKernel) -> std::sync::Arc<dyn ObjectStore> {
     kernel.store_handle()
 }
 
+/// Cache settings for every read this module performs.
+///
+/// # Why this is not `CacheConfig::default()`
+///
+/// It was, and `CacheConfig::default()` leaves `disk_dir` at `None`, which
+/// disables the disk tier. Every reader here is also constructed per call, so
+/// its memory tier dies with it. The result was that nothing on the shipped
+/// read path cached anything at all: four identical scans of the same
+/// collection each paid full price, and the "warm" column measured in
+/// `docs/ROUND_TRIP_AUDIT.md` was unreachable through the public API — the
+/// benchmark reached it only by constructing the cache itself.
+///
+/// A disk tier is safe to switch on here for a reason specific to this design:
+/// every cached object is named by the hash of its own bytes. A cache entry
+/// therefore cannot go stale, cannot be invalidated, and cannot collide — two
+/// ponds sharing a directory share the objects they have in common and nothing
+/// else. `verify_on_read` re-hashes on the way out, so a corrupted file is
+/// discarded rather than served.
+///
+/// # Where it goes, and how to turn it off
+///
+/// `POND_CACHE_DIR` names the directory. Setting it to `off` (or to the empty
+/// string) disables the disk tier and restores the previous behaviour, for a
+/// read-only filesystem or a caller who wants no local footprint.
+///
+/// With nothing set, it goes under the platform cache directory, which is
+/// where a cache belongs and where a user already expects to find reclaimable
+/// files. The cap is deliberately modest rather than the 8 GiB default: this
+/// is switched on for everyone, and a library that quietly grows to gigabytes
+/// in someone home directory is a library that gets uninstalled.
+///
+/// If no cache directory can be determined or created, the disk tier stays
+/// off. A cache is an optimisation and must never be the reason a read fails.
 fn pond_cache_config() -> pond_cache::CacheConfig {
-    pond_cache::CacheConfig::default()
+    const CAP: u64 = 1024 * 1024 * 1024;
+
+    let dir = match std::env::var("POND_CACHE_DIR") {
+        Ok(v) if v.is_empty() || v == "off" => return pond_cache::CacheConfig::default(),
+        Ok(v) => std::path::PathBuf::from(v),
+        Err(_) => match platform_cache_dir() {
+            Some(d) => d,
+            None => return pond_cache::CacheConfig::default(),
+        },
+    };
+
+    if std::fs::create_dir_all(&dir).is_err() {
+        return pond_cache::CacheConfig::default();
+    }
+    pond_cache::CacheConfig::default().with_disk(dir, CAP)
+}
+
+/// `$XDG_CACHE_HOME/pond`, else `$HOME/.cache/pond`, else nothing.
+fn platform_cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
+        if !x.is_empty() {
+            return Some(std::path::PathBuf::from(x).join("pond"));
+        }
+    }
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(std::path::PathBuf::from(home).join(".cache").join("pond"))
 }
 
 /// Open an engine using the chunk configuration this collection was created
