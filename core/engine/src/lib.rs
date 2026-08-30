@@ -217,6 +217,36 @@ const HEADS_PREFIX: &str = "heads/";
 /// from needing a registry.
 pub const COMPACTOR_WRITER_ID: u64 = u64::MAX;
 
+/// Collections a head carries inline before the map moves into an index.
+///
+/// # Why this number, derived rather than picked
+///
+/// Externalising is not free, and the first version of this constant was 256,
+/// which made things measurably worse across a range that matters. The trade:
+///
+///   saves   ~40 bytes per collection, on every publish and every open
+///   costs   one extra round trip on publish — the map's nodes must land
+///           before the head that names them — and a map descent on the
+///           first access to each collection, which an inline map answers
+///           from memory for free
+///
+/// Priced at this repository's own model (30 ms per round trip, 20 ms per MiB
+/// — see `docs/ROUND_TRIP_AUDIT.md`), one extra round trip costs the same as
+/// 1.5 MiB of transfer. At ~40 bytes an entry that is about 39,000
+/// collections before the bytes saved cover a single extra wait — and reads
+/// pay a descent too, which pushes it higher still.
+///
+/// So: 50,000. Below it an inline map is genuinely cheaper and this changes
+/// nothing; above it the inline map is unbounded while the alternative is
+/// flat. Measured at 10,000 collections, externalising at 256 turned a 67.6 ms
+/// publish into a 90.0 ms one — the right fix applied at the wrong size is
+/// still a regression.
+///
+/// The number is model-dependent, and deliberately so: it is stated in terms
+/// of the two constants the audit uses, so a deployment with different
+/// latency or bandwidth can re-derive it rather than guess at it.
+pub const INLINE_COLLECTION_LIMIT: usize = 50_000;
+
 /// How many merges of one reduction level run at once.
 ///
 /// Matches the S3 backend's batch width: the requests these merges issue are
@@ -242,6 +272,15 @@ pub struct EngineConfig {
     pub chunk: ChunkConfig,
     /// Values at or above this size are spilled to their own object.
     pub spill_threshold: usize,
+    /// Collections a head carries inline before its map moves into an index.
+    ///
+    /// Defaults to [`INLINE_COLLECTION_LIMIT`], which is derived from the
+    /// latency and bandwidth constants the round-trip audit uses. It is
+    /// settable because that derivation is deployment-specific — a pond on a
+    /// fast local network wants a different number from one across an ocean —
+    /// and because a constant of 50,000 is otherwise only reachable by a test
+    /// that writes 50,000 collections.
+    pub inline_collection_limit: usize,
 }
 
 impl Default for EngineConfig {
@@ -249,6 +288,7 @@ impl Default for EngineConfig {
         Self {
             chunk: ChunkConfig::default(),
             spill_threshold: spill::SPILL_THRESHOLD,
+            inline_collection_limit: INLINE_COLLECTION_LIMIT,
         }
     }
 }
@@ -261,6 +301,12 @@ impl EngineConfig {
 
     pub fn with_spill_threshold(mut self, threshold: usize) -> Self {
         self.spill_threshold = threshold;
+        self
+    }
+
+    /// See [`EngineConfig::inline_collection_limit`].
+    pub fn with_inline_collection_limit(mut self, limit: usize) -> Self {
+        self.inline_collection_limit = limit;
         self
     }
 }
@@ -570,6 +616,49 @@ impl<S: ObjectStore> Engine<S> {
         decode_pairs(self.store.inner(), raw, collection)
     }
 
+    /// Move the collection map into an index once it is large enough to hurt.
+    ///
+    /// # What this costs and what it saves
+    ///
+    /// A head is rewritten whole on every publish, so an inline map makes a
+    /// single-row write move bytes proportional to *every* collection the
+    /// writer owns — measured at ~40 bytes each, so ~40 MB at 10^6
+    /// collections, and a reader pays the same on open. `pond_bench --bin
+    /// headscale` has the table.
+    ///
+    /// Above [`INLINE_COLLECTION_LIMIT`] the map is written as a
+    /// content-addressed index and the head carries only its root. Publishing
+    /// then rewrites the O(log C) nodes on one path plus a fixed-size head.
+    /// Because the index is content-addressed and built the same way every
+    /// time, the unchanged parts of the map are shared with the previous
+    /// publish rather than rewritten — the same property that makes the data
+    /// trees cheap to update.
+    ///
+    /// Crucially the head is still **one object**, so atomic multi-collection
+    /// publish — the reason the map is in the head at all — is untouched.
+    ///
+    /// Below the limit nothing changes: the map stays inline, the encoding
+    /// stays v2, and a small pond pays neither the extra descent on read nor a
+    /// format it does not need.
+    fn externalise_collection_map(&mut self) -> Result<()> {
+        if self.head.collections.len() <= self.config.inline_collection_limit {
+            self.head.collections_root = None;
+            return Ok(());
+        }
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .head
+            .collections
+            .iter()
+            .map(|(name, root)| (name.as_bytes().to_vec(), root.as_bytes().to_vec()))
+            .collect();
+
+        let tree = Tree::build(&self.store, entries, self.config.chunk);
+        self.head.collections_root = Some(tree.root);
+        self.head.collections.clear();
+        Ok(())
+    }
+
     /// Publish every staged collection **atomically**.
     ///
     /// One PUT of one head object. Object stores give single-object atomicity,
@@ -583,6 +672,7 @@ impl<S: ObjectStore> Engine<S> {
         for (collection, tree) in &self.staged {
             self.head.set_root(collection, &tree.root);
         }
+        self.externalise_collection_map()?;
         let bytes = pond_record::encode_head(&self.head);
         self.seq += 1;
         let key = head_key(self.writer_id, self.seq, &pond_kernel::hash_bytes(&bytes));
@@ -662,6 +752,13 @@ impl<S: ObjectStore> Engine<S> {
 pub struct Reader<S: ObjectStore> {
     store: EngineStore<BlobCache<S>>,
     roots: BTreeMap<String, Vec<String>>,
+    /// Roots of collection maps that were too large to carry inline.
+    ///
+    /// One per head that externalised its map. They are resolved on demand
+    /// rather than expanded at open, which is the point: expanding them would
+    /// read the whole map and give back exactly the cost externalising them
+    /// avoided.
+    collection_maps: Vec<String>,
     config: EngineConfig,
     merged: BTreeMap<String, Tree>,
     /// Every head this reader read, as (content hash, head) — including the
@@ -785,6 +882,7 @@ impl<S: ObjectStore> Reader<S> {
         }
 
         let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut collection_maps: Vec<String> = Vec::new();
         for (_, head) in &heads {
             for (collection, root) in &head.collections {
                 roots
@@ -792,12 +890,19 @@ impl<S: ObjectStore> Reader<S> {
                     .or_default()
                     .push(root.clone());
             }
+            // Deliberately not expanded here. Reading every externalised map at
+            // open would restore the O(collections) cost that externalising
+            // them exists to remove.
+            if let Some(map_root) = &head.collections_root {
+                collection_maps.push(map_root.clone());
+            }
         }
 
 
         Ok(Self {
             store,
             roots,
+            collection_maps,
             config,
             merged: BTreeMap::new(),
             heads,
@@ -807,8 +912,42 @@ impl<S: ObjectStore> Reader<S> {
     }
 
     /// Collections visible across all writers.
+    ///
+    /// Externalised maps are scanned here, which is O(collections) — but this
+    /// is a listing operation, so that is its honest cost rather than a cost
+    /// smuggled into every read.
     pub fn collections(&self) -> Vec<String> {
-        self.roots.keys().cloned().collect()
+        let mut names: std::collections::BTreeSet<String> =
+            self.roots.keys().cloned().collect();
+        if !self.collection_maps.is_empty() {
+            for (k, _) in pond_index::scan_from_roots(&self.store, &self.collection_maps) {
+                if let Ok(name) = String::from_utf8(k) {
+                    names.insert(name);
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// Every writer's root for one collection.
+    ///
+    /// Inline maps answer from memory; externalised ones are descended, all of
+    /// them together in one lockstep walk, so the cost is one wait per level
+    /// however many writers externalised.
+    fn roots_of(&self, collection: &str) -> Vec<String> {
+        let mut out = self.roots.get(collection).cloned().unwrap_or_default();
+        if !self.collection_maps.is_empty() {
+            for bytes in pond_index::get_from_roots(
+                &self.store,
+                &self.collection_maps,
+                collection.as_bytes(),
+            ) {
+                if let Ok(root) = String::from_utf8(bytes) {
+                    out.push(root);
+                }
+            }
+        }
+        out
     }
 
     /// Fold every writer's root into one tree, halving the set at each step
@@ -1020,7 +1159,7 @@ impl<S: ObjectStore> Reader<S> {
                 config: self.config.chunk,
             };
         }
-        let roots = self.roots.get(collection).cloned().unwrap_or_default();
+        let roots = self.roots_of(collection);
         let acc = self.reduce(roots);
         self.merged.insert(
             collection.to_string(),
@@ -1081,7 +1220,7 @@ impl<S: ObjectStore> Reader<S> {
             };
             tree.get(&self.store, &key.encode())
         } else {
-            let roots = self.roots.get(collection).cloned().unwrap_or_default();
+            let roots = self.roots_of(collection);
             pond_index::get_from_roots(&self.store, &roots, &key.encode())
                 .into_iter()
                 .reduce(|a, b| resolve_records(&a, &b))
@@ -1146,7 +1285,7 @@ impl<S: ObjectStore> Reader<S> {
                 None => tree.scan(&self.store),
             };
         }
-        let roots = self.roots.get(collection).cloned().unwrap_or_default();
+        let roots = self.roots_of(collection);
         let groups = match range {
             Some((s, e)) => pond_index::scan_range_from_roots(&self.store, &roots, s, e),
             None => pond_index::scan_from_roots(&self.store, &roots),

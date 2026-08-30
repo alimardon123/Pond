@@ -125,13 +125,23 @@ apart the clocks in a deployment can drift.
   argues it well and the argument is sound. The cost is that the object is
   rewritten whole when any one collection changes.
 
-  The fix that keeps the property: put the collection map in a prolly tree and
-  let the head carry its root. Publishing then rewrites O(log C) tree nodes and
-  one small head, so atomicity is untouched — the head is still one object —
-  while the bytes stop scaling with C. Resolving a collection becomes a
-  descent, which `get_from_roots` already does across writers. Keeping the map
-  inline below a threshold preserves today's flat 2-round-trip open for small
-  ponds. Not done.
+  **Fixed above a threshold.** The map moves into a content-addressed index
+  and the head carries only its root, so a publish rewrites the O(log C) nodes
+  on one path plus a fixed-size head — and the head is still one object, so the
+  atomicity this design is built on is untouched. Measured with the limit set
+  low enough to exercise it: a single-row publish stops growing with the
+  collection count.
+
+  The threshold is the interesting part, and the first attempt at it was wrong.
+  Externalising costs an extra round trip on publish (the map's nodes must land
+  before the head that names them) and a descent on first access to each
+  collection, which an inline map answers from memory for free. At 30 ms per
+  round trip and 20 ms per MiB, one extra wait is worth 1.5 MiB of transfer —
+  about 39,000 collections at ~40 bytes each, and reads push it higher. Set at
+  256, the change turned a 67.6 ms publish at 10,000 collections into a 90.0 ms
+  one: the right fix at the wrong size is still a regression. It is now 50,000,
+  derived from those two constants and settable per deployment, since the
+  derivation depends on them.
 
 - **The two formats disagree about row order.** A legacy collection returns
   rows in insertion order; an engine collection orders by key, and a row

@@ -53,6 +53,31 @@ pub struct Head {
     pub writer_id: u64,
     /// collection name -> root hash of that collection's index.
     pub collections: BTreeMap<String, String>,
+    /// An index holding `collection -> root`, when the map is too large to
+    /// carry inline.
+    ///
+    /// # Why a head can stop listing its own collections
+    ///
+    /// A head is rewritten whole on every publish, so its size is paid on
+    /// every write and every open. With the map inline that is linear in the
+    /// number of collections the writer publishes: measured at ~40 bytes each,
+    /// so 10^6 collections means ~40 MB moved to write a single row. `pond_bench
+    /// --bin headscale` has the table.
+    ///
+    /// Above [`INLINE_COLLECTION_LIMIT`] the map moves into a content-addressed
+    /// index and the head carries only its root. Publishing then rewrites the
+    /// O(log C) nodes on one path plus a head of fixed size, and the head is
+    /// still **one object** — which is the whole reason the map lived here in
+    /// the first place, since single-object write atomicity is what makes
+    /// multi-collection publish atomic.
+    ///
+    /// This type does not interpret the root. `pond_record` knows nothing about
+    /// indexes, and giving it that dependency to hold a hash would be paying a
+    /// large price for a small convenience — the engine owns the meaning.
+    ///
+    /// When this is set, `collections` is empty; when it is `None`, the map is
+    /// inline. Both are read.
+    pub collections_root: Option<String>,
     /// Roots this writer has seen from other writers, as a version vector.
     ///
     /// This is what turns "these two states differ" into "this state causally
@@ -67,6 +92,7 @@ impl Head {
         Self {
             writer_id,
             collections: BTreeMap::new(),
+            collections_root: None,
             observed: BTreeMap::new(),
         }
     }
@@ -135,6 +161,13 @@ impl Head {
 /// while keeping single-object atomicity.
 const VERSION_V2: u8 = 2;
 
+/// v3 adds an optional index root for the collection map — see
+/// [`Head::collections_root`]. Everything else is identical to v2, and v3 is
+/// written only when the root is actually present, so a head that carries its
+/// map inline still encodes exactly as v2 did and old readers keep working
+/// for as long as that is true.
+const VERSION_V3: u8 = 3;
+
 /// A root that is not 32 bytes of hex, written as text.
 ///
 /// Every root the engine produces is a 64-character hex hash, so this should
@@ -162,7 +195,14 @@ fn put_root(out: &mut Vec<u8>, root: &str) {
 pub fn encode_head(h: &Head) -> Vec<u8> {
     const MAGIC: &[u8; 4] = b"PHED";
     let mut out = Vec::from(*MAGIC);
-    out.push(VERSION_V2);
+    // Only claim v3 when there is something only v3 can express. A pond that
+    // never grows past the inline limit stays readable by anything that
+    // understands v2.
+    out.push(if h.collections_root.is_some() {
+        VERSION_V3
+    } else {
+        VERSION_V2
+    });
     out.extend_from_slice(&h.writer_id.to_le_bytes());
 
     out.extend_from_slice(&(h.collections.len() as u32).to_le_bytes());
@@ -175,6 +215,10 @@ pub fn encode_head(h: &Head) -> Vec<u8> {
     out.extend_from_slice(&(h.observed.len() as u32).to_le_bytes());
     for (writer, root) in &h.observed {
         out.extend_from_slice(&writer.to_le_bytes());
+        put_root(&mut out, root);
+    }
+
+    if let Some(root) = &h.collections_root {
         put_root(&mut out, root);
     }
     out
@@ -197,7 +241,7 @@ pub fn decode_head(buf: &[u8]) -> Option<Head> {
     // readable — the version byte is what makes that possible rather than a
     // guess about length.
     let version = take(&mut pos, 1)?[0];
-    if version != 1 && version != VERSION_V2 {
+    if version != 1 && version != VERSION_V2 && version != VERSION_V3 {
         return None;
     }
     let writer_id = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
@@ -248,9 +292,16 @@ pub fn decode_head(buf: &[u8]) -> Option<Head> {
         observed.insert(w, root);
     }
 
+    let collections_root = if version == VERSION_V3 {
+        Some(get_root(&mut pos)?)
+    } else {
+        None
+    };
+
     Some(Head {
         writer_id,
         collections,
+        collections_root,
         observed,
     })
 }
