@@ -1420,8 +1420,11 @@ impl ObjectStore for S3ObjectStore {
         match self.s3_request("DELETE", &key, None, None, &[]) {
             Ok(_) => Ok(true),
             Err(e) => {
-                // Check if it was a 404 (already gone)
-                if e.to_string().contains("404") {
+                // Already gone counts as success-with-nothing-deleted. The
+                // status is read from the error, not matched in its message:
+                // a key, a request id or a region name containing "404" would
+                // otherwise turn a real failure into a cheerful `Ok(false)`.
+                if status_of(&e) == Some(404) {
                     Ok(false)
                 } else {
                     Err(e)
@@ -1492,13 +1495,20 @@ impl ObjectStore for S3ObjectStore {
         match self.s3_request("HEAD", &key, None, None, &[]) {
             Ok(_) => true,
             Err(e) => {
-                // 404 means not found
-                if e.to_string().contains("404") {
-                    false
-                } else {
-                    // Other errors — be safe and report false
-                    false
+                // Both arms returned false, so the branch decided nothing —
+                // and "absent" is the wrong answer for an unreachable store.
+                // The signature has no way to say "could not ask", so the
+                // failure is at least logged rather than presented as fact;
+                // callers that must not confuse the two use a path that can
+                // return an error.
+                if status_of(&e) != Some(404) {
+                    eprintln!(
+                        "pond: blob_exists({}) could not reach the store: {}; \
+                         reporting absent",
+                        hash, e
+                    );
                 }
+                false
             }
         }
     }
@@ -1508,7 +1518,7 @@ impl ObjectStore for S3ObjectStore {
         match self.s3_request("DELETE", &key, None, None, &[]) {
             Ok(_) => Ok(true),
             Err(e) => {
-                if e.to_string().contains("404") {
+                if status_of(&e) == Some(404) {
                     Ok(false)
                 } else {
                     Err(e)

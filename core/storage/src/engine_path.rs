@@ -82,13 +82,51 @@ pub fn create(kernel: &PondKernel, collection: &str) -> Result<()> {
     if definition::load(kernel, collection).format == Format::Engine {
         return Ok(());
     }
+
+    // Everything below decides whether it is safe to write a definition, and
+    // every question it asks is asked of a store that might not answer.
+    //
+    // Both guards used to fail *open*. `definition::load` turns an unreadable
+    // definition into `legacy()`, and `has_legacy_data` turned a failed
+    // listing into an empty one, so during an outage an established Engine
+    // collection full of rows presented as a blank slate — and this function
+    // wrote a fresh definition over it, with a new random `chunk_salt` and no
+    // columns, and returned `Ok`. The salt decides where content-defined chunk
+    // boundaries fall, so every later write would chunk against boundaries
+    // nothing already stored shares: structural sharing and deterministic
+    // rebuild, the two properties the index rests on, gone silently. The
+    // comment below already said reformatting in place is the worst failure
+    // available here; the code did it anyway whenever the store went quiet.
+    //
+    // So the emptiness has to be established rather than assumed.
+    let prefix = format!("collections/{}/", collection);
+    let listing = kernel.try_list_names_prefix(&prefix).map_err(|e| {
+        format!(
+            "cannot determine whether collection '{}' already exists: {}; \
+             refusing to create over a collection that may hold data",
+            collection, e
+        )
+    })?;
+
+    // The decisive case. If the store lists a definition object but reading it
+    // came back empty, that is a read failure, not an absent definition — the
+    // two are otherwise indistinguishable, and this is the one place they can
+    // be told apart.
+    let def_path = crate::definition_ref(collection);
+    if listing.contains(&def_path) && kernel.read_named(&def_path).is_none() {
+        return Err(format!(
+            "collection '{}' has a definition that could not be read; \
+             refusing to overwrite it",
+            collection
+        ));
+    }
+
     // Refuse to reformat a collection that already holds legacy data. The
     // definition alone cannot tell us — a legacy collection has none, which is
     // exactly how it is recognised — so the question has to be asked of the
     // data: does a branch ref exist? Writing an Engine definition over a
     // populated legacy collection would leave every one of its commits
-    // unreachable while reporting success, which is the worst failure mode
-    // available here.
+    // unreachable while reporting success.
     if has_legacy_data(kernel, collection) {
         return Err(format!(
             "collection '{}' already holds data in the legacy format; \

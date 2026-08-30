@@ -325,10 +325,25 @@ impl PondKernel {
     }
 
     pub fn list_names_prefix(&self, prefix: &str) -> Vec<String> {
+        self.try_list_names_prefix(prefix).unwrap_or_default()
+    }
+
+    /// As [`list_names_prefix`](Self::list_names_prefix), but a failed listing
+    /// is an error rather than an empty result.
+    ///
+    /// The convenient form above cannot distinguish "there is nothing under
+    /// this prefix" from "I could not ask", and both are `Vec::new()`. That is
+    /// fine for a caller displaying what exists and wrong for a caller
+    /// *deciding* something on the basis of emptiness — a guard that reads
+    /// silence as "nothing there" opens exactly when it is most needed, during
+    /// the outage. `engine_path::create` was such a caller: an unreachable
+    /// store made a populated collection look new, and it wrote a fresh
+    /// definition over it and reported success.
+    pub fn try_list_names_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
         if validate_ref_path(prefix).is_err() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        self.store.list_paths(prefix).unwrap_or_default()
+        self.store.list_paths(prefix)
     }
 
     pub fn delete_ref(&self, name: &str) -> io::Result<bool> {

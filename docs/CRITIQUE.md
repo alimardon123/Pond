@@ -108,10 +108,6 @@ misreading; nothing goes above this line until it has been reproduced.
   0/10 at dim 32), with dimension columns sorted lexicographically at three
   sites and unsorted at a fourth, so build and search would use different
   coordinate frames. HNSW reportedly reads the whole collection per query.
-- `S3ObjectStore::get_object` maps every failure — 403, 500, DNS — to `None`,
-  the same read-error-becomes-wrong-answer shape fixed below for nodes, but at
-  the definition layer, where it reportedly lets `create` install a new
-  `chunk_salt` and an empty schema over live rows.
 - The canonical URI is not percent-encoded, so a collection named `a?b` signs
   and writes to a different key than intended.
 - A head is ~85 bytes per collection and is rewritten in full on every publish,
@@ -127,6 +123,22 @@ misreading; nothing goes above this line until it has been reproduced.
   logical counter, and the merge kept whichever argument came first. Fixed by
   breaking the tie on the canonical encoding of the value; the laws are now
   tested as laws in `core/record/src/lib.rs`.
+
+- **`create` overwrote a live collection during a read outage.** Verified: with
+  reads failing, `engine_path::create` on a populated Engine collection
+  returned `Ok` and replaced its definition — a new random `chunk_salt` and an
+  empty column list. The salt decides where content-defined chunk boundaries
+  fall, so every later write would chunk against boundaries nothing already
+  stored shares, destroying structural sharing and deterministic rebuild
+  silently. Both of its guards failed *open*: `definition::load` turns an
+  unreadable definition into `legacy()`, and `has_legacy_data` turned a failed
+  listing into an empty one, so an unreachable store looked like a blank slate.
+  `create` now establishes emptiness instead of assuming it, via a listing that
+  reports failure (`PondKernel::try_list_names_prefix`), and refuses when the
+  store lists a definition object that cannot be read — the one place "absent"
+  and "unreadable" can be told apart. `core/storage/tests/create_outage.rs`;
+  the reproduction fails without the guard, and three sibling tests show
+  creation, idempotence and legacy refusal are unchanged.
 
 - **A failed node read became a short answer.** `EngineStore::get` mapped every
   backend error to `None`, which a traversal reads as "empty subtree", so one
