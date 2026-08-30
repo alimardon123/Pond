@@ -50,6 +50,10 @@ path = "src/roundtrips.rs"
 name = "headscale"
 path = "src/headscale.rs"
 
+[[bin]]
+name = "vectorscale"
+path = "src/vectorscale.rs"
+
 [dependencies]
 tempfile = { workspace = true }
 pond_index = { path = "../core/index" }
@@ -58,3 +62,5 @@ pond_engine = { path = "../core/engine" }
 pond_cache = { path = "../core/cache" }
 pond_kernel = { path = "../core/kernel" }
 pond_s3 = { path = "../core/s3" }
+pond_storage = { path = "../core/storage" }
+pond_vector_lens = { path = "../lenses/vector/rust" }

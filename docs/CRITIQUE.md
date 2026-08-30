@@ -150,26 +150,39 @@ Recorded so they are not lost, and marked so nobody treats them as established.
 The last review asserted a lost-update bug that turned out to be a
 misreading; nothing goes above this line until it has been reproduced.
 
-- **HNSW reads every vector in the collection on every query.** Reproduced and
-  measured: bytes read are exactly linear in N — ~256 bytes per vector at 500,
-  1000, 2000 and 4000 vectors, so a 10-nearest-neighbour query over 4000
-  vectors reads the whole 999 KiB collection. The graph walk itself is
-  constant (17 round trips at every size); it is the vector fetch that is
-  linear, at `extensions/indexes/hnsw/rust/src/lib.rs`, where the search loads
-  all vectors "for distance computation". Sublinear search is the entire
-  reason an HNSW index exists, so this cancels its benefit in bytes while
-  keeping its cost in build time and storage. The fix is for the index to own
-  its vectors — as IVF now does for its cluster blobs — so a search reads only
-  what it visits. Not done.
+- **HNSW reads every vector in the collection on every query, and that is the
+  smaller half of the problem below ~16,000 vectors.** Reproduced and measured
+  by `cargo run --release -p pond_bench --bin vectorscale`, at 128 dimensions,
+  from a reader with nothing warm:
 
-  The share that is vector payload rises with dimension, which is what makes
-  this worth fixing rather than tolerating: 24% at 8 dimensions, 55% at 32,
-  83% at 128, **93% at 384** — and 384 is an ordinary sentence-embedding width.
+  | vectors | round trips | KiB read | latency ms | transfer ms | total ms |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1,000 | 12 | 1,199 | 360 | 23 | 383 |
+  | 4,000 | 12 | 4,772 | 360 | 93 | 453 |
+  | 16,000 | 13 | 19,081 | 390 | 373 | 763 |
+  | 64,000 | 14 | 76,350 | 420 | 1,491 | 1,911 |
 
-  The kernel-level blob cache added since keeps a *repeated* query off the
-  network — measured 1199 KiB to 0 for a second reader over a warm disk cache
-  — but the query still reads every vector, from local disk rather than across
-  a network. A cache is not a layout.
+  Bytes are linear in N, as the read-everything implementation implies, and the
+  share that is vector payload rises with dimension — 24% at 8, 55% at 32, 83%
+  at 128, **93% at 384**, an ordinary sentence-embedding width.
+
+  But round trips barely move with N, and below about 16,000 vectors they are
+  the larger term: at 1,000 vectors the query spends 360 ms waiting and 23 ms
+  transferring. HNSW is pointer chasing — walk a layer, decide, walk the next —
+  so those waits are sequential and mostly independent of N.
+
+  **This changes what to fix, and rules out the obvious fix.** Fetching each
+  visited node's vector on demand is the natural response to "it reads
+  everything", and it trades the term that does not dominate for the term that
+  does: a round trip per hop to save bytes that were nearly free. It would make
+  every collection under ~16,000 vectors substantially slower. The design that
+  fixes both is blocked vector storage with graph-locality ordering, so a walk
+  touches few blocks and they can be fetched in a few batched rounds. Not done.
+
+  The kernel-level blob cache keeps a *repeated* query off the network entirely
+  — 1199 KiB to 0 for a second reader over a warm disk cache — but the query
+  still reads every vector, from local disk instead of across a network. A
+  cache is not a layout.
 - The canonical URI is not percent-encoded, so a collection named `a?b` signs
   and writes to a different key than intended.
 - `engine_kv`, `engine_oltp` and `engine_stream` have no callers outside their

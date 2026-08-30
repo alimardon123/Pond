@@ -1571,6 +1571,8 @@ dependencies = [
  "pond_kernel",
  "pond_record",
  "pond_s3",
+ "pond_storage",
+ "pond_vector_lens",
  "tempfile",
 ]
 
