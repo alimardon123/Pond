@@ -245,6 +245,37 @@ pub fn writer_id_from_env() -> u64 {
 }
 
 /// Set by an entry point that was given an identity on its command line.
+/// Monotonic logical counter, shared by every write in this process.
+static LOGICAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reserve `n` consecutive logical counter values and return the first.
+///
+/// # The bug this exists to prevent
+///
+/// A record's version is `(physical, logical, writer)`, compared in that
+/// order. The columnar write path used the *row index within the batch* as the
+/// logical component, with the comment that this "orders after anything from
+/// an earlier batch". It does not. Write a thousand rows, then immediately
+/// update one of them: the update is row 0 of its batch, so it carries
+/// `logical = 0`, while the row it means to supersede carries `logical = 999`.
+/// Inside one millisecond the physical components tie, and per-field
+/// last-writer-wins discards the newer write. Silently — no error, no
+/// conflict, no retry, and the old value is what every later reader sees.
+///
+/// A counter that never restarts fixes it. Reserving a block per batch keeps
+/// rows within a batch distinct (so two updates to the same row in one batch
+/// still resolve to the later one) while guaranteeing every value in a later
+/// batch exceeds every value in an earlier one.
+///
+/// The counter is per process, so two processes sharing a writer id can still
+/// produce equal versions. That residue is handled where it has to be — in the
+/// merge, which breaks an exact tie on the canonical encoding of the value
+/// rather than on argument order. The two together make the ordering total
+/// without requiring anything of how writer ids are assigned.
+pub fn reserve_logical(n: u64) -> u64 {
+    LOGICAL.fetch_add(n.max(1), std::sync::atomic::Ordering::Relaxed)
+}
+
 static EXPLICIT_WRITER_ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// Name this process's writer identity, once, at startup.

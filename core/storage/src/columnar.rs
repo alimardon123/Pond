@@ -73,7 +73,17 @@ pub fn columns_to_records_with_nulls(
     let n_rows = columns.first().map(|(_, c)| c.len()).unwrap_or(0);
     let mut out = Vec::with_capacity(n_rows);
 
+    // One block of logical counter values for this batch, so row versions are
+    // distinct within it *and* every one of them exceeds every version from an
+    // earlier batch. The row index alone did the first and not the second: a
+    // single-row update landing in the same millisecond as a thousand-row
+    // write took `logical = 0` against that write's `logical = 999`, lost the
+    // comparison, and was discarded with no error. See
+    // `pond_kernel::crdt::reserve_logical`.
+    let logical_base = pond_kernel::crdt::reserve_logical(n_rows as u64);
+
     for row in 0..n_rows {
+        let version = Version::new(physical, logical_base + row as u64, writer_id);
         let mut record = Record::new();
         let mut rowid: Option<String> = None;
 
@@ -97,10 +107,7 @@ pub fn columns_to_records_with_nulls(
                     rowid = Some(s.clone());
                 }
             }
-            // The logical counter is the row index, so two rows written in the
-            // same batch never collide on version while still ordering after
-            // anything from an earlier batch.
-            record = record.with_field(name, value, Version::new(physical, row as u64, writer_id));
+            record = record.with_field(name, value, version);
         }
 
         // A supplied `_rowid` is the row's identity, across writers and across
@@ -116,11 +123,7 @@ pub fn columns_to_records_with_nulls(
             Some(id) => Key::new(vec![str_(id)]),
             None => {
                 let id = pond_kernel::crdt::uuidv7();
-                record = record.with_field(
-                    ROWID,
-                    Value::Str(id.clone()),
-                    Version::new(physical, row as u64, writer_id),
-                );
+                record = record.with_field(ROWID, Value::Str(id.clone()), version);
                 Key::new(vec![str_(id)])
             }
         };

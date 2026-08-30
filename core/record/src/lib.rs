@@ -257,11 +257,37 @@ impl Record {
 /// the never-drop-unknown-fields law at the merge layer: a writer that has
 /// never heard of a field cannot delete it by omission.
 ///
-/// The result is a semilattice join: commutative, associative, and idempotent,
-/// because `Version` is a total order and `max` over a total order has all
-/// three properties. Two replicas that have seen the same writes therefore
-/// hold byte-identical records — which is what lets any node compact, and
-/// lets two stores converge after a plain file copy.
+/// The result is a semilattice join: commutative, associative, and idempotent.
+/// Two replicas that have seen the same writes therefore hold byte-identical
+/// records — which is what lets any node compact, and lets two stores converge
+/// after a plain file copy.
+///
+/// # The tie, and why it is broken on the value
+///
+/// This used to say the three properties followed from `Version` being a total
+/// order, and to keep the value already present when versions compared equal,
+/// on the reasoning that "equal versions can only mean the same write, since
+/// `writer` makes the order total".
+///
+/// That reasoning has a precondition it does not state: one writer id per
+/// process. [`pond_kernel::crdt::stable_writer_id`] derives an id from the host
+/// and user, so two processes run by the same user on the same machine share
+/// one. Two such processes writing different values in the same millisecond at
+/// the same logical counter produce *identical* versions over *different*
+/// values — and then "keep what is already there" means "keep whichever
+/// argument came first", so `merge(a, b)` and `merge(b, a)` disagree.
+/// Commutativity is the whole basis of the conflict-free claim, and it was
+/// resting on a configuration precondition rather than on the code.
+///
+/// So the tie is now broken on the value itself, by its canonical encoding,
+/// which is a total order that every replica computes identically. The
+/// resulting join is commutative, associative and idempotent unconditionally —
+/// no assumption about writer ids required. The comparison only runs when
+/// versions are exactly equal and the values differ, which is rare, so the
+/// common path is unchanged.
+///
+/// Which value wins is arbitrary and does not matter; that every replica picks
+/// the *same* one is the entire point.
 pub fn merge_records(a: &Record, b: &Record) -> Record {
     let mut out = Record::new();
 
@@ -270,10 +296,17 @@ pub fn merge_records(a: &Record, b: &Record) -> Record {
     }
     for (name, field) in &b.fields {
         match out.fields.get(name) {
-            // Strictly greater, so equal versions keep the value already
-            // present. Equal versions can only mean the same write, since
-            // `writer` makes the order total.
-            Some(existing) if existing.version >= field.version => {}
+            Some(existing) if existing.version > field.version => {}
+            Some(existing) if existing.version == field.version => {
+                // Same version, different values: a tie that argument order
+                // must not decide. Encoding is only reached here.
+                if existing.value != field.value
+                    && crate::encode::encode_value(&field.value)
+                        > crate::encode::encode_value(&existing.value)
+                {
+                    out.fields.insert(name.clone(), field.clone());
+                }
+            }
             _ => {
                 out.fields.insert(name.clone(), field.clone());
             }
@@ -303,6 +336,115 @@ mod tests {
 
     fn v(physical: u64, writer: u64) -> Version {
         Version::new(physical, 0, writer)
+    }
+
+    // -----------------------------------------------------------------------
+    // The semilattice laws, as laws rather than as examples
+    // -----------------------------------------------------------------------
+
+    /// Records that collide on version with different values — the case the
+    /// merge used to decide by argument order.
+    fn colliding_pair() -> (Record, Record) {
+        let tie = Version::new(100, 7, 5);
+        (
+            Record::new().with_field("x", Value::Int(1), tie),
+            Record::new().with_field("x", Value::Int(2), tie),
+        )
+    }
+
+    /// merge(a, b) == merge(b, a).
+    ///
+    /// This is the property the whole conflict-free claim rests on, and it did
+    /// not hold: two processes sharing a writer id (which `stable_writer_id`
+    /// hands out per host+user, not per process) can write different values at
+    /// the same physical time and logical counter, and the merge kept
+    /// whichever argument it saw first. Two replicas merging the same pair in
+    /// different orders then held different data, permanently, with nothing to
+    /// detect it.
+    #[test]
+    fn merging_is_commutative_even_when_versions_tie() {
+        let (a, b) = colliding_pair();
+        assert_eq!(
+            merge_records(&a, &b),
+            merge_records(&b, &a),
+            "argument order changed the result: the join is not commutative"
+        );
+    }
+
+    /// merge(merge(a, b), c) == merge(a, merge(b, c)).
+    ///
+    /// Unlike the commutativity test, this one passes under the old
+    /// argument-order behaviour too — "keep the first" is associative, just
+    /// not commutative — so it is here to state the law and catch a future
+    /// regression, not as the guard for the bug above.
+    #[test]
+    fn merging_is_associative_even_when_versions_tie() {
+        let tie = Version::new(100, 7, 5);
+        let a = Record::new().with_field("x", Value::Int(1), tie);
+        let b = Record::new().with_field("x", Value::Int(2), tie);
+        let c = Record::new().with_field("x", Value::Int(3), tie);
+        assert_eq!(
+            merge_records(&merge_records(&a, &b), &c),
+            merge_records(&a, &merge_records(&b, &c)),
+            "grouping changed the result: the join is not associative"
+        );
+    }
+
+    /// merge(a, a) == a, and merging a second time changes nothing.
+    #[test]
+    fn merging_is_idempotent_even_when_versions_tie() {
+        let (a, b) = colliding_pair();
+        let once = merge_records(&a, &b);
+        assert_eq!(merge_records(&once, &once), once);
+        assert_eq!(merge_records(&once, &a), once, "re-merging an input moved it");
+        assert_eq!(merge_records(&once, &b), once, "re-merging an input moved it");
+    }
+
+    /// The three laws over many shapes at once, so the tie-break cannot be
+    /// right for integers and wrong for strings, vectors or nulls.
+    #[test]
+    fn the_laws_hold_across_value_shapes() {
+        let tie = Version::new(42, 3, 9);
+        let values = [
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::F64(1.5),
+            Value::Str(String::new()),
+            Value::Str("z".into()),
+            Value::Bytes(vec![0, 1]),
+            Value::Vector(vec![1.0, 2.0]),
+            Value::Json("{}".into()),
+        ];
+        for x in &values {
+            for y in &values {
+                let a = Record::new().with_field("f", x.clone(), tie);
+                let b = Record::new().with_field("f", y.clone(), tie);
+                assert_eq!(
+                    merge_records(&a, &b),
+                    merge_records(&b, &a),
+                    "not commutative for {:?} against {:?}",
+                    x,
+                    y
+                );
+                let m = merge_records(&a, &b);
+                assert_eq!(merge_records(&m, &m), m, "not idempotent for {:?}/{:?}", x, y);
+            }
+        }
+    }
+
+    /// A tie must not disturb the ordinary case: a strictly higher version
+    /// still wins outright, whichever side it is on.
+    #[test]
+    fn a_higher_version_still_wins_from_either_side() {
+        let lo = Version::new(100, 0, 1);
+        let hi = Version::new(200, 0, 1);
+        let old = Record::new().with_field("x", Value::Int(1), lo);
+        let new = Record::new().with_field("x", Value::Int(2), hi);
+        assert_eq!(merge_records(&old, &new).get("x"), Some(&Value::Int(2)));
+        assert_eq!(merge_records(&new, &old).get("x"), Some(&Value::Int(2)));
     }
 
     // -----------------------------------------------------------------------
