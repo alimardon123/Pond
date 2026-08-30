@@ -587,6 +587,137 @@ fn collect_leaf_refs<S: NodeStore>(
 /// Order is preserved because a level is decoded left to right and each node's
 /// children are appended in order, so the frontier is always in key order and
 /// leaves are drained in the order they are met.
+/// Drop repeats from a level, preserving first-seen order.
+///
+/// Writers branch from common history, so their trees share subtrees — and a
+/// shared subtree has the same hash in every tree that contains it, because
+/// nodes are content-addressed. Reading it once per tree is the same bytes
+/// fetched repeatedly. Deduplicating the frontier turns "requests grow with
+/// the number of writers" into "requests grow with the number of *distinct*
+/// nodes", which for writers that share history is much closer to flat.
+///
+/// It is safe for the same reason it is possible: the merge of a value with
+/// itself is that value. Idempotence is one of the three laws the record merge
+/// is tested against, so collapsing duplicates cannot change an answer.
+fn dedup_preserving_order(hashes: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(hashes.len());
+    let mut out = Vec::with_capacity(hashes.len());
+    for h in hashes {
+        if seen.insert(h.clone()) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+/// Every entry in several trees at once, grouped by key, one wait per level.
+///
+/// The scan counterpart of [`get_from_roots`], and it exists for the same
+/// reason: a reader's view is the merge of every writer's tree, and building
+/// that merge is a write. A scan that merges first pays a round trip and a PUT
+/// per writer before it reads anything.
+///
+/// A scan does not need the merged tree either. It needs every entry, and
+/// which values share a key. Walking all the trees together — batch a level,
+/// collect the next — costs one wait per level however many trees there are,
+/// and writes nothing. Entries are returned grouped by key so the caller can
+/// fold each group with whatever resolution it would have used inside the
+/// merge.
+///
+/// Keys come back in order. Entries arrive interleaved across trees, so they
+/// are sorted here rather than emerging sorted as they do from a single tree.
+/// That is CPU against I/O, which is the right trade by orders of magnitude at
+/// object-storage latency.
+pub fn scan_from_roots<S: NodeStore>(
+    store: &S,
+    roots: &[String],
+) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut frontier = dedup_preserving_order(roots.to_vec());
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for bytes in store.get_batch(&frontier) {
+            let Some(node) = bytes.and_then(|b| Node::decode(&b)) else {
+                continue;
+            };
+            match node {
+                Node::Leaf { entries: e } => entries.extend(e),
+                Node::Internal { children } => {
+                    next.extend(children.into_iter().map(|c| c.hash));
+                }
+            }
+        }
+        frontier = dedup_preserving_order(next);
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    for (k, v) in entries {
+        match out.last_mut() {
+            Some((last_key, vals)) if *last_key == k => vals.push(v),
+            _ => out.push((k, vec![v])),
+        }
+    }
+    out
+}
+
+/// As [`scan_from_roots`], restricted to `[start, end)`.
+///
+/// Subtrees outside the range are dropped from the frontier before the batch
+/// is issued, so a narrow range still reads only the nodes it needs.
+pub fn scan_range_from_roots<S: NodeStore>(
+    store: &S,
+    roots: &[String],
+    start: &[u8],
+    end: &[u8],
+) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut frontier = dedup_preserving_order(roots.to_vec());
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for bytes in store.get_batch(&frontier) {
+            let Some(node) = bytes.and_then(|b| Node::decode(&b)) else {
+                continue;
+            };
+            match node {
+                Node::Leaf { entries: e } => {
+                    for (k, v) in e {
+                        if k.as_slice() >= start && k.as_slice() < end {
+                            entries.push((k, v));
+                        }
+                    }
+                }
+                Node::Internal { children } => {
+                    for c in children {
+                        if c.max_key.as_slice() < start {
+                            continue;
+                        }
+                        next.push(c.hash);
+                        if c.max_key.as_slice() >= end {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        frontier = dedup_preserving_order(next);
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    for (k, v) in entries {
+        match out.last_mut() {
+            Some((last_key, vals)) if *last_key == k => vals.push(v),
+            _ => out.push((k, vec![v])),
+        }
+    }
+    out
+}
+
 /// Look one key up in several trees at once, one wait per level.
 ///
 /// # Why this exists
@@ -616,7 +747,7 @@ fn collect_leaf_refs<S: NodeStore>(
 /// differently from the merge would answer differently, which is worse than
 /// being slow.
 pub fn get_from_roots<S: NodeStore>(store: &S, roots: &[String], key: &[u8]) -> Vec<Vec<u8>> {
-    let mut frontier: Vec<String> = roots.to_vec();
+    let mut frontier = dedup_preserving_order(roots.to_vec());
     let mut found = Vec::new();
 
     while !frontier.is_empty() {
@@ -642,7 +773,7 @@ pub fn get_from_roots<S: NodeStore>(store: &S, roots: &[String], key: &[u8]) -> 
                 }
             }
         }
-        frontier = next;
+        frontier = dedup_preserving_order(next);
     }
 
     found

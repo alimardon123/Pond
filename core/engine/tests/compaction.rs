@@ -72,6 +72,24 @@ fn compaction_does_not_change_what_readers_see() {
 }
 
 /// The point of the exercise: readers stop merging the folded heads.
+///
+/// # What this measures, and what it used to
+///
+/// It used to assert that compaction cut a scan's **round trips**, which it
+/// did — a reader merged the writers' trees one pair at a time, so a scan over
+/// 16 writers waited many times and a compacted one waited once.
+///
+/// That is no longer the difference, because an uncompacted scan now walks
+/// every root together and also waits once. Round trips cannot separate the
+/// two any more, and an assertion that cannot fail for the right reason is
+/// worse than no assertion.
+///
+/// What compaction still buys is **requests and objects**. An uncompacted
+/// reader issues one read per writer's root and folds W trees in memory; a
+/// compacted one reads a single root. That is the object-storage bill, the
+/// bytes moved, and the CPU spent folding — all real, none of them latency.
+/// So that is what this now measures, and it says so rather than quietly
+/// changing what "far less" refers to.
 #[test]
 fn compaction_collapses_the_roots_a_reader_merges() {
     let dir = tempfile::tempdir().unwrap();
@@ -82,7 +100,7 @@ fn compaction_collapses_the_roots_a_reader_merges() {
     let mut r = Reader::open(Arc::clone(&store_m)).unwrap();
     store_m.reset();
     r.scan("t").unwrap();
-    let before = store_m.stats().round_trips;
+    let before = store_m.stats();
 
     let report = compact(dir.path());
     assert_eq!(report.heads_seen, WRITERS as usize);
@@ -93,15 +111,28 @@ fn compaction_collapses_the_roots_a_reader_merges() {
     let mut r = Reader::open(Arc::clone(&store_m)).unwrap();
     store_m.reset();
     r.scan("t").unwrap();
-    let after = store_m.stats().round_trips;
+    let after = store_m.stats();
 
-    println!("first scan over {} writers: {} -> {} round trips", WRITERS, before, after);
+    println!(
+        "first scan over {} writers: {} -> {} requests, {} -> {} round trips",
+        WRITERS,
+        before.requests(),
+        after.requests(),
+        before.round_trips,
+        after.round_trips
+    );
     assert!(
-        after * 4 < before,
-        "a compacted pond should read far less to serve the same scan: \
-         {} -> {} round trips",
-        before,
-        after
+        after.requests() * 4 < before.requests(),
+        "a compacted pond should read far fewer objects to serve the same \
+         scan: {} -> {} requests",
+        before.requests(),
+        after.requests()
+    );
+    assert!(
+        after.round_trips <= before.round_trips,
+        "compaction made a scan wait more: {} -> {} round trips",
+        before.round_trips,
+        after.round_trips
     );
 }
 

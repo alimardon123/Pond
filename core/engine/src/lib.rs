@@ -1027,6 +1027,25 @@ impl<S: ObjectStore> Reader<S> {
         acc
     }
 
+    /// Candidate values for each key, folded the way the merge would.
+    ///
+    /// `scan_from_roots` returns every value stored under a key across all
+    /// writers; the merged tree would have combined them with
+    /// `resolve_records`. Folding here gives the same answer without building
+    /// — and storing — the merged tree first. Order within a group does not
+    /// matter: the record merge is commutative and associative, tested as
+    /// laws.
+    fn fold_groups(groups: Vec<(Vec<u8>, Vec<Vec<u8>>)>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        groups
+            .into_iter()
+            .filter_map(|(k, vals)| {
+                vals.into_iter()
+                    .reduce(|a, b| resolve_records(&a, &b))
+                    .map(|v| (k, v))
+            })
+            .collect()
+    }
+
     /// Read one record from the merged view of every writer.
     ///
     /// A record hidden by a tombstone reads as absent — including a tombstone
@@ -1085,13 +1104,49 @@ impl<S: ObjectStore> Reader<S> {
     }
 
     pub fn scan(&mut self, collection: &str) -> Result<Vec<(Key, Record)>> {
-        let tree = self.tree_for(collection);
         let before = self.store.read_failures();
-        let raw = tree.scan(&self.store);
+        let raw = self.raw_scan(collection, None);
         if let Some(e) = self.store.failure_since(before) {
             return Err(e.into());
         }
         decode_pairs(self.store.inner(), raw, collection)
+    }
+
+    /// Every key's resolved value, without building the merged tree.
+    ///
+    /// A reader's view is the merge of every writer's tree, and merging is a
+    /// write — so a scan that merged first paid a round trip and a PUT per
+    /// writer before reading anything, exactly as point reads did. A scan does
+    /// not need the merged tree either: it needs every entry and which values
+    /// share a key. Walking all the roots together costs one wait per level
+    /// however many writers there are, and writes nothing.
+    ///
+    /// When a previous call has already built the merged tree, that is used
+    /// instead: one descent beats descending every writer's.
+    ///
+    /// `range` restricts the walk, with pruning applied before each batch is
+    /// issued so a narrow range still reads only the nodes it needs.
+    fn raw_scan(
+        &mut self,
+        collection: &str,
+        range: Option<(&[u8], &[u8])>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if let Some(t) = self.merged.get(collection) {
+            let tree = Tree {
+                root: t.root.clone(),
+                config: self.config.chunk,
+            };
+            return match range {
+                Some((s, e)) => tree.scan_range(&self.store, s, e),
+                None => tree.scan(&self.store),
+            };
+        }
+        let roots = self.roots.get(collection).cloned().unwrap_or_default();
+        let groups = match range {
+            Some((s, e)) => pond_index::scan_range_from_roots(&self.store, &roots, s, e),
+            None => pond_index::scan_from_roots(&self.store, &roots),
+        };
+        Self::fold_groups(groups)
     }
 
     pub fn scan_range(
@@ -1100,9 +1155,10 @@ impl<S: ObjectStore> Reader<S> {
         start: &Key,
         end: &Key,
     ) -> Result<Vec<(Key, Record)>> {
-        let tree = self.tree_for(collection);
         let before = self.store.read_failures();
-        let raw = tree.scan_range(&self.store, &start.encode(), &end.encode());
+        let start_k = start.encode();
+        let end_k = end.encode();
+        let raw = self.raw_scan(collection, Some((&start_k, &end_k)));
         if let Some(e) = self.store.failure_since(before) {
             return Err(e.into());
         }
@@ -1133,9 +1189,8 @@ impl<S: ObjectStore> Reader<S> {
         collection: &str,
         fields: &[&str],
     ) -> Result<Vec<(Key, Record)>> {
-        let tree = self.tree_for(collection);
         let before = self.store.read_failures();
-        let raw = tree.scan(&self.store);
+        let raw = self.raw_scan(collection, None);
         if let Some(e) = self.store.failure_since(before) {
             return Err(e.into());
         }

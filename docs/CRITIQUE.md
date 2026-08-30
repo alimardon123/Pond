@@ -151,8 +151,19 @@ misreading; nothing goes above this line until it has been reproduced.
   `core/engine/tests/writer_scaling.rs` pins both the cost and the agreement
   with the merged scan.
 
-  Scans still go through the merged tree and still pay for it. That is the
-  remaining half of this finding.
+  Scans took the same route and are fixed the same way:
+  `scan_from_roots` / `scan_range_from_roots` walk every root together and
+  return values grouped by key for the caller to fold. Measured at 64 writers
+  with 200 rows each: **1 round trip, 0 PUTs, all 12,800 rows**, against a
+  merge-first scan that paid per writer.
+
+  Both walks also deduplicate each level. Writers branch from common history
+  and nodes are content-addressed, so a shared subtree has the same hash in
+  every tree holding it, and reading it once per tree fetches identical bytes
+  repeatedly. Sixteen writers publishing byte-identical content now cost fewer
+  than 16 requests rather than exactly 16. Collapsing duplicates is safe
+  because merging a value with itself is that value — idempotence, one of the
+  three laws the record merge is tested against.
 
 - **Scans waited once per node instead of once per level.** A cold full scan of
   100,000 rows was 51 sequential round trips at batch width 1.0 — nothing in
