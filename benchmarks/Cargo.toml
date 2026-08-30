@@ -46,6 +46,10 @@ path = "src/spillpoint.rs"
 name = "roundtrips"
 path = "src/roundtrips.rs"
 
+[[bin]]
+name = "headscale"
+path = "src/headscale.rs"
+
 [dependencies]
 tempfile = { workspace = true }
 pond_index = { path = "../core/index" }

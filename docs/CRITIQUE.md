@@ -97,6 +97,37 @@ apart the clocks in a deployment can drift.
 
 ## Open, reproduced here
 
+- **A publish moves bytes proportional to every collection the writer owns.**
+  Measured by `cargo run --release -p pond_bench --bin headscale`: a single-row
+  write into one collection, at increasing collection counts.
+
+  | collections | bytes per publish | modelled ms |
+  | ---: | ---: | ---: |
+  | 1 | 183 | 60.0 |
+  | 10 | 813 | 60.0 |
+  | 100 | 7,203 | 60.1 |
+  | 1,000 | 72,003 | 61.4 |
+  | 10,000 | 729,003 | 73.9 |
+
+  About 73 bytes per collection, linear, and a reader pays the same on open.
+  At 10^6 collections that is ~73 MB moved to write one row, and ~73 MB read
+  to open the pond. **Round trips stay flat at 2 throughout**, which is why a
+  round-trip count alone never showed this — it needed its own measurement.
+
+  The cause is deliberate: a head is one writer's whole view of the pond in a
+  single object, which is what makes atomic multi-collection publish free on a
+  store that guarantees single-object write atomicity. `core/record/src/head.rs`
+  argues it well and the argument is sound. The cost is that the object is
+  rewritten whole when any one collection changes.
+
+  The fix that keeps the property: put the collection map in a prolly tree and
+  let the head carry its root. Publishing then rewrites O(log C) tree nodes and
+  one small head, so atomicity is untouched — the head is still one object —
+  while the bytes stop scaling with C. Resolving a collection becomes a
+  descent, which `get_from_roots` already does across writers. Keeping the map
+  inline below a threshold preserves today's flat 2-round-trip open for small
+  ponds. Not done.
+
 - **The two formats disagree about row order.** A legacy collection returns
   rows in insertion order; an engine collection orders by key, and a row
   written without an explicit `_rowid` gets a generated one, so `[1, 2, 3]`
@@ -127,8 +158,6 @@ misreading; nothing goes above this line until it has been reproduced.
   what it visits. Not done.
 - The canonical URI is not percent-encoded, so a collection named `a?b` signs
   and writes to a different key than intended.
-- A head is ~85 bytes per collection and is rewritten in full on every publish,
-  so a single-row write at 10^6 collections would move ~85 MB.
 - `engine_kv`, `engine_oltp` and `engine_stream` have no callers outside their
   own tests, and `KeyValueLens::get` is still a full scan.
 
