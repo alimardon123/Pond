@@ -116,25 +116,66 @@ impl Head {
 /// Layout: magic, version, writer_id, then length-prefixed maps. As with
 /// records, every length is explicit and no buffer-supplied count is used to
 /// pre-allocate.
+/// Format version written by [`encode_head`].
+///
+/// v1 stored every root as its 64-character hex text. v2 stores the 32 raw
+/// bytes instead, which is the same information at half the size — and the
+/// head is rewritten whole on every publish, so its size is paid on every
+/// write and every open. `pond_bench --bin headscale` measured the v1 cost at
+/// about 73 bytes per collection: 729 KB to write one row into a pond with
+/// 10,000 collections.
+///
+/// The same change was made to spilled-value hashes in the record encoder for
+/// the same reason. A hash is bytes; hex is a display format.
+///
+/// This is a constant factor, not a fix for the growth. The head still carries
+/// one entry per collection and is still rewritten whole, so the cost is still
+/// linear in the number of collections a writer publishes — see
+/// docs/CRITIQUE.md for the tree-backed head that would remove the linearity
+/// while keeping single-object atomicity.
+const VERSION_V2: u8 = 2;
+
+/// A root that is not 32 bytes of hex, written as text.
+///
+/// Every root the engine produces is a 64-character hex hash, so this should
+/// not occur. It exists because a format that cannot represent something it
+/// is handed will either panic or silently truncate, and both are worse than
+/// one extra byte.
+const ROOT_TEXT: u8 = 0;
+/// A root stored as its 32 raw bytes.
+const ROOT_BINARY: u8 = 1;
+
+fn put_root(out: &mut Vec<u8>, root: &str) {
+    match crate::encode::decode_hex32(root) {
+        Some(raw) => {
+            out.push(ROOT_BINARY);
+            out.extend_from_slice(&raw);
+        }
+        None => {
+            out.push(ROOT_TEXT);
+            out.extend_from_slice(&(root.len() as u16).to_le_bytes());
+            out.extend_from_slice(root.as_bytes());
+        }
+    }
+}
+
 pub fn encode_head(h: &Head) -> Vec<u8> {
     const MAGIC: &[u8; 4] = b"PHED";
     let mut out = Vec::from(*MAGIC);
-    out.push(1u8); // format version
+    out.push(VERSION_V2);
     out.extend_from_slice(&h.writer_id.to_le_bytes());
 
     out.extend_from_slice(&(h.collections.len() as u32).to_le_bytes());
     for (name, root) in &h.collections {
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&(root.len() as u16).to_le_bytes());
-        out.extend_from_slice(root.as_bytes());
+        put_root(&mut out, root);
     }
 
     out.extend_from_slice(&(h.observed.len() as u32).to_le_bytes());
     for (writer, root) in &h.observed {
         out.extend_from_slice(&writer.to_le_bytes());
-        out.extend_from_slice(&(root.len() as u16).to_le_bytes());
-        out.extend_from_slice(root.as_bytes());
+        put_root(&mut out, root);
     }
     out
 }
@@ -151,34 +192,59 @@ pub fn decode_head(buf: &[u8]) -> Option<Head> {
     if take(&mut pos, 4)? != b"PHED" {
         return None;
     }
-    if take(&mut pos, 1)?[0] != 1 {
+    // Both versions are read. A content-addressed store cannot rewrite what
+    // it already holds, so heads written before v2 stay on disk and stay
+    // readable — the version byte is what makes that possible rather than a
+    // guess about length.
+    let version = take(&mut pos, 1)?[0];
+    if version != 1 && version != VERSION_V2 {
         return None;
     }
     let writer_id = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
 
+    // One root, in whichever form this version stores them.
+    let get_root = |pos: &mut usize| -> Option<String> {
+        if version == 1 {
+            let rl = u16::from_le_bytes(take(pos, 2)?.try_into().ok()?) as usize;
+            return String::from_utf8(take(pos, rl)?.to_vec()).ok();
+        }
+        match take(pos, 1)?[0] {
+            ROOT_BINARY => {
+                let raw: [u8; 32] = take(pos, 32)?.try_into().ok()?;
+                Some(crate::encode::encode_hex32(raw))
+            }
+            ROOT_TEXT => {
+                let rl = u16::from_le_bytes(take(pos, 2)?.try_into().ok()?) as usize;
+                String::from_utf8(take(pos, rl)?.to_vec()).ok()
+            }
+            _ => None,
+        }
+    };
+
     let n_coll = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
-    // Smallest possible entry is 2 + 0 + 2 + 0 = 4 bytes.
-    if n_coll.saturating_mul(4) > buf.len().saturating_sub(pos) {
+    // Smallest possible entry: a zero-length name plus the shortest root form.
+    let min_entry = if version == 1 { 4 } else { 3 };
+    if n_coll.saturating_mul(min_entry) > buf.len().saturating_sub(pos) {
         return None;
     }
     let mut collections = BTreeMap::new();
     for _ in 0..n_coll {
         let nl = u16::from_le_bytes(take(&mut pos, 2)?.try_into().ok()?) as usize;
         let name = String::from_utf8(take(&mut pos, nl)?.to_vec()).ok()?;
-        let rl = u16::from_le_bytes(take(&mut pos, 2)?.try_into().ok()?) as usize;
-        let root = String::from_utf8(take(&mut pos, rl)?.to_vec()).ok()?;
+        let root = get_root(&mut pos)?;
         collections.insert(name, root);
     }
 
     let n_obs = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
-    if n_obs.saturating_mul(10) > buf.len().saturating_sub(pos) {
+    if n_obs.saturating_mul(if version == 1 { 10 } else { 9 })
+        > buf.len().saturating_sub(pos)
+    {
         return None;
     }
     let mut observed = BTreeMap::new();
     for _ in 0..n_obs {
         let w = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
-        let rl = u16::from_le_bytes(take(&mut pos, 2)?.try_into().ok()?) as usize;
-        let root = String::from_utf8(take(&mut pos, rl)?.to_vec()).ok()?;
+        let root = get_root(&mut pos)?;
         observed.insert(w, root);
     }
 
@@ -192,6 +258,77 @@ pub fn decode_head(buf: &[u8]) -> Option<Head> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode a head the way v1 did: roots as their hex text.
+    ///
+    /// Written out longhand rather than kept as a captured byte string,
+    /// because the point is that the *shape* still decodes, and a reader
+    /// should be able to see what that shape was.
+    fn encode_head_v1(h: &Head) -> Vec<u8> {
+        let mut out = Vec::from(*b"PHED");
+        out.push(1u8);
+        out.extend_from_slice(&h.writer_id.to_le_bytes());
+        out.extend_from_slice(&(h.collections.len() as u32).to_le_bytes());
+        for (name, root) in &h.collections {
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(root.len() as u16).to_le_bytes());
+            out.extend_from_slice(root.as_bytes());
+        }
+        out.extend_from_slice(&(h.observed.len() as u32).to_le_bytes());
+        for (writer, root) in &h.observed {
+            out.extend_from_slice(&writer.to_le_bytes());
+            out.extend_from_slice(&(root.len() as u16).to_le_bytes());
+            out.extend_from_slice(root.as_bytes());
+        }
+        out
+    }
+
+    fn sample() -> Head {
+        let mut h = Head::new(42);
+        h.set_root("users", &"a1".repeat(32));
+        h.set_root("orders", &"b2".repeat(32));
+        h.observe(7, &"c3".repeat(32));
+        h
+    }
+
+    /// Heads written before v2 must still read. A content-addressed store
+    /// cannot rewrite what it already holds, so old objects stay on disk
+    /// forever and staying readable is not optional.
+    #[test]
+    fn a_v1_head_still_decodes() {
+        let h = sample();
+        let decoded = decode_head(&encode_head_v1(&h)).expect("v1 head must decode");
+        assert_eq!(decoded, h);
+    }
+
+    /// And v2 is smaller, which is the whole reason for it.
+    #[test]
+    fn v2_is_smaller_than_v1() {
+        let mut h = Head::new(1);
+        for i in 0..100 {
+            h.set_root(&format!("c{i}"), &format!("{:064x}", i));
+        }
+        let v1 = encode_head_v1(&h).len();
+        let v2 = encode_head(&h).len();
+        assert!(
+            v2 * 3 < v1 * 2,
+            "v2 should be well under two-thirds of v1: {v1} -> {v2}"
+        );
+        assert_eq!(decode_head(&encode_head(&h)).as_ref(), Some(&h));
+    }
+
+    /// A root that is not 32 bytes of hex must survive rather than be
+    /// truncated or panicked on. No engine produces one, which is exactly why
+    /// nothing else would catch it.
+    #[test]
+    fn a_root_that_is_not_a_hash_round_trips() {
+        let mut h = Head::new(3);
+        h.set_root("odd", "not-a-hash");
+        h.set_root("empty", "");
+        h.observe(9, "also-not-a-hash");
+        assert_eq!(decode_head(&encode_head(&h)).as_ref(), Some(&h));
+    }
 
     #[test]
     fn test_head_roundtrip() {

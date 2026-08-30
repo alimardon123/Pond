@@ -308,7 +308,7 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
 ///
 /// Returns `None` for anything else, so a hash of a different width or casing
 /// is stored as text rather than mangled.
-fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
@@ -335,7 +335,7 @@ fn hex_val(c: u8) -> Option<u8> {
 
 /// The inverse of [`decode_hex32`], always lowercase so a round trip is
 /// byte-identical and two writers cannot disagree on casing.
-fn encode_hex32(raw: [u8; 32]) -> String {
+pub(crate) fn encode_hex32(raw: [u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
     for b in raw {

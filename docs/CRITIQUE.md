@@ -101,18 +101,23 @@ apart the clocks in a deployment can drift.
   Measured by `cargo run --release -p pond_bench --bin headscale`: a single-row
   write into one collection, at increasing collection counts.
 
-  | collections | bytes per publish | modelled ms |
-  | ---: | ---: | ---: |
-  | 1 | 183 | 60.0 |
-  | 10 | 813 | 60.0 |
-  | 100 | 7,203 | 60.1 |
-  | 1,000 | 72,003 | 61.4 |
-  | 10,000 | 729,003 | 73.9 |
+  | collections | bytes per publish (v1) | after v2 head | modelled ms |
+  | ---: | ---: | ---: | ---: |
+  | 1 | 183 | 150 | 60.0 |
+  | 10 | 813 | 483 | 60.0 |
+  | 100 | 7,203 | 3,903 | 60.1 |
+  | 1,000 | 72,003 | 39,003 | 60.7 |
+  | 10,000 | 729,003 | 399,003 | 67.6 |
 
-  About 73 bytes per collection, linear, and a reader pays the same on open.
-  At 10^6 collections that is ~73 MB moved to write one row, and ~73 MB read
-  to open the pond. **Round trips stay flat at 2 throughout**, which is why a
-  round-trip count alone never showed this — it needed its own measurement.
+  A reader pays the same on open. **Round trips stay flat at 2 throughout**,
+  which is why a round-trip count alone never showed this — it needed its own
+  measurement.
+
+  The v2 head encoding stores roots as their 32 raw bytes rather than as
+  64 characters of hex, taking this from ~73 to ~40 bytes per collection. That
+  is a constant factor and it is **not** the fix: the cost is still linear, so
+  10^6 collections still means ~40 MB moved to write one row. It buys roughly
+  a factor of two of headroom, nothing more.
 
   The cause is deliberate: a head is one writer's whole view of the pond in a
   single object, which is what makes atomic multi-collection publish free on a
