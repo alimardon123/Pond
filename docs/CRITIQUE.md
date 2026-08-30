@@ -133,6 +133,18 @@ misreading; nothing goes above this line until it has been reproduced.
   breaking the tie on the canonical encoding of the value; the laws are now
   tested as laws in `core/record/src/lib.rs`.
 
+- **Scans waited once per node instead of once per level.** A cold full scan of
+  100,000 rows was 51 sequential round trips at batch width 1.0 — nothing in
+  the read path issued a parallel request — although every leaf hash is known
+  from the internal nodes before the first leaf is fetched. `collect` and
+  `collect_range` now walk a level at a time through a new
+  `NodeStore::get_batch`, which `EngineStore` routes to the backend's parallel
+  batch read. Measured: **51 waits to 4**, width 1.0 to 12.8, 1610 ms to 200 ms
+  modelled, on an unchanged 51 requests. Range pruning happens before the batch
+  is issued, so a narrow range still reads almost nothing.
+  `core/engine/tests/fan_out.rs` pins it — this is a property with no
+  correctness signal, so without a direct assertion it regresses silently.
+
 - **The vector lens lost vectors three different ways.** All three verified in
   one function, `VectorLens::commit`. (a) It called the legacy writer while
   `search` and `get_all` dispatch on format, so on an engine-backed collection

@@ -57,6 +57,26 @@ pub trait NodeStore {
     fn put_batch(&self, items: Vec<Vec<u8>>) -> Vec<Hash> {
         items.into_iter().map(|b| self.put(b)).collect()
     }
+
+    /// Read many nodes, returning them in the same order.
+    ///
+    /// The mirror of [`put_batch`](Self::put_batch), and it matters for the
+    /// same reason. A traversal that descends one node at a time waits once
+    /// per node however parallel the backend is: a scan of a 100,000-row
+    /// collection was 51 sequential round trips, ~1.6 s at object-storage
+    /// latency, even though every leaf hash is known from the internal nodes
+    /// before the first leaf is fetched. Read a whole level at once and the
+    /// same scan waits once per *level* — depth, not width.
+    ///
+    /// `None` at a position means that node could not be produced, exactly as
+    /// [`get`](Self::get) means it.
+    ///
+    /// The default is the obvious sequential loop, so every store is correct
+    /// without implementing this; backends that can issue requests in parallel
+    /// override it.
+    fn get_batch(&self, hashes: &[String]) -> Vec<Option<Vec<u8>>> {
+        hashes.iter().map(|h| self.get(h)).collect()
+    }
 }
 
 /// In-memory store with I/O counters, for tests and measurement.

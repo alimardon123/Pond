@@ -574,20 +574,49 @@ fn collect_leaf_refs<S: NodeStore>(
     }
 }
 
+/// Every entry under `hash`, in key order.
+///
+/// Walked a level at a time rather than a node at a time. The recursive
+/// descent this replaces read one node per round trip, so a scan cost one wait
+/// per *node* — 51 of them for a 100,000-row collection, ~1.6 s at
+/// object-storage latency — even though the hashes of every node on a level
+/// are known as soon as the level above is decoded. Reading them together
+/// costs one wait per level, which is depth rather than width: the same 51
+/// nodes over a tree of depth 3 become 3 waits.
+///
+/// Order is preserved because a level is decoded left to right and each node's
+/// children are appended in order, so the frontier is always in key order and
+/// leaves are drained in the order they are met.
 fn collect<S: NodeStore>(store: &S, hash: &str, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
-    let Some(node) = store.get(hash).and_then(|b| Node::decode(&b)) else {
-        return;
-    };
-    match node {
-        Node::Leaf { entries } => out.extend(entries),
-        Node::Internal { children } => {
-            for c in children {
-                collect(store, &c.hash, out);
+    let mut frontier = vec![hash.to_string()];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for bytes in store.get_batch(&frontier) {
+            // A node that could not be read contributes nothing here, exactly
+            // as before. Whether that is data loss or an empty subtree is not
+            // decidable at this layer; `EngineStore` counts the failures and
+            // the caller refuses a result one passed through.
+            let Some(node) = bytes.and_then(|b| Node::decode(&b)) else {
+                continue;
+            };
+            match node {
+                Node::Leaf { entries } => out.extend(entries),
+                Node::Internal { children } => {
+                    next.extend(children.into_iter().map(|c| c.hash));
+                }
             }
         }
+        frontier = next;
     }
 }
 
+/// The entries under `hash` within `[start, end)`, in key order.
+///
+/// Level at a time, like [`collect`], and for the same reason — but the
+/// pruning is what makes this worth doing rather than just faster. Subtrees
+/// outside the range are dropped from the frontier *before* the batch is
+/// issued, so a narrow range still reads only the nodes it needs, and it reads
+/// them in one wait per level instead of one per node.
 fn collect_range<S: NodeStore>(
     store: &S,
     hash: &str,
@@ -595,31 +624,38 @@ fn collect_range<S: NodeStore>(
     end: &[u8],
     out: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) {
-    let Some(node) = store.get(hash).and_then(|b| Node::decode(&b)) else {
-        return;
-    };
-    match node {
-        Node::Leaf { entries } => {
-            for (k, v) in entries {
-                if k.as_slice() >= start && k.as_slice() < end {
-                    out.push((k, v));
+    let mut frontier = vec![hash.to_string()];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for bytes in store.get_batch(&frontier) {
+            let Some(node) = bytes.and_then(|b| Node::decode(&b)) else {
+                continue;
+            };
+            match node {
+                Node::Leaf { entries } => {
+                    for (k, v) in entries {
+                        if k.as_slice() >= start && k.as_slice() < end {
+                            out.push((k, v));
+                        }
+                    }
+                }
+                Node::Internal { children } => {
+                    for c in children {
+                        // Below the range: skip without reading.
+                        if c.max_key.as_slice() < start {
+                            continue;
+                        }
+                        next.push(c.hash);
+                        // Once a subtree's max key reaches the end bound,
+                        // later siblings are all above the range.
+                        if c.max_key.as_slice() >= end {
+                            break;
+                        }
+                    }
                 }
             }
         }
-        Node::Internal { children } => {
-            for c in children {
-                // Skip subtrees entirely below the range without reading them.
-                if c.max_key.as_slice() < start {
-                    continue;
-                }
-                collect_range(store, &c.hash, start, end, out);
-                // Once a subtree's max key reaches the end bound, later
-                // siblings are all above the range.
-                if c.max_key.as_slice() >= end {
-                    break;
-                }
-            }
-        }
+        frontier = next;
     }
 }
 

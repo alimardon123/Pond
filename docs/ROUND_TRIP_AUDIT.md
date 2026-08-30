@@ -72,23 +72,23 @@ stated rate. Same-region S3 is faster and cross-region slower — multiply.
 | point read | 10000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
 | point read | 100000 | cold | 4 | 4 | 1.0 | 28.4 | 120.6 |
 | point read | 100000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
-| range scan 1k | 1000 | cold | 5 | 5 | 1.0 | 45.8 | 150.9 |
+| range scan 1k | 1000 | cold | 4 | 5 | 1.2 | 45.8 | 120.9 |
 | range scan 1k | 1000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
-| range scan 1k | 10000 | cold | 5 | 5 | 1.0 | 78.8 | 151.5 |
+| range scan 1k | 10000 | cold | 4 | 5 | 1.2 | 78.8 | 121.5 |
 | range scan 1k | 10000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
-| range scan 1k | 100000 | cold | 5 | 5 | 1.0 | 81.9 | 151.6 |
+| range scan 1k | 100000 | cold | 4 | 5 | 1.2 | 81.9 | 121.6 |
 | range scan 1k | 100000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
-| full scan | 1000 | cold | 5 | 5 | 1.0 | 45.8 | 150.9 |
+| full scan | 1000 | cold | 4 | 5 | 1.2 | 45.8 | 120.9 |
 | full scan | 1000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
-| full scan | 10000 | cold | 9 | 9 | 1.0 | 399.5 | 277.8 |
+| full scan | 10000 | cold | 4 | 9 | 2.2 | 399.5 | 127.8 |
 | full scan | 10000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
-| full scan | 100000 | cold | 51 | 51 | 1.0 | 4111.9 | 1610.3 |
+| full scan | 100000 | cold | 4 | 51 | 12.8 | 4111.9 | 200.3 |
 | full scan | 100000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
-| projected scan 2/8 | 1000 | cold | 5 | 5 | 1.0 | 45.8 | 150.9 |
+| projected scan 2/8 | 1000 | cold | 4 | 5 | 1.2 | 45.8 | 120.9 |
 | projected scan 2/8 | 1000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
-| projected scan 2/8 | 10000 | cold | 9 | 9 | 1.0 | 399.5 | 277.8 |
+| projected scan 2/8 | 10000 | cold | 4 | 9 | 2.2 | 399.5 | 127.8 |
 | projected scan 2/8 | 10000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
-| projected scan 2/8 | 100000 | cold | 51 | 51 | 1.0 | 4111.9 | 1610.3 |
+| projected scan 2/8 | 100000 | cold | 4 | 51 | 12.8 | 4111.9 | 200.3 |
 | projected scan 2/8 | 100000 | warm | 2 | 2 | 1.0 | 0.1 | 60.0 |
 | write 1 row | 1000 | cold | 3 | 3 | 1.0 | 0.2 | 90.0 |
 | write 1 row | 10000 | cold | 3 | 3 | 1.0 | 0.2 | 90.0 |
@@ -117,13 +117,18 @@ and nothing more — and the open is now the whole warm cost.
 the open, two for the descent. The constant-depth claim holds over the range
 measured.
 
-**Batch width is 1.0 in every single row of the table.** Not one operation in
-the profile issues a parallel request. A cold full scan of 100k rows is 51
-sequential waits — 1.6 s modelled — where the leaf hashes are all known from
-the internal nodes before any leaf is fetched, so they could go out as one
-batch. The `ObjectStore` batch methods exist, the cache forwards them, and the
-read path never calls them. This is the largest single latency gap in the
-system and it is mechanical to close.
+**Scans now wait per level, not per node.** They did not. A cold full scan of
+100k rows was 51 sequential waits at batch width 1.0 — 1.6 s modelled — even
+though every leaf hash is known from the internal nodes before the first leaf
+is fetched. The traversal descended recursively, one node per round trip.
+Walking a level at a time and reading it in one batch takes the same scan to
+**4 waits at width 12.8, 200 ms** — an 8× reduction in wall clock for an
+unchanged 51 requests, which is the right trade: requests are the bill, round
+trips are the wait.
+
+Point reads stay at 4 waits and cannot improve this way: a descent is
+inherently sequential, since each level's hashes come from decoding the level
+above. Fewer waits there needs a different mechanism, not a wider batch.
 
 **Projection reads every byte it discards.** `projected scan 2/8` is identical
 to `full scan` — same round trips, same 4111.9 KiB — at every scale. Selecting
@@ -141,8 +146,8 @@ staging read before them. Two-digit milliseconds needs this at 2.
 | --- | --- |
 | Open cost flat in data and in history | holds — 2 round trips at every scale |
 | Point read cost flat in data | holds — 4 cold round trips at every scale |
-| Minimum round trips | **not yet** — batch width is 1.0 everywhere; a 100k scan takes 51 sequential waits |
-| Two-digit-ms reads and writes | cold: no (120–1600 ms). warm: 60 ms, all of it the open |
+| Minimum round trips | scans yes — a 100k scan is 4 waits, down from 51. Point reads still 4, bounded by descent depth |
+| Two-digit-ms reads and writes | cold: closer — 120–200 ms, down from 120–1600. warm: 60 ms, all of it the open |
 | Single-digit-ms warm reads | **not reachable today** — the open alone is 2 round trips, and no cache can remove it |
 | The disk cache is on the shipped read path | now yes — it was not when this was first published; 22 round trips to 3 through `read_rows` |
 | Column projection reduces I/O | **no** — a 2-of-8 projection reads 100% of the bytes |

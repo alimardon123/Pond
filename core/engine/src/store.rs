@@ -113,6 +113,29 @@ impl<S: ObjectStore> NodeStore for EngineStore<S> {
             .expect("node write failed — storage is unavailable or full")
     }
 
+    fn get_batch(&self, hashes: &[String]) -> Vec<Option<Vec<u8>>> {
+        if hashes.is_empty() {
+            return Vec::new();
+        }
+        self.gets.fetch_add(hashes.len() as u64, Ordering::Relaxed);
+        match self.inner.get_blob_batch(hashes) {
+            Ok(blobs) if blobs.len() == hashes.len() => blobs.into_iter().map(Some).collect(),
+            Ok(_) => {
+                // A short batch is a failure of the whole batch: there is no
+                // way to know which positions are missing, and guessing would
+                // silently drop nodes. Counted so the caller refuses the
+                // result rather than returning a short scan.
+                self.read_failures.fetch_add(1, Ordering::Relaxed);
+                vec![None; hashes.len()]
+            }
+            Err(_) => {
+                self.read_failures
+                    .fetch_add(hashes.len() as u64, Ordering::Relaxed);
+                vec![None; hashes.len()]
+            }
+        }
+    }
+
     fn get(&self, hash: &str) -> Option<Vec<u8>> {
         self.gets.fetch_add(1, Ordering::Relaxed);
         match self.inner.get_blob(hash) {
