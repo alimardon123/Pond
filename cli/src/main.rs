@@ -578,7 +578,9 @@ fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>
         #[cfg(feature = "s3")]
         {
             let store = pond_s3::S3ObjectStore::from_url(root)?;
-            let kernel = with_keystore(PondKernel::new_with_store(Box::new(store)))?;
+            // Cached: every blob read otherwise crosses the network again,
+            // including the legacy path, the lenses and the index extensions.
+            let kernel = with_keystore(pond_storage::cached_kernel(std::sync::Arc::new(store)))?;
             Ok(UnifiedStorage::new(kernel))
         }
         #[cfg(not(feature = "s3"))]
@@ -590,7 +592,7 @@ fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>
         }
     } else {
         let path = root.strip_prefix("file://").unwrap_or(root);
-        let kernel = with_keystore(PondKernel::new_local(path)?)?;
+        let kernel = with_keystore(pond_storage::cached_local_kernel(path)?)?;
         Ok(UnifiedStorage::new(kernel))
     }
 }

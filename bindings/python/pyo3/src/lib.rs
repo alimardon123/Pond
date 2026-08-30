@@ -1432,7 +1432,9 @@ impl Storage {
                 }
                 let store = pond_s3::S3ObjectStore::from_url(&url)
                     .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-                let kernel = PondKernel::new_with_store(Box::new(store));
+                // Cached: see pond_storage::cached_kernel. Without it every
+                // blob read crosses the network again.
+                let kernel = pond_storage::cached_kernel(std::sync::Arc::new(store));
                 let storage = UnifiedStorage::new(kernel);
                 Ok(Self {
                     storage: Arc::new(Mutex::new(storage)),
@@ -1468,7 +1470,7 @@ impl Storage {
     fn from_s3(url: &str) -> PyResult<Self> {
         let store = pond_s3::S3ObjectStore::from_url(url)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let kernel = PondKernel::new_with_store(Box::new(store));
+        let kernel = pond_storage::cached_kernel(std::sync::Arc::new(store));
         let storage = UnifiedStorage::new(kernel);
         Ok(Self {
             storage: Arc::new(Mutex::new(storage)),
