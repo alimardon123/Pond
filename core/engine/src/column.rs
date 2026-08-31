@@ -46,9 +46,11 @@
 //
 // # Byte layout (little-endian lengths)
 //
-//   [0]                type_tag: u8 — the one variant every typed value in
-//                       this chunk shares, or TAG_NONE if there are none
-//   [1..5]              n: u32 — row count
+//   magic               "PCOL", 4 bytes
+//   version             1 byte — see `FORMAT_VERSION`'s doc comment for why
+//   type_tag: u8        the one variant every typed value in this chunk
+//                       shares, or TAG_NONE if there are none
+//   n: u32              row count
 //   presence bitmap     ceil(n/8) bytes, bit i set means row i is `Some(_)`
 //   null bitmap         ceil(n/8) bytes, bit i set means row i is
 //                       `Some(Value::Null)`; meaningless where the presence
@@ -72,6 +74,23 @@
 // `pond_index::node`.
 
 use pond_record::Value;
+
+const MAGIC: &[u8; 4] = b"PCOL";
+/// The format a chunk is written in.
+///
+/// Without a magic and a version, `encode(&[])` is `[00,00,00,00,00]` —
+/// byte-for-byte identical to `pond_index::node::Node::Leaf { entries: [] }
+/// .encode()`, which also puts a `u32` count right after its tag byte and
+/// also accepts tags in 0..=7. Same bytes, same SHA-256, same name in the
+/// shared, content-addressed object store, from two codecs that agree on
+/// nothing else. `MAGIC` and `FORMAT_VERSION` close that off, laid out the
+/// way `core/record/src/encode.rs:31,48` leads with `PREC` for the same
+/// reason.
+///
+/// `docs/COLUMNAR_LAYOUT.md` used to claim this format "already carries a
+/// version" before it did any such thing; that line is fixed to describe
+/// what is now actually true.
+const FORMAT_VERSION: u8 = 1;
 
 const TAG_NONE: u8 = 0;
 const TAG_BOOL: u8 = 1;
@@ -116,33 +135,43 @@ fn get_bit(bitmap: &[u8], i: usize) -> bool {
     (bitmap[i / 8] >> (i % 8)) & 1 == 1
 }
 
-fn put_payload(out: &mut Vec<u8>, v: &Value) {
+/// Writes a `u32` length prefix, refusing a length this format has no room
+/// for rather than truncating it — `n as u32` on a length over 4 GiB wraps
+/// to `n % 2^32` and writes a prefix for the wrong length entirely.
+fn put_len_prefix(out: &mut Vec<u8>, len: usize) -> Option<()> {
+    let len: u32 = len.try_into().ok()?;
+    out.extend_from_slice(&len.to_le_bytes());
+    Some(())
+}
+
+fn put_payload(out: &mut Vec<u8>, v: &Value) -> Option<()> {
     match v {
         Value::Bool(b) => out.push(*b as u8),
         Value::Int(i) => out.extend_from_slice(&i.to_le_bytes()),
         Value::F64(f) => out.extend_from_slice(&f.to_bits().to_le_bytes()),
         Value::Str(s) => {
-            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            put_len_prefix(out, s.len())?;
             out.extend_from_slice(s.as_bytes());
         }
         Value::Bytes(b) => {
-            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            put_len_prefix(out, b.len())?;
             out.extend_from_slice(b);
         }
         Value::Vector(fs) => {
-            out.extend_from_slice(&(fs.len() as u32).to_le_bytes());
+            put_len_prefix(out, fs.len())?;
             for f in fs {
                 out.extend_from_slice(&f.to_bits().to_le_bytes());
             }
         }
         Value::Json(s) => {
-            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            put_len_prefix(out, s.len())?;
             out.extend_from_slice(s.as_bytes());
         }
         Value::Null | Value::Spilled { .. } => {
             unreachable!("encode() filters both out before calling put_payload")
         }
     }
+    Some(())
 }
 
 /// Encode a column chunk. `None` at index `i` means row `i` has no value for
@@ -151,9 +180,16 @@ fn put_payload(out: &mut Vec<u8>, v: &Value) {
 ///
 /// Returns `None` when the input cannot be represented as one chunk: a
 /// `Value::Spilled` anywhere (a chunk stores resolved values, never
-/// placeholders), or two typed values that are not the same variant.
+/// placeholders), two typed values that are not the same variant, more rows
+/// than [`MAX_DECLARED_ROWS`] (this format's own decoder would refuse the
+/// result, so encoding it would record a name for a permanently unreadable
+/// object), or a `Str`, `Bytes`, `Vector`, or `Json` payload whose length
+/// does not fit in the `u32` this format prefixes it with.
 pub fn encode(values: &[Option<Value>]) -> Option<Vec<u8>> {
     let n = values.len();
+    if n > MAX_DECLARED_ROWS {
+        return None;
+    }
 
     // One pass to find the chunk's type — the variant every typed value must
     // share — and to refuse anything this format cannot hold. `Value::Null`
@@ -189,17 +225,32 @@ pub fn encode(values: &[Option<Value>]) -> Option<Vec<u8>> {
     }
 
     let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.push(FORMAT_VERSION);
     out.push(type_tag);
+    // `n <= MAX_DECLARED_ROWS`, checked above, so this cannot truncate.
     out.extend_from_slice(&(n as u32).to_le_bytes());
     out.extend_from_slice(&present);
     out.extend_from_slice(&is_null);
     for v in values {
         match v {
             Some(Value::Null) | None => {}
-            Some(val) => put_payload(&mut out, val),
+            Some(val) => put_payload(&mut out, val)?,
         }
     }
     Some(out)
+}
+
+/// The bits in a `ceil(n/8)`-byte bitmap at and above row `n` carry no
+/// meaning — `encode` always leaves them zero, so a decoder that ignored
+/// them would accept a set bit there as just another spelling of the same
+/// chunk. Reject it instead: see the module comment on canonical decoding.
+fn bitmap_padding_is_clear(bitmap: &[u8], n: usize) -> bool {
+    let used = n % 8;
+    if used == 0 {
+        return true; // no partial last byte
+    }
+    bitmap[bitmap.len() - 1] & (!0u8 << used) == 0
 }
 
 /// Decode a chunk written by [`encode`].
@@ -211,8 +262,35 @@ pub fn encode(values: &[Option<Value>]) -> Option<Vec<u8>> {
 /// before it drives anything, and the output vector is grown incrementally
 /// rather than pre-sized from it, the same discipline `pond_index::node` uses
 /// for its declared entry count.
+///
+/// # Canonical decoding
+///
+/// These bytes are an object's *name* — the store addresses a chunk by the
+/// hash of exactly this encoding — so a decoder that accepts more than one
+/// spelling of a value breaks the promise that the name proves the content:
+/// re-encoding what you decoded would not reproduce the bytes you were
+/// handed, and a second implementation that spells the same value
+/// differently would silently mint a second name for it. `encode` already
+/// produces only one spelling per value, so this decoder rejects every
+/// other one rather than accepting it: trailing bytes past the last field,
+/// set padding bits above `n` in either bitmap, a null bit set on a row
+/// whose presence bit is clear, a bool payload byte other than 0 or 1, and
+/// a non-`TAG_NONE` type tag on a chunk with no typed row (all eight tag
+/// values are otherwise indistinguishable on an all-null-or-absent chunk,
+/// since no payload is ever read to tell them apart).
+///
+/// `pond_index::node::decode_plain` does not do this, and that is a
+/// deliberate difference, not an oversight this should match: it has no
+/// bitmaps, no sentinel type tag, and no bool byte, so it has far fewer
+/// spellings of a value to get wrong in the first place.
 pub fn decode(buf: &[u8]) -> Option<Vec<Option<Value>>> {
     let mut r = Reader { buf, pos: 0 };
+    if r.take(4)? != MAGIC {
+        return None;
+    }
+    if r.u8()? != FORMAT_VERSION {
+        return None;
+    }
     let type_tag = r.u8()?;
     if type_tag > TAG_JSON {
         return None;
@@ -224,10 +302,20 @@ pub fn decode(buf: &[u8]) -> Option<Vec<Option<Value>>> {
     let bitmap_bytes = n.div_ceil(8);
     let present = r.take(bitmap_bytes)?;
     let is_null = r.take(bitmap_bytes)?;
+    if !bitmap_padding_is_clear(present, n) || !bitmap_padding_is_clear(is_null, n) {
+        return None;
+    }
 
+    let mut saw_typed = false;
     let mut out = Vec::new();
     for i in 0..n {
         if !get_bit(present, i) {
+            // The null bit is meaningless where presence is clear, but
+            // `encode` always leaves it clear there too — a set bit is a
+            // second spelling of the same absent row.
+            if get_bit(is_null, i) {
+                return None;
+            }
             out.push(None);
             continue;
         }
@@ -236,12 +324,20 @@ pub fn decode(buf: &[u8]) -> Option<Vec<Option<Value>>> {
             continue;
         }
         // A row claiming a typed value in a chunk whose type is TAG_NONE has
-        // no defined payload format to read — this can only be a corrupt or
-        // hand-crafted buffer, since `encode` never produces it.
-        if type_tag == TAG_NONE {
-            return None;
-        }
+        // no defined payload format to read; `Reader::payload` already
+        // returns `None` for `TAG_NONE`, so this falls through to that.
+        saw_typed = true;
         out.push(Some(r.payload(type_tag)?));
+    }
+    // A chunk with no typed row has nothing to fix a type from, so `encode`
+    // always writes TAG_NONE for it — any other tag is unconstrained, since
+    // no payload is ever read to check it against, and would let one chunk
+    // have as many as eight valid names.
+    if !saw_typed && type_tag != TAG_NONE {
+        return None;
+    }
+    if r.pos != buf.len() {
+        return None;
     }
     Some(out)
 }
@@ -270,7 +366,13 @@ impl<'a> Reader<'a> {
 
     fn payload(&mut self, type_tag: u8) -> Option<Value> {
         Some(match type_tag {
-            TAG_BOOL => Value::Bool(self.u8()? != 0),
+            // `encode` writes exactly 0 or 1 — any other byte is a second
+            // spelling of `true` this decoder must not accept.
+            TAG_BOOL => Value::Bool(match self.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            }),
             TAG_INT => Value::Int(i64::from_le_bytes(self.take(8)?.try_into().ok()?)),
             TAG_F64 => {
                 Value::F64(f64::from_bits(u64::from_le_bytes(self.take(8)?.try_into().ok()?)))
@@ -484,6 +586,33 @@ mod tests {
         assert_eq!(encode(&[Some(spilled)]), None);
     }
 
+    /// `decode` refuses a declared row count over [`MAX_DECLARED_ROWS`], so
+    /// `encode` must refuse the same input rather than handing back bytes
+    /// this module's own decoder cannot read — otherwise a writer records a
+    /// name for a permanently unreadable object.
+    #[test]
+    fn encode_refuses_more_rows_than_the_declared_row_cap() {
+        let at_cap = vec![None; MAX_DECLARED_ROWS];
+        assert!(encode(&at_cap).is_some());
+
+        let one_over = vec![None; MAX_DECLARED_ROWS + 1];
+        assert_eq!(encode(&one_over), None);
+    }
+
+    /// `put_len_prefix` is what stands between a `Str`, `Bytes`, `Vector`, or
+    /// `Json` value's real length and the `u32` this format prefixes it
+    /// with — this pins the guard directly rather than by actually
+    /// allocating a multi-gigabyte value in a test.
+    #[test]
+    fn put_len_prefix_refuses_a_length_that_does_not_fit_in_u32() {
+        let mut ok = Vec::new();
+        assert_eq!(put_len_prefix(&mut ok, u32::MAX as usize), Some(()));
+        assert_eq!(ok, u32::MAX.to_le_bytes());
+
+        let mut too_big = Vec::new();
+        assert_eq!(put_len_prefix(&mut too_big, u32::MAX as usize + 1), None);
+    }
+
     // -----------------------------------------------------------------------
     // Canonical encoding
     // -----------------------------------------------------------------------
@@ -511,6 +640,139 @@ mod tests {
             Some(Value::Str("column".into())),
         ];
         assert_eq!(encode(&rebuilt).unwrap(), once);
+    }
+
+    /// Offsets into a canonically-encoded buffer, so the tests below can name
+    /// the byte they are mutating instead of a magic number.
+    struct Layout {
+        type_tag: usize,
+        presence: usize,
+        null: usize,
+    }
+
+    fn layout(n_rows: usize) -> Layout {
+        let bitmap_bytes = n_rows.div_ceil(8);
+        Layout {
+            type_tag: 4 + 1,
+            presence: 4 + 1 + 1 + 4,
+            null: 4 + 1 + 1 + 4 + bitmap_bytes,
+        }
+    }
+
+    /// Trailing bytes past the last field are never part of any encoding
+    /// `encode` produces, so `decode` must not silently ignore them — a name
+    /// derived from a hash of the whole buffer would otherwise be shared by
+    /// two different objects, one of which is garbage `encode` never wrote.
+    #[test]
+    fn trailing_bytes_after_a_canonical_encoding_are_refused() {
+        let values = vec![Some(Value::Int(1)), None, Some(Value::Null)];
+        let canonical = encode(&values).unwrap();
+        assert!(
+            decode(&canonical).is_some(),
+            "the canonical bytes must decode on their own"
+        );
+
+        let mut four_extra = canonical.clone();
+        four_extra.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(decode(&four_extra), None);
+
+        let mut one_extra = canonical.clone();
+        one_extra.push(0x00);
+        assert_eq!(decode(&one_extra), None);
+    }
+
+    /// The bits above row `n` in the presence bitmap's last byte carry no
+    /// meaning, but `encode` always leaves them zero — a decoder that
+    /// ignored them would accept a set padding bit as another spelling of
+    /// the same chunk.
+    #[test]
+    fn presence_bitmap_padding_bits_above_n_are_refused() {
+        let values = vec![Some(Value::Int(1)), None, Some(Value::Null)]; // n = 3
+        let canonical = encode(&values).unwrap();
+        let l = layout(3);
+        let mut evil = canonical.clone();
+        evil[l.presence] |= 0xF8; // bits 3..8 are padding when n = 3
+        assert_eq!(decode(&evil), None);
+    }
+
+    /// Same as above, for the null bitmap's padding bits.
+    #[test]
+    fn null_bitmap_padding_bits_above_n_are_refused() {
+        let values = vec![Some(Value::Int(1)), None, Some(Value::Null)]; // n = 3
+        let canonical = encode(&values).unwrap();
+        let l = layout(3);
+        let mut evil = canonical.clone();
+        evil[l.null] |= 0xF8;
+        assert_eq!(decode(&evil), None);
+    }
+
+    /// The null bit is never inspected when a row's presence bit is clear —
+    /// but that makes it a spare bit a decoder could accept two ways unless
+    /// it is constrained too. `encode` always leaves it clear on an absent
+    /// row.
+    #[test]
+    fn a_null_bit_set_on_an_absent_row_is_refused() {
+        let values = vec![None, Some(Value::Int(1))]; // row 0 absent
+        let canonical = encode(&values).unwrap();
+        let l = layout(2);
+        let mut evil = canonical.clone();
+        evil[l.null] |= 0b01; // row 0's null bit, though row 0 is absent
+        assert_eq!(decode(&evil), None);
+    }
+
+    /// `encode` writes a bool payload as exactly the byte `1` or `0`.
+    /// `0xFF` must not decode as `true` by the same accident `!= 0` would
+    /// make it.
+    #[test]
+    fn a_non_canonical_bool_payload_byte_is_refused() {
+        let values = vec![Some(Value::Bool(true))];
+        let canonical = encode(&values).unwrap();
+        let payload = canonical.len() - 1; // the single bool byte, at the end
+        assert_eq!(canonical[payload], 1);
+        let mut evil = canonical.clone();
+        evil[payload] = 0xFF;
+        assert_eq!(decode(&evil), None);
+    }
+
+    /// The worst of the non-canonical shapes: on a chunk with no row that is
+    /// both present and non-null, no payload is ever read, so nothing
+    /// distinguishes `TAG_NONE` from any other tag — all eight would decode
+    /// identically, giving one chunk eight valid names. `encode` always
+    /// picks `TAG_NONE`; `decode` must require it.
+    #[test]
+    fn an_all_null_chunks_type_tag_must_be_tag_none() {
+        let values = vec![None, Some(Value::Null), None];
+        let canonical = encode(&values).unwrap();
+        let l = layout(3);
+        assert_eq!(canonical[l.type_tag], TAG_NONE);
+        for tag in TAG_BOOL..=TAG_JSON {
+            let mut evil = canonical.clone();
+            evil[l.type_tag] = tag;
+            assert_eq!(
+                decode(&evil),
+                None,
+                "tag {} on an all-null chunk must be refused",
+                tag
+            );
+        }
+    }
+
+    /// The direct statement of what all of the above are instances of:
+    /// `decode`'s accepted set is exactly `encode`'s output set. Re-encoding
+    /// what a canonical buffer decodes to must reproduce that same buffer,
+    /// for every shape [`golden_inputs`] exercises.
+    #[test]
+    fn decoding_then_re_encoding_a_canonical_buffer_reproduces_it() {
+        for (name, values) in golden_inputs() {
+            let canonical = encode(&values).expect("golden inputs must encode");
+            let decoded = decode(&canonical).expect("must decode");
+            assert_eq!(
+                encode(&decoded).unwrap(),
+                canonical,
+                "{:?} did not round trip byte-for-byte",
+                name
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -552,6 +814,40 @@ mod tests {
                     Some(Value::Str("hello".into())),
                     None,
                     Some(Value::Str("日本語".into())),
+                ],
+            ),
+            (
+                "bytes",
+                vec![
+                    Some(Value::Bytes(vec![])),
+                    Some(Value::Bytes(vec![0, 0, 1, 0, 255])),
+                    None,
+                    // Long enough that the length prefix spans more than one
+                    // byte, so a change to how that prefix is written — a
+                    // reserved byte inserted before it, its width changed —
+                    // moves the digest.
+                    Some(Value::Bytes((0..300).map(|i| i as u8).collect())),
+                ],
+            ),
+            (
+                "vectors",
+                vec![
+                    Some(Value::Vector(vec![])),
+                    Some(Value::Vector(vec![1.0, -2.5, 0.0, -0.0, f32::NAN, f32::INFINITY])),
+                    None,
+                    Some(Value::Vector((0..80).map(|i| i as f32).collect())),
+                ],
+            ),
+            (
+                "json",
+                vec![
+                    Some(Value::Json("{}".into())),
+                    Some(Value::Json(r#"{"a":[1,2,3],"b":null}"#.into())),
+                    None,
+                    Some(Value::Json(format!(
+                        r#"{{"padding":"{}"}}"#,
+                        "x".repeat(300)
+                    ))),
                 ],
             ),
             (
@@ -605,24 +901,27 @@ mod tests {
         use sha2::{Digest, Sha256};
 
         let expected: &[(&str, &str)] = &[
-            ("empty", "8855508aade16ec573d21e6a485dfd0a7624085c1a14b5ecdd6485de0c6839a4"),
-            ("bools", "317a78e887c1d036d69251ca0677dce855223c3a0e2bb13ca1ecfb2971506aac"),
-            ("ints", "8a747de307769e716ea326eca0f5cdeed4f81082da4b4443b40ca07f97bb534f"),
+            ("empty", "21605a6206ddb02d24839d29a04ae0f5f2113e58fd843c438a88082427ee5cf3"),
+            ("bools", "85af85a5843aecd6000496e1c344ae5447f1ceb9de5fe3b0d7306905fc48dfbb"),
+            ("ints", "4370883392ea8c2f9878d911c398e90559575f0f2a7eca0eeee7d26e39db65c9"),
             (
                 "floats with nan and signed zero",
-                "ebbcf2c712ee1ebfa0a9ccf7405ab18ed13a74f1a82a349f0b7d92247c12937f",
+                "b30b593260824abfd84e2dcda9847359e8b787ee2bc0c96aba6205d3fd9467ba",
             ),
             (
                 "strings",
-                "e1c2ac964c58d6e92dc9118bdd2fd4f11db8878b3179366e53a8d22236e4e2fd",
+                "39f3718328364a05dbfb4e0b5e69a2a29f16bd0ce0058d9d2cba9e2863b1ded9",
             ),
+            ("bytes", "5529f186e6afd536b6b0be2f2519d315e0f8b6f6f923617409a894df63536e2b"),
+            ("vectors", "9f4327acc243628d6cf196ed17919737881b6dda574c192cd00adc5bf5c5fb36"),
+            ("json", "b748d255a5d3da33586235dcf61526577728e792b44f7edc3377bfcb223a9e6b"),
             (
                 "nulls and absences with no typed value",
-                "0af399eca54faf2502a667eddcacabcb8a2e4ee5f7be7c84ac90f70a3a513575",
+                "f8a21e1cfe3b252deba6b68949dff8b1fb14b3890c8d8a12ead2e3c1cccd6879",
             ),
             (
                 "interleaved typed values, nulls and absences",
-                "3ccd0144b19f1bad86b60334922734a03845f5c02fb4baf4866bc24eb70e4ad9",
+                "361b90303ad8344772357118c492c8e6802f04a8eacc6c034776c1d104a532f2",
             ),
         ];
 
@@ -648,39 +947,91 @@ mod tests {
     // Malformed input
     // -----------------------------------------------------------------------
 
+    /// The fixed prefix (`MAGIC` + `FORMAT_VERSION` + `type_tag`) every test
+    /// below starts from, so each one only has to spell out the part of the
+    /// buffer it is actually testing.
+    fn header(type_tag: u8) -> Vec<u8> {
+        let mut out = Vec::from(*MAGIC);
+        out.push(FORMAT_VERSION);
+        out.push(type_tag);
+        out
+    }
+
     #[test]
     fn an_empty_buffer_is_refused() {
         assert_eq!(decode(&[]), None);
     }
 
     #[test]
-    fn an_unknown_type_tag_is_refused() {
-        assert_eq!(decode(&[99, 0, 0, 0, 0]), None);
+    fn a_buffer_with_the_wrong_magic_is_refused() {
+        let mut evil = b"XXXX".to_vec();
+        evil.push(FORMAT_VERSION);
+        evil.push(TAG_NONE);
+        evil.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode(&evil), None);
     }
 
-    /// A row count the buffer could not possibly hold is refused before it
-    /// drives any allocation — the same discipline `pond_index::node` uses
-    /// for a declared entry count of 4 billion in a 5-byte buffer.
+    #[test]
+    fn a_buffer_with_an_unknown_version_is_refused() {
+        let mut evil = Vec::from(*MAGIC);
+        evil.push(FORMAT_VERSION + 1);
+        evil.push(TAG_NONE);
+        evil.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode(&evil), None);
+    }
+
+    #[test]
+    fn an_unknown_type_tag_is_refused() {
+        let mut evil = header(99);
+        evil.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode(&evil), None);
+    }
+
+    /// A row count the buffer could not possibly hold is refused — `decode`
+    /// never allocates proportional to `n` (every read takes a bounded slice
+    /// out of the buffer that already exists, and `out` grows one row at a
+    /// time), so this is not a protection against an allocation the code
+    /// would otherwise perform. It is the cap check below, exercised on a
+    /// buffer where the declared count is absurd rather than merely large.
     #[test]
     fn a_declared_row_count_far_larger_than_the_buffer_is_refused() {
-        let mut evil = vec![TAG_INT];
+        let mut evil = header(TAG_INT);
         evil.extend_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(decode(&evil), None);
     }
 
-    /// The declared-row cap itself, at its edge — mutation testing on
-    /// `pond_index::node` found that "at the limit" and "one past it" are the
-    /// only inputs that distinguish `>` from `>=`.
+    /// The declared-row cap itself, at its edge, built so the cap is the
+    /// *only* thing that can refuse: both buffers carry the full presence
+    /// and null bitmap bytes their declared row count calls for, so nothing
+    /// downstream of the cap check can fail first and mask it. Without that,
+    /// a header with no bitmap bytes fails on the next read regardless of
+    /// the cap, which is how the two tests this replaced passed with the
+    /// cap deleted, and with `>` loosened to `>=`.
+    ///
+    /// Mutation-tested: with `if n > MAX_DECLARED_ROWS { return None; }`
+    /// deleted, `at_limit` still passes but `over` now decodes to
+    /// `Some(vec![None; MAX_DECLARED_ROWS + 1])` instead of `None`, so this
+    /// test fails. Changing `>` to `>=` makes `at_limit` decode to `None`
+    /// instead of the full row vec, so this test fails on that edge too.
+    /// Restoring the check as written makes it pass again.
     #[test]
     fn the_declared_row_cap_is_exact() {
-        let mut at_limit = vec![TAG_NONE];
-        at_limit.extend_from_slice(&(MAX_DECLARED_ROWS as u32).to_le_bytes());
-        // Exactly at the cap is permitted by the count check and then fails
-        // for lack of bitmap bytes, not on the bound itself.
-        assert_eq!(decode(&at_limit), None);
+        fn full_buffer(n: usize) -> Vec<u8> {
+            let mut buf = header(TAG_NONE);
+            buf.extend_from_slice(&(n as u32).to_le_bytes());
+            let bitmap_bytes = n.div_ceil(8);
+            buf.extend(vec![0u8; bitmap_bytes * 2]);
+            buf
+        }
 
-        let mut over = vec![TAG_NONE];
-        over.extend_from_slice(&((MAX_DECLARED_ROWS + 1) as u32).to_le_bytes());
+        // Exactly at the cap: permitted, and decodes to `n` absent rows —
+        // there is nothing past the bitmaps for a TAG_NONE chunk to fail on.
+        let at_limit = full_buffer(MAX_DECLARED_ROWS);
+        assert_eq!(decode(&at_limit), Some(vec![None; MAX_DECLARED_ROWS]));
+
+        // One past it: refused by the cap itself, with every bitmap byte
+        // that row count would need already present.
+        let over = full_buffer(MAX_DECLARED_ROWS + 1);
         assert_eq!(decode(&over), None);
     }
 
@@ -688,7 +1039,7 @@ mod tests {
     /// the same class of bug the module comment traces to the PND2 decoder.
     #[test]
     fn a_string_length_exceeding_the_buffer_is_refused() {
-        let mut evil = vec![TAG_STR];
+        let mut evil = header(TAG_STR);
         evil.extend_from_slice(&1u32.to_le_bytes()); // n = 1 row
         evil.push(0b1); // present
         evil.push(0b0); // not null
@@ -699,7 +1050,7 @@ mod tests {
 
     #[test]
     fn a_bytes_length_exceeding_the_buffer_is_refused() {
-        let mut evil = vec![TAG_BYTES];
+        let mut evil = header(TAG_BYTES);
         evil.extend_from_slice(&1u32.to_le_bytes());
         evil.push(0b1);
         evil.push(0b0);
@@ -710,7 +1061,7 @@ mod tests {
 
     #[test]
     fn a_vector_length_exceeding_the_buffer_is_refused() {
-        let mut evil = vec![TAG_VECTOR];
+        let mut evil = header(TAG_VECTOR);
         evil.extend_from_slice(&1u32.to_le_bytes());
         evil.push(0b1);
         evil.push(0b0);
@@ -720,7 +1071,7 @@ mod tests {
     }
 
     /// Every truncation of a real, non-trivial chunk must decode to `None`,
-    /// never panic.
+    /// never partially decode into a value that was never actually there.
     #[test]
     fn a_truncated_chunk_is_refused_not_partially_read() {
         let values: Vec<Option<Value>> = (0..40)
@@ -734,7 +1085,12 @@ mod tests {
             .collect();
         let encoded = encode(&values).unwrap();
         for cut in 1..encoded.len() {
-            let _ = decode(&encoded[..encoded.len() - cut]);
+            assert_eq!(
+                decode(&encoded[..encoded.len() - cut]),
+                None,
+                "cut {} bytes from the end must be refused, not partially decoded",
+                cut
+            );
         }
     }
 

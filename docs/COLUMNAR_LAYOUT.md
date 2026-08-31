@@ -100,11 +100,13 @@ chunk of its group — one batch, so one extra round trip rather than one per
 column, but a round trip that a row-major layout does not pay. For a key-value
 or OLTP workload, which reads whole rows by key, this is a real regression and
 it is the central trade. Mitigation is to keep narrow collections row-major:
-the format already carries a version, and a collection records its own layout
-in its definition, so both can exist and each collection can take the one that
-suits it. A collection that is read by key and a collection that is scanned by
-column want different layouts, and pretending otherwise is how systems end up
-mediocre at both.
+the row-major leaf format already carries a version, and the column chunk
+format (`core/engine/src/column.rs`) leads with a magic and a version too, so
+either can change shape later without breaking what it already wrote — and a
+collection records its own layout in its definition, so both can exist and
+each collection can take the one that suits it. A collection that is read by
+key and a collection that is scanned by column want different layouts, and
+pretending otherwise is how systems end up mediocre at both.
 
 **Write amplification changes shape.** Updating one field of one row rewrites
 that column's chunk for the whole group, rather than one record. For
