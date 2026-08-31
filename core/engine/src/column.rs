@@ -111,6 +111,24 @@ const TAG_JSON: u8 = 7;
 /// leaf bound can in `pond_index::node` (there the index cannot depend on the
 /// engine, so it keeps a documented assumption instead; here nothing stops
 /// referencing the real thing).
+///
+/// # The coupling is safe in one direction only
+///
+/// Raising the leaf bound is harmless: chunks already written stay under the
+/// new, larger cap and keep decoding.
+///
+/// **Lowering it is a format break.** This cap is not a tuning parameter — it
+/// is part of what `decode` accepts, so reducing it makes every already-written
+/// chunk with more rows than the new value permanently undecodable, in a store
+/// that by design cannot rewrite what it holds. Nothing in `pond_index` would
+/// warn you: chunking's own constants are a size/latency trade there, and the
+/// person tuning them has no reason to look here.
+///
+/// If the leaf bound ever needs to shrink, this constant must be pinned to the
+/// old value instead of following it, and a comment must say why. That is the
+/// cost of referencing the real thing rather than duplicating it — the drift
+/// this coupling prevents is worth more than the hazard it introduces, but the
+/// hazard is real and undocumented hazards are how formats break.
 const MAX_DECLARED_ROWS: usize = pond_index::chunk::MAX_ENTRIES_PER_CHUNK;
 
 /// The variant tag a typed (non-`Null`, non-`Spilled`) value encodes under.
@@ -773,6 +791,124 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// The same property, at a scale hand-written shapes cannot reach.
+    ///
+    /// # Why the test above is not enough
+    ///
+    /// `decoding_then_re_encoding_a_canonical_buffer_reproduces_it` checks ten
+    /// inputs the author chose, so it can only find spellings the author
+    /// thought of. The six non-canonical spellings this codec used to accept
+    /// were found by a fuzz, not by inspection, and one of them — an all-null
+    /// chunk whose type tag was unconstrained, giving one object eight valid
+    /// names — is not a shape anybody writes down on purpose.
+    ///
+    /// So: generate buffers that are *structurally plausible* rather than
+    /// uniformly random, because uniform noise is rejected at the magic and
+    /// never reaches the interesting checks. A valid header with a random
+    /// tag, row count, bitmaps and payload bytes lands constantly on padding
+    /// bits above `n`, null bits on absent rows, and tag/content mismatches —
+    /// precisely the cases that were wrong.
+    ///
+    /// The assertion is the one that matters in a content-addressed store:
+    /// every buffer `decode` accepts must re-encode to itself. If it does not,
+    /// two byte strings name one value, a blob cannot be checked against its
+    /// own name, and a second implementation that spells padding differently
+    /// silently stops sharing objects with this one.
+    ///
+    /// Deterministic, and small enough to belong in the unit suite. The full
+    /// sweep that established the property ran 12.28M buffers with 360,473
+    /// accepted and zero non-canonical; this is the regression guard, not the
+    /// original proof.
+    #[test]
+    fn every_buffer_the_decoder_accepts_re_encodes_to_itself() {
+        let mut rng: u64 = 0x5eed_1234_abcd_ef01;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let mut accepted = 0usize;
+        for _ in 0..40_000 {
+            let tag = (next() % 9) as u8; // 8 is out of range on purpose
+            let n = (next() % 9) as usize;
+            let bitmap = n.div_ceil(8);
+
+            // Random bitmaps are the point: padding bits above `n`, null bits
+            // on absent rows, and all-null chunks under a typed tag all occur
+            // naturally here, and each was a real non-canonical spelling.
+            let present: Vec<u8> = (0..bitmap).map(|_| next() as u8).collect();
+            let nulls: Vec<u8> = (0..bitmap).map(|_| next() as u8).collect();
+
+            // How many rows carry a payload, by the same rule `decode` uses.
+            let bit = |m: &[u8], i: usize| m[i / 8] & (1 << (i % 8)) != 0;
+            let payload_rows = (0..n)
+                .filter(|&i| bit(&present, i) && !bit(&nulls, i))
+                .count();
+
+            let mut buf = Vec::from(MAGIC);
+            buf.push(FORMAT_VERSION);
+            buf.push(tag);
+            buf.extend_from_slice(&(n as u32).to_le_bytes());
+            buf.extend_from_slice(&present);
+            buf.extend_from_slice(&nulls);
+
+            // Correctly *sized* payloads, so a buffer is rejected for its
+            // bitmaps rather than for being the wrong length. Emitting random
+            // trailing bytes instead makes almost everything fail at the
+            // length check and the fuzz stops reaching the interesting code —
+            // an earlier version of this test accepted 46 buffers out of
+            // 40,000 for exactly that reason.
+            for _ in 0..payload_rows {
+                match tag {
+                    TAG_BOOL => buf.push((next() % 3) as u8), // 2 is non-canonical
+                    TAG_INT | TAG_F64 => {
+                        buf.extend_from_slice(&next().to_le_bytes());
+                    }
+                    TAG_STR | TAG_BYTES | TAG_JSON => {
+                        let len = (next() % 4) as u32;
+                        buf.extend_from_slice(&len.to_le_bytes());
+                        for _ in 0..len {
+                            // Keep it ASCII so `Str` and `Json` have a chance
+                            // of being valid UTF-8 rather than always failing.
+                            buf.push(b'a' + (next() % 26) as u8);
+                        }
+                    }
+                    TAG_VECTOR => {
+                        let len = (next() % 3) as u32;
+                        buf.extend_from_slice(&len.to_le_bytes());
+                        for _ in 0..len {
+                            buf.extend_from_slice(&(next() as u32).to_le_bytes());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(values) = decode(&buf) {
+                accepted += 1;
+                let re = encode(&values).expect("anything decode accepts must encode");
+                assert_eq!(
+                    re, buf,
+                    "decode accepted a buffer that is not encode's own output: \
+                     {:02x?} re-encodes to {:02x?}",
+                    buf, re
+                );
+            }
+        }
+
+        // A fuzz that accepts nothing proves nothing. This guards against a
+        // future change making every generated buffer invalid, which would
+        // leave the assertion above running zero times and passing.
+        assert!(
+            accepted > 200,
+            "only {accepted} of 40000 generated buffers were accepted — the \
+             generator is no longer producing plausible chunks, so this test \
+             is not exercising the property it claims to"
+        );
     }
 
     // -----------------------------------------------------------------------
