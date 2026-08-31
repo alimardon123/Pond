@@ -65,10 +65,17 @@
 // because `BTreeMap` cannot hold two entries under one key — so `decode`
 // rejects everything else: trailing bytes past the last column (`pos ==
 // buf.len()`), a row count or column count over its cap, a name length
-// reaching past the buffer, and — the one specific to this format — names
-// that are not strictly ascending. That single check catches both an
-// out-of-order name and a duplicate one, because a spelling with either
-// could not have come from iterating a `BTreeMap`.
+// reaching past the buffer, a name that is not valid UTF-8, and — the one
+// specific to this format — names that are not strictly ascending. That
+// single check catches both an out-of-order name and a duplicate one,
+// because a spelling with either could not have come from iterating a
+// `BTreeMap`.
+//
+// The UTF-8 item was missing from this list, and from the mutation table
+// that was supposed to prove each item is enforced — nine rows against ten
+// checks. Nothing noticed, because no test in the suite ever built a name
+// out of anything but ASCII. A list of what a decoder rejects is a claim
+// like any other, and an unchecked one drifts.
 
 use std::collections::BTreeMap;
 
@@ -97,6 +104,13 @@ const FORMAT_VERSION: u8 = 1;
 /// this cap is part of what `decode` accepts, so shrinking it makes an
 /// already-written footer with a larger row count permanently undecodable in
 /// a store that cannot rewrite what it holds.
+///
+/// So, the instruction, spelled out here as it is in `column.rs` rather than
+/// left implied: **if the leaf bound ever needs to shrink, pin this constant
+/// to the old value instead of following it, and say why in a comment.** The
+/// person tuning `DEFAULT_TARGET_ENTRIES` is making a size and latency
+/// decision and has no reason to read this file, which is exactly why the
+/// instruction belongs on this side of the coupling.
 const MAX_ROWS: usize = pond_index::chunk::MAX_ENTRIES_PER_CHUNK;
 
 /// Cap on the number of columns a footer can declare.
@@ -111,6 +125,14 @@ const MAX_ROWS: usize = pond_index::chunk::MAX_ENTRIES_PER_CHUNK;
 /// reuses [`MAX_ROWS`]'s value: no collection in this system comes
 /// remotely close to `pond_index::chunk::MAX_ENTRIES_PER_CHUNK` columns, so
 /// the cap costs nothing real while still bounding the loop before it runs.
+///
+/// One consequence of borrowing that value rather than choosing one: this
+/// constant inherits [`MAX_ROWS`]'s coupling to the leaf bound along a second,
+/// unrelated axis. A column count has no semantic relationship to a chunk's
+/// entry bound at all, so lowering `DEFAULT_TARGET_ENTRIES` would make
+/// already-written footers undecodable for having too many *columns* — a
+/// connection nobody would predict from either end. The same instruction
+/// applies, doubly: pin this, do not follow it down.
 const MAX_COLUMNS: usize = MAX_ROWS;
 
 /// The metadata a leaf's row group carries about its columns: how many rows
@@ -252,6 +274,12 @@ pub fn decode(buf: &[u8]) -> Option<Footer> {
     let mut previous: Option<String> = None;
     for _ in 0..n {
         let name_len = u16::from_le_bytes(r.take(2)?.try_into().ok()?) as usize;
+        // Refused, not repaired. `from_utf8_lossy` would map every invalid
+        // byte to U+FFFD, so `ff`, `fe` and the three bytes of U+FFFD itself
+        // all become the same name — three byte strings, one footer, three
+        // names for one object. That is the exact failure this format's
+        // canonical decoding exists to prevent, and it is reachable from a
+        // single corrupt byte.
         let name = String::from_utf8(r.take(name_len)?.to_vec()).ok()?;
         // Strictly ascending, not merely non-descending: this is what
         // catches a duplicate name and an out-of-order one with the same
@@ -471,9 +499,25 @@ mod tests {
         assert_eq!(encode(&a).unwrap(), encode(&b).unwrap());
     }
 
-    /// The direct statement of canonical decoding: re-encoding a decoded
-    /// footer reproduces the exact bytes it was decoded from, for every
-    /// shape [`golden_inputs`] exercises.
+    /// Re-encoding a decoded footer reproduces the bytes it came from, for
+    /// every shape [`golden_inputs`] exercises.
+    ///
+    /// # What this does not establish
+    ///
+    /// It used to call itself "the direct statement of canonical decoding",
+    /// which overstates it: the only buffers it hands to `decode` are ones
+    /// `encode` just produced, so it asserts
+    /// `encode(decode(encode(f))) == encode(f)` — implied by the round-trip
+    /// tests above and caught by nothing they miss. Against seventeen
+    /// mutations of this module it was the sole detector of none.
+    ///
+    /// The property it names — that `decode`'s accepted set is exactly
+    /// `encode`'s output set — is tested by
+    /// [`every_buffer_the_decoder_accepts_re_encodes_to_itself`], which
+    /// reaches buffers `encode` would never emit. This one is kept as the
+    /// cheap, readable statement of the shape; the comment is corrected
+    /// because in a file whose comments are load-bearing, a test that claims
+    /// more than it checks is how a gap gets believed to be covered.
     #[test]
     fn decoding_then_re_encoding_a_canonical_buffer_reproduces_it() {
         for (name, f) in golden_inputs() {
@@ -553,6 +597,18 @@ mod tests {
             ),
         ];
 
+        // `zip` stops at the shorter side, so without this the golden set
+        // can shrink and every assertion below simply stops running. Deleting
+        // three of five inputs here left the whole suite green — the frozen
+        // set silently became one input, and "the encoder's output is frozen"
+        // went on passing while freezing almost nothing. A loop that asserts
+        // per element needs someone to assert how many elements there were.
+        assert_eq!(
+            golden_inputs().len(),
+            expected.len(),
+            "golden inputs and expectations are different lengths, so some of \
+             them are not being checked at all"
+        );
         for ((name, f), (ename, digest)) in golden_inputs().iter().zip(expected) {
             assert_eq!(name, ename, "golden inputs and expectations drifted apart");
             let encoded = encode(f).expect("golden inputs must encode");
@@ -794,6 +850,69 @@ mod tests {
     /// strings name one footer, and a second implementation that spells the
     /// same footer differently would silently stop sharing objects with this
     /// one.
+    /// A column name that is not valid UTF-8 is refused, not repaired.
+    ///
+    /// # Why repairing would be the worst option
+    ///
+    /// `String::from_utf8_lossy` maps every invalid byte to U+FFFD, so a name
+    /// of `[0xff]`, a name of `[0xfe]`, and a name that genuinely spells
+    /// U+FFFD as `[0xef,0xbf,0xbd]` all decode to the same `Footer`. Three
+    /// byte strings, one value, three valid names for one object in a store
+    /// that addresses objects by the hash of their bytes.
+    ///
+    /// This check existed and nothing tested it: swapping it for a lossy
+    /// conversion left all 29 tests passing. It was also missing from the
+    /// module comment's list of what `decode` rejects, and from the mutation
+    /// table meant to show each rejection is enforced — nine rows for ten
+    /// checks. The suite never built a name from anything but ASCII, so
+    /// neither the tests nor the fuzz could reach it.
+    #[test]
+    fn a_column_name_that_is_not_valid_utf8_is_refused() {
+        // Each of these is a distinct way to be invalid, and each has bitten
+        // a real decoder somewhere: a byte that is never valid, a lone
+        // continuation byte, a truncated 4-byte sequence, an overlong
+        // encoding of NUL, and a UTF-16 surrogate half in CESU-8.
+        let bad: &[&[u8]] = &[
+            &[0xff],
+            &[0x80],
+            &[0xf0, 0x9f, 0x8e],
+            &[0xc0, 0x80],
+            &[0xed, 0xa0, 0x80],
+        ];
+
+        for name in bad {
+            let mut buf = Vec::from(MAGIC);
+            buf.push(FORMAT_VERSION);
+            buf.extend_from_slice(&0u32.to_le_bytes()); // row_count
+            buf.extend_from_slice(&1u32.to_le_bytes()); // one column
+            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name);
+            buf.extend_from_slice(&[7u8; 32]); // a well-formed hash
+
+            assert!(
+                decode(&buf).is_none(),
+                "a name of {:02x?} was accepted; lossy repair would give it \
+                 the same value as several other byte strings",
+                name
+            );
+        }
+
+        // And the control: the same shape with a valid multibyte name must be
+        // accepted, so this test cannot pass by refusing everything.
+        let good = "é".as_bytes();
+        let mut buf = Vec::from(MAGIC);
+        buf.push(FORMAT_VERSION);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&(good.len() as u16).to_le_bytes());
+        buf.extend_from_slice(good);
+        buf.extend_from_slice(&[7u8; 32]);
+        assert!(
+            decode(&buf).is_some(),
+            "a valid multibyte name was refused — this test is now vacuous"
+        );
+    }
+
     #[test]
     fn every_buffer_the_decoder_accepts_re_encodes_to_itself() {
         let mut rng: u64 = 0xF00D_5EED_1234_ABCD;
@@ -826,7 +945,19 @@ mod tests {
                 let name_len = 1 + (next() % 3) as usize;
                 buf.extend_from_slice(&(name_len as u16).to_le_bytes());
                 for _ in 0..name_len {
-                    buf.push(b'a' + (next() % 4) as u8);
+                    // Not ASCII-only. The alphabet used to be `b'a'..b'd'`,
+                    // which cannot produce an invalid sequence, so the fuzz
+                    // structurally could not reach the UTF-8 check — one of
+                    // the reasons that check went untested. High bytes,
+                    // continuation bytes and multi-byte lead bytes are all
+                    // in range now.
+                    buf.push(match next() % 8 {
+                        0..=3 => b'a' + (next() % 4) as u8,
+                        4 => 0xff,
+                        5 => 0x80, // a lone continuation byte
+                        6 => 0xc3, // a 2-byte lead, often left dangling
+                        _ => 0xf0, // a 4-byte lead
+                    });
                 }
                 for _ in 0..32 {
                     buf.push(next() as u8);

@@ -339,6 +339,18 @@ mod tests {
             ("incompressible", "d7ef9056482ff18fa99bd93c7adb7b803d92aa5ccabf6dccadda75ca2b092174"),
         ];
 
+        // `zip` stops at the shorter side, so without this the golden set
+        // can shrink and every assertion below simply stops running. Deleting
+        // three of five inputs here left the whole suite green — the frozen
+        // set silently became one input, and "the encoder's output is frozen"
+        // went on passing while freezing almost nothing. A loop that asserts
+        // per element needs someone to assert how many elements there were.
+        assert_eq!(
+            golden_inputs().len(),
+            expected.len(),
+            "golden inputs and expectations are different lengths, so some of \
+             them are not being checked at all"
+        );
         for ((name, data), (ename, digest)) in golden_inputs().iter().zip(expected) {
             assert_eq!(name, ename, "golden inputs and expectations drifted apart");
             let packed = pack(data);
