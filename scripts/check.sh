@@ -77,6 +77,18 @@ cargo build --workspace 2>&1 | grep -E "^error" -A 5 && fail "build"
 echo "== test =="
 test_out=$(mktemp)
 if ! cargo test --workspace >"$test_out" 2>&1; then
+  # E0460 is "found possibly newer version of crate", which means another
+  # cargo process rebuilt a dependency underneath this one — two runs sharing
+  # ./target. It arrives looking exactly like a real failure ("doctest
+  # failed", a named crate, a wall of rustdoc arguments), and chasing it as
+  # one wastes an afternoon. Same reasoning as the disk-space warning above:
+  # a failure mode that impersonates a different failure mode should say what
+  # it is.
+  if grep -q "E0460" "$test_out"; then
+    echo "  E0460: another cargo process is using ./target concurrently."
+    echo "  This is contention, not a test failure. Re-run when it is done."
+    fail "tests (concurrent cargo)"
+  fi
   grep -E "^(error|test result: FAILED)|^---- |panicked at|assertion" -A 4 "$test_out" | head -40
   fail "tests"
 fi

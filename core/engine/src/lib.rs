@@ -46,6 +46,7 @@ use pond_kernel::ObjectStore;
 use pond_record::{decode_record, encode_record, merge_records, Head, Record};
 
 pub mod column;
+pub mod footer;
 pub mod spill;
 pub mod store;
 pub mod history;
