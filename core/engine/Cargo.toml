@@ -16,3 +16,4 @@ pond_cache = { path = "../cache" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+sha2 = "0.10"

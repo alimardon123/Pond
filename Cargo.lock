@@ -1629,6 +1629,7 @@ dependencies = [
  "pond_index",
  "pond_kernel",
  "pond_record",
+ "sha2",
  "tempfile",
 ]
 
